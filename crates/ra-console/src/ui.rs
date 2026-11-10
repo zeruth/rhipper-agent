@@ -42,6 +42,8 @@ enum Input {
     Wheel(i32, u16),
     /// A left click on screen row `y`.
     Click(u16),
+    /// The pointer moved to screen row `y`.
+    Hover(u16),
 }
 
 struct App {
@@ -67,6 +69,10 @@ struct App {
     model: String,
     /// The node a click picked; the tree highlights its row.
     selected: Option<i64>,
+    /// The screen row the pointer is over, for the hover surface.
+    hover: Option<u16>,
+    /// The marquee offset of the model badge, advanced while the name overflows its panel.
+    marquee: usize,
 }
 
 /// Runs the console until it is told to quit.
@@ -95,6 +101,8 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         roadmap: None,
         model: DEFAULT_MODEL.to_owned(),
         selected: None,
+        hover: None,
+        marquee: 0,
     };
     sink.push(Kind::Output, "Rhipper Agent console ready. Type help for commands.");
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -123,8 +131,8 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
             // scrolled past the oldest line: hold at it, so scrolling down answers at once
             app.scroll = app.scroll.min(max_scroll);
             if let Some(area) = tree_area {
-                let rows = app.roadmap.as_ref().map_or(0, |nodes| roadmap_pane::rows(nodes, &app.folded).len());
-                app.tree_scroll = app.tree_scroll.min(rows.saturating_sub(area.height as usize));
+                let cards = app.roadmap.as_ref().map_or(0, |nodes| roadmap_pane::card_rows(nodes, &app.folded, app.selected).len());
+                app.tree_scroll = app.tree_scroll.min(cards.saturating_sub(area.height as usize));
             }
             last_draw = Instant::now();
             dirty = false;
@@ -135,19 +143,26 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                 dirty = true;
                 match input {
                     Input::Click(y) => {
-                        // a click inside the tree pane picks the node: its details land in the log,
+                        // a click inside the tree pane picks the card: its details expand inline,
                         // a second click on an open parent folds it
                         if let Some(area) = tree_area {
                             if (area.y..area.y + area.height).contains(&y) {
-                                let row = roadmap_pane::row_at((y - area.y) as usize, app.tree_scroll);
+                                let row = roadmap_pane::row_at(y, area.y, app.tree_scroll);
                                 if let Some(nodes) = &app.roadmap {
-                                    let visible = roadmap_pane::rows(nodes, &app.folded);
+                                    let visible = roadmap_pane::card_rows(nodes, &app.folded, app.selected);
                                     if let Some(row) = visible.get(row) {
-                                        let id = row.node.id;
-                                        if app.selected == Some(id) && !row.folded {
-                                            app.folded.push(id);
-                                        } else if app.selected == Some(id) && row.folded {
-                                            app.folded.retain(|f| *f != id);
+                                        let id = row.id;
+                                        let has_children = nodes.iter().any(|n| n.parent == Some(id));
+                                        if app.selected == Some(id) {
+                                            if has_children {
+                                                if app.folded.contains(&id) {
+                                                    app.folded.retain(|f| *f != id);
+                                                } else {
+                                                    app.folded.push(id);
+                                                }
+                                            } else {
+                                                app.selected = None;
+                                            }
                                         } else {
                                             app.selected = Some(id);
                                             if let Ok(node) = store.read(id).await {
@@ -157,6 +172,16 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                                     }
                                 }
                             }
+                        }
+                        continue;
+                    }
+                    Input::Hover(y) => {
+                        let over_tree = tree_area.is_some_and(|area| (area.y..area.y + area.height).contains(&y));
+                        let next = over_tree.then_some(y);
+                        if app.hover != next {
+                            app.hover = next;
+                        } else {
+                            dirty = false;
                         }
                         continue;
                     }
@@ -194,6 +219,11 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                 }
             }
             _ = tick.tick() => {
+                // the marquee walks while the model name overflows its badge
+                if app.model.chars().count() + 3 > 16 {
+                    app.marquee = (app.marquee + 1) % (app.model.chars().count() + 3);
+                    dirty = true;
+                }
                 // the roadmap pane follows the file, an outside edit included
                 if let Ok(nodes) = store.all().await {
                     if app.roadmap.as_ref() != Some(&nodes) {
@@ -235,6 +265,11 @@ fn read_keys(tx: mpsc::UnboundedSender<Input>, stop: Arc<AtomicBool>) {
                         }
                     }
                     // any button press folds the node under it; drag and release pass through
+                    MouseEventKind::Moved => {
+                        if tx.send(Input::Hover(m.row)).is_err() {
+                            return;
+                        }
+                    }
                     MouseEventKind::Down(_) => {
                         if tx.send(Input::Click(m.row)).is_err() {
                             return;
@@ -378,7 +413,7 @@ fn draw(f: &mut Frame, app: &App, sink: &Sink) -> usize {
     f.render_widget(Paragraph::new(status_line(app)).style(Style::new().bg(theme::PANEL)), header);
     draw_usage(f, usage, app);
     if let Some(nodes) = &app.roadmap {
-        roadmap_pane::draw(f, nodes, &app.folded, app.selected, app.tree_scroll, tree);
+        roadmap_pane::draw(f, nodes, &app.folded, app.selected, app.hover, app.tree_scroll, tree);
     }
     let max_scroll = draw_log(f, app, sink, body);
     draw_input(f, app, input);
@@ -410,13 +445,15 @@ fn tree_area_of(f: &Frame) -> Option<Rect> {
 fn draw_usage(f: &mut Frame, area: Rect, app: &App) {
     let [model, task, tokens, ledger] =
         Layout::horizontal([Constraint::Length(18), Constraint::Min(14), Constraint::Length(20), Constraint::Length(17)]).areas(area);
-    // the model badge: the model the next worker session would run on
+    // the model badge: the model the next worker session would run on, marqueeing when it overflows
     let inner = usage_panel(f, model);
-    let model = app.model.as_str();
+    let model_text = app.model.as_str();
+    let room = usize::from(inner.width).saturating_sub(2);
+    let shown = marquee(model_text, room, app.marquee);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("◉ ", Style::new().fg(theme::ACCENT)),
-            Span::styled(short_model(model, inner.width as usize - 3), Style::new().fg(theme::TEXT).bold()),
+            Span::styled(shown, Style::new().fg(theme::TEXT).bold()),
         ])),
         inner,
     );
@@ -454,10 +491,16 @@ fn draw_usage(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(vec![Span::styled("◌", dim), Span::raw(" "), Span::styled("not linked", dim)])), inner);
 }
 
-/// The model id without its vendor, clipped to `room`: `z-ai/glm-5.3-flash` becomes `glm-5.3-flash`.
-fn short_model(model: &str, room: usize) -> String {
-    let short = model.rsplit('/').next().unwrap_or(model);
-    short_title(short, room)
+/// A window of `room` characters over `text`, offset by `step`, with a gap of three spaces when it
+/// wraps; a short text comes back whole.
+fn marquee(text: &str, room: usize, step: usize) -> String {
+    let mut chars: Vec<char> = text.chars().collect();
+    if chars.len() <= room {
+        return text.to_owned();
+    }
+    chars.extend([' ', ' ', ' ']);
+    let run = chars.len();
+    (0..room).map(|i| chars[(step + i) % run]).collect()
 }
 
 /// The title clipped to `room` characters, with an ellipsis when it gives one up.
