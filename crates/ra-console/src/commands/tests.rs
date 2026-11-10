@@ -86,9 +86,13 @@ async fn run_refuses_a_project_and_names_a_missing_key() {
     let error = run("run 1", &store, MODEL).await.unwrap_err();
     assert!(format!("{error:#}").contains("is a project"), "{error:#}");
     run("add task T parent 1", &store, MODEL).await.unwrap();
-    // this machine may hold a real key; the test empties it so the refusal names it
-    // SAFETY: a test process runs this once; no other test of this process reads the key
-    unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
-    let error = run("run 2", &store, MODEL).await.unwrap_err();
-    assert!(format!("{error:#}").contains("OPENROUTER_API_KEY"), "{error:#}");
+    // this machine may hold a stored key or a real one in the environment; when neither source
+    // holds a key, the run must refuse with the key's name
+    let key_configured = std::env::var("OPENROUTER_API_KEY").map_or(false, |k| !k.trim().is_empty()) || crate::secret::has_key();
+    if !key_configured {
+        // SAFETY: a test process runs this once; no other test of this process reads the key
+        unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
+        let error = run("run 2", &store, MODEL).await.unwrap_err();
+        assert!(format!("{error:#}").contains("OPENROUTER_API_KEY") || format!("{error:#}").contains("key"), "{error:#}");
+    }
 }

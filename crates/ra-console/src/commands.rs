@@ -22,6 +22,7 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "depend", usage: "<id> <id>...", help: "makes the first node wait for the others" },
     Spec { name: "set", usage: "<id> <state>", help: "sets the state: the twelve lifecycle names" },
     Spec { name: "model", usage: "<id>", help: "the model of the next worker session, an OpenRouter id" },
+    Spec { name: "key", usage: "[<paste> | clear]", help: "stores, shows the state of, or clears the OpenRouter key" },
     Spec { name: "ping", usage: "", help: "one round trip to the badge model, through OpenRouter" },
     Spec { name: "run", usage: "<id>", help: "executes one roadmap task on the badge model" },
     Spec { name: "seed", usage: "", help: "fills the roadmap with the improvement plan of the agent itself" },
@@ -126,6 +127,21 @@ pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<
             anyhow::ensure!(args.is_empty(), "usage: seed");
             let ids = seed(store).await?;
             out.push(format!("planted the improvement roadmap: {} nodes under the project", ids.len()));
+        }
+        "key" => {
+            if args == "clear" {
+                crate::secret::clear()?;
+                out.push("the stored key is gone; the environment variable still wins when it is set".into());
+            } else if args.is_empty() {
+                if crate::secret::has_key() {
+                    out.push(format!("a key is stored ({}); the environment variable overrides it when set", crate::secret::masked()?));
+                } else {
+                    out.push("no key stored; set one with key <paste>".into());
+                }
+            } else {
+                crate::secret::set_key(args)?;
+                out.push(format!("the key is in the credential store ({})", crate::secret::masked()?));
+            }
         }
         "ping" => {
             anyhow::ensure!(args.is_empty(), "usage: ping");

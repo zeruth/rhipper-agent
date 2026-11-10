@@ -1,6 +1,7 @@
 //! The agent loop: the console's live path to a model. `ping` proves the connection; `run` sends
 //! one roadmap task to the badge model and records what came back.
 
+use crate::secret;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError};
 use ra_roadmap::model::{Node, TaskState};
 use ra_roadmap::store::Store;
@@ -8,12 +9,9 @@ use ra_roadmap::store::Store;
 /// The model of the next run, as the badge holds it.
 pub type Model = String;
 
-/// Reads the OpenRouter key from the environment.
+/// Reads the OpenRouter key: the credential store, with the environment as the override.
 pub fn api_key() -> anyhow::Result<String> {
-    match std::env::var("OPENROUTER_API_KEY").ok().filter(|k| !k.trim().is_empty()) {
-        Some(key) => Ok(key),
-        None => anyhow::bail!("OPENROUTER_API_KEY is not set: export it before a run"),
-    }
+    secret::api_key()
 }
 
 /// Sends one message and returns the answer and the usage as log lines.
@@ -38,9 +36,10 @@ pub async fn ping(model: &str) -> anyhow::Result<Vec<String>> {
 /// Runs one roadmap task: builds the context from the node, its ancestors and its dependencies,
 /// sends it to the model, and writes the answer and the state back.
 pub async fn run(store: &Store, id: i64, model: &str) -> anyhow::Result<Vec<String>> {
-    let key = api_key()?;
+    // the node first, so a bad id or a project is named before the key matters
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != ra_roadmap::model::NodeKind::Project, "#{} is a project; run a task", id);
+    let key = api_key()?;
     store.set_state(id, TaskState::InProgress).await?;
 
     let context = context_of(store, &node).await?;

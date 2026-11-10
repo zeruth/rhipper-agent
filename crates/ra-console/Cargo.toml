@@ -18,6 +18,7 @@ parking_lot.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+keyring = { version = "3", features = ["windows-native"] }
 
 [dev-dependencies]
 tempfile.workspace = true
