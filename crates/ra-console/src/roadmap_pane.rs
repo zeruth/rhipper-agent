@@ -23,33 +23,24 @@ struct Row {
     line: Line<'static>,
 }
 
-/// The style of an outline row: the accent for the selected card, the warm highlight for the
-/// hovered one, the rule color otherwise, all on the panel surface.
-fn outline(selected: bool, hovered: bool) -> Style {
-    let fg = if selected {
-        theme::ACCENT
-    } else if hovered {
-        theme::WARN_TEXT
-    } else {
-        theme::RULE
-    };
-    Style::new().fg(fg).bg(theme::PANEL)
-}
-
 /// The rows of one card and, when it is open, of its whole subtree. `width` is the outer width of
-/// this card's box; a child's box takes two columns less, one for each side of its parent.
+/// this card's box; a child's box takes two columns less, one for each side of its parent. The
+/// outline takes the lane color of the depth: bright on the hovered chain and the selected card,
+/// dim everywhere else.
 fn rows_of(
     node: &Node,
     children: &HashMap<i64, Vec<Node>>,
     folded: &[i64],
     selected: Option<i64>,
-    hover_id: Option<i64>,
+    chain: &std::collections::HashSet<i64>,
+    depth: usize,
     width: usize,
 ) -> Vec<Row> {
     let id = node.id;
     let is_selected = selected == Some(id);
-    let is_hovered = hover_id == Some(id);
-    let outline_style = outline(is_selected, is_hovered);
+    let in_chain = chain.contains(&id);
+    let lane = if in_chain || is_selected { theme::lane(depth) } else { theme::dim_lane(depth) };
+    let outline_style = Style::new().fg(lane).bg(theme::PANEL);
     let folded_here = children.contains_key(&id) && folded.contains(&id);
     let mut rows = vec![Row { id, border: true, line: edge_row("╭", "─", "╮", width, outline_style) }];
 
@@ -87,7 +78,7 @@ fn rows_of(
     if !folded_here {
         if let Some(kids) = children.get(&id) {
             for kid in kids {
-                for row in rows_of(kid, children, folded, selected, hover_id, width.saturating_sub(2)) {
+                for row in rows_of(kid, children, folded, selected, chain, depth + 1, width.saturating_sub(2)) {
                     rows.push(Row { id: row.id, border: row.border, line: frame_row(row.line, width, outline_style) });
                 }
             }
@@ -242,9 +233,18 @@ pub fn draw(
         }
     }
     let width = area.width as usize;
+    // the hovered card and its ancestors carry their lane colors bright
+    let mut chain: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    if let Some(hover) = hover_id {
+        let mut next = Some(hover);
+        while let Some(id) = next {
+            chain.insert(id);
+            next = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent);
+        }
+    }
     let mut rows: Vec<Row> = Vec::new();
     for root in &roots {
-        rows.extend(rows_of(root, &children, folded, selected, hover_id, width));
+        rows.extend(rows_of(root, &children, folded, selected, &chain, 0, width));
     }
 
     let height = area.height as usize;

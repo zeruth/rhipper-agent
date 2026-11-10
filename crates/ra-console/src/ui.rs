@@ -77,6 +77,8 @@ struct App {
     ticks: u32,
     /// Whether the trace lines show in the log; `debug` toggles them.
     show_debug: bool,
+    /// The height of the log-and-prompt card, in rows; the wheel over it resizes it.
+    log_card: u16,
 }
 
 /// Runs the console until it is told to quit.
@@ -109,6 +111,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         marquee: 0,
         ticks: 0,
         show_debug: false,
+        log_card: 12,
     };
     sink.push(Kind::Output, "Rhipper Agent console ready. Type help for commands.");
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -116,6 +119,10 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
     let mut dirty = true;
     // the screen rows of the tree pane, so the wheel and the clicks route to it
     let mut tree_area: Option<Rect> = None;
+    // the log card's screen area, so the wheel knows where to resize it
+    let mut log_area: Option<Rect> = None;
+    // the frame height, for the resize clamp
+    let mut frame_height: u16 = 24;
     // the node id under every visible tree row, as the last draw laid them out
     let mut tree_rows: Vec<i64> = Vec::new();
     let result = loop {
@@ -138,8 +145,10 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                 _ => None,
             };
             if let Err(e) = terminal.draw(|f| {
-                (max_scroll, tree_max_scroll) = draw(f, &app, &sink, hover_id, &mut row_ids);
-                tree_area = tree_area_of(f);
+                frame_height = f.area().height;
+                let panes;
+                (max_scroll, tree_max_scroll, panes) = draw(f, &app, &sink, hover_id, &mut row_ids);
+                (tree_area, log_area) = (panes.tree, panes.log);
             }) {
                 break Err(e.into());
             }
@@ -197,8 +206,15 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                     }
                     Input::Wheel(rows, y) => {
                         let over_tree = tree_area.is_some_and(|area| (area.y..area.y + area.height).contains(&y));
+                        let over_log = log_area.is_some_and(|area| (area.y..area.y + area.height).contains(&y));
                         if over_tree {
                             app.tree_scroll = app.tree_scroll.saturating_add_signed(rows as isize * WHEEL_ROWS as isize);
+                        } else if over_log {
+                            // the wheel over the log card grows or shrinks it; the roadmap takes the rest
+                            let next = i32::from(app.log_card) + rows * 2;
+                            let low = 7i32;
+                            let high = i32::from(frame_height).saturating_sub(12).max(low);
+                            app.log_card = next.clamp(low, high) as u16;
                         } else {
                             app.scroll = app.scroll.saturating_add_signed(rows as isize * WHEEL_ROWS as isize);
                         }
@@ -421,8 +437,15 @@ fn shift_held(key: &KeyEvent) -> bool {
 /// can, and fills `row_ids` with the node id under every visible tree row. `hover_id` names the
 /// card the pointer rests on. The panes from the top: the status line, the usage pane, the roadmap
 /// tree, the log, the prompt and the footer.
-fn draw(f: &mut Frame, app: &App, sink: &Sink, hover_id: Option<i64>, row_ids: &mut Vec<i64>) -> (usize, usize) {
-    let [header, usage, tree, body, input, footer] = pane_layout().areas(f.area());
+/// The screen areas the wheel and the clicks route against.
+#[derive(Default, Clone, Copy)]
+struct Panes {
+    tree: Option<Rect>,
+    log: Option<Rect>,
+}
+
+fn draw(f: &mut Frame, app: &App, sink: &Sink, hover_id: Option<i64>, row_ids: &mut Vec<i64>) -> (usize, usize, Panes) {
+    let [header, usage, tree, log_card, footer] = pane_layout(app.log_card).areas(f.area());
     // every cell, so even gaps the widgets never touch paint the theme
     use ratatui::widgets::Widget;
     Block::new().style(Style::new().bg(theme::BG)).render(f.area(), f.buffer_mut());
@@ -434,28 +457,29 @@ fn draw(f: &mut Frame, app: &App, sink: &Sink, hover_id: Option<i64>, row_ids: &
         *row_ids = ids;
         tree_max = tree_max_scroll;
     }
-    let max_scroll = draw_log(f, app, sink, body);
-    draw_input(f, app, input);
+    // the log and the prompt live in one rounded card; the roadmap takes the rest
+    let border = if app.quit_armed.is_some() { theme::WARN } else { theme::RULE };
+    let card =
+        Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(border)).style(Style::new().bg(theme::PANEL));
+    f.render_widget(card, log_card);
+    let inner =
+        Rect { x: log_card.x + 1, y: log_card.y + 1, width: log_card.width.saturating_sub(2), height: log_card.height.saturating_sub(2) };
+    let [log, prompt] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    let max_scroll = draw_log(f, app, sink, log);
+    draw_prompt(f, app, prompt);
     f.render_widget(Paragraph::new(footer_line(app, footer.width)).style(Style::new().bg(theme::BG)), footer);
-    (max_scroll, tree_max)
+    (max_scroll, tree_max, Panes { tree: Some(tree), log: Some(log_card) })
 }
 
-/// The vertical pane layout, once, so the draw and the hit-testing agree on it.
-fn pane_layout() -> Layout {
+/// The vertical pane layout for a log-card height, so the draw and the hit-testing agree on it.
+fn pane_layout(log_card: u16) -> Layout {
     Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
-        Constraint::Percentage(40),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(log_card),
         Constraint::Length(1),
     ])
-}
-
-/// The tree pane's screen area, as the layout just computed it. The draw of the frame already ran,
-/// so a re-split of the frame area gives the same rectangles.
-fn tree_area_of(f: &Frame) -> Option<Rect> {
-    pane_layout().split(f.area()).get(2).copied()
 }
 
 /// The usage pane: four areas on one row. The badges name the model and the task of the next run;
@@ -667,12 +691,9 @@ fn wrap(text: &str, room: usize) -> Vec<String> {
     rows
 }
 
-fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    let border = if app.quit_armed.is_some() { theme::WARN } else { theme::ACCENT_DEEP };
-    let block =
-        Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(border)).style(Style::new().bg(theme::PANEL));
-    let inner = block.inner(area);
-    let room = (inner.width as usize).saturating_sub(PROMPT.chars().count() + 1).max(1);
+/// Draws the prompt as one row inside the log card.
+fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let room = (area.width as usize).saturating_sub(PROMPT.chars().count() + 1).max(1);
     // keep the cursor in view
     let skip = app.cursor.saturating_sub(room);
     let text: String = app.input.iter().skip(skip).take(room).collect();
@@ -682,9 +703,9 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     } else {
         spans.push(Span::styled(text, Style::new().fg(theme::TEXT)));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
-    let x = inner.x + (PROMPT.chars().count() + app.cursor - skip) as u16;
-    f.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let x = area.x + (PROMPT.chars().count() + app.cursor - skip) as u16;
+    f.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
 }
 
 fn footer_line(app: &App, width: u16) -> Line<'static> {
@@ -701,9 +722,8 @@ fn footer_line(app: &App, width: u16) -> Line<'static> {
         ("help", "commands"),
         ("↑↓", "history"),
         ("Tab", "complete"),
-        ("wheel", "scroll"),
+        ("wheel", "tree · log size"),
         ("click", "pick node"),
-        ("PgUp/PgDn", "page log"),
         ("Ctrl+C×2", "stop"),
     ]
     .into_iter()

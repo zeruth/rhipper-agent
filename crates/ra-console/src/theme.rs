@@ -26,3 +26,30 @@ pub const WARN_TEXT: Color = Color::Rgb(242, 204, 96);
 pub const DEBUG: Color = Color::Rgb(57, 197, 207);
 pub const TRACE: Color = Color::Rgb(188, 140, 255);
 pub const ONLINE: Color = Color::Rgb(63, 185, 80);
+
+/// The lane colors of the tree depth, GitKraken style: one vivid color per level of the roadmap.
+const LANES: [(u8, u8, u8); 10] = [
+    (255, 83, 112),  // red
+    (255, 148, 82),  // orange
+    (255, 214, 102), // yellow
+    (63, 200, 120),  // green
+    (57, 197, 178),  // teal
+    (87, 214, 224),  // cyan
+    (100, 148, 255), // blue
+    (163, 133, 255), // violet
+    (255, 121, 198), // magenta
+    (255, 110, 149), // rose
+];
+
+/// The bright lane color of a depth.
+pub fn lane(depth: usize) -> Color {
+    let (r, g, b) = LANES[depth % LANES.len()];
+    Color::Rgb(r, g, b)
+}
+
+/// The lane color of a depth, dimmed toward the background for the cards out of the hover chain.
+pub fn dim_lane(depth: usize) -> Color {
+    let (r, g, b) = LANES[depth % LANES.len()];
+    let mix = |c: u8| u8::try_from(u16::from(c) * 45 / 100 + 12).unwrap_or(c);
+    Color::Rgb(mix(r), mix(g), mix(b))
+}
