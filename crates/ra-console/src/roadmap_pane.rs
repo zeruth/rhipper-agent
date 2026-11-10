@@ -74,7 +74,8 @@ fn rows_of(
     if is_selected && !folded_here {
         for (label, value) in [("objective", node.objective.as_deref()), ("acceptance", node.acceptance.as_deref())] {
             let Some(value) = value else { continue };
-            rows.push(Row { id, border: false, buttons: Vec::new(), line: section_row(label, room, outline_style) });
+            // the rule spans the card's full width, so its corners meet both side borders
+            rows.push(Row { id, border: false, buttons: Vec::new(), line: section_row(label, width, outline_style) });
             for line in wrap_spans(vec![Span::styled(value.to_owned(), Style::new().fg(theme::TEXT).bg(theme::PANEL))], room) {
                 rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line, width, outline_style) });
             }
@@ -157,9 +158,10 @@ fn short_title(title: &str, room: usize) -> String {
     }
 }
 
-/// The top edge of a card, with the id, the title and the badges set into the outline itself, the
-/// way the objective labels sit in their rules. The title clips when it would not fit, and the
-/// filler run closes the edge to `width`.
+/// The top edge of a card, with the role, the id, the title and the badges set into the outline
+/// itself, the way the objective labels sit in their rules. A project, a milestone or a section
+/// reads as `Roadmap:`, a task or a subtask as `Task:`. The title clips when it would not fit, and
+/// the filler run closes the edge to `width`.
 fn titled_edge(node: &Node, is_selected: bool, width: usize, outline_style: Style) -> Line<'static> {
     let title_style = if is_selected {
         Style::new().fg(theme::WARN_TEXT).bold().bg(theme::PANEL)
@@ -167,10 +169,15 @@ fn titled_edge(node: &Node, is_selected: bool, width: usize, outline_style: Styl
         Style::new().fg(theme::TEXT).bold().bg(theme::PANEL)
     };
     let badge = |text: String, color: ratatui::style::Color| Span::styled(text, Style::new().fg(color).bg(theme::PANEL));
+    let role = match node.kind {
+        NodeKind::Task | NodeKind::Subtask => "Task: ",
+        _ => "Roadmap: ",
+    };
     let assignee = node.assignee.as_ref().map_or(0, |a| format!(" [{}:{}]", a.role, a.model).chars().count());
     let overhead = 2usize
         + if node.kind == NodeKind::Project { 2 } else { 0 }
         + format!("#{} ", node.id).chars().count()
+        + role.chars().count()
         + format!(" {{c{}}}", node.complexity).chars().count()
         + format!(" [{}]", node.state.serde_name()).chars().count()
         + assignee
@@ -181,6 +188,7 @@ fn titled_edge(node: &Node, is_selected: bool, width: usize, outline_style: Styl
         spans.push(badge("◆ ".to_owned(), theme::ACCENT));
     }
     spans.push(badge(format!("#{} ", node.id), theme::DIM));
+    spans.push(badge(role.to_owned(), theme::TRACE));
     spans.push(Span::styled(title, title_style));
     spans.push(badge(format!(" {{c{}}}", node.complexity), theme::DIM));
     spans.push(badge(format!(" [{}]", node.state.serde_name()), state_color(node.state)));
@@ -218,12 +226,12 @@ fn frame_row(line: Line<'static>, width: usize, outline_style: Style) -> Line<'s
 }
 
 /// A section rule of the selected card: `├─ objective ────┤`, attached to both side borders of the
-/// card, so the field sits inside the card's lines instead of breaking them. The rows span `room`
-/// cells, the content width of the card.
-fn section_row(label: &str, room: usize, outline_style: Style) -> Line<'static> {
+/// card, so the field sits inside the card's lines without breaking them. The row spans the full
+/// `width` of the card, corners included.
+fn section_row(label: &str, width: usize, outline_style: Style) -> Line<'static> {
     let label_style = Style::new().fg(theme::ACCENT).bold().bg(theme::PANEL);
     let label_cell = format!("─ {label} ");
-    let run = room.saturating_sub(label_cell.chars().count() + 1);
+    let run = width.saturating_sub(label_cell.chars().count() + 2);
     Line::from(vec![
         Span::styled("├", outline_style),
         Span::styled(label_cell, label_style),
