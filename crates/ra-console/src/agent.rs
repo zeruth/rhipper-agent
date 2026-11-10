@@ -57,9 +57,14 @@ pub async fn run(store: &Store, id: i64, model: &str) -> anyhow::Result<Vec<Stri
     store.set_notes(id, &answer.text).await?;
     store.set_state(id, TaskState::Implemented).await?;
     Ok(vec![
-        format!("#{} implemented on {}", node.title, short(model)),
-        format!("  in {} out {} cached {}", answer.usage.prompt_tokens, answer.usage.completion_tokens, answer.usage.cached_tokens),
-        answer.text,
+        format!(
+            "✓ #{} implemented on {} · in {} out {}",
+            node.title,
+            short(model),
+            answer.usage.prompt_tokens,
+            answer.usage.completion_tokens
+        ),
+        "  the full answer is in the notes of the card in rhipper.md".to_owned(),
     ])
 }
 
@@ -69,21 +74,18 @@ pub async fn run(store: &Store, id: i64, model: &str) -> anyhow::Result<Vec<Stri
 pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> anyhow::Result<Vec<String>> {
     let key = api_key()?;
     let provider = ra_providers::openrouter::OpenRouter::new(key)?;
-    let mut out = Vec::new();
+    let mut revised: Vec<String> = Vec::new();
     let mut queue = vec![id];
-    let mut done = 0usize;
     while let Some(current) = queue.pop() {
-        let lines = reassess_one(store, &provider, model, current).await?;
-        out.extend(lines);
-        done += 1;
+        reassess_one(store, &provider, model, current).await?;
+        revised.push(format!("#{}", current));
         if recursive {
             let kids: Vec<i64> = store.all().await?.iter().filter(|n| n.parent == Some(current)).map(|n| n.id).collect();
             // the children go back on the stack, so the parent reassesses first
             queue.extend(kids);
         }
     }
-    out.insert(0, format!("{done} node(s) reassessed on {}", short(model)));
-    Ok(out)
+    Ok(vec![format!("✓ {} node(s) reassessed on {}: {}", revised.len(), short(model), revised.join(" "))])
 }
 
 /// One reassessment: the model returns two lines, and the store takes them.

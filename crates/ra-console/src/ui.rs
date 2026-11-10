@@ -40,10 +40,10 @@ enum Input {
     Key(KeyEvent),
     /// Mouse wheel: rows up (positive) or down, at screen row `y`.
     Wheel(i32, u16),
-    /// A left click on screen row `y`.
-    Click(u16),
-    /// The pointer moved to screen row `y`.
-    Hover(u16),
+    /// A left click at column `x`, row `y`.
+    Click(u16, u16),
+    /// The pointer moved to column `x`, row `y`.
+    Hover(u16, u16),
 }
 
 struct App {
@@ -69,8 +69,8 @@ struct App {
     model: String,
     /// The node a click picked; the tree highlights its row.
     selected: Option<i64>,
-    /// The screen row the pointer is over, for the hover surface.
-    hover: Option<u16>,
+    /// The screen position the pointer is over, for the hover surface and the buttons.
+    hover: Option<(u16, u16)>,
     /// The marquee offset of the model badge, advanced while the name overflows its panel.
     marquee: usize,
     /// The tick counter; the marquee advances on every fourth tick.
@@ -79,6 +79,8 @@ struct App {
     show_debug: bool,
     /// The height of the log-and-prompt card, in rows; the wheel over it resizes it.
     log_card: u16,
+    /// The slow call in flight, shown as the animated status above the prompt.
+    job: Option<String>,
 }
 
 /// Runs the console until it is told to quit.
@@ -112,8 +114,11 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         ticks: 0,
         show_debug: false,
         log_card: 12,
+        job: None,
     };
-    sink.push(Kind::Output, "Rhipper Agent console ready. Type help for commands.");
+    sink.push(Kind::Banner, format!("Rhipper Agent v{} — Tyler Bochard. Type help for commands.", env!("CARGO_PKG_VERSION")));
+    // the slow calls report their completion here, so the status above the prompt can stop
+    let (job_tx, mut job_done) = mpsc::unbounded_channel::<()>();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     let mut dirty = true;
@@ -160,20 +165,21 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                 let Some(input) = input else { break Ok(()) };
                 dirty = true;
                 match input {
-                    Input::Click(y) => {
-                        // a click inside the tree pane: a button row runs its command, any other row
-                        // picks the card it names
+                    Input::Click(x, y) => {
+                        // a click inside the tree pane: a button column runs its command, any other
+                        // row picks the card it names
                         if let Some(area) = tree_area {
                             if (area.y..area.y + area.height).contains(&y) {
                                 let index = (y - area.y) as usize;
                                 if let Some(hit) = tree_rows.get(index) {
-                                    if let Some(button) = hit.action {
+                                    let column = usize::from(x).saturating_sub(usize::from(area.x));
+                                    if let Some(&(_, _, button)) = hit.buttons.iter().find(|(start, end, _)| column >= usize::from(*start) && column < usize::from(*end)) {
                                         let line = match button {
                                             roadmap_pane::Button::Run => format!("run {}", hit.id),
                                             roadmap_pane::Button::Reassess => format!("reassess {}", hit.id),
                                             roadmap_pane::Button::ReassessTree => format!("reassess-tree {}", hit.id),
                                         };
-                                        if execute_line(line, &store, &sink, &mut app).await {
+                                        if execute_line(line, &store, &sink, &mut app, &job_tx).await {
                                             break Ok(());
                                         }
                                         continue;
@@ -201,9 +207,9 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                         }
                         continue;
                     }
-                    Input::Hover(y) => {
+                    Input::Hover(x, y) => {
                         let over_tree = tree_area.is_some_and(|area| (area.y..area.y + area.height).contains(&y));
-                        let next = over_tree.then_some(y);
+                        let next = over_tree.then_some((x, y));
                         if app.hover != next {
                             app.hover = next;
                         } else {
@@ -232,18 +238,27 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                         Action::None => {}
                         Action::Quit => break Ok(()),
                         Action::Run(line) => {
-                            if execute_line(line, &store, &sink, &mut app).await {
+                            if execute_line(line, &store, &sink, &mut app, &job_tx).await {
                                 break Ok(());
                             }
                         }
                     },
                 }
             }
+            Some(()) = job_done.recv() => {
+                // the background call finished; the status above the prompt goes away
+                app.job = None;
+                dirty = true;
+            }
             _ = tick.tick() => {
                 app.ticks = app.ticks.wrapping_add(1);
                 // the marquee walks a step every fourth tick, a pace the eye follows
                 if app.ticks % 4 == 0 && app.model.chars().count() + 3 > 14 {
                     app.marquee = (app.marquee + 1) % (app.model.chars().count() + 3);
+                    dirty = true;
+                }
+                // the working status flashes while a call is in flight
+                if app.job.is_some() && app.ticks % 2 == 0 {
                     dirty = true;
                 }
                 // the roadmap pane follows the file, an outside edit included
@@ -286,14 +301,14 @@ fn read_keys(tx: mpsc::UnboundedSender<Input>, stop: Arc<AtomicBool>) {
                             return;
                         }
                     }
-                    // any button press folds the node under it; drag and release pass through
+                    // any button press picks or runs; drag and release pass through
                     MouseEventKind::Moved => {
-                        if tx.send(Input::Hover(m.row)).is_err() {
+                        if tx.send(Input::Hover(m.column, m.row)).is_err() {
                             return;
                         }
                     }
                     MouseEventKind::Down(_) => {
-                        if tx.send(Input::Click(m.row)).is_err() {
+                        if tx.send(Input::Click(m.column, m.row)).is_err() {
                             return;
                         }
                     }
@@ -424,9 +439,36 @@ fn shift_held(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
-/// Runs one command line through the dispatcher, showing the input and the answer in the log.
-/// Returns whether the line stopped the console.
-async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App) -> bool {
+/// Runs one command line through the dispatcher. A slow call (a run, a reassess, a ping) goes to a
+/// background task: the console stays live, the status above the prompt shows the work, and the
+/// completion lands in the log through the sink. Returns whether the line stopped the console.
+async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, job_done: &mpsc::UnboundedSender<()>) -> bool {
+    let name = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    if matches!(name.as_str(), "run" | "reassess" | "reassess-tree" | "ping") {
+        sink.push(Kind::Input, line.clone());
+        let arg = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+        app.job = Some(match name.as_str() {
+            "run" => format!("running #{arg}"),
+            "ping" => "pinging the provider".to_owned(),
+            other => format!("{other} #{arg}"),
+        });
+        let store = store.clone();
+        let sink = sink.clone();
+        let model = app.model.clone();
+        let tx = job_done.clone();
+        tokio::spawn(async move {
+            match commands::run(&line, &store, &model).await {
+                Ok((out, _)) => {
+                    for l in out {
+                        sink.push(Kind::Output, l);
+                    }
+                }
+                Err(e) => sink.push(Kind::Error, format!("{e:#}")),
+            }
+            let _ = tx.send(());
+        });
+        return false;
+    }
     sink.push(Kind::Input, line.clone());
     match commands::run(&line, store, &app.model).await {
         Ok((out, outcome)) => {
@@ -493,8 +535,20 @@ fn draw(f: &mut Frame, app: &App, sink: &Sink, row_ids: &mut Vec<roadmap_pane::H
     f.render_widget(card, log_card);
     let inner =
         Rect { x: log_card.x + 1, y: log_card.y + 1, width: log_card.width.saturating_sub(2), height: log_card.height.saturating_sub(2) };
-    let [log, prompt] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    let [log, status, prompt] = Layout::vertical([Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
     let max_scroll = draw_log(f, app, sink, log);
+    if let Some(job) = &app.job {
+        // the working status flashes while a slow call is in flight
+        let spinner = SPINNER[usize::try_from(app.ticks % SPINNER.len() as u32).unwrap_or(0)];
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {spinner} "), Style::new().fg(theme::ACCENT).bold().bg(theme::PANEL)),
+                Span::styled(format!("{job}…"), Style::new().fg(theme::WARN_TEXT).bg(theme::PANEL)),
+            ]))
+            .style(Style::new().bg(theme::PANEL)),
+            status,
+        );
+    }
     draw_prompt(f, app, prompt);
     f.render_widget(Paragraph::new(footer_line(app, footer.width)).style(Style::new().bg(theme::BG)), footer);
     (max_scroll, tree_max, Panes { tree: Some(tree), log: Some(log_card) })
@@ -635,7 +689,9 @@ fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect) -> usize {
             if matches!(line.kind, Kind::Log(tracing::Level::DEBUG) | Kind::Log(tracing::Level::TRACE)) && !app.show_debug {
                 continue;
             }
-            let mut r = rows_of(line, width);
+            // the lane index counts forward from the oldest line, so a bubble keeps its color
+            let lane_index = lines.len() - 1 - i;
+            let mut r = rows_of(line, width, lane_index);
             r.reverse();
             taken.extend(r);
             if taken.len() >= want && i + 1 < lines.len() {
@@ -660,39 +716,50 @@ fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect) -> usize {
     max_scroll
 }
 
-/// One log line as screen rows `width` wide: a styled prefix, then the text, wrapped under it.
-fn rows_of(line: &crate::logs::Line, width: usize) -> Vec<Line<'static>> {
-    let dim = Style::new().fg(theme::DIM);
-    let (prefix, text_style): (Vec<Span<'static>>, Style) = match line.kind {
-        Kind::Input => {
-            let (name, args) = line.text.split_once(' ').unwrap_or((&line.text, ""));
-            let mut spans = vec![Span::styled(PROMPT.to_string(), Style::new().fg(theme::ACCENT).bold())];
-            if !args.is_empty() {
-                return vec![Line::from(vec![
-                    Span::styled(PROMPT.to_string(), Style::new().fg(theme::ACCENT).bold()),
-                    Span::styled(name.to_owned(), Style::new().fg(theme::ACCENT).bold()),
-                    Span::styled(format!(" {args}"), Style::new().fg(theme::TEXT)),
-                ])];
-            }
-            spans.push(Span::styled(name.to_owned(), Style::new().fg(theme::ACCENT).bold()));
-            return vec![Line::from(spans)];
+/// The spinner frames of the working status.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// One log entry as a rounded bubble: the outline in the kind's color, the text in a color that
+/// matches it. An output entry takes the lane color of its place in the session, never red; an
+/// error and the banner stay red.
+fn rows_of(line: &crate::logs::Line, width: usize, lane_index: usize) -> Vec<Line<'static>> {
+    let (border, text) = match line.kind {
+        Kind::Input => (theme::ACCENT, theme::TEXT),
+        Kind::Output => {
+            let lane = theme::lane(1 + lane_index % (theme::LANE_COUNT - 1));
+            (lane, lane)
         }
-        Kind::Output => (vec![Span::styled("  ⎿ ".to_string(), dim)], Style::new().fg(theme::OUTPUT)),
-        Kind::Error => (vec![Span::styled("  ⎿ ".to_string(), dim)], Style::new().fg(theme::ERROR_TEXT)),
-        Kind::Log(_) => (vec![Span::styled("· ".to_string(), dim)], Style::new().fg(theme::TEXT)),
+        Kind::Banner => (theme::ACCENT, theme::ACCENT),
+        Kind::Error => (theme::ACCENT, theme::ERROR_TEXT),
+        Kind::Log(tracing::Level::ERROR) => (theme::ACCENT, theme::ERROR_TEXT),
+        Kind::Log(tracing::Level::WARN) => (theme::WARN, theme::WARN_TEXT),
+        Kind::Log(tracing::Level::DEBUG) => (theme::DEBUG, theme::DEBUG),
+        Kind::Log(tracing::Level::TRACE) => (theme::TRACE, theme::TRACE),
+        Kind::Log(_) => (theme::DIM, theme::TEXT),
     };
-    let indent: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
-    let room = width.saturating_sub(indent).max(10);
-    let mut out = Vec::new();
-    for (i, piece) in wrap(&line.text, room).into_iter().enumerate() {
-        let mut spans = if i == 0 { prefix.clone() } else { vec![Span::raw(" ".repeat(indent))] };
-        spans.push(Span::styled(piece, text_style));
-        out.push(Line::from(spans));
+    let border_style = Style::new().fg(border);
+    let text_style = Style::new().fg(text).bg(theme::PANEL);
+    let room = width.saturating_sub(4).max(4);
+    let mut rows = vec![Line::from(vec![
+        Span::styled("╭", border_style),
+        Span::styled("─".repeat(room + 2), border_style),
+        Span::styled("╮", border_style),
+    ])];
+    for piece in wrap(&line.text, room) {
+        let pad = " ".repeat(room.saturating_sub(piece.chars().count()));
+        rows.push(Line::from(vec![
+            Span::styled("│ ", border_style),
+            Span::styled(piece, text_style),
+            Span::styled(pad, Style::new().bg(theme::PANEL)),
+            Span::styled(" │", border_style),
+        ]));
     }
-    if out.is_empty() {
-        out.push(Line::from(prefix));
-    }
-    out
+    rows.push(Line::from(vec![
+        Span::styled("╰", border_style),
+        Span::styled("─".repeat(room + 2), border_style),
+        Span::styled("╯", border_style),
+    ]));
+    rows
 }
 
 /// Wraps `text` into rows of at most `room` characters, on spaces where it can.

@@ -41,6 +41,9 @@ const LANES: [(u8, u8, u8); 10] = [
     (255, 110, 149), // rose
 ];
 
+/// The number of lane colors.
+pub const LANE_COUNT: usize = LANES.len();
+
 /// The bright lane color of a depth.
 pub fn lane(depth: usize) -> Color {
     let (r, g, b) = LANES[depth % LANES.len()];

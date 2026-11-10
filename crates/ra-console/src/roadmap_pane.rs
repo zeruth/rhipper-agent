@@ -18,12 +18,13 @@ use ratatui::widgets::Paragraph;
 use crate::theme;
 
 /// One generated row of the pane: the card it belongs to, whether it is a border row, its content,
-/// and the button a click on it runs.
+/// and the buttons its columns run.
 struct Row {
     id: i64,
     border: bool,
     line: Line<'static>,
-    action: Option<Button>,
+    /// The clickable columns of the row, pane-relative: start, end, button.
+    buttons: Vec<(u16, u16, Button)>,
 }
 
 /// The lifecycle buttons of the expanded card.
@@ -37,11 +38,12 @@ pub enum Button {
     ReassessTree,
 }
 
-/// One row of the hit test: the card under it and the button it runs, if any.
-#[derive(Debug, Clone, Copy)]
+/// One row of the hit test: the card under it and the buttons its columns run.
+#[derive(Debug, Clone)]
 pub struct Hit {
     pub id: i64,
-    pub action: Option<Button>,
+    /// The clickable columns of the row, pane-relative: start, end, button.
+    pub buttons: Vec<(u16, u16, Button)>,
 }
 
 /// The rows of one card and, when it is open, of its whole subtree. `width` is the outer width of
@@ -54,6 +56,7 @@ fn rows_of(
     folded: &[i64],
     selected: Option<i64>,
     chain: &std::collections::HashSet<i64>,
+    hover_button: Option<Button>,
     depth: usize,
     width: usize,
 ) -> Vec<Row> {
@@ -63,7 +66,7 @@ fn rows_of(
     let lane = if in_chain || is_selected { theme::lane(depth) } else { theme::dim_lane(depth) };
     let outline_style = Style::new().fg(lane).bg(theme::PANEL);
     let folded_here = children.contains_key(&id) && folded.contains(&id);
-    let mut rows = vec![Row { id, border: true, action: None, line: edge_row("╭", "─", "╮", width, outline_style) }];
+    let mut rows = vec![Row { id, border: true, buttons: Vec::new(), line: edge_row("╭", "─", "╮", width, outline_style) }];
 
     // the title rows: the marker, the id, the title and the badges, wrapped inside the box
     let room = width.saturating_sub(4);
@@ -86,28 +89,38 @@ fn rows_of(
         body.push(Span::styled(format!(" [{}:{}]", assignee.role, assignee.model), Style::new().fg(theme::TRACE).bg(theme::PANEL)));
     }
     for line in wrap_spans(body, room) {
-        rows.push(Row { id, border: false, action: None, line: boxed_row(line, width, outline_style) });
+        rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line, width, outline_style) });
     }
 
     // the selected card opens its fields: the objective and the acceptance framed in the accent,
-    // the notes plain, and the lifecycle buttons at the end
+    // the notes plain, and the lifecycle buttons on one row, dim until the pointer is over one
     if is_selected {
         for (label, value) in [("objective", node.objective.as_deref()), ("acceptance", node.acceptance.as_deref())] {
             if let Some(value) = value {
                 for line in framed_block(label, value, room) {
-                    rows.push(Row { id, border: false, action: None, line });
+                    rows.push(Row { id, border: false, buttons: Vec::new(), line });
                 }
             }
         }
         for line in plain_detail(node, room) {
-            rows.push(Row { id, border: false, action: None, line });
+            rows.push(Row { id, border: false, buttons: Vec::new(), line });
         }
+        let mut defs: Vec<(Button, String)> = Vec::new();
         if node.kind == NodeKind::Task || node.kind == NodeKind::Subtask {
-            rows.push(Row { id, border: false, action: Some(Button::Run), line: button_row("▶ run") });
+            defs.push((Button::Run, "▶ run".to_owned()));
         }
         if node.kind != NodeKind::Project {
-            rows.push(Row { id, border: false, action: Some(Button::Reassess), line: button_row("↻ re-assess") });
-            rows.push(Row { id, border: false, action: Some(Button::ReassessTree), line: button_row("↻↻ re-assess tree") });
+            defs.push((Button::Reassess, "↻ re-assess".to_owned()));
+            defs.push((Button::ReassessTree, "↻↻ re-assess tree".to_owned()));
+        }
+        if !defs.is_empty() {
+            let labels: Vec<(Button, &str)> = defs.iter().map(|(b, l)| (*b, l.as_str())).collect();
+            let (content, mut ranges) = buttons_row(&labels, hover_button);
+            // the columns sit after the ancestors' frames and this card's own border and margin
+            for range in ranges.iter_mut() {
+                *range = (range.0 + depth as u16 + 2, range.1 + depth as u16 + 2, range.2);
+            }
+            rows.push(Row { id, border: false, buttons: ranges, line: boxed_row(content, width, outline_style) });
         }
     }
 
@@ -116,14 +129,19 @@ fn rows_of(
     if !folded_here {
         if let Some(kids) = children.get(&id) {
             for kid in kids {
-                for row in rows_of(kid, children, folded, selected, chain, depth + 1, width.saturating_sub(2)) {
-                    rows.push(Row { id: row.id, border: row.border, action: row.action, line: frame_row(row.line, width, outline_style) });
+                for row in rows_of(kid, children, folded, selected, chain, hover_button, depth + 1, width.saturating_sub(2)) {
+                    rows.push(Row {
+                        id: row.id,
+                        border: row.border,
+                        buttons: row.buttons,
+                        line: frame_row(row.line, width, outline_style),
+                    });
                 }
             }
         }
     }
 
-    rows.push(Row { id, border: true, action: None, line: edge_row("╰", "─", "╯", width, outline_style) });
+    rows.push(Row { id, border: true, buttons: Vec::new(), line: edge_row("╰", "─", "╯", width, outline_style) });
     rows
 }
 
@@ -218,14 +236,28 @@ fn plain_detail(node: &Node, room: usize) -> Vec<Line<'static>> {
     rows
 }
 
-/// One lifecycle button as a row: a bracketed label in the accent, clickable, one per row.
-fn button_row(label: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("  ", Style::new().bg(theme::PANEL)),
-        Span::styled("[", Style::new().fg(theme::DIM).bg(theme::PANEL)),
-        Span::styled(label.to_owned(), Style::new().fg(theme::ACCENT).bold().bg(theme::PANEL)),
-        Span::styled("]", Style::new().fg(theme::DIM).bg(theme::PANEL)),
-    ])
+/// The lifecycle buttons on one row: bracketed labels, dim until the pointer rests on one. Returns
+/// the spans and each button's columns within the row.
+fn buttons_row(buttons: &[(Button, &str)], hover_button: Option<Button>) -> (Vec<Span<'static>>, Vec<(u16, u16, Button)>) {
+    let dim = Style::new().fg(theme::DIM).bg(theme::PANEL);
+    let hot = Style::new().fg(theme::ACCENT).bold().bg(theme::PANEL);
+    let mut spans = Vec::new();
+    let mut ranges = Vec::new();
+    let mut offset = 0u16;
+    for (i, (button, label)) in buttons.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", dim));
+            offset += 2;
+        }
+        let start = offset;
+        spans.push(Span::styled("[", dim));
+        let style = if hover_button == Some(*button) { hot } else { dim };
+        spans.push(Span::styled((*label).to_owned(), style));
+        spans.push(Span::styled("]", dim));
+        offset += 1 + label.chars().count() as u16 + 1;
+        ranges.push((start, offset, *button));
+    }
+    (spans, ranges)
 }
 
 /// Wraps plain text into rows of at most `room` characters, on spaces where it can.
@@ -287,15 +319,15 @@ fn wrap_spans(spans: Vec<Span<'static>>, room: usize) -> Vec<Vec<Span<'static>>>
 }
 
 /// Draws the pane at `scroll`; returns how far back the rows can scroll and the hit test under
-/// every visible screen row. `hover` is the pointer's screen row; the hovered card and its
-/// ancestors carry their lane colors bright, resolved on the layout of this very frame, so an
-/// open or a close cannot leave the highlight on the wrong card.
+/// every visible screen row. `hover` is the pointer's position; the hovered card and its ancestors
+/// carry their lane colors bright and the hovered button runs hot, all resolved on the layout of
+/// this very frame, so an open or a close cannot leave the highlight on the wrong card.
 pub fn draw(
     f: &mut Frame,
     nodes: &[Node],
     folded: &[i64],
     selected: Option<i64>,
-    hover: Option<u16>,
+    hover: Option<(u16, u16)>,
     scroll: usize,
     area: Rect,
 ) -> (usize, Vec<Hit>) {
@@ -311,22 +343,28 @@ pub fn draw(
     let empty = std::collections::HashSet::new();
     let mut rows: Vec<Row> = Vec::new();
     for root in &roots {
-        rows.extend(rows_of(root, &children, folded, selected, &empty, 0, width));
+        rows.extend(rows_of(root, &children, folded, selected, &empty, None, 0, width));
     }
-    // the card under the pointer, on this frame's layout, then the rows again with its chain bright
-    let hover_id = hover.and_then(|y| usize::from(y).checked_sub(usize::from(area.y))).and_then(|i| rows.get(i + scroll)).map(|row| row.id);
-    if let Some(hover) = hover_id {
+    // the card and the button under the pointer, on this frame's layout, then the rows again with
+    // the chain bright and the button hot
+    let index = hover.and_then(|(_, y)| usize::from(y).checked_sub(usize::from(area.y))).map(|i| i + scroll);
+    let hover_id = index.and_then(|i| rows.get(i)).map(|row| row.id);
+    let hover_button = index.and_then(|i| rows.get(i)).and_then(|row| {
+        hover.and_then(|(x, _)| {
+            let x = usize::from(x).saturating_sub(usize::from(area.x));
+            row.buttons.iter().find(|(start, end, _)| x >= usize::from(*start) && x < usize::from(*end)).map(|b| b.2)
+        })
+    });
+    if let Some(hover_id) = hover_id {
         let mut chain: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        let mut next = Some(hover);
+        let mut next = Some(hover_id);
         while let Some(id) = next {
             chain.insert(id);
             next = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent);
         }
-        if !chain.is_empty() {
-            rows.clear();
-            for root in &roots {
-                rows.extend(rows_of(root, &children, folded, selected, &chain, 0, width));
-            }
+        rows.clear();
+        for root in &roots {
+            rows.extend(rows_of(root, &children, folded, selected, &chain, hover_button, 0, width));
         }
     }
 
@@ -346,7 +384,7 @@ pub fn draw(
     for (i, row) in rows.iter().skip(scroll).take(height).enumerate() {
         let y = area.y + i as u16;
         f.render_widget(Paragraph::new(row.line.clone()), Rect { x: area.x, y, width: area.width, height: 1 });
-        row_ids.push(Hit { id: row.id, action: row.action });
+        row_ids.push(Hit { id: row.id, buttons: row.buttons.clone() });
     }
     (max_scroll, row_ids)
 }

@@ -13,6 +13,8 @@ pub enum Kind {
     Input,
     /// An answer of the console or a worker.
     Output,
+    /// The greeting of the console.
+    Banner,
     /// A logged event, at a level.
     Log(tracing::Level),
     /// A failure.
