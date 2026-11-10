@@ -27,6 +27,7 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "run", usage: "<id>", help: "executes one roadmap task on the badge model" },
     Spec { name: "seed", usage: "", help: "fills the roadmap with the improvement plan of the agent itself" },
     Spec { name: "clear", usage: "", help: "clears the log view" },
+    Spec { name: "debug", usage: "", help: "toggles the trace lines in the log; the file copy always runs" },
     Spec { name: "quit", usage: "", help: "stops the console (also exit, or Ctrl+C twice)" },
 ];
 
@@ -37,6 +38,8 @@ pub enum Outcome {
     Quit,
     /// The console adopts the model on the badge: `model <id>` set it.
     Model(String),
+    /// The console shows or hides the trace lines: `debug` toggled them.
+    ToggleDebug,
 }
 
 /// Command names that start with `prefix`.
@@ -152,6 +155,10 @@ pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<
             return Ok((crate::agent::run(store, id, &model).await?, Outcome::Continue));
         }
         "clear" | "cls" => return Ok((out, Outcome::Clear)),
+        "debug" => {
+            anyhow::ensure!(args.is_empty(), "usage: debug");
+            return Ok((out, Outcome::ToggleDebug));
+        }
         "model" => {
             anyhow::ensure!(!args.is_empty(), "usage: model <openrouter id>, such as z-ai/glm-5.3-flash");
             out.push(format!("the next worker session runs on {args}"));

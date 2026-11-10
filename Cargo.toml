@@ -26,7 +26,7 @@ ratatui = "0.30"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 thiserror = "2"
 tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

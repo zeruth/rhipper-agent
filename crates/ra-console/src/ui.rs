@@ -75,6 +75,8 @@ struct App {
     marquee: usize,
     /// The tick counter; the marquee advances on every fourth tick.
     ticks: u32,
+    /// Whether the trace lines show in the log; `debug` toggles them.
+    show_debug: bool,
 }
 
 /// Runs the console until it is told to quit.
@@ -106,6 +108,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         hover: None,
         marquee: 0,
         ticks: 0,
+        show_debug: false,
     };
     sink.push(Kind::Output, "Rhipper Agent console ready. Type help for commands.");
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -146,6 +149,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
             tree_rows = row_ids;
             last_draw = Instant::now();
             dirty = false;
+            tracing::debug!("frame: log scroll {} of {}, tree scroll {}", app.scroll, max_scroll, app.tree_scroll);
         }
         tokio::select! {
             input = keys.recv() => {
@@ -217,6 +221,10 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                                         Outcome::Clear => sink.clear(),
                                         Outcome::Quit => break Ok(()),
                                         Outcome::Model(model) => app.model = model,
+                                        Outcome::ToggleDebug => {
+                                            app.show_debug = !app.show_debug;
+                                            sink.push(Kind::Output, format!("trace lines {}", if app.show_debug { "on" } else { "off" }));
+                                        }
                                     }
                                 }
                                 Err(e) => sink.push(Kind::Error, format!("{e:#}")),
@@ -572,6 +580,10 @@ fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect) -> usize {
         let mut taken: Vec<Line<'static>> = Vec::new();
         let mut all = true;
         for (i, line) in lines.iter().rev().enumerate() {
+            // the trace lines stay out of the log until debug turns them on
+            if matches!(line.kind, Kind::Log(tracing::Level::DEBUG) | Kind::Log(tracing::Level::TRACE)) && !app.show_debug {
+                continue;
+            }
             let mut r = rows_of(line, width);
             r.reverse();
             taken.extend(r);

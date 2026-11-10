@@ -115,14 +115,23 @@ impl std::str::FromStr for TaskStateArg {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let options = Options::parse();
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
     match options.command {
-        Command::Show { id } => show(id).await,
+        Command::Show { id } => {
+            plain_tracing()?;
+            show(id).await
+        }
         Command::Add { kind, title, parent, objective, acceptance, complexity } => {
+            plain_tracing()?;
             add(kind.0, &title, parent, objective.as_deref(), acceptance.as_deref(), complexity).await
         }
-        Command::Depend { id, waits_for } => depend(id, &waits_for).await,
-        Command::Set { id, state } => set(id, state.0).await,
+        Command::Depend { id, waits_for } => {
+            plain_tracing()?;
+            depend(id, &waits_for).await
+        }
+        Command::Set { id, state } => {
+            plain_tracing()?;
+            set(id, state.0).await
+        }
         Command::Console { roadmap } => console(roadmap).await,
     }
 }
@@ -130,6 +139,15 @@ async fn main() -> anyhow::Result<()> {
 /// The default roadmap file; the commands open it in the working directory.
 fn store_path() -> PathBuf {
     PathBuf::from("rhipper.md")
+}
+
+/// Opens the trace file and initializes the subscriber for the plain subcommands; they hold no
+/// console, so the file is the only destination.
+fn plain_tracing() -> anyhow::Result<()> {
+    std::fs::create_dir_all("var")?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open("var/console.log")?;
+    ra_console::trace::init(log, None);
+    Ok(())
 }
 
 async fn open_store() -> anyhow::Result<Store> {
@@ -228,10 +246,13 @@ async fn set(id: i64, state: TaskState) -> anyhow::Result<()> {
 }
 
 async fn console(roadmap: PathBuf) -> anyhow::Result<()> {
+    std::fs::create_dir_all("var")?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open("var/console.log")?;
     let store = Store::open(&roadmap, "Rhipper Agent").await?;
     if !ra_console::ui::is_terminal() {
         anyhow::bail!("the console needs a terminal");
     }
     let sink = ra_console::logs::Sink::new();
+    ra_console::trace::init(log, Some(sink.clone()));
     ra_console::ui::run(store, sink).await
 }

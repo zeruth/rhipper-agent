@@ -9,4 +9,5 @@ pub mod logs;
 pub mod roadmap_pane;
 pub mod secret;
 pub mod theme;
+pub mod trace;
 pub mod ui;
