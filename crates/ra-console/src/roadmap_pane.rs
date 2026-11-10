@@ -52,20 +52,21 @@ pub fn rows(nodes: &[Node], folded: &[i64]) -> Vec<Row> {
     out
 }
 
-/// Draws the pane at `scroll`; returns how far back it can scroll.
-pub fn draw(f: &mut Frame, nodes: &[Node], folded: &[i64], scroll: usize, area: Rect) -> usize {
+/// Draws the pane at `scroll`, with the row of `selected` highlighted; returns how far back it can
+/// scroll.
+pub fn draw(f: &mut Frame, nodes: &[Node], folded: &[i64], selected: Option<i64>, scroll: usize, area: Rect) -> usize {
     let rows = rows(nodes, folded);
     let height = area.height as usize;
     let total = rows.len();
     let max_scroll = total.saturating_sub(height);
     let scroll = scroll.min(max_scroll);
-    let shown: Vec<Line> = rows.into_iter().skip(scroll).take(height).map(row_line).collect();
+    let shown: Vec<Line> = rows.into_iter().skip(scroll).take(height).map(|row| row_line(&row, selected == Some(row.node.id))).collect();
     f.render_widget(Paragraph::new(shown), area);
     max_scroll
 }
 
 /// The row of one node: the fold marker, the id, the kind, the title and the inline fields.
-fn row_line(row: Row) -> Line<'static> {
+fn row_line(row: &Row, selected: bool) -> Line<'static> {
     let marker = if row.node.kind == NodeKind::Project {
         "◆ ".to_owned()
     } else if row.folded {
@@ -75,11 +76,12 @@ fn row_line(row: Row) -> Line<'static> {
     };
     let marker_color = if row.folded { theme::DIM } else { theme::ACCENT };
     let state_color = state_color(row.node.state);
+    let title_style = if selected { Style::new().fg(theme::WARN_TEXT).bold() } else { Style::new().fg(theme::TEXT).bold() };
     let mut spans = vec![
         Span::styled("  ".repeat(row.depth), Style::new()),
         Span::styled(marker, Style::new().fg(marker_color)),
         Span::styled(format!("#{} ", row.node.id), Style::new().fg(theme::DIM)),
-        Span::styled(row.node.title.clone(), Style::new().fg(theme::TEXT).bold()),
+        Span::styled(row.node.title.clone(), title_style),
         Span::styled(format!(" {{c{}}}", row.node.complexity), Style::new().fg(theme::DIM)),
         Span::styled(format!(" [{}]", row.node.state.serde_name()), Style::new().fg(state_color)),
     ];

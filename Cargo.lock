@@ -1749,6 +1749,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "parking_lot",
+ "ra-providers",
  "ra-roadmap",
  "ratatui",
  "tempfile",

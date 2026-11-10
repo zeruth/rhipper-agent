@@ -27,6 +27,8 @@ const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const PROMPT: &str = "❯ ";
 /// Rows a mouse wheel notch scrolls.
 const WHEEL_ROWS: usize = 3;
+/// The model the console starts with; `model` swaps it.
+pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
 
 /// Whether stdout is a terminal; the console needs one.
 pub fn is_terminal() -> bool {
@@ -61,8 +63,10 @@ struct App {
     hint: Option<String>,
     /// The last-known roadmap nodes, for the tree pane.
     roadmap: Option<Vec<ra_roadmap::model::Node>>,
-    /// The model the next worker session would run on; `model` sets it.
-    model: Option<String>,
+    /// The model the next worker session would run on; `model` swaps it.
+    model: String,
+    /// The node a click picked; the tree highlights its row.
+    selected: Option<i64>,
 }
 
 /// Runs the console until it is told to quit.
@@ -89,7 +93,8 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         started: Instant::now(),
         hint: None,
         roadmap: None,
-        model: None,
+        model: DEFAULT_MODEL.to_owned(),
+        selected: None,
     };
     sink.push(Kind::Output, "Rhipper Agent console ready. Type help for commands.");
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -130,7 +135,8 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                 dirty = true;
                 match input {
                     Input::Click(y) => {
-                        // a click inside the tree pane folds or unfolds the node under it
+                        // a click inside the tree pane picks the node: its details land in the log,
+                        // a second click on an open parent folds it
                         if let Some(area) = tree_area {
                             if (area.y..area.y + area.height).contains(&y) {
                                 let row = roadmap_pane::row_at((y - area.y) as usize, app.tree_scroll);
@@ -138,10 +144,15 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                                     let visible = roadmap_pane::rows(nodes, &app.folded);
                                     if let Some(row) = visible.get(row) {
                                         let id = row.node.id;
-                                        if let Some(i) = app.folded.iter().position(|f| *f == id) {
-                                            app.folded.remove(i);
-                                        } else {
+                                        if app.selected == Some(id) && !row.folded {
                                             app.folded.push(id);
+                                        } else if app.selected == Some(id) && row.folded {
+                                            app.folded.retain(|f| *f != id);
+                                        } else {
+                                            app.selected = Some(id);
+                                            if let Ok(node) = store.read(id).await {
+                                                sink.push(Kind::Output, node_brief(&node));
+                                            }
                                         }
                                     }
                                 }
@@ -163,7 +174,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                         Action::Quit => break Ok(()),
                         Action::Run(line) => {
                             sink.push(Kind::Input, line.clone());
-                            match commands::run(&line, &store).await {
+                            match commands::run(&line, &store, &app.model).await {
                                 Ok((out, outcome)) => {
                                     for l in out {
                                         sink.push(Kind::Output, l);
@@ -172,7 +183,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                                         Outcome::Continue => {}
                                         Outcome::Clear => sink.clear(),
                                         Outcome::Quit => break Ok(()),
-                                        Outcome::Model(model) => app.model = Some(model),
+                                        Outcome::Model(model) => app.model = model,
                                     }
                                 }
                                 Err(e) => sink.push(Kind::Error, format!("{e:#}")),
@@ -367,7 +378,7 @@ fn draw(f: &mut Frame, app: &App, sink: &Sink) -> usize {
     f.render_widget(Paragraph::new(status_line(app)).style(Style::new().bg(theme::PANEL)), header);
     draw_usage(f, usage, app);
     if let Some(nodes) = &app.roadmap {
-        roadmap_pane::draw(f, nodes, &app.folded, app.tree_scroll, tree);
+        roadmap_pane::draw(f, nodes, &app.folded, app.selected, app.tree_scroll, tree);
     }
     let max_scroll = draw_log(f, app, sink, body);
     draw_input(f, app, input);
@@ -393,35 +404,36 @@ fn tree_area_of(f: &Frame) -> Option<Rect> {
     pane_layout().split(f.area()).get(2).copied()
 }
 
-/// The usage pane: two areas on one row. The tokens sit on the left; the ledger, the OpenRouter
-/// connection state, sits on the right until the provider integration fills it.
+/// The usage pane: four areas on one row. The badges name the model and the task of the next run;
+/// the tokens carry the counts; the ledger, the OpenRouter connection state, stands on the right
+/// until the provider integration fills it.
 fn draw_usage(f: &mut Frame, area: Rect, app: &App) {
-    let [badges, tokens, ledger] = Layout::horizontal([Constraint::Length(34), Constraint::Min(20), Constraint::Length(24)]).areas(area);
+    let [model, task, tokens, ledger] =
+        Layout::horizontal([Constraint::Length(18), Constraint::Min(14), Constraint::Length(20), Constraint::Length(17)]).areas(area);
     // the model badge: the model the next worker session would run on
-    let inner = usage_panel(f, badges);
-    let model = app.model.as_deref().unwrap_or("no model yet");
+    let inner = usage_panel(f, model);
+    let model = app.model.as_str();
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("◉ ", Style::new().fg(theme::ACCENT)),
-            Span::styled(short_model(model), Style::new().fg(theme::TEXT).bold()),
+            Span::styled(short_model(model, inner.width as usize - 3), Style::new().fg(theme::TEXT).bold()),
         ])),
         inner,
     );
     // the task badge: the node the workers hold next, planned or in progress
-    let task = app.roadmap.as_deref().and_then(current_task);
-    let inner = usage_panel(f, tokens);
+    let task_node = app.roadmap.as_deref().and_then(current_task);
+    let inner = usage_panel(f, task);
     let mut spans = vec![Span::styled("◇ ", Style::new().fg(theme::TRACE))];
-    match task {
+    match task_node {
         Some(node) => {
             spans.push(Span::styled(format!("#{} ", node.id), Style::new().fg(theme::DIM)));
-            spans.push(Span::styled(short_title(&node.title, inner.width as usize - 6), Style::new().fg(theme::TEXT).bold()));
-            spans.push(Span::styled(format!(" {}", node.state.serde_name()), Style::new().fg(theme::WARN_TEXT)));
+            spans.push(Span::styled(short_title(&node.title, inner.width as usize - 9), Style::new().fg(theme::TEXT).bold()));
         }
         None => spans.push(Span::styled("no task queued", Style::new().fg(theme::DIM))),
     }
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
-    // the tokens: in, out, cached and the session cost, the ledger apart on the right
-    let inner = usage_panel(f, ledger);
+    // the tokens: in, out and the session cost; the counts land with the OpenRouter run
+    let inner = usage_panel(f, tokens);
     let dim = Style::new().fg(theme::DIM);
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -437,11 +449,15 @@ fn draw_usage(f: &mut Frame, area: Rect, app: &App) {
         ])),
         inner,
     );
+    // the ledger: the OpenRouter connection, its own panel on the right
+    let inner = usage_panel(f, ledger);
+    f.render_widget(Paragraph::new(Line::from(vec![Span::styled("◌", dim), Span::raw(" "), Span::styled("not linked", dim)])), inner);
 }
 
-/// The model id without its vendor, so a badge holds it: `z-ai/glm-5.3-flash` becomes `glm-5.3-flash`.
-fn short_model(model: &str) -> String {
-    model.rsplit('/').next().unwrap_or(model).to_owned()
+/// The model id without its vendor, clipped to `room`: `z-ai/glm-5.3-flash` becomes `glm-5.3-flash`.
+fn short_model(model: &str, room: usize) -> String {
+    let short = model.rsplit('/').next().unwrap_or(model);
+    short_title(short, room)
 }
 
 /// The title clipped to `room` characters, with an ellipsis when it gives one up.
@@ -605,6 +621,24 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     f.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
 }
 
+/// One node as a log line: the fields a click on its tree row shows.
+fn node_brief(node: &ra_roadmap::model::Node) -> String {
+    let mut text = format!("#{} {} {} {{c{}}}", node.id, node.kind.serde_name(), node.title, node.complexity);
+    if let Some(objective) = &node.objective {
+        text.push_str(&format!("\n  objective: {objective}"));
+    }
+    if let Some(acceptance) = &node.acceptance {
+        text.push_str(&format!("\n  acceptance: {acceptance}"));
+    }
+    if !node.depends_on.is_empty() {
+        text.push_str(&format!("\n  waits-on: {:?}", node.depends_on));
+    }
+    if let Some(notes) = &node.notes {
+        text.push_str(&format!("\n  notes: {notes}"));
+    }
+    text
+}
+
 fn footer_line(app: &App, width: u16) -> Line<'static> {
     let dim = Style::new().fg(theme::DIM);
     let key = Style::new().fg(theme::ACCENT);
@@ -615,10 +649,17 @@ fn footer_line(app: &App, width: u16) -> Line<'static> {
         return Line::from(Span::styled(format!("  {hint}"), key));
     }
     let mut spans = vec![Span::raw("  ")];
-    for (i, (k, what)) in
-        [("help", "commands"), ("↑↓", "history"), ("Tab", "complete"), ("wheel/PgUp/PgDn", "scroll"), ("Ctrl+C×2", "stop")]
-            .into_iter()
-            .enumerate()
+    for (i, (k, what)) in [
+        ("help", "commands"),
+        ("↑↓", "history"),
+        ("Tab", "complete"),
+        ("wheel", "scroll"),
+        ("click", "pick node"),
+        ("PgUp/PgDn", "page log"),
+        ("Ctrl+C×2", "stop"),
+    ]
+    .into_iter()
+    .enumerate()
     {
         if i > 0 {
             spans.push(Span::styled(" · ", dim));

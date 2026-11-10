@@ -22,6 +22,9 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "depend", usage: "<id> <id>...", help: "makes the first node wait for the others" },
     Spec { name: "set", usage: "<id> <state>", help: "sets the state: the twelve lifecycle names" },
     Spec { name: "model", usage: "<id>", help: "the model of the next worker session, an OpenRouter id" },
+    Spec { name: "ping", usage: "", help: "one round trip to the badge model, through OpenRouter" },
+    Spec { name: "run", usage: "<id>", help: "executes one roadmap task on the badge model" },
+    Spec { name: "seed", usage: "", help: "fills the roadmap with the improvement plan of the agent itself" },
     Spec { name: "clear", usage: "", help: "clears the log view" },
     Spec { name: "quit", usage: "", help: "stops the console (also exit, or Ctrl+C twice)" },
 ];
@@ -40,8 +43,9 @@ pub fn complete(prefix: &str) -> Vec<&'static str> {
     COMMANDS.iter().map(|c| c.name).filter(|n| n.starts_with(prefix)).collect()
 }
 
-/// Runs one line against the store; the lines to show, or an error to show.
-pub async fn run(line: &str, store: &Store) -> anyhow::Result<(Vec<String>, Outcome)> {
+/// Runs one line against the store; the lines to show, or an error to show. `model` is the model
+/// of the badge, which `ping` and `run` talk to.
+pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<String>, Outcome)> {
     let line = line.trim().trim_start_matches(['/', '.']);
     let (name, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let args = rest.trim();
@@ -118,6 +122,19 @@ pub async fn run(line: &str, store: &Store) -> anyhow::Result<(Vec<String>, Outc
             store.set_state(id, state).await?;
             out.push(format!("#{id} is now {}", state.serde_name()));
         }
+        "seed" => {
+            anyhow::ensure!(args.is_empty(), "usage: seed");
+            let ids = seed(store).await?;
+            out.push(format!("planted the improvement roadmap: {} nodes under the project", ids.len()));
+        }
+        "ping" => {
+            anyhow::ensure!(args.is_empty(), "usage: ping");
+            return Ok((crate::agent::ping(&model).await?, Outcome::Continue));
+        }
+        "run" => {
+            let id = args.parse::<i64>().context("usage: run <id>")?;
+            return Ok((crate::agent::run(store, id, &model).await?, Outcome::Continue));
+        }
         "clear" | "cls" => return Ok((out, Outcome::Clear)),
         "model" => {
             anyhow::ensure!(!args.is_empty(), "usage: model <openrouter id>, such as z-ai/glm-5.3-flash");
@@ -128,6 +145,99 @@ pub async fn run(line: &str, store: &Store) -> anyhow::Result<(Vec<String>, Outc
         other => anyhow::bail!("no command {other}; help lists them"),
     }
     Ok((out, Outcome::Continue))
+}
+
+/// Plants the improvement roadmap of the agent itself under the first project, as milestone,
+/// section and task nodes with acceptance criteria. It refuses when the project already holds
+/// nodes, so a seed never doubles.
+async fn seed(store: &Store) -> anyhow::Result<Vec<i64>> {
+    let nodes = store.all().await?;
+    let project = nodes.first().with_context(|| "the roadmap is empty: the store always holds one project")?;
+    anyhow::ensure!(nodes.len() == 1, "the project already holds nodes; seed runs on an empty roadmap");
+    let root = project.id;
+    let mut ids = Vec::new();
+    let milestone = store
+        .insert(
+            Some(root),
+            NodeKind::Milestone,
+            "Phase A: a working loop",
+            Some("one task goes from the roadmap to a model and back, end to end."),
+            Some("`run <id>` completes on a real model, and the answer lands in the log."),
+            3,
+        )
+        .await?;
+    ids.push(milestone);
+    let providers = store
+        .insert(
+            Some(milestone),
+            NodeKind::Section,
+            "Providers",
+            Some("the console talks to OpenRouter with the key from the environment."),
+            Some("a `ping` command rounds a hello through the chat endpoint."),
+            2,
+        )
+        .await?;
+    ids.push(providers);
+    let t1 = store
+        .insert(
+            Some(providers),
+            NodeKind::Task,
+            "Load OPENROUTER_API_KEY",
+            Some("the console reads the key and refuses plainly without one."),
+            Some("`run` without the key prints a refusal that names it."),
+            1,
+        )
+        .await?;
+    ids.push(t1);
+    let t2 = store
+        .insert(
+            Some(providers),
+            NodeKind::Task,
+            "A ping through the provider",
+            Some("a `ping` command sends one message and prints the answer and the usage."),
+            Some("`ping` shows the answer, then in, out and cached token counts."),
+            2,
+        )
+        .await?;
+    ids.push(t2);
+    let runner = store
+        .insert(
+            Some(milestone),
+            NodeKind::Section,
+            "Task runner",
+            Some("`run <id>` executes one roadmap task on the badge model."),
+            Some("the state walks defined to implemented, and the answer lands in the log."),
+            3,
+        )
+        .await?;
+    ids.push(runner);
+    let t3 = store
+        .insert(
+            Some(runner),
+            NodeKind::Task,
+            "run <id> builds the context",
+            Some("the runner reads the node, its ancestors and its dependencies into one prompt."),
+            Some("a task with an objective and acceptance produces a prompt that names both."),
+            2,
+        )
+        .await?;
+    ids.push(t3);
+    let t4 = store
+        .insert(
+            Some(runner),
+            NodeKind::Task,
+            "run <id> records the answer",
+            Some("the runner writes the answer to the log and the usage to the ledger."),
+            Some("after a run, the token panel shows real counts and the node holds notes."),
+            2,
+        )
+        .await?;
+    ids.push(t4);
+    store.depend_on(t2, t1).await?;
+    store.depend_on(t3, t1).await?;
+    store.depend_on(t4, t2).await?;
+    store.depend_on(t4, t3).await?;
+    Ok(ids)
 }
 
 fn kind_of(text: &str) -> Option<NodeKind> {

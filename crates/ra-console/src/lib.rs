@@ -3,6 +3,7 @@
 //! prompt at the bottom for the [`commands`]. Only the binary uses it; anything not on a terminal
 //! logs plainly instead.
 
+pub mod agent;
 pub mod commands;
 pub mod logs;
 pub mod roadmap_pane;
