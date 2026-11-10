@@ -1,0 +1,16 @@
+[package]
+name = "ra-usage"
+description = "Token and cost accounting for model executions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+sqlx.workspace = true

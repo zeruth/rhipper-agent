@@ -1,0 +1,6 @@
+/target
+/var
+*.db
+*.db-wal
+*.db-shm
+Cargo.lock.bak
