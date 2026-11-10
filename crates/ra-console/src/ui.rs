@@ -73,6 +73,8 @@ struct App {
     hover: Option<u16>,
     /// The marquee offset of the model badge, advanced while the name overflows its panel.
     marquee: usize,
+    /// The tick counter; the marquee advances on every fourth tick.
+    ticks: u32,
 }
 
 /// Runs the console until it is told to quit.
@@ -103,6 +105,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         selected: None,
         hover: None,
         marquee: 0,
+        ticks: 0,
     };
     sink.push(Kind::Output, "Rhipper Agent console ready. Type help for commands.");
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -131,7 +134,10 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
             // scrolled past the oldest line: hold at it, so scrolling down answers at once
             app.scroll = app.scroll.min(max_scroll);
             if let Some(area) = tree_area {
-                let cards = app.roadmap.as_ref().map_or(0, |nodes| roadmap_pane::card_rows(nodes, &app.folded, app.selected).len());
+                let cards = app
+                    .roadmap
+                    .as_ref()
+                    .map_or(0, |nodes| roadmap_pane::card_rows(nodes, &app.folded, app.selected, area.width as usize).len());
                 app.tree_scroll = app.tree_scroll.min(cards.saturating_sub(area.height as usize));
             }
             last_draw = Instant::now();
@@ -149,7 +155,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                             if (area.y..area.y + area.height).contains(&y) {
                                 let row = roadmap_pane::row_at(y, area.y, app.tree_scroll);
                                 if let Some(nodes) = &app.roadmap {
-                                    let visible = roadmap_pane::card_rows(nodes, &app.folded, app.selected);
+                                    let visible = roadmap_pane::card_rows(nodes, &app.folded, app.selected, area.width as usize);
                                     if let Some(row) = visible.get(row) {
                                         let id = row.id;
                                         let has_children = nodes.iter().any(|n| n.parent == Some(id));
@@ -219,8 +225,9 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                 }
             }
             _ = tick.tick() => {
-                // the marquee walks while the model name overflows its badge
-                if app.model.chars().count() + 3 > 16 {
+                app.ticks = app.ticks.wrapping_add(1);
+                // the marquee walks a step every fourth tick, a pace the eye follows
+                if app.ticks % 4 == 0 && app.model.chars().count() + 3 > 14 {
                     app.marquee = (app.marquee + 1) % (app.model.chars().count() + 3);
                     dirty = true;
                 }
