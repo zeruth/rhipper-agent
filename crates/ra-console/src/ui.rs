@@ -208,7 +208,8 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                         let over_tree = tree_area.is_some_and(|area| (area.y..area.y + area.height).contains(&y));
                         let over_log = log_area.is_some_and(|area| (area.y..area.y + area.height).contains(&y));
                         if over_tree {
-                            app.tree_scroll = app.tree_scroll.saturating_add_signed(rows as isize * WHEEL_ROWS as isize);
+                            // the tree skips rows from its top, so wheel-down reads downward
+                            app.tree_scroll = app.tree_scroll.saturating_add_signed(-rows as isize * WHEEL_ROWS as isize);
                         } else if over_log {
                             // the wheel over the log card grows or shrinks it; the roadmap takes the rest
                             let next = i32::from(app.log_card) + rows * 2;
