@@ -4,7 +4,8 @@ use super::*;
 
 #[test]
 fn the_environment_overrides_the_store() {
-    // SAFETY: the test serializes on the process env; no parallel test reads this key
+    let _guard = ENV_LOCK.lock();
+    // SAFETY: the test holds the env lock; no parallel test reads this key
     unsafe { std::env::set_var("OPENROUTER_API_KEY", "sk-or-from-env") };
     assert_eq!(api_key().unwrap(), "sk-or-from-env");
     unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
@@ -22,7 +23,8 @@ fn masked_of(key: &str) -> String {
 
 #[test]
 fn an_empty_environment_falls_back_to_the_store() {
-    // SAFETY: the test serializes on the process env; no parallel test reads this key
+    let _guard = ENV_LOCK.lock();
+    // SAFETY: the test holds the env lock; no parallel test reads this key
     unsafe { std::env::set_var("OPENROUTER_API_KEY", "  ") };
     // an empty environment falls back to the credential store: a machine with a stored key
     // answers, a machine without one is refused with the key's name

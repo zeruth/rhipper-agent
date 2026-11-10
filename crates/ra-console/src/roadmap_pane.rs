@@ -92,9 +92,8 @@ fn rows_of(
         rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line, width, outline_style) });
     }
 
-    // the selected card opens its fields: the objective and the acceptance framed in the accent,
-    // the notes plain, and the lifecycle buttons on one row, dim until the pointer is over one
-    if is_selected {
+    // the selected card opens its fields only while it stands open: a folded card stays a title
+    if is_selected && !folded_here {
         for (label, value) in [("objective", node.objective.as_deref()), ("acceptance", node.acceptance.as_deref())] {
             if let Some(value) = value {
                 for line in framed_block(label, value, room) {

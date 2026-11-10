@@ -1,6 +1,8 @@
 //! The agent loop: the console's live path to a model. `ping` proves the connection; `run` sends
 //! one roadmap task to the badge model and records what came back.
 
+use std::collections::HashMap;
+
 use crate::secret;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError};
 use ra_roadmap::model::{Node, TaskState};
@@ -74,35 +76,87 @@ pub async fn run(store: &Store, id: i64, model: &str) -> anyhow::Result<Vec<Stri
 pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> anyhow::Result<Vec<String>> {
     let key = api_key()?;
     let provider = ra_providers::openrouter::OpenRouter::new(key)?;
+    let nodes = store.all().await?;
+    // one pass over the tree before any call, so the recursion cannot stall midway
+    let order = if recursive { subtree_preorder(&nodes, id) } else { vec![id] };
     let mut revised: Vec<String> = Vec::new();
-    let mut queue = vec![id];
-    while let Some(current) = queue.pop() {
-        reassess_one(store, &provider, model, current).await?;
-        revised.push(format!("#{}", current));
-        if recursive {
-            let kids: Vec<i64> = store.all().await?.iter().filter(|n| n.parent == Some(current)).map(|n| n.id).collect();
-            // the children go back on the stack, so the parent reassesses first
-            queue.extend(kids);
+    let mut warnings: Vec<String> = Vec::new();
+    for current in order {
+        match reassess_one(store, &provider, model, current, &nodes).await {
+            Ok(()) => revised.push(format!("#{}", current)),
+            Err(e) => warnings.push(format!("⚠ #{}: {e:#}", current)),
         }
     }
-    Ok(vec![format!("✓ {} node(s) reassessed on {}: {}", revised.len(), short(model), revised.join(" "))])
+    let mut out = vec![format!("✓ {} node(s) reassessed on {}: {}", revised.len(), short(model), revised.join(" "))];
+    out.extend(warnings);
+    Ok(out)
 }
 
-/// One reassessment: the model returns two lines, and the store takes them.
-async fn reassess_one(store: &Store, provider: &ra_providers::openrouter::OpenRouter, model: &str, id: i64) -> anyhow::Result<Vec<String>> {
+/// The subtree of `root` in preorder: the node first, then each child's subtree in id order.
+pub fn subtree_preorder(nodes: &[Node], root: i64) -> Vec<i64> {
+    let mut kids: HashMap<i64, Vec<i64>> = HashMap::new();
+    for node in nodes {
+        if let Some(parent) = node.parent {
+            kids.entry(parent).or_default().push(node.id);
+        }
+    }
+    for list in kids.values_mut() {
+        list.sort_unstable();
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        out.push(id);
+        if let Some(children) = kids.get(&id) {
+            for child in children.iter().rev() {
+                stack.push(*child);
+            }
+        }
+    }
+    out
+}
+
+/// One reassessment: the model returns two lines, and the store takes them. The prompt carries the
+/// node's own notes and its children with their states, so the revision names only the work the
+/// subtree still owes.
+async fn reassess_one(
+    store: &Store,
+    provider: &ra_providers::openrouter::OpenRouter,
+    model: &str,
+    id: i64,
+    nodes: &[Node],
+) -> anyhow::Result<()> {
     let node = store.read(id).await?;
     let context = context_of(store, &node).await?;
-    let ask = format!(
-        "{context}\n\nThe task above may have drifted from the work still ahead. Revise its objective and its \
-         acceptance so they name the remaining work alone. Reply with exactly two lines and nothing else:\n\
-         objective: <the revised objective, one line>\nacceptance: <the revised acceptance, one line>"
+    let mut ask = context;
+    if let Some(notes) = &node.notes {
+        ask.push_str(&format!("\nNotes of earlier work on this node: {}\n", first_line(notes)));
+    }
+    let children: Vec<&Node> = nodes.iter().filter(|n| n.parent == Some(id)).collect();
+    if !children.is_empty() {
+        ask.push_str("\nWhat this node's children already cover:\n");
+        for kid in children {
+            ask.push_str(&format!(
+                "- #{} {} [{}]: {}\n",
+                kid.id,
+                kid.title,
+                kid.state.serde_name(),
+                kid.objective.as_deref().unwrap_or("no objective")
+            ));
+        }
+    }
+    ask.push_str(
+        "\nRevise the objective and the acceptance so they name only the work still ahead: leave out what the \
+         children and the notes show as done, and make every acceptance criterion concrete and checkable without \
+         interpretation. Reply with exactly two lines and nothing else:\n\
+         objective: <the revised objective, one line>\nacceptance: <the revised acceptance, one line>",
     );
     let answer = provider
         .complete(CompletionRequest {
             model: model.to_owned(),
             messages: vec![Message::system(ARCHITECT), Message::user(ask)],
             temperature: Some(0.2),
-            max_tokens: Some(256),
+            max_tokens: Some(512),
         })
         .await
         .map_err(map_error)?;
@@ -122,12 +176,16 @@ async fn reassess_one(store: &Store, provider: &ra_providers::openrouter::OpenRo
     }
     anyhow::ensure!(
         objective.is_some() || acceptance.is_some(),
-        "#{}: the reassessment held no objective or acceptance line; the answer started with: {}",
-        id,
+        "the reassessment held no objective or acceptance line; the answer started with: {}",
         answer.text.lines().next().unwrap_or("")
     );
     store.set_details(id, objective.as_deref(), acceptance.as_deref()).await?;
-    Ok(vec![format!("#{} {} revised", node.id, node.title)])
+    Ok(())
+}
+
+/// The first line of a note, for a prompt that stays short.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or("").chars().take(200).collect()
 }
 
 /// The system prompt of a worker session.

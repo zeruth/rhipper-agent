@@ -8,6 +8,10 @@ use keyring::Entry;
 const SERVICE: &str = "rhipper-agent";
 const ACCOUNT: &str = "openrouter";
 
+/// The tests of the environment path hold this lock, so parallel tests cannot flip the variable
+/// under one another.
+pub static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// Reads the OpenRouter key: the environment first, then the credential store.
 pub fn api_key() -> anyhow::Result<String> {
     if let Some(key) = std::env::var("OPENROUTER_API_KEY").ok().filter(|k| !k.trim().is_empty()) {

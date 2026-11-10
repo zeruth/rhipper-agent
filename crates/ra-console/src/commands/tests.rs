@@ -69,6 +69,29 @@ async fn depths_grow_down_the_tree() {
     assert_eq!(depth(&nodes, &nodes[1]), 1);
 }
 
+#[test]
+fn the_subtree_walks_preorder() {
+    use crate::agent::subtree_preorder;
+    use ra_roadmap::model::{Node, NodeKind, TaskState};
+    let node = |id: i64, parent: Option<i64>| Node {
+        id,
+        parent,
+        kind: NodeKind::Task,
+        title: String::new(),
+        objective: None,
+        acceptance: None,
+        depends_on: Vec::new(),
+        state: TaskState::Defined,
+        assignee: None,
+        complexity: 3,
+        notes: None,
+    };
+    let nodes = vec![node(1, None), node(2, Some(1)), node(3, Some(2)), node(4, Some(2)), node(5, Some(1))];
+    assert_eq!(subtree_preorder(&nodes, 2), vec![2, 3, 4]);
+    assert_eq!(subtree_preorder(&nodes, 1), vec![1, 2, 3, 4, 5]);
+    assert_eq!(subtree_preorder(&nodes, 5), vec![5]);
+}
+
 #[tokio::test]
 async fn seed_fills_an_empty_roadmap_and_refuses_a_second_time() {
     let store = store().await;
@@ -87,12 +110,15 @@ async fn run_refuses_a_project_and_names_a_missing_key() {
     assert!(format!("{error:#}").contains("is a project"), "{error:#}");
     run("add task T parent 1", &store, MODEL).await.unwrap();
     // this machine may hold a stored key or a real one in the environment; when neither source
-    // holds a key, the run must refuse with the key's name
+    // holds a key, the run must refuse with the key's name. The env lock covers the read and the
+    // removal, so a parallel secret test cannot flip the variable in between.
+    let guard = crate::secret::ENV_LOCK.lock();
     let key_configured = std::env::var("OPENROUTER_API_KEY").map_or(false, |k| !k.trim().is_empty()) || crate::secret::has_key();
     if !key_configured {
-        // SAFETY: a test process runs this once; no other test of this process reads the key
+        // SAFETY: the test holds the env lock; no parallel test reads the key
         unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
         let error = run("run 2", &store, MODEL).await.unwrap_err();
         assert!(format!("{error:#}").contains("OPENROUTER_API_KEY") || format!("{error:#}").contains("key"), "{error:#}");
     }
+    drop(guard);
 }
