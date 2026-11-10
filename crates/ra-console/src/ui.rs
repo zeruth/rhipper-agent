@@ -12,13 +12,14 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Style, Stylize};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use tokio::sync::mpsc;
 
 use crate::commands::{self, Outcome};
 use crate::logs::{Kind, Sink};
+use crate::roadmap_pane;
 use crate::theme;
 
 /// Ctrl+C twice within this stops the console.
@@ -35,8 +36,10 @@ pub fn is_terminal() -> bool {
 /// What the input thread reads.
 enum Input {
     Key(KeyEvent),
-    /// Mouse wheel: rows up (positive) or down.
-    Wheel(i32),
+    /// Mouse wheel: rows up (positive) or down, at screen row `y`.
+    Wheel(i32, u16),
+    /// A left click on screen row `y`.
+    Click(u16),
 }
 
 struct App {
@@ -45,19 +48,25 @@ struct App {
     history: Vec<String>,
     /// Where Up/Down is in `history`; `None` is the line being typed.
     browsing: Option<usize>,
-    /// Rows scrolled up from the newest line; 0 follows the log.
+    /// Rows scrolled up from the newest log line; 0 follows the log.
     scroll: usize,
+    /// Rows scrolled up in the roadmap pane.
+    tree_scroll: usize,
+    /// The ids of the nodes whose children are folded away.
+    folded: Vec<i64>,
     seen: u64,
     quit_armed: Option<Instant>,
     started: Instant,
     /// Shown under the prompt until the next key (Tab's choices, for one).
     hint: Option<String>,
+    /// The last-known roadmap nodes, for the tree pane.
+    roadmap: Option<Vec<ra_roadmap::model::Node>>,
 }
 
 /// Runs the console until it is told to quit.
 pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
-    // the wheel scrolls the log (Shift+drag still selects text in most terminals)
+    // the wheel scrolls the panes (Shift+drag still selects text in most terminals)
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let (keys_tx, mut keys) = mpsc::unbounded_channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -71,15 +80,20 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         history: vec![],
         browsing: None,
         scroll: 0,
+        tree_scroll: 0,
+        folded: Vec::new(),
         seen: 0,
         quit_armed: None,
         started: Instant::now(),
         hint: None,
+        roadmap: None,
     };
     sink.push(Kind::Output, "Rhipper Agent console ready. Type help for commands.");
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     let mut dirty = true;
+    // the screen rows of the tree pane, so the wheel and the clicks route to it
+    let mut tree_area: Option<Rect> = None;
     let result = loop {
         let version = sink.version();
         if version != app.seen {
@@ -92,11 +106,18 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         }
         if dirty || last_draw.elapsed() >= Duration::from_secs(1) {
             let mut max_scroll = app.scroll;
-            if let Err(e) = terminal.draw(|f| max_scroll = draw(f, &app, &sink)) {
+            if let Err(e) = terminal.draw(|f| {
+                max_scroll = draw(f, &app, &sink);
+                tree_area = tree_area_of(f);
+            }) {
                 break Err(e.into());
             }
             // scrolled past the oldest line: hold at it, so scrolling down answers at once
             app.scroll = app.scroll.min(max_scroll);
+            if let Some(area) = tree_area {
+                let rows = app.roadmap.as_ref().map_or(0, |nodes| roadmap_pane::rows(nodes, &app.folded).len());
+                app.tree_scroll = app.tree_scroll.min(rows.saturating_sub(area.height as usize));
+            }
             last_draw = Instant::now();
             dirty = false;
         }
@@ -104,36 +125,68 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
             input = keys.recv() => {
                 let Some(input) = input else { break Ok(()) };
                 dirty = true;
-                let key = match input {
-                    Input::Wheel(rows) => {
-                        app.scroll = app.scroll.saturating_add_signed(rows as isize * WHEEL_ROWS as isize);
-                        continue;
-                    }
-                    Input::Key(key) => key,
-                };
-                match on_key(&mut app, key) {
-                    Action::None => {}
-                    Action::Quit => break Ok(()),
-                    Action::Run(line) => {
-                        sink.push(Kind::Input, line.clone());
-                        match commands::run(&line, &store).await {
-                            Ok((out, outcome)) => {
-                                for l in out {
-                                    sink.push(Kind::Output, l);
-                                }
-                                match outcome {
-                                    Outcome::Continue => {}
-                                    Outcome::Clear => sink.clear(),
-                                    Outcome::Quit => break Ok(()),
+                match input {
+                    Input::Click(y) => {
+                        // a click inside the tree pane folds or unfolds the node under it
+                        if let Some(area) = tree_area {
+                            if (area.y..area.y + area.height).contains(&y) {
+                                let row = roadmap_pane::row_at((y - area.y) as usize, app.tree_scroll);
+                                if let Some(nodes) = &app.roadmap {
+                                    let visible = roadmap_pane::rows(nodes, &app.folded);
+                                    if let Some(row) = visible.get(row) {
+                                        let id = row.node.id;
+                                        if let Some(i) = app.folded.iter().position(|f| *f == id) {
+                                            app.folded.remove(i);
+                                        } else {
+                                            app.folded.push(id);
+                                        }
+                                    }
                                 }
                             }
-                            Err(e) => sink.push(Kind::Error, format!("{e:#}")),
                         }
-                        app.scroll = 0;
+                        continue;
+                    }
+                    Input::Wheel(rows, y) => {
+                        let over_tree = tree_area.is_some_and(|area| (area.y..area.y + area.height).contains(&y));
+                        if over_tree {
+                            app.tree_scroll = app.tree_scroll.saturating_add_signed(rows as isize * WHEEL_ROWS as isize);
+                        } else {
+                            app.scroll = app.scroll.saturating_add_signed(rows as isize * WHEEL_ROWS as isize);
+                        }
+                        continue;
+                    }
+                    Input::Key(key) => match on_key(&mut app, key) {
+                        Action::None => {}
+                        Action::Quit => break Ok(()),
+                        Action::Run(line) => {
+                            sink.push(Kind::Input, line.clone());
+                            match commands::run(&line, &store).await {
+                                Ok((out, outcome)) => {
+                                    for l in out {
+                                        sink.push(Kind::Output, l);
+                                    }
+                                    match outcome {
+                                        Outcome::Continue => {}
+                                        Outcome::Clear => sink.clear(),
+                                        Outcome::Quit => break Ok(()),
+                                    }
+                                }
+                                Err(e) => sink.push(Kind::Error, format!("{e:#}")),
+                            }
+                            app.scroll = 0;
+                        }
+                    },
+                }
+            }
+            _ = tick.tick() => {
+                // the roadmap pane follows the file, an outside edit included
+                if let Ok(nodes) = store.all().await {
+                    if app.roadmap.as_ref() != Some(&nodes) {
+                        app.roadmap = Some(nodes);
+                        dirty = true;
                     }
                 }
             }
-            _ = tick.tick() => {}
         }
     };
     stop.store(true, Ordering::Relaxed);
@@ -155,16 +208,25 @@ fn read_keys(tx: mpsc::UnboundedSender<Input>, stop: Arc<AtomicBool>) {
                         return;
                     }
                 }
-                Ok(Event::Mouse(m)) => {
-                    let rows = match m.kind {
-                        MouseEventKind::ScrollUp => 1,
-                        MouseEventKind::ScrollDown => -1,
-                        _ => continue,
-                    };
-                    if tx.send(Input::Wheel(rows)).is_err() {
-                        return;
+                Ok(Event::Mouse(m)) => match m.kind {
+                    MouseEventKind::ScrollUp => {
+                        if tx.send(Input::Wheel(1, m.row)).is_err() {
+                            return;
+                        }
                     }
-                }
+                    MouseEventKind::ScrollDown => {
+                        if tx.send(Input::Wheel(-1, m.row)).is_err() {
+                            return;
+                        }
+                    }
+                    // any button press folds the node under it; drag and release pass through
+                    MouseEventKind::Down(_) => {
+                        if tx.send(Input::Click(m.row)).is_err() {
+                            return;
+                        }
+                    }
+                    _ => {}
+                },
                 Ok(_) => {}
                 Err(_) => return,
             },
@@ -290,21 +352,70 @@ fn shift_held(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
-/// Draws the console; returns how far back the log can scroll (in rows).
+/// Draws the console; returns how far back the log can scroll (in rows). The panes from the top:
+/// the status line, the usage pane, the roadmap tree, the log, the prompt and the footer. The
+/// prompt stays anchored at the bottom; the log and the tree take the middle.
 fn draw(f: &mut Frame, app: &App, sink: &Sink) -> usize {
-    let [header, rule, body, input, footer] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1), Constraint::Length(3), Constraint::Length(1)])
-            .areas(f.area());
-    f.render_widget(Block::new().style(Style::new().bg(theme::BG)), f.area());
+    let [header, usage, tree, body, input, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Percentage(40),
+        Constraint::Min(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .areas(f.area());
     // every cell, so even gaps the widgets never touch paint the theme
     use ratatui::widgets::Widget;
     Block::new().style(Style::new().bg(theme::BG)).render(f.area(), f.buffer_mut());
     f.render_widget(Paragraph::new(status_line(app)).style(Style::new().bg(theme::PANEL)), header);
-    f.render_widget(Paragraph::new("━".repeat(rule.width as usize)).fg(theme::RULE), rule);
+    draw_usage(f, usage);
+    if let Some(nodes) = &app.roadmap {
+        roadmap_pane::draw(f, nodes, &app.folded, app.tree_scroll, tree);
+    }
     let max_scroll = draw_log(f, app, sink, body);
     draw_input(f, app, input);
     f.render_widget(Paragraph::new(footer_line(app, footer.width)).style(Style::new().bg(theme::BG)), footer);
     max_scroll
+}
+
+/// The tree pane's screen area, as the layout just computed it. The draw of the frame already ran,
+/// so a re-split of the frame area gives the same rectangles.
+fn tree_area_of(f: &Frame) -> Option<Rect> {
+    let areas = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Percentage(40),
+        Constraint::Min(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .split(f.area());
+    areas.get(2).copied()
+}
+
+/// The usage pane: the token and cost line of the session. The ledger comes with the OpenRouter
+/// integration; until then the pane shows the placeholder.
+fn draw_usage(f: &mut Frame, area: Rect) {
+    let block =
+        Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme::RULE)).style(Style::new().bg(theme::PANEL));
+    f.render_widget(block, area);
+    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: 1 };
+    let dim = Style::new().fg(theme::DIM);
+    let line = Line::from(vec![
+        Span::styled(" tokens ", Style::new().fg(theme::ACCENT).bold()),
+        Span::styled("· in — out — cached —", dim),
+        Span::raw("  "),
+        Span::styled("cost ", Style::new().fg(theme::DIM)),
+        Span::styled("$—", Style::new().fg(theme::WARN_TEXT)),
+        Span::raw("  "),
+        Span::styled("budget ", Style::new().fg(theme::DIM)),
+        Span::styled("$20.00", Style::new().fg(theme::TEXT)),
+        Span::raw("  "),
+        Span::styled("·", Style::new().fg(theme::ONLINE)),
+        Span::styled(" the ledger lands with the OpenRouter run", dim),
+    ]);
+    f.render_widget(Paragraph::new(line), inner);
 }
 
 fn status_line(app: &App) -> Line<'static> {

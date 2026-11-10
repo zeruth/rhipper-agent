@@ -5,5 +5,6 @@
 
 pub mod commands;
 pub mod logs;
+pub mod roadmap_pane;
 pub mod theme;
 pub mod ui;

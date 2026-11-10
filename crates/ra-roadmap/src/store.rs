@@ -1,66 +1,62 @@
-//! The SQLite store of the roadmap. It creates its schema and reads and writes the nodes.
+//! The store over a `rhipper.md` file. Every mutation rewrites the file, so a git diff shows each
+//! change and an editor outside the console stays authoritative: the store reads the file again
+//! when it changed on disk.
+//!
+//! The ids come from the file, not from a counter: the highest id plus one, so a hand-added node
+//! keeps its number and a deleted node's id is not reused for a while.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
-use sqlx::{Row, SqliteConnection};
 
+use crate::markdown::{self, render};
 use crate::model::{Assignment, Node, NodeKind, TaskState};
 
-/// The store over one SQLite database.
-#[derive(Clone)]
+/// The store over one `rhipper.md`.
+#[derive(Clone, Debug)]
 pub struct Store {
-    pool: SqlitePool,
+    path: PathBuf,
 }
 
 impl Store {
-    /// Opens the store at `path`, creating the parent directory and the schema when new.
-    pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
+    /// Opens the store at `path`, creating the file with one project when it is new.
+    pub async fn open(path: &Path, title: &str) -> anyhow::Result<Self> {
+        if !path.exists() {
+            let root = Node {
+                id: 1,
+                parent: None,
+                kind: NodeKind::Project,
+                title: title.to_owned(),
+                objective: None,
+                acceptance: None,
+                depends_on: Vec::new(),
+                state: TaskState::Defined,
+                assignee: None,
+                complexity: 3,
+                notes: None,
+            };
+            std::fs::write(path, render(std::slice::from_ref(&root))).with_context(|| format!("cannot write {}", path.display()))?;
         }
-        let options = SqliteConnectOptions::new().filename(path).create_if_missing(true).foreign_keys(true);
-        let pool =
-            SqlitePool::connect_with(options).await.with_context(|| format!("cannot open the roadmap store at {}", path.display()))?;
-        Self::migrate(&mut *pool.acquire().await?).await?;
-        Ok(Self { pool })
+        Ok(Self { path: path.to_owned() })
     }
 
-    /// Opens the store in memory, for tests. The pool holds one connection: each connection of an
-    /// in-memory SQLite pool would otherwise see its own empty database.
-    pub async fn in_memory() -> anyhow::Result<Self> {
-        let options = SqliteConnectOptions::new().in_memory(true).foreign_keys(true);
-        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(options).await?;
-        Self::migrate(&mut *pool.acquire().await?).await?;
-        Ok(Self { pool })
+    /// The file the store reads and writes.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
-    async fn migrate(connection: &mut SqliteConnection) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            create table if not exists nodes (
-                id integer primary key autoincrement,
-                parent integer references nodes(id),
-                kind text not null,
-                title text not null,
-                objective text,
-                acceptance text,
-                depends_on text not null default '[]',
-                state text not null default 'defined',
-                assignee_model text,
-                assignee_role text,
-                complexity integer not null default 3,
-                notes text
-            )
-            "#,
-        )
-        .execute(connection)
-        .await?;
-        Ok(())
+    /// Reads every node, in tree order.
+    pub async fn all(&self) -> anyhow::Result<Vec<Node>> {
+        let text = std::fs::read_to_string(&self.path).with_context(|| format!("cannot read {}", self.path.display()))?;
+        markdown::parse(&text)
     }
 
-    /// Inserts a node under `parent` (or as a project when it is `None`) and returns its id.
+    /// Reads one node.
+    pub async fn read(&self, id: i64) -> anyhow::Result<Node> {
+        self.all().await?.into_iter().find(|n| n.id == id).with_context(|| format!("no node {id}"))
+    }
+
+    /// Inserts a node under `parent` (`None` for a project) and returns its id.
     pub async fn insert(
         &self,
         parent: Option<i64>,
@@ -70,116 +66,75 @@ impl Store {
         acceptance: Option<&str>,
         complexity: u8,
     ) -> anyhow::Result<i64> {
-        let id = sqlx::query("insert into nodes (parent, kind, title, objective, acceptance, complexity) values (?, ?, ?, ?, ?, ?)")
-            .bind(parent)
-            .bind(kind.serde_name())
-            .bind(title)
-            .bind(objective)
-            .bind(acceptance)
-            .bind(i64::from(complexity))
-            .execute(&self.pool)
-            .await?
-            .last_insert_rowid();
+        let mut nodes = self.all().await?;
+        if kind != NodeKind::Project {
+            anyhow::ensure!(parent.is_some(), "a node below a project needs a parent");
+            let parent = parent.unwrap();
+            anyhow::ensure!(nodes.iter().any(|n| n.id == parent), "no node {parent}");
+        }
+        let id = nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
+        let node = Node {
+            id,
+            parent: parent.filter(|_| kind != NodeKind::Project),
+            kind,
+            title: title.to_owned(),
+            objective: objective.map(str::to_owned),
+            acceptance: acceptance.map(str::to_owned),
+            depends_on: Vec::new(),
+            state: TaskState::Defined,
+            assignee: None,
+            complexity,
+            notes: None,
+        };
+        nodes.push(node);
+        self.write(nodes).await?;
         Ok(id)
     }
 
     /// Adds a dependency: `id` waits for `waits_for`.
     pub async fn depend_on(&self, id: i64, waits_for: i64) -> anyhow::Result<()> {
-        let mut deps = self.read(id).await?.depends_on;
-        if !deps.contains(&waits_for) {
-            deps.push(waits_for);
-            sqlx::query("update nodes set depends_on = ? where id = ?").bind(serde_json_deps(&deps)?).bind(id).execute(&self.pool).await?;
+        let mut nodes = self.all().await?;
+        let node = node_mut(&mut nodes, id)?;
+        if !node.depends_on.contains(&waits_for) {
+            node.depends_on.push(waits_for);
+            self.write(nodes).await?;
         }
         Ok(())
     }
 
-    /// Reads one node.
-    pub async fn read(&self, id: i64) -> anyhow::Result<Node> {
-        sqlx::query("select * from nodes where id = ?")
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await
-            .map(|row| node_from_row(&row))
-            .context("no node with that id")
-    }
-
-    /// Reads every node, ordered so that a parent comes before its children.
-    pub async fn all(&self) -> anyhow::Result<Vec<Node>> {
-        let rows = sqlx::query("select * from nodes order by id").fetch_all(&self.pool).await?;
-        Ok(rows.iter().map(|r| node_from_row(r)).collect())
-    }
-
     /// Sets the state of a node.
     pub async fn set_state(&self, id: i64, state: TaskState) -> anyhow::Result<()> {
-        sqlx::query("update nodes set state = ? where id = ?").bind(state.serde_name()).bind(id).execute(&self.pool).await?;
-        Ok(())
+        let mut nodes = self.all().await?;
+        node_mut(&mut nodes, id)?.state = state;
+        self.write(nodes).await
     }
 
     /// Assigns a node to a worker, or clears the assignment with `None`.
     pub async fn assign(&self, id: i64, assignment: Option<&Assignment>) -> anyhow::Result<()> {
-        sqlx::query("update nodes set assignee_model = ?, assignee_role = ? where id = ?")
-            .bind(assignment.map(|a| a.model.as_str()))
-            .bind(assignment.map(|a| a.role.as_str()))
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        let mut nodes = self.all().await?;
+        node_mut(&mut nodes, id)?.assignee = assignment.cloned();
+        self.write(nodes).await
     }
 
     /// Records the notes of the last execution on a node.
     pub async fn set_notes(&self, id: i64, notes: &str) -> anyhow::Result<()> {
-        sqlx::query("update nodes set notes = ? where id = ?").bind(notes).bind(id).execute(&self.pool).await?;
-        Ok(())
+        let mut nodes = self.all().await?;
+        node_mut(&mut nodes, id)?.notes = Some(notes.to_owned());
+        self.write(nodes).await
+    }
+
+    /// Writes the nodes back as the `rhipper.md` text. The file is small, so a blocking write stays
+    /// fine.
+    async fn write(&self, nodes: Vec<Node>) -> anyhow::Result<()> {
+        let text = render(&nodes);
+        std::fs::write(&self.path, text).with_context(|| format!("cannot write {}", self.path.display()))
     }
 }
 
-fn serde_json_deps(deps: &[i64]) -> anyhow::Result<String> {
-    Ok(serde_json::to_string(deps)?)
+/// The node with `id`, mutable.
+fn node_mut<'a>(nodes: &'a mut [Node], id: i64) -> anyhow::Result<&'a mut Node> {
+    nodes.iter_mut().find(|n| n.id == id).with_context(|| format!("no node {id}"))
 }
 
-fn kind_of(name: &str) -> NodeKind {
-    match name {
-        "milestone" => NodeKind::Milestone,
-        "section" => NodeKind::Section,
-        "task" => NodeKind::Task,
-        "subtask" => NodeKind::Subtask,
-        _ => NodeKind::Project,
-    }
-}
-
-fn state_of(name: &str) -> TaskState {
-    match name {
-        "ready" => TaskState::Ready,
-        "assigned" => TaskState::Assigned,
-        "in_progress" => TaskState::InProgress,
-        "implemented" => TaskState::Implemented,
-        "testing" => TaskState::Testing,
-        "review" => TaskState::Review,
-        "accepted" => TaskState::Accepted,
-        "blocked" => TaskState::Blocked,
-        "failed" => TaskState::Failed,
-        "needs_revision" => TaskState::NeedsRevision,
-        "cancelled" => TaskState::Cancelled,
-        _ => TaskState::Defined,
-    }
-}
-
-fn node_from_row(row: &SqliteRow) -> Node {
-    let deps: String = row.get("depends_on");
-    Node {
-        id: row.get("id"),
-        parent: row.get("parent"),
-        kind: kind_of(&row.get::<String, _>("kind")),
-        title: row.get("title"),
-        objective: row.get("objective"),
-        acceptance: row.get("acceptance"),
-        depends_on: serde_json::from_str(&deps).unwrap_or_default(),
-        state: state_of(&row.get::<String, _>("state")),
-        assignee: match (row.get::<Option<String>, _>("assignee_model"), row.get::<Option<String>, _>("assignee_role")) {
-            (Some(model), Some(role)) => Some(Assignment { model, role }),
-            _ => None,
-        },
-        complexity: u8::try_from(row.get::<i64, _>("complexity")).unwrap_or(3),
-        notes: row.get("notes"),
-    }
-}
+#[cfg(test)]
+mod tests;

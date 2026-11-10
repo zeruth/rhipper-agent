@@ -51,9 +51,9 @@ enum Command {
     Set { id: i64, state: TaskStateArg },
     /// Starts the console over the orchestrator.
     Console {
-        /// The roadmap database.
-        #[arg(long, default_value = "var/roadmap.db")]
-        db: PathBuf,
+        /// The roadmap file.
+        #[arg(long, default_value = "rhipper.md")]
+        roadmap: PathBuf,
     },
 }
 
@@ -123,17 +123,17 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Depend { id, waits_for } => depend(id, &waits_for).await,
         Command::Set { id, state } => set(id, state.0).await,
-        Command::Console { db } => console(db).await,
+        Command::Console { roadmap } => console(roadmap).await,
     }
 }
 
-/// The default store location; the console subcommand creates it.
+/// The default roadmap file; the commands open it in the working directory.
 fn store_path() -> PathBuf {
-    PathBuf::from("var/roadmap.db")
+    PathBuf::from("rhipper.md")
 }
 
 async fn open_store() -> anyhow::Result<Store> {
-    Store::open(&store_path()).await
+    Store::open(&store_path(), "Rhipper Agent").await
 }
 
 async fn show(id: Option<i64>) -> anyhow::Result<()> {
@@ -227,8 +227,8 @@ async fn set(id: i64, state: TaskState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn console(db: PathBuf) -> anyhow::Result<()> {
-    let store = Store::open(&db).await?;
+async fn console(roadmap: PathBuf) -> anyhow::Result<()> {
+    let store = Store::open(&roadmap, "Rhipper Agent").await?;
     if !ra_console::ui::is_terminal() {
         anyhow::bail!("the console needs a terminal");
     }

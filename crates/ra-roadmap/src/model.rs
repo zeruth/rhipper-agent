@@ -82,7 +82,7 @@ pub struct Assignment {
 
 /// One node of the roadmap. A task carries the execution fields; a project or milestone carries
 /// mostly the title.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub id: i64,
     /// The parent node; `None` for a project.

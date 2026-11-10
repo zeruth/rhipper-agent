@@ -11,27 +11,30 @@ execution state and acceptance.
 
 | Crate | Responsibility |
 |---|---|
-| `ra-roadmap` | Projects, milestones, sections, tasks, dependencies, states; SQLite persistence |
+| `ra-roadmap` | Projects, milestones, sections, tasks, dependencies, states; the `rhipper.md` store |
 | `ra-providers` | The `ModelProvider` trait and the OpenRouter adapter |
 | `ra-usage` | Token and cost accounting per model and task |
-| `ra-console` | The Blood Moon terminal UI |
+| `ra-console` | The Blood Moon terminal UI: the usage pane, the roadmap tree, the log and the prompt |
 | `rc` (app) | The CLI: `show`, `add`, `depend`, `set`, `console` |
 
 ## Run
 
 ```powershell
-cargo run -p rc -- add project "My project"
-cargo run -p rc -- add milestone "Phase 1" --parent 1
+cargo run -p rc -- add task "Write the decoder" --parent 1
 cargo run -p rc -- show
+cargo run -p rc -- console
 ```
 
-The roadmap database is `var/roadmap.db`; `--db` moves it.
+The roadmap file is `rhipper.md`; `--roadmap` moves it. A project opens the file in the working
+directory, and the console follows edits from an outside editor on its next tick.
 
 ## Status
 
-Phase 1 of the plan in Rhipper-IDE's `docs/rhipper/`: the roadmap model, the store and the
-OpenRouter adapter compile and the CLI exercises them. The console, the worker runtime, the
-communication bus and the verification engine come next.
+Phase 1 (Foundation) of the plan in Rhipper-IDE's `docs/rhipper/`. The roadmap lives in a
+`rhipper.md` file: one numbered line per node, the detail fields indented beneath, dependencies
+by id. The console shows the usage pane, a scrollable and clickable roadmap tree, and the log;
+the prompt stays anchored at the bottom. The OpenRouter adapter, the worker runtime and the
+verification engine come next.
 
 ## License
 
