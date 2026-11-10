@@ -21,10 +21,14 @@ fn masked_of(key: &str) -> String {
 }
 
 #[test]
-fn an_empty_key_is_a_refusal() {
+fn an_empty_environment_falls_back_to_the_store() {
     // SAFETY: the test serializes on the process env; no parallel test reads this key
     unsafe { std::env::set_var("OPENROUTER_API_KEY", "  ") };
-    let error = api_key().unwrap_err();
-    assert!(format!("{error:#}").contains("no OpenRouter key"), "{error:#}");
+    // an empty environment falls back to the credential store: a machine with a stored key
+    // answers, a machine without one is refused with the key's name
+    match api_key() {
+        Ok(key) => assert!(!key.trim().is_empty(), "the fallback yields a key"),
+        Err(error) => assert!(format!("{error:#}").contains("no OpenRouter key"), "{error:#}"),
+    }
     unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
 }

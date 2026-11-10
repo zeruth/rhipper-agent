@@ -63,9 +63,21 @@ struct WireChoice {
     message: WireMessageOwned,
 }
 
+/// The message of an answer. A reasoning model answers in `reasoning` and leaves `content` null or
+/// empty, so both fields are optional and the text takes whichever one holds something.
 #[derive(Deserialize)]
 struct WireMessageOwned {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+impl WireMessageOwned {
+    /// The text of the answer: the content, else the reasoning.
+    fn text(&self) -> String {
+        self.content.clone().filter(|c| !c.trim().is_empty()).or_else(|| self.reasoning.clone()).unwrap_or_default()
+    }
 }
 
 #[derive(Deserialize)]
@@ -116,13 +128,14 @@ impl ModelProvider for OpenRouter {
         let body = response.text().await.map_err(|e| ProviderError::Unavailable(e.to_string()))?;
         match status {
             StatusCode::OK => {
-                let parsed: WireResponse =
-                    serde_json::from_str(&body).map_err(|e| ProviderError::Other(format!("unparsable answer: {e}")))?;
+                let parsed: WireResponse = serde_json::from_str(&body)
+                    .map_err(|e| ProviderError::Other(format!("unparsable answer: {e}; body starts with: {}", snippet(&body))))?;
                 let text = parsed
                     .choices
                     .first()
-                    .map(|c| c.message.content.clone())
-                    .ok_or_else(|| ProviderError::Other("the answer holds no choice".into()))?;
+                    .map(|c| c.message.text())
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| ProviderError::Other(format!("the answer holds no text; body starts with: {}", snippet(&body))))?;
                 let usage = parsed
                     .usage
                     .map(|u| Usage {
@@ -147,3 +160,15 @@ impl ModelProvider for OpenRouter {
 fn error_text(body: &str, status: StatusCode) -> String {
     serde_json::from_str::<WireError>(body).ok().map(|e| e.error.message).unwrap_or_else(|| format!("HTTP {status}: {body}"))
 }
+
+/// The first 200 characters of a body, for an error message.
+fn snippet(body: &str) -> String {
+    let mut text: String = body.chars().take(200).collect();
+    if body.chars().count() > 200 {
+        text.push('…');
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests;
