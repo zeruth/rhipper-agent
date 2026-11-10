@@ -1,10 +1,10 @@
 //! The roadmap pane: rounded cards nested inside each other. The project card holds the whole
 //! tree; a milestone card holds its sections; a section card holds its tasks. A parent's border
 //! columns run through its children, so an expanded branch reads as boxes embedded in their
-//! ancestor's box. The selected card opens its objective and acceptance as small framed panels and
-//! its lifecycle buttons inside its own outline. The outlines take the lane color of the depth,
-//! bright on the hovered chain, dim elsewhere. The wheel and the keys scroll it, the mouse clicks
-//! it.
+//! ancestor's box, with a blank line of the card between parent and children. The selected card
+//! opens its objective, acceptance and notes as self-contained bubbles inside its outline, with
+//! the lifecycle buttons beneath. The outlines take the lane color of the depth, bright on the
+//! hovered chain, dim elsewhere. The wheel and the keys scroll it, the mouse clicks it.
 
 use std::collections::HashMap;
 
@@ -68,20 +68,20 @@ fn rows_of(
     let folded_here = children.contains_key(&id) && folded.contains(&id);
     let mut rows = vec![Row { id, border: true, buttons: Vec::new(), line: titled_edge(node, is_selected, width, outline_style) }];
 
-    // the objective and the acceptance of the selected card, each under its own rule that runs
-    // between the card's side borders, and only as tall as the text needs
+    // the objective and the acceptance of the selected card, each in its own rounded bubble in the
+    // accent, sealed off from the parent's outline, with the notes in a dim one beneath
     let room = width.saturating_sub(4);
     if is_selected && !folded_here {
+        let accent = Style::new().fg(theme::ACCENT).bg(theme::PANEL);
         for (label, value) in [("objective", node.objective.as_deref()), ("acceptance", node.acceptance.as_deref())] {
             let Some(value) = value else { continue };
-            // the rule spans the card's full width, so its corners meet both side borders
-            rows.push(Row { id, border: false, buttons: Vec::new(), line: section_row(label, width, outline_style) });
-            for line in wrap_spans(vec![Span::styled(value.to_owned(), Style::new().fg(theme::TEXT).bg(theme::PANEL))], room) {
-                rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line, width, outline_style) });
+            for line in field_bubble(label, value, accent, theme::ACCENT, room) {
+                rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line.spans, width, outline_style) });
             }
         }
         if let Some(notes) = &node.notes {
-            for line in notes_bubble(notes, room) {
+            let dim = Style::new().fg(theme::DIM).bg(theme::PANEL);
+            for line in field_bubble("notes", notes, dim, theme::DIM, room) {
                 rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line.spans, width, outline_style) });
             }
         }
@@ -120,11 +120,13 @@ fn rows_of(
         }
     }
 
-    // the children, embedded: each child's box is two columns narrower, and this card's outline
-    // runs down both sides of it
+    // the children, embedded: each child's box is two columns narrower, this card's outline runs
+    // down both sides of it, and a blank line of the card separates the parent from its children
+    // and each child from the next
     if !folded_here {
         if let Some(kids) = children.get(&id) {
             for kid in kids {
+                rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(Vec::new(), width, outline_style) });
                 for row in rows_of(kid, children, folded, selected, chain, hover_button, depth + 1, width.saturating_sub(2)) {
                     rows.push(Row {
                         id: row.id,
@@ -225,44 +227,32 @@ fn frame_row(line: Line<'static>, width: usize, outline_style: Style) -> Line<'s
     Line::from(spans)
 }
 
-/// A section rule of the selected card: `├─ objective ────┤`, attached to both side borders of the
-/// card, so the field sits inside the card's lines without breaking them. The row spans the full
-/// `width` of the card, corners included.
-fn section_row(label: &str, width: usize, outline_style: Style) -> Line<'static> {
-    let label_style = Style::new().fg(theme::ACCENT).bold().bg(theme::PANEL);
-    let label_cell = format!("─ {label} ");
-    let run = width.saturating_sub(label_cell.chars().count() + 2);
-    Line::from(vec![
-        Span::styled("├", outline_style),
-        Span::styled(label_cell, label_style),
-        Span::styled("─".repeat(run), outline_style),
-        Span::styled("┤", outline_style),
-    ])
-}
-
-/// The notes of the selected card as one rounded bubble, dim, `room` cells wide.
-fn notes_bubble(notes: &str, room: usize) -> Vec<Line<'static>> {
-    let dim = Style::new().fg(theme::DIM).bg(theme::PANEL);
+/// One rounded bubble inside a card: the label set into the top edge, the wrapped text sealed
+/// inside, the outline and the label in their own colors, `room` cells wide. The bubble touches
+/// nothing else; the caller frames it with the card's outline.
+fn field_bubble(label: &str, value: &str, frame: Style, label_color: ratatui::style::Color, room: usize) -> Vec<Line<'static>> {
+    let label_style = Style::new().fg(label_color).bold().bg(theme::PANEL);
     let text = Style::new().fg(theme::TEXT).bg(theme::PANEL);
     let inner = room.saturating_sub(4).max(4);
+    let head = format!(" {label} ");
+    let head_width = head.chars().count();
     let mut rows = Vec::new();
-    let head = " notes ";
     rows.push(Line::from(vec![
-        Span::styled("╭", dim),
-        Span::styled(head.to_owned(), dim),
-        Span::styled("─".repeat(inner.saturating_sub(head.chars().count())), dim),
-        Span::styled("╮", dim),
+        Span::styled("╭", frame),
+        Span::styled(head, label_style),
+        Span::styled("─".repeat(inner.saturating_sub(head_width)), frame),
+        Span::styled("╮", frame),
     ]));
-    for piece in wrap(notes, inner) {
+    for piece in wrap(value, inner) {
         let pad = " ".repeat(inner.saturating_sub(piece.chars().count()));
         rows.push(Line::from(vec![
-            Span::styled("│ ", dim),
+            Span::styled("│ ", frame),
             Span::styled(piece, text),
             Span::styled(pad, Style::new().bg(theme::PANEL)),
-            Span::styled(" │", dim),
+            Span::styled(" │", frame),
         ]));
     }
-    rows.push(Line::from(vec![Span::styled("╰", dim), Span::styled("─".repeat(inner), dim), Span::styled("╯", dim)]));
+    rows.push(Line::from(vec![Span::styled("╰", frame), Span::styled("─".repeat(inner), frame), Span::styled("╯", frame)]));
     rows
 }
 
@@ -311,40 +301,6 @@ fn wrap(text: &str, room: usize) -> Vec<String> {
         current.push_str(word);
     }
     rows.push(current);
-    rows
-}
-
-/// Packs styled spans into rows of `room` cells, splitting a span at the boundary.
-fn wrap_spans(spans: Vec<Span<'static>>, room: usize) -> Vec<Vec<Span<'static>>> {
-    if room == 0 {
-        return vec![spans];
-    }
-    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut used = 0usize;
-    for span in spans {
-        let style = span.style;
-        for word in span.content.split_inclusive(' ') {
-            let take = word.chars().count();
-            if take > room {
-                // a word longer than the room: each chunk takes a row of its own
-                for piece in word.chars().collect::<Vec<_>>().chunks(room) {
-                    rows.push(vec![Span::styled(piece.iter().collect::<String>(), style)]);
-                }
-                used = 0;
-                continue;
-            }
-            if used + take > room && used > 0 {
-                rows.push(Vec::new());
-                used = 0;
-            }
-            rows.last_mut().unwrap().push(Span::styled(word.to_owned(), style));
-            used += take;
-        }
-    }
-    rows.retain(|row| !row.is_empty());
-    if rows.is_empty() {
-        rows.push(Vec::new());
-    }
     rows
 }
 
