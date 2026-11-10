@@ -61,6 +61,8 @@ struct App {
     hint: Option<String>,
     /// The last-known roadmap nodes, for the tree pane.
     roadmap: Option<Vec<ra_roadmap::model::Node>>,
+    /// The model the next worker session would run on; `model` sets it.
+    model: Option<String>,
 }
 
 /// Runs the console until it is told to quit.
@@ -87,6 +89,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         started: Instant::now(),
         hint: None,
         roadmap: None,
+        model: None,
     };
     sink.push(Kind::Output, "Rhipper Agent console ready. Type help for commands.");
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -169,6 +172,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                                         Outcome::Continue => {}
                                         Outcome::Clear => sink.clear(),
                                         Outcome::Quit => break Ok(()),
+                                        Outcome::Model(model) => app.model = Some(model),
                                     }
                                 }
                                 Err(e) => sink.push(Kind::Error, format!("{e:#}")),
@@ -356,20 +360,12 @@ fn shift_held(key: &KeyEvent) -> bool {
 /// the status line, the usage pane, the roadmap tree, the log, the prompt and the footer. The
 /// prompt stays anchored at the bottom; the log and the tree take the middle.
 fn draw(f: &mut Frame, app: &App, sink: &Sink) -> usize {
-    let [header, usage, tree, body, input, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(3),
-        Constraint::Percentage(40),
-        Constraint::Min(1),
-        Constraint::Length(3),
-        Constraint::Length(1),
-    ])
-    .areas(f.area());
+    let [header, usage, tree, body, input, footer] = pane_layout().areas(f.area());
     // every cell, so even gaps the widgets never touch paint the theme
     use ratatui::widgets::Widget;
     Block::new().style(Style::new().bg(theme::BG)).render(f.area(), f.buffer_mut());
     f.render_widget(Paragraph::new(status_line(app)).style(Style::new().bg(theme::PANEL)), header);
-    draw_usage(f, usage);
+    draw_usage(f, usage, app);
     if let Some(nodes) = &app.roadmap {
         roadmap_pane::draw(f, nodes, &app.folded, app.tree_scroll, tree);
     }
@@ -379,10 +375,9 @@ fn draw(f: &mut Frame, app: &App, sink: &Sink) -> usize {
     max_scroll
 }
 
-/// The tree pane's screen area, as the layout just computed it. The draw of the frame already ran,
-/// so a re-split of the frame area gives the same rectangles.
-fn tree_area_of(f: &Frame) -> Option<Rect> {
-    let areas = Layout::vertical([
+/// The vertical pane layout, once, so the draw and the hit-testing agree on it.
+fn pane_layout() -> Layout {
+    Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Percentage(40),
@@ -390,32 +385,97 @@ fn tree_area_of(f: &Frame) -> Option<Rect> {
         Constraint::Length(3),
         Constraint::Length(1),
     ])
-    .split(f.area());
-    areas.get(2).copied()
 }
 
-/// The usage pane: the token and cost line of the session. The ledger comes with the OpenRouter
-/// integration; until then the pane shows the placeholder.
-fn draw_usage(f: &mut Frame, area: Rect) {
-    let block =
-        Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme::RULE)).style(Style::new().bg(theme::PANEL));
-    f.render_widget(block, area);
-    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: 1 };
+/// The tree pane's screen area, as the layout just computed it. The draw of the frame already ran,
+/// so a re-split of the frame area gives the same rectangles.
+fn tree_area_of(f: &Frame) -> Option<Rect> {
+    pane_layout().split(f.area()).get(2).copied()
+}
+
+/// The usage pane: two areas on one row. The tokens sit on the left; the ledger, the OpenRouter
+/// connection state, sits on the right until the provider integration fills it.
+fn draw_usage(f: &mut Frame, area: Rect, app: &App) {
+    let [badges, tokens, ledger] = Layout::horizontal([Constraint::Length(34), Constraint::Min(20), Constraint::Length(24)]).areas(area);
+    // the model badge: the model the next worker session would run on
+    let inner = usage_panel(f, badges);
+    let model = app.model.as_deref().unwrap_or("no model yet");
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("◉ ", Style::new().fg(theme::ACCENT)),
+            Span::styled(short_model(model), Style::new().fg(theme::TEXT).bold()),
+        ])),
+        inner,
+    );
+    // the task badge: the node the workers hold next, planned or in progress
+    let task = app.roadmap.as_deref().and_then(current_task);
+    let inner = usage_panel(f, tokens);
+    let mut spans = vec![Span::styled("◇ ", Style::new().fg(theme::TRACE))];
+    match task {
+        Some(node) => {
+            spans.push(Span::styled(format!("#{} ", node.id), Style::new().fg(theme::DIM)));
+            spans.push(Span::styled(short_title(&node.title, inner.width as usize - 6), Style::new().fg(theme::TEXT).bold()));
+            spans.push(Span::styled(format!(" {}", node.state.serde_name()), Style::new().fg(theme::WARN_TEXT)));
+        }
+        None => spans.push(Span::styled("no task queued", Style::new().fg(theme::DIM))),
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
+    // the tokens: in, out, cached and the session cost, the ledger apart on the right
+    let inner = usage_panel(f, ledger);
     let dim = Style::new().fg(theme::DIM);
-    let line = Line::from(vec![
-        Span::styled(" tokens ", Style::new().fg(theme::ACCENT).bold()),
-        Span::styled("· in — out — cached —", dim),
-        Span::raw("  "),
-        Span::styled("cost ", Style::new().fg(theme::DIM)),
-        Span::styled("$—", Style::new().fg(theme::WARN_TEXT)),
-        Span::raw("  "),
-        Span::styled("budget ", Style::new().fg(theme::DIM)),
-        Span::styled("$20.00", Style::new().fg(theme::TEXT)),
-        Span::raw("  "),
-        Span::styled("·", Style::new().fg(theme::ONLINE)),
-        Span::styled(" the ledger lands with the OpenRouter run", dim),
-    ]);
-    f.render_widget(Paragraph::new(line), inner);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("⇅", Style::new().fg(theme::ACCENT)),
+            Span::raw(" "),
+            Span::styled("in ", dim),
+            Span::styled("—", Style::new().fg(theme::TEXT)),
+            Span::styled(" out ", dim),
+            Span::styled("—", Style::new().fg(theme::TEXT)),
+            Span::raw(" "),
+            Span::styled("$", dim),
+            Span::styled("—", Style::new().fg(theme::WARN_TEXT)),
+        ])),
+        inner,
+    );
+}
+
+/// The model id without its vendor, so a badge holds it: `z-ai/glm-5.3-flash` becomes `glm-5.3-flash`.
+fn short_model(model: &str) -> String {
+    model.rsplit('/').next().unwrap_or(model).to_owned()
+}
+
+/// The title clipped to `room` characters, with an ellipsis when it gives one up.
+fn short_title(title: &str, room: usize) -> String {
+    let count = title.chars().count();
+    if count <= room {
+        title.to_owned()
+    } else {
+        let cut: String = title.chars().take(room.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+/// The task the workers hold next: the first node in progress, else the first planned one.
+fn current_task(nodes: &[ra_roadmap::model::Node]) -> Option<ra_roadmap::model::Node> {
+    nodes
+        .iter()
+        .find(|n| matches!(n.state, ra_roadmap::model::TaskState::InProgress | ra_roadmap::model::TaskState::Assigned))
+        .or_else(|| nodes.iter().find(|n| n.state == ra_roadmap::model::TaskState::Ready))
+        .or_else(|| {
+            nodes.iter().find(|n| n.state == ra_roadmap::model::TaskState::Defined && n.kind != ra_roadmap::model::NodeKind::Project)
+        })
+        .cloned()
+}
+
+/// Paints one rounded panel of the usage row and returns the rect for its text.
+fn usage_panel(f: &mut Frame, area: Rect) -> Rect {
+    use ratatui::widgets::Widget;
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::RULE))
+        .style(Style::new().bg(theme::PANEL))
+        .render(area, f.buffer_mut());
+    Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(3), height: 1 }
 }
 
 fn status_line(app: &App) -> Line<'static> {

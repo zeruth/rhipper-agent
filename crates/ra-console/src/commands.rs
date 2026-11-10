@@ -21,6 +21,7 @@ pub const COMMANDS: &[Spec] = &[
     },
     Spec { name: "depend", usage: "<id> <id>...", help: "makes the first node wait for the others" },
     Spec { name: "set", usage: "<id> <state>", help: "sets the state: the twelve lifecycle names" },
+    Spec { name: "model", usage: "<id>", help: "the model of the next worker session, an OpenRouter id" },
     Spec { name: "clear", usage: "", help: "clears the log view" },
     Spec { name: "quit", usage: "", help: "stops the console (also exit, or Ctrl+C twice)" },
 ];
@@ -30,6 +31,8 @@ pub enum Outcome {
     Continue,
     Clear,
     Quit,
+    /// The console adopts the model on the badge: `model <id>` set it.
+    Model(String),
 }
 
 /// Command names that start with `prefix`.
@@ -116,6 +119,11 @@ pub async fn run(line: &str, store: &Store) -> anyhow::Result<(Vec<String>, Outc
             out.push(format!("#{id} is now {}", state.serde_name()));
         }
         "clear" | "cls" => return Ok((out, Outcome::Clear)),
+        "model" => {
+            anyhow::ensure!(!args.is_empty(), "usage: model <openrouter id>, such as z-ai/glm-5.3-flash");
+            out.push(format!("the next worker session runs on {args}"));
+            return Ok((out, Outcome::Model(args.to_owned())));
+        }
         "quit" | "exit" | "shutdown" | "stop" => return Ok((out, Outcome::Quit)),
         other => anyhow::bail!("no command {other}; help lists them"),
     }

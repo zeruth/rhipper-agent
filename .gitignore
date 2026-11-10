@@ -1,5 +1,6 @@
 /target
 /var
+/rhipper.md
 *.db
 *.db-wal
 *.db-shm
