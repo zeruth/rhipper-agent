@@ -3,9 +3,10 @@
 
 use ratatui::style::Color;
 
-/// The console's background, and the header's and the prompt's.
+/// The console's background: near-black maroon, gray-10 of the Blood Moon ramp.
 pub const BG: Color = Color::Rgb(23, 7, 9); // gray-10 #170709
-pub const PANEL: Color = Color::Rgb(38, 14, 18); // gray-30 #260E12
+/// The raised surfaces: the usage bar and the prompt box.
+pub const PANEL: Color = Color::Rgb(56, 22, 27); // between gray-40 and gray-60
 /// The accent: the theme's red.
 pub const ACCENT: Color = Color::Rgb(230, 57, 53); // blue-90 #E53935
 pub const ACCENT_DEEP: Color = Color::Rgb(198, 40, 40); // blue-80 #C62828

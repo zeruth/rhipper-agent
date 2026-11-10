@@ -229,7 +229,9 @@ async fn set(id: i64, state: TaskState) -> anyhow::Result<()> {
 
 async fn console(db: PathBuf) -> anyhow::Result<()> {
     let store = Store::open(&db).await?;
-    let _nodes = store.all().await?;
-    println!("console is not wired yet; the store at {} opens", db.display());
-    Ok(())
+    if !ra_console::ui::is_terminal() {
+        anyhow::bail!("the console needs a terminal");
+    }
+    let sink = ra_console::logs::Sink::new();
+    ra_console::ui::run(store, sink).await
 }

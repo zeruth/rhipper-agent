@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqliteRow};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqliteConnection};
 
 use crate::model::{Assignment, Node, NodeKind, TaskState};
@@ -27,10 +27,11 @@ impl Store {
         Ok(Self { pool })
     }
 
-    /// Opens the store in memory, for tests.
+    /// Opens the store in memory, for tests. The pool holds one connection: each connection of an
+    /// in-memory SQLite pool would otherwise see its own empty database.
     pub async fn in_memory() -> anyhow::Result<Self> {
         let options = SqliteConnectOptions::new().in_memory(true).foreign_keys(true);
-        let pool = SqlitePool::connect_with(options).await?;
+        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(options).await?;
         Self::migrate(&mut *pool.acquire().await?).await?;
         Ok(Self { pool })
     }
