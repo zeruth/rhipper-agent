@@ -68,13 +68,11 @@ fn rows_of(
     let folded_here = children.contains_key(&id) && folded.contains(&id);
     let mut rows = vec![Row { id, border: true, buttons: Vec::new(), line: titled_edge(node, is_selected, width, outline_style) }];
 
-    // the objective and the acceptance of every open card: a roadmap-level card carries them
-    // whenever it stands open, a task opens them on a pick. Each sits in its own rounded bubble in
-    // the accent, sealed off from the parent's outline; the notes and the buttons stay with the
-    // picked card
+    // the objective and the acceptance of every open card, each in its own rounded bubble in the
+    // accent, sealed off from the parent's outline. The notes and the buttons stay with the picked
+    // card alone
     let room = width.saturating_sub(4);
-    let is_roadmap = !matches!(node.kind, NodeKind::Task | NodeKind::Subtask);
-    if !folded_here && (is_selected || is_roadmap) {
+    if !folded_here {
         let accent = Style::new().fg(theme::ACCENT).bg(theme::PANEL);
         for (label, value) in [("objective", node.objective.as_deref()), ("acceptance", node.acceptance.as_deref())] {
             let Some(value) = value else { continue };
