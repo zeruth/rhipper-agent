@@ -68,10 +68,13 @@ fn rows_of(
     let folded_here = children.contains_key(&id) && folded.contains(&id);
     let mut rows = vec![Row { id, border: true, buttons: Vec::new(), line: titled_edge(node, is_selected, width, outline_style) }];
 
-    // the objective and the acceptance of the selected card, each in its own rounded bubble in the
-    // accent, sealed off from the parent's outline, with the notes in a dim one beneath
+    // the objective and the acceptance of every open card: a roadmap-level card carries them
+    // whenever it stands open, a task opens them on a pick. Each sits in its own rounded bubble in
+    // the accent, sealed off from the parent's outline; the notes and the buttons stay with the
+    // picked card
     let room = width.saturating_sub(4);
-    if is_selected && !folded_here {
+    let is_roadmap = !matches!(node.kind, NodeKind::Task | NodeKind::Subtask);
+    if !folded_here && (is_selected || is_roadmap) {
         let accent = Style::new().fg(theme::ACCENT).bg(theme::PANEL);
         for (label, value) in [("objective", node.objective.as_deref()), ("acceptance", node.acceptance.as_deref())] {
             let Some(value) = value else { continue };
@@ -79,44 +82,48 @@ fn rows_of(
                 rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line.spans, width, outline_style) });
             }
         }
-        if let Some(notes) = &node.notes {
-            let dim = Style::new().fg(theme::DIM).bg(theme::PANEL);
-            for line in field_bubble("notes", notes, dim, theme::DIM, room) {
-                rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line.spans, width, outline_style) });
+        if is_selected {
+            if let Some(notes) = &node.notes {
+                let dim = Style::new().fg(theme::DIM).bg(theme::PANEL);
+                for line in field_bubble("notes", notes, dim, theme::DIM, room) {
+                    rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line.spans, width, outline_style) });
+                }
             }
         }
-        if !node.depends_on.is_empty() {
-            let ids: Vec<String> = node.depends_on.iter().map(|id| id.to_string()).collect();
-            rows.push(Row {
-                id,
-                border: false,
-                buttons: Vec::new(),
-                line: boxed_row(
-                    vec![
-                        Span::styled("waits-on: ", Style::new().fg(theme::DIM).bg(theme::PANEL)),
-                        Span::styled(ids.join(" "), Style::new().fg(theme::TEXT).bg(theme::PANEL)),
-                    ],
-                    width,
-                    outline_style,
-                ),
-            });
-        }
-        let mut defs: Vec<(Button, String)> = Vec::new();
-        if node.kind == NodeKind::Task || node.kind == NodeKind::Subtask {
-            defs.push((Button::Run, "▶ run".to_owned()));
-        }
-        if node.kind != NodeKind::Project {
-            defs.push((Button::Reassess, "↻ re-assess".to_owned()));
-            defs.push((Button::ReassessTree, "↻↻ re-assess tree".to_owned()));
-        }
-        if !defs.is_empty() {
-            let labels: Vec<(Button, &str)> = defs.iter().map(|(b, l)| (*b, l.as_str())).collect();
-            let (content, mut ranges) = buttons_row(&labels, hover_button);
-            // the columns sit after the ancestors' frames and this card's own border and margin
-            for range in ranges.iter_mut() {
-                *range = (range.0 + depth as u16 + 2, range.1 + depth as u16 + 2, range.2);
+        if is_selected {
+            if !node.depends_on.is_empty() {
+                let ids: Vec<String> = node.depends_on.iter().map(|id| id.to_string()).collect();
+                rows.push(Row {
+                    id,
+                    border: false,
+                    buttons: Vec::new(),
+                    line: boxed_row(
+                        vec![
+                            Span::styled("waits-on: ", Style::new().fg(theme::DIM).bg(theme::PANEL)),
+                            Span::styled(ids.join(" "), Style::new().fg(theme::TEXT).bg(theme::PANEL)),
+                        ],
+                        width,
+                        outline_style,
+                    ),
+                });
             }
-            rows.push(Row { id, border: false, buttons: ranges, line: boxed_row(content, width, outline_style) });
+            let mut defs: Vec<(Button, String)> = Vec::new();
+            if node.kind == NodeKind::Task || node.kind == NodeKind::Subtask {
+                defs.push((Button::Run, "▶ run".to_owned()));
+            }
+            if node.kind != NodeKind::Project {
+                defs.push((Button::Reassess, "↻ re-assess".to_owned()));
+                defs.push((Button::ReassessTree, "↻↻ re-assess tree".to_owned()));
+            }
+            if !defs.is_empty() {
+                let labels: Vec<(Button, &str)> = defs.iter().map(|(b, l)| (*b, l.as_str())).collect();
+                let (content, mut ranges) = buttons_row(&labels, hover_button);
+                // the columns sit after the ancestors' frames and this card's own border and margin
+                for range in ranges.iter_mut() {
+                    *range = (range.0 + depth as u16 + 2, range.1 + depth as u16 + 2, range.2);
+                }
+                rows.push(Row { id, border: false, buttons: ranges, line: boxed_row(content, width, outline_style) });
+            }
         }
     }
 
