@@ -13,19 +13,50 @@ use serde::Deserialize;
 /// One message of a chat conversation.
 #[derive(Debug, Clone)]
 pub struct Message {
-    /// `system`, `user` or `assistant`.
+    /// `system`, `user`, `assistant` or `tool`.
     pub role: String,
     pub content: String,
+    /// The tool calls of an assistant message.
+    pub tool_calls: Vec<ToolCall>,
+    /// The id of the call a tool message answers.
+    pub tool_call_id: Option<String>,
+}
+
+/// One tool call an assistant asked for.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// The arguments, as a JSON object in text form.
+    pub arguments: String,
 }
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into() }
+        Self { role: "system".into(), content: content.into(), tool_calls: Vec::new(), tool_call_id: None }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self { role: "user".into(), content: content.into(), tool_calls: Vec::new(), tool_call_id: None }
     }
+
+    /// An assistant message that asks for tool calls.
+    pub fn assistant_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self { role: "assistant".into(), content: content.into(), tool_calls, tool_call_id: None }
+    }
+
+    /// The result of one tool call.
+    pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self { role: "tool".into(), content: content.into(), tool_calls: Vec::new(), tool_call_id: Some(call_id.into()) }
+    }
+}
+
+/// A tool the model may call, with a JSON schema for its arguments.
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
 
 /// A request for one completion.
@@ -37,6 +68,8 @@ pub struct CompletionRequest {
     pub temperature: Option<f64>,
     /// The maximum tokens of the answer; `None` lets the provider decide.
     pub max_tokens: Option<u32>,
+    /// The tools the model may call; empty sends no tools.
+    pub tools: Vec<ToolSpec>,
 }
 
 /// One answer, with the usage the provider reported.
@@ -44,6 +77,8 @@ pub struct CompletionRequest {
 pub struct Completion {
     pub text: String,
     pub usage: Usage,
+    /// The tool calls the answer asks for; empty means a plain answer.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// The token counts of one execution, as the provider reported them.

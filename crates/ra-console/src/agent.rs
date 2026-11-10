@@ -26,6 +26,7 @@ pub async fn ping(model: &str) -> anyhow::Result<Vec<String>> {
             messages: vec![Message::user("Reply with the single word: pong.")],
             temperature: Some(0.0),
             max_tokens: Some(16),
+            tools: Vec::new(),
         })
         .await
         .map_err(map_error)?;
@@ -52,6 +53,7 @@ pub async fn run(store: &Store, id: i64, model: &str) -> anyhow::Result<Vec<Stri
             messages: vec![Message::system(SYSTEM), Message::user(context)],
             temperature: Some(0.4),
             max_tokens: Some(1024),
+            tools: Vec::new(),
         })
         .await
         .map_err(map_error)?;
@@ -165,6 +167,7 @@ async fn reassess_one(
             messages: vec![Message::system(ARCHITECT), Message::user(ask)],
             temperature: Some(0.2),
             max_tokens: Some(512),
+            tools: Vec::new(),
         })
         .await
         .map_err(map_error)?;
