@@ -113,6 +113,8 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
     let mut dirty = true;
     // the screen rows of the tree pane, so the wheel and the clicks route to it
     let mut tree_area: Option<Rect> = None;
+    // the node id under every visible tree row, as the last draw laid them out
+    let mut tree_rows: Vec<i64> = Vec::new();
     let result = loop {
         let version = sink.version();
         if version != app.seen {
@@ -125,21 +127,18 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         }
         if dirty || last_draw.elapsed() >= Duration::from_secs(1) {
             let mut max_scroll = app.scroll;
+            let mut tree_max_scroll = 0usize;
+            let mut row_ids: Vec<i64> = Vec::new();
             if let Err(e) = terminal.draw(|f| {
-                max_scroll = draw(f, &app, &sink);
+                (max_scroll, tree_max_scroll) = draw(f, &app, &sink, &mut row_ids);
                 tree_area = tree_area_of(f);
             }) {
                 break Err(e.into());
             }
             // scrolled past the oldest line: hold at it, so scrolling down answers at once
             app.scroll = app.scroll.min(max_scroll);
-            if let Some(area) = tree_area {
-                let cards = app
-                    .roadmap
-                    .as_ref()
-                    .map_or(0, |nodes| roadmap_pane::card_rows(nodes, &app.folded, app.selected, area.width as usize).len());
-                app.tree_scroll = app.tree_scroll.min(cards.saturating_sub(area.height as usize));
-            }
+            app.tree_scroll = app.tree_scroll.min(tree_max_scroll);
+            tree_rows = row_ids;
             last_draw = Instant::now();
             dirty = false;
         }
@@ -149,15 +148,13 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                 dirty = true;
                 match input {
                     Input::Click(y) => {
-                        // a click inside the tree pane picks the card: its details expand inline,
-                        // a second click on an open parent folds it
+                        // a click inside the tree pane picks the card the row ids name: its details
+                        // expand inside its outline, a second click folds a parent
                         if let Some(area) = tree_area {
                             if (area.y..area.y + area.height).contains(&y) {
-                                let row = roadmap_pane::row_at(y, area.y, app.tree_scroll);
-                                if let Some(nodes) = &app.roadmap {
-                                    let visible = roadmap_pane::card_rows(nodes, &app.folded, app.selected, area.width as usize);
-                                    if let Some(row) = visible.get(row) {
-                                        let id = row.id;
+                                let index = (y - area.y) as usize;
+                                if let Some(&id) = tree_rows.get(index) {
+                                    if let Some(nodes) = &app.roadmap {
                                         let has_children = nodes.iter().any(|n| n.parent == Some(id));
                                         if app.selected == Some(id) {
                                             if has_children {
@@ -409,23 +406,27 @@ fn shift_held(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
-/// Draws the console; returns how far back the log can scroll (in rows). The panes from the top:
+/// Draws the console; returns how far back the log can scroll (in rows) and how far back the tree
+/// can, and fills `row_ids` with the node id under every visible tree row. The panes from the top:
 /// the status line, the usage pane, the roadmap tree, the log, the prompt and the footer. The
 /// prompt stays anchored at the bottom; the log and the tree take the middle.
-fn draw(f: &mut Frame, app: &App, sink: &Sink) -> usize {
+fn draw(f: &mut Frame, app: &App, sink: &Sink, row_ids: &mut Vec<i64>) -> (usize, usize) {
     let [header, usage, tree, body, input, footer] = pane_layout().areas(f.area());
     // every cell, so even gaps the widgets never touch paint the theme
     use ratatui::widgets::Widget;
     Block::new().style(Style::new().bg(theme::BG)).render(f.area(), f.buffer_mut());
     f.render_widget(Paragraph::new(status_line(app)).style(Style::new().bg(theme::PANEL)), header);
     draw_usage(f, usage, app);
+    let mut tree_max = 0usize;
     if let Some(nodes) = &app.roadmap {
-        roadmap_pane::draw(f, nodes, &app.folded, app.selected, app.hover, app.tree_scroll, tree);
+        let (tree_max_scroll, ids) = roadmap_pane::draw(f, nodes, &app.folded, app.selected, app.hover, app.tree_scroll, tree);
+        *row_ids = ids;
+        tree_max = tree_max_scroll;
     }
     let max_scroll = draw_log(f, app, sink, body);
     draw_input(f, app, input);
     f.render_widget(Paragraph::new(footer_line(app, footer.width)).style(Style::new().bg(theme::BG)), footer);
-    max_scroll
+    (max_scroll, tree_max)
 }
 
 /// The vertical pane layout, once, so the draw and the hit-testing agree on it.
