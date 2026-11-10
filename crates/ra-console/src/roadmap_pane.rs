@@ -250,6 +250,15 @@ pub fn draw(
     let height = area.height as usize;
     let max_scroll = rows.len().saturating_sub(height);
     let scroll = scroll.min(max_scroll);
+    tracing::debug!(
+        "roadmap pane: {} rows, {} cards, scroll {} of {}, pane {}x{}",
+        rows.len(),
+        roots.len(),
+        scroll,
+        max_scroll,
+        area.width,
+        area.height
+    );
     let mut row_ids: Vec<i64> = Vec::with_capacity(height);
     for (i, row) in rows.iter().skip(scroll).take(height).enumerate() {
         let y = area.y + i as u16;

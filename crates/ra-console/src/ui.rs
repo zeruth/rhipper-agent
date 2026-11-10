@@ -177,9 +177,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                                             }
                                         } else {
                                             app.selected = Some(id);
-                                            if let Ok(node) = store.read(id).await {
-                                                sink.push(Kind::Output, node_brief(&node));
-                                            }
+                                            // the details live in the card itself; the log stays for commands
                                         }
                                     }
                                 }
@@ -687,24 +685,6 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     let x = inner.x + (PROMPT.chars().count() + app.cursor - skip) as u16;
     f.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
-}
-
-/// One node as a log line: the fields a click on its tree row shows.
-fn node_brief(node: &ra_roadmap::model::Node) -> String {
-    let mut text = format!("#{} {} {} {{c{}}}", node.id, node.kind.serde_name(), node.title, node.complexity);
-    if let Some(objective) = &node.objective {
-        text.push_str(&format!("\n  objective: {objective}"));
-    }
-    if let Some(acceptance) = &node.acceptance {
-        text.push_str(&format!("\n  acceptance: {acceptance}"));
-    }
-    if !node.depends_on.is_empty() {
-        text.push_str(&format!("\n  waits-on: {:?}", node.depends_on));
-    }
-    if let Some(notes) = &node.notes {
-        text.push_str(&format!("\n  notes: {notes}"));
-    }
-    text
 }
 
 fn footer_line(app: &App, width: u16) -> Line<'static> {
