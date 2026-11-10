@@ -129,8 +129,13 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
             let mut max_scroll = app.scroll;
             let mut tree_max_scroll = 0usize;
             let mut row_ids: Vec<i64> = Vec::new();
+            // the card the pointer rests on, named by the previous frame's hit test
+            let hover_id = match (app.hover, tree_area) {
+                (Some(y), Some(a)) if (a.y..a.y + a.height).contains(&y) => tree_rows.get((y - a.y) as usize).copied(),
+                _ => None,
+            };
             if let Err(e) = terminal.draw(|f| {
-                (max_scroll, tree_max_scroll) = draw(f, &app, &sink, &mut row_ids);
+                (max_scroll, tree_max_scroll) = draw(f, &app, &sink, hover_id, &mut row_ids);
                 tree_area = tree_area_of(f);
             }) {
                 break Err(e.into());
@@ -407,10 +412,10 @@ fn shift_held(key: &KeyEvent) -> bool {
 }
 
 /// Draws the console; returns how far back the log can scroll (in rows) and how far back the tree
-/// can, and fills `row_ids` with the node id under every visible tree row. The panes from the top:
-/// the status line, the usage pane, the roadmap tree, the log, the prompt and the footer. The
-/// prompt stays anchored at the bottom; the log and the tree take the middle.
-fn draw(f: &mut Frame, app: &App, sink: &Sink, row_ids: &mut Vec<i64>) -> (usize, usize) {
+/// can, and fills `row_ids` with the node id under every visible tree row. `hover_id` names the
+/// card the pointer rests on. The panes from the top: the status line, the usage pane, the roadmap
+/// tree, the log, the prompt and the footer.
+fn draw(f: &mut Frame, app: &App, sink: &Sink, hover_id: Option<i64>, row_ids: &mut Vec<i64>) -> (usize, usize) {
     let [header, usage, tree, body, input, footer] = pane_layout().areas(f.area());
     // every cell, so even gaps the widgets never touch paint the theme
     use ratatui::widgets::Widget;
@@ -419,7 +424,7 @@ fn draw(f: &mut Frame, app: &App, sink: &Sink, row_ids: &mut Vec<i64>) -> (usize
     draw_usage(f, usage, app);
     let mut tree_max = 0usize;
     if let Some(nodes) = &app.roadmap {
-        let (tree_max_scroll, ids) = roadmap_pane::draw(f, nodes, &app.folded, app.selected, app.hover, app.tree_scroll, tree);
+        let (tree_max_scroll, ids) = roadmap_pane::draw(f, nodes, &app.folded, app.selected, hover_id, app.tree_scroll, tree);
         *row_ids = ids;
         tree_max = tree_max_scroll;
     }
