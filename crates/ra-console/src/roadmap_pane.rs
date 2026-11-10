@@ -1,8 +1,7 @@
 //! The roadmap pane: slim rounded cards, one per node, stacked and indented under their parent.
-//! Each card carries the rounded outline the prompt has, in the state's color; the hovered card
-//! raises its border, and the selected card expands its detail fields inside its own outline. A
-//! parent card folds its children. The wheel and the keys scroll it, the mouse hovers and clicks
-//! it.
+//! Each card carries the rounded outline the prompt has; the hovered card raises its border, and
+//! the selected card expands its detail fields inside its own outline. A parent card folds its
+//! children. The wheel and the keys scroll it, the mouse hovers and clicks it.
 
 use ra_roadmap::model::{Node, NodeKind, TaskState};
 use ratatui::Frame;
@@ -13,16 +12,10 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 
 use crate::theme;
 
-/// One visible card: the node it renders, its tree depth and whether its children are folded away.
-struct Card {
-    id: i64,
-    node: Node,
-    level: usize,
-    folded: bool,
-}
-
-/// The visible cards, in tree order, with the children of a folded parent left out.
-fn cards(nodes: &[Node], folded: &[i64]) -> Vec<Card> {
+/// The visible cards, in tree order, with the children of a folded parent left out. Each card
+/// carries its geometry, computed once: the indent, the inner width and its content rows, so the
+/// drawn layout and the reserved heights cannot disagree.
+fn cards(nodes: &[Node], folded: &[i64], selected: Option<i64>, area_width: usize) -> Vec<LaidCard> {
     let by_id: std::collections::HashMap<i64, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
     let depth = |node: &Node| -> usize {
         let mut level = 0;
@@ -48,9 +41,27 @@ fn cards(nodes: &[Node], folded: &[i64]) -> Vec<Card> {
             continue;
         }
         let has_children = nodes.iter().any(|n| n.parent == Some(node.id));
-        out.push(Card { id: node.id, node: node.clone(), level: depth(node), folded: has_children && folded.contains(&node.id) });
+        let level = depth(node);
+        let is_selected = selected == Some(node.id);
+        let inner = area_width.saturating_sub(2 * level + 2);
+        let lines = content_lines(node, has_children && folded.contains(&node.id), is_selected, inner);
+        out.push(LaidCard { id: node.id, level, lines });
     }
     out
+}
+
+/// One card with its geometry settled.
+struct LaidCard {
+    id: i64,
+    level: usize,
+    lines: Vec<Line<'static>>,
+}
+
+impl LaidCard {
+    /// The screen height: two border rows plus the content rows.
+    fn height(&self) -> usize {
+        2 + self.lines.len()
+    }
 }
 
 /// Draws the pane at `scroll`; the card under `hover` and the selected card carry a brighter
@@ -65,12 +76,11 @@ pub fn draw(
     scroll: usize,
     area: Rect,
 ) -> (usize, Vec<i64>) {
-    let all = cards(nodes, folded);
-    let width = area.width as usize;
+    let all = cards(nodes, folded, selected, area.width as usize);
     let mut visible = 0usize;
     let mut used = 0usize;
     for card in all.iter().rev() {
-        let h = card_height(card, selected == Some(card.id), width);
+        let h = card.height();
         if used + h > area.height as usize && used > 0 {
             break;
         }
@@ -84,12 +94,11 @@ pub fn draw(
     let mut y = u16::from(area.y);
     for card in all.iter().skip(scroll) {
         let is_selected = selected == Some(card.id);
-        let height = card_height(card, is_selected, width);
+        let height = card.height();
         if y + height as u16 > area.y + area.height {
             break;
         }
-        let level = card.level;
-        let indent = 2 * level;
+        let indent = 2 * card.level;
         let rect = Rect { x: area.x + indent as u16, y, width: area.width.saturating_sub(indent as u16), height: height as u16 };
         let hovered = hover.is_some_and(|hy| (rect.y..rect.y + rect.height).contains(&hy));
         let border = if is_selected {
@@ -103,8 +112,7 @@ pub fn draw(
             Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(border)).style(Style::new().bg(theme::PANEL));
         f.render_widget(block, rect);
         let inner = Rect { x: rect.x + 1, y: rect.y + 1, width: rect.width.saturating_sub(2), height: rect.height.saturating_sub(2) };
-        let lines = content_lines(card, is_selected, inner.width as usize);
-        for (i, line) in lines.iter().enumerate() {
+        for (i, line) in card.lines.iter().enumerate() {
             f.render_widget(Paragraph::new(line.clone()), Rect { y: inner.y + i as u16, ..inner });
         }
         for _ in 0..height {
@@ -115,25 +123,19 @@ pub fn draw(
     (max_scroll, row_ids)
 }
 
-/// The screen height of one card: two border rows plus its content rows.
-fn card_height(card: &Card, is_selected: bool, width: usize) -> usize {
-    2 + content_lines(card, is_selected, width.saturating_sub(2)).len()
-}
-
 /// The content rows of a card: the title row, its wrapped continuations, and, when selected, the
 /// detail fields.
-fn content_lines(card: &Card, is_selected: bool, width: usize) -> Vec<Line<'static>> {
-    let node = &card.node;
+fn content_lines(node: &Node, folded: bool, is_selected: bool, width: usize) -> Vec<Line<'static>> {
     let marker = if node.kind == NodeKind::Project {
         "◆"
-    } else if card.folded {
+    } else if folded {
         "▸"
     } else {
         "▾"
     };
     let title_style = if is_selected { Style::new().fg(theme::WARN_TEXT).bold() } else { Style::new().fg(theme::TEXT).bold() };
     let mut body = vec![
-        Span::styled(marker.to_owned(), Style::new().fg(if card.folded { theme::DIM } else { theme::ACCENT })),
+        Span::styled(marker.to_owned(), Style::new().fg(if folded { theme::DIM } else { theme::ACCENT })),
         Span::styled(format!(" #{} ", node.id), Style::new().fg(theme::DIM)),
         Span::styled(node.title.clone(), title_style),
         Span::styled(format!(" {{c{}}}", node.complexity), Style::new().fg(theme::DIM)),
@@ -237,7 +239,7 @@ fn wrap_spans(spans: Vec<Span<'static>>, room: usize) -> Vec<Vec<Span<'static>>>
 }
 
 /// The color of a state: the bright material colors carry the meaning.
-pub fn state_color(state: TaskState) -> ratatui::style::Color {
+fn state_color(state: TaskState) -> ratatui::style::Color {
     match state {
         TaskState::Accepted => theme::ONLINE,
         TaskState::InProgress | TaskState::Assigned => theme::WARN_TEXT,
