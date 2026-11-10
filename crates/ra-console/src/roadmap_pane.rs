@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use ra_roadmap::model::{Node, NodeKind, TaskState};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -66,43 +66,39 @@ fn rows_of(
     let lane = if in_chain || is_selected { theme::lane(depth) } else { theme::dim_lane(depth) };
     let outline_style = Style::new().fg(lane).bg(theme::PANEL);
     let folded_here = children.contains_key(&id) && folded.contains(&id);
-    let mut rows = vec![Row { id, border: true, buttons: Vec::new(), line: edge_row("╭", "─", "╮", width, outline_style) }];
+    let mut rows = vec![Row { id, border: true, buttons: Vec::new(), line: titled_edge(node, is_selected, width, outline_style) }];
 
-    // the title rows: the marker, the id, the title and the badges, wrapped inside the box
+    // the objective and the acceptance of the selected card, each under its own rule that runs
+    // between the card's side borders, and only as tall as the text needs
     let room = width.saturating_sub(4);
-    let title_style = if is_selected {
-        Style::new().fg(theme::WARN_TEXT).bold().bg(theme::PANEL)
-    } else {
-        Style::new().fg(theme::TEXT).bold().bg(theme::PANEL)
-    };
-    let mut body = vec![
-        Span::styled(
-            marker_of(node.kind, folded_here),
-            Style::new().fg(if folded_here { theme::DIM } else { theme::ACCENT }).bg(theme::PANEL),
-        ),
-        Span::styled(format!(" #{} ", id), Style::new().fg(theme::DIM).bg(theme::PANEL)),
-        Span::styled(node.title.clone(), title_style),
-        Span::styled(format!(" {{c{}}}", node.complexity), Style::new().fg(theme::DIM).bg(theme::PANEL)),
-        Span::styled(format!(" [{}]", node.state.serde_name()), Style::new().fg(state_color(node.state)).bg(theme::PANEL)),
-    ];
-    if let Some(assignee) = &node.assignee {
-        body.push(Span::styled(format!(" [{}:{}]", assignee.role, assignee.model), Style::new().fg(theme::TRACE).bg(theme::PANEL)));
-    }
-    for line in wrap_spans(body, room) {
-        rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line, width, outline_style) });
-    }
-
-    // the selected card opens its fields only while it stands open: a folded card stays a title
     if is_selected && !folded_here {
         for (label, value) in [("objective", node.objective.as_deref()), ("acceptance", node.acceptance.as_deref())] {
-            if let Some(value) = value {
-                for line in framed_block(label, value, room) {
-                    rows.push(Row { id, border: false, buttons: Vec::new(), line });
-                }
+            let Some(value) = value else { continue };
+            rows.push(Row { id, border: false, buttons: Vec::new(), line: section_row(label, room, outline_style) });
+            for line in wrap_spans(vec![Span::styled(value.to_owned(), Style::new().fg(theme::TEXT).bg(theme::PANEL))], room) {
+                rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line, width, outline_style) });
             }
         }
-        for line in plain_detail(node, room) {
-            rows.push(Row { id, border: false, buttons: Vec::new(), line });
+        if let Some(notes) = &node.notes {
+            for line in notes_bubble(notes, room) {
+                rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(line.spans, width, outline_style) });
+            }
+        }
+        if !node.depends_on.is_empty() {
+            let ids: Vec<String> = node.depends_on.iter().map(|id| id.to_string()).collect();
+            rows.push(Row {
+                id,
+                border: false,
+                buttons: Vec::new(),
+                line: boxed_row(
+                    vec![
+                        Span::styled("waits-on: ", Style::new().fg(theme::DIM).bg(theme::PANEL)),
+                        Span::styled(ids.join(" "), Style::new().fg(theme::TEXT).bg(theme::PANEL)),
+                    ],
+                    width,
+                    outline_style,
+                ),
+            });
         }
         let mut defs: Vec<(Button, String)> = Vec::new();
         if node.kind == NodeKind::Task || node.kind == NodeKind::Subtask {
@@ -144,22 +140,58 @@ fn rows_of(
     rows
 }
 
-/// The fold marker of a card: a diamond for the project, an arrow for a parent, a bar for a leaf.
-fn marker_of(kind: NodeKind, folded: bool) -> String {
-    let marker = if kind == NodeKind::Project {
-        "◆"
-    } else if folded {
-        "▸"
-    } else {
-        "▾"
-    };
-    format!("{marker} ")
-}
-
 /// A border row: the corners and the run between them, `width` cells wide.
 fn edge_row(left: &str, fill: &str, right: &str, width: usize, style: Style) -> Line<'static> {
     let run = width.saturating_sub(2);
     Line::from(vec![Span::styled(left.to_owned(), style), Span::styled(fill.repeat(run), style), Span::styled(right.to_owned(), style)])
+}
+
+/// The text clipped to `room` characters, with an ellipsis when it gives one up.
+fn short_title(title: &str, room: usize) -> String {
+    let count = title.chars().count();
+    if count <= room {
+        title.to_owned()
+    } else {
+        let cut: String = title.chars().take(room.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+/// The top edge of a card, with the id, the title and the badges set into the outline itself, the
+/// way the objective labels sit in their rules. The title clips when it would not fit, and the
+/// filler run closes the edge to `width`.
+fn titled_edge(node: &Node, is_selected: bool, width: usize, outline_style: Style) -> Line<'static> {
+    let title_style = if is_selected {
+        Style::new().fg(theme::WARN_TEXT).bold().bg(theme::PANEL)
+    } else {
+        Style::new().fg(theme::TEXT).bold().bg(theme::PANEL)
+    };
+    let badge = |text: String, color: ratatui::style::Color| Span::styled(text, Style::new().fg(color).bg(theme::PANEL));
+    let assignee = node.assignee.as_ref().map_or(0, |a| format!(" [{}:{}]", a.role, a.model).chars().count());
+    let overhead = 2usize
+        + if node.kind == NodeKind::Project { 2 } else { 0 }
+        + format!("#{} ", node.id).chars().count()
+        + format!(" {{c{}}}", node.complexity).chars().count()
+        + format!(" [{}]", node.state.serde_name()).chars().count()
+        + assignee
+        + 2; // the space and the closing corner
+    let title = short_title(&node.title, width.saturating_sub(overhead).max(4));
+    let mut spans = vec![Span::styled("╭ ", outline_style)];
+    if node.kind == NodeKind::Project {
+        spans.push(badge("◆ ".to_owned(), theme::ACCENT));
+    }
+    spans.push(badge(format!("#{} ", node.id), theme::DIM));
+    spans.push(Span::styled(title, title_style));
+    spans.push(badge(format!(" {{c{}}}", node.complexity), theme::DIM));
+    spans.push(badge(format!(" [{}]", node.state.serde_name()), state_color(node.state)));
+    if let Some(assignee) = &node.assignee {
+        spans.push(badge(format!(" [{}:{}]", assignee.role, assignee.model), theme::TRACE));
+    }
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let filler = width.saturating_sub(used + 1);
+    spans.push(Span::styled("─".repeat(filler), outline_style));
+    spans.push(Span::styled("╮", outline_style));
+    Line::from(spans)
 }
 
 /// A body row inside a box: the left outline, the content padded to fit, the right outline.
@@ -185,74 +217,65 @@ fn frame_row(line: Line<'static>, width: usize, outline_style: Style) -> Line<'s
     Line::from(spans)
 }
 
-/// One framed field of the selected card: a top edge naming the field, the wrapped text, a bottom
-/// edge, all in the accent. The rows span `room` cells, the content width of the card.
-fn framed_block(label: &str, value: &str, room: usize) -> Vec<Line<'static>> {
-    let frame = Style::new().fg(theme::ACCENT).bg(theme::PANEL);
-    let label_style = Style::new().fg(theme::WARN_TEXT).bold().bg(theme::PANEL);
-    let text_style = Style::new().fg(theme::TEXT).bg(theme::PANEL);
-    let inner = room.saturating_sub(4);
-    let mut rows = Vec::new();
-    let label_cell = format!(" {label} ");
-    let run = inner.saturating_sub(label_cell.chars().count());
-    rows.push(Line::from(vec![
-        Span::styled("╭", frame),
+/// A section rule of the selected card: `├─ objective ────┤`, attached to both side borders of the
+/// card, so the field sits inside the card's lines instead of breaking them. The rows span `room`
+/// cells, the content width of the card.
+fn section_row(label: &str, room: usize, outline_style: Style) -> Line<'static> {
+    let label_style = Style::new().fg(theme::ACCENT).bold().bg(theme::PANEL);
+    let label_cell = format!("─ {label} ");
+    let run = room.saturating_sub(label_cell.chars().count() + 1);
+    Line::from(vec![
+        Span::styled("├", outline_style),
         Span::styled(label_cell, label_style),
-        Span::styled("─".repeat(run), frame),
-        Span::styled("╮", frame),
-    ]));
-    for piece in wrap(value, inner) {
-        let pad = " ".repeat(inner.saturating_sub(piece.chars().count()));
-        rows.push(Line::from(vec![
-            Span::styled("│ ", frame),
-            Span::styled(piece, text_style),
-            Span::styled(pad, Style::new().bg(theme::PANEL)),
-            Span::styled(" │", frame),
-        ]));
-    }
-    rows.push(Line::from(vec![Span::styled("╰", frame), Span::styled("─".repeat(inner), frame), Span::styled("╯", frame)]));
-    rows
+        Span::styled("─".repeat(run), outline_style),
+        Span::styled("┤", outline_style),
+    ])
 }
 
-/// The plain detail rows of the selected card: the notes and the waits-on, dim.
-fn plain_detail(node: &Node, room: usize) -> Vec<Line<'static>> {
+/// The notes of the selected card as one rounded bubble, dim, `room` cells wide.
+fn notes_bubble(notes: &str, room: usize) -> Vec<Line<'static>> {
     let dim = Style::new().fg(theme::DIM).bg(theme::PANEL);
     let text = Style::new().fg(theme::TEXT).bg(theme::PANEL);
+    let inner = room.saturating_sub(4).max(4);
     let mut rows = Vec::new();
-    if let Some(notes) = &node.notes {
-        for (i, piece) in notes.split('\n').enumerate() {
-            let head = if i == 0 { "notes: ".to_owned() } else { "  ".to_owned() };
-            for (j, part) in wrap(piece, room.saturating_sub(head.chars().count())).into_iter().enumerate() {
-                let head = if j == 0 { head.clone() } else { "  ".to_owned() };
-                rows.push(Line::from(vec![Span::styled(head, dim), Span::styled(part, text)]));
-            }
-        }
+    let head = " notes ";
+    rows.push(Line::from(vec![
+        Span::styled("╭", dim),
+        Span::styled(head.to_owned(), dim),
+        Span::styled("─".repeat(inner.saturating_sub(head.chars().count())), dim),
+        Span::styled("╮", dim),
+    ]));
+    for piece in wrap(notes, inner) {
+        let pad = " ".repeat(inner.saturating_sub(piece.chars().count()));
+        rows.push(Line::from(vec![
+            Span::styled("│ ", dim),
+            Span::styled(piece, text),
+            Span::styled(pad, Style::new().bg(theme::PANEL)),
+            Span::styled(" │", dim),
+        ]));
     }
-    if !node.depends_on.is_empty() {
-        let ids: Vec<String> = node.depends_on.iter().map(|id| id.to_string()).collect();
-        rows.push(Line::from(vec![Span::styled("waits-on: ", dim), Span::styled(ids.join(" "), text)]));
-    }
+    rows.push(Line::from(vec![Span::styled("╰", dim), Span::styled("─".repeat(inner), dim), Span::styled("╯", dim)]));
     rows
 }
 
-/// The lifecycle buttons on one row: bracketed labels, dim until the pointer rests on one. Returns
-/// the spans and each button's columns within the row.
+/// The lifecycle buttons on one row: bracketed labels in cyan, brightening when the pointer rests
+/// on one. Returns the spans and each button's columns within the row.
 fn buttons_row(buttons: &[(Button, &str)], hover_button: Option<Button>) -> (Vec<Span<'static>>, Vec<(u16, u16, Button)>) {
-    let dim = Style::new().fg(theme::DIM).bg(theme::PANEL);
-    let hot = Style::new().fg(theme::ACCENT).bold().bg(theme::PANEL);
+    let cool = Style::new().fg(theme::DEBUG).bg(theme::PANEL);
+    let hot = Style::new().fg(Color::Rgb(140, 240, 248)).bold().bg(theme::PANEL);
     let mut spans = Vec::new();
     let mut ranges = Vec::new();
     let mut offset = 0u16;
     for (i, (button, label)) in buttons.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("  ", dim));
+            spans.push(Span::styled("  ", cool));
             offset += 2;
         }
         let start = offset;
-        spans.push(Span::styled("[", dim));
-        let style = if hover_button == Some(*button) { hot } else { dim };
+        spans.push(Span::styled("[", cool));
+        let style = if hover_button == Some(*button) { hot } else { cool };
         spans.push(Span::styled((*label).to_owned(), style));
-        spans.push(Span::styled("]", dim));
+        spans.push(Span::styled("]", cool));
         offset += 1 + label.chars().count() as u16 + 1;
         ranges.push((start, offset, *button));
     }

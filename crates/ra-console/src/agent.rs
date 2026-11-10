@@ -81,13 +81,18 @@ pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> a
     let order = if recursive { subtree_preorder(&nodes, id) } else { vec![id] };
     let mut revised: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let mut receipts: Vec<String> = Vec::new();
     for current in order {
         match reassess_one(store, &provider, model, current, &nodes).await {
-            Ok(()) => revised.push(format!("#{}", current)),
+            Ok(receipt) => {
+                revised.push(format!("#{}", current));
+                receipts.push(receipt);
+            }
             Err(e) => warnings.push(format!("⚠ #{}: {e:#}", current)),
         }
     }
     let mut out = vec![format!("✓ {} node(s) reassessed on {}: {}", revised.len(), short(model), revised.join(" "))];
+    out.extend(receipts);
     out.extend(warnings);
     Ok(out)
 }
@@ -125,8 +130,10 @@ async fn reassess_one(
     model: &str,
     id: i64,
     nodes: &[Node],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let node = store.read(id).await?;
+    let old_objective = node.objective.clone();
+    let old_acceptance = node.acceptance.clone();
     let context = context_of(store, &node).await?;
     let mut ask = context;
     if let Some(notes) = &node.notes {
@@ -148,7 +155,8 @@ async fn reassess_one(
     ask.push_str(
         "\nRevise the objective and the acceptance so they name only the work still ahead: leave out what the \
          children and the notes show as done, and make every acceptance criterion concrete and checkable without \
-         interpretation. Reply with exactly two lines and nothing else:\n\
+         interpretation. Reply with exactly three lines and nothing else:\n\
+         overview: <one sentence on what you changed and why>\n\
          objective: <the revised objective, one line>\nacceptance: <the revised acceptance, one line>",
     );
     let answer = provider
@@ -160,11 +168,16 @@ async fn reassess_one(
         })
         .await
         .map_err(map_error)?;
-    let mut objective = None;
-    let mut acceptance = None;
+    let mut overview: Option<String> = None;
+    let mut objective: Option<String> = None;
+    let mut acceptance: Option<String> = None;
     for line in answer.text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("objective:") {
+        if let Some(rest) = line.strip_prefix("overview:") {
+            if !rest.trim().is_empty() {
+                overview = Some(rest.trim().to_owned());
+            }
+        } else if let Some(rest) = line.strip_prefix("objective:") {
             if !rest.trim().is_empty() {
                 objective = Some(rest.trim().to_owned());
             }
@@ -180,7 +193,34 @@ async fn reassess_one(
         answer.text.lines().next().unwrap_or("")
     );
     store.set_details(id, objective.as_deref(), acceptance.as_deref()).await?;
-    Ok(())
+
+    // the receipt reads like a patch: an overview line, then the old and the new of each field
+    let mut receipt = format!("#{} {}", node.id, node.title);
+    if let Some(overview) = &overview {
+        receipt.push_str(&format!("\n~ overview: {overview}"));
+    }
+    let mut changed = 0usize;
+    for (name, old, new) in [("objective", old_objective, objective.clone()), ("acceptance", old_acceptance, acceptance.clone())] {
+        match (old, new) {
+            (Some(old), Some(new)) if old != new => {
+                receipt.push_str(&format!("\n- {name}: {old}"));
+                receipt.push_str(&format!("\n+ {name}: {new}"));
+                changed += 1;
+            }
+            (Some(_), Some(_)) => receipt.push_str(&format!("\n~ {name}: unchanged")),
+            (None, Some(new)) => {
+                receipt.push_str(&format!("\n+ {name}: {new}"));
+                changed += 1;
+            }
+            (Some(_), None) => {
+                receipt.push_str(&format!("\n- {name}: removed"));
+                changed += 1;
+            }
+            (None, None) => {}
+        }
+    }
+    receipt.push_str(&format!("\n{changed} field(s) changed"));
+    Ok(receipt)
 }
 
 /// The first line of a note, for a prompt that stays short.

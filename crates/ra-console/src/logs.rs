@@ -15,6 +15,9 @@ pub enum Kind {
     Output,
     /// The greeting of the console.
     Banner,
+    /// A change report whose lines carry their own meaning: `+` names an addition, `-` a removal,
+    /// and any other line reads as commentary. The bubble colors the lines like a diff.
+    Diff,
     /// A logged event, at a level.
     Log(tracing::Level),
     /// A failure.

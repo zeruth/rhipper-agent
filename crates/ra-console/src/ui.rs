@@ -460,7 +460,9 @@ async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, j
             match commands::run(&line, &store, &model).await {
                 Ok((out, _)) => {
                     for l in out {
-                        sink.push(Kind::Output, l);
+                        // a multi-line answer is a change report; the bubble colors it as a diff
+                        let kind = if l.contains('\n') { Kind::Diff } else { Kind::Output };
+                        sink.push(kind, l);
                     }
                 }
                 Err(e) => sink.push(Kind::Error, format!("{e:#}")),
@@ -721,11 +723,12 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 /// One log entry as a rounded bubble: the outline in the kind's color, the text in a color that
 /// matches it. An output entry takes the lane color of its place in the session, never red; an
-/// error and the banner stay red.
+/// error and the banner stay red. A diff entry colors its lines like a patch: `+` green, `-` red,
+/// commentary in the bubble's color.
 fn rows_of(line: &crate::logs::Line, width: usize, lane_index: usize) -> Vec<Line<'static>> {
     let (border, text) = match line.kind {
         Kind::Input => (theme::ACCENT, theme::TEXT),
-        Kind::Output => {
+        Kind::Output | Kind::Diff => {
             let lane = theme::lane(1 + lane_index % (theme::LANE_COUNT - 1));
             (lane, lane)
         }
@@ -739,20 +742,40 @@ fn rows_of(line: &crate::logs::Line, width: usize, lane_index: usize) -> Vec<Lin
     };
     let border_style = Style::new().fg(border);
     let text_style = Style::new().fg(text).bg(theme::PANEL);
+    let added = Style::new().fg(theme::ONLINE).bg(theme::PANEL);
+    let removed = Style::new().fg(theme::ERROR_TEXT).bg(theme::PANEL);
     let room = width.saturating_sub(4).max(4);
+    // every entry may hold several lines; a diff colors each by its marker
+    let sources: Vec<(String, Style)> = match line.kind {
+        Kind::Diff => line
+            .text
+            .split('\n')
+            .map(|src| {
+                let style = match src.chars().next() {
+                    Some('+') => added,
+                    Some('-') => removed,
+                    _ => text_style,
+                };
+                (src.to_owned(), style)
+            })
+            .collect(),
+        _ => vec![(line.text.clone(), text_style)],
+    };
     let mut rows = vec![Line::from(vec![
         Span::styled("╭", border_style),
         Span::styled("─".repeat(room + 2), border_style),
         Span::styled("╮", border_style),
     ])];
-    for piece in wrap(&line.text, room) {
-        let pad = " ".repeat(room.saturating_sub(piece.chars().count()));
-        rows.push(Line::from(vec![
-            Span::styled("│ ", border_style),
-            Span::styled(piece, text_style),
-            Span::styled(pad, Style::new().bg(theme::PANEL)),
-            Span::styled(" │", border_style),
-        ]));
+    for (source, style) in sources {
+        for piece in wrap(&source, room) {
+            let pad = " ".repeat(room.saturating_sub(piece.chars().count()));
+            rows.push(Line::from(vec![
+                Span::styled("│ ", border_style),
+                Span::styled(piece, style),
+                Span::styled(pad, Style::new().bg(theme::PANEL)),
+                Span::styled(" │", border_style),
+            ]));
+        }
     }
     rows.push(Line::from(vec![
         Span::styled("╰", border_style),
