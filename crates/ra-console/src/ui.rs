@@ -123,8 +123,8 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
     let mut log_area: Option<Rect> = None;
     // the frame height, for the resize clamp
     let mut frame_height: u16 = 24;
-    // the node id under every visible tree row, as the last draw laid them out
-    let mut tree_rows: Vec<i64> = Vec::new();
+    // the node under every visible tree row, as the last draw laid them out
+    let mut tree_rows: Vec<roadmap_pane::Hit> = Vec::new();
     let result = loop {
         let version = sink.version();
         if version != app.seen {
@@ -138,16 +138,11 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         if dirty || last_draw.elapsed() >= Duration::from_secs(1) {
             let mut max_scroll = app.scroll;
             let mut tree_max_scroll = 0usize;
-            let mut row_ids: Vec<i64> = Vec::new();
-            // the card the pointer rests on, named by the previous frame's hit test
-            let hover_id = match (app.hover, tree_area) {
-                (Some(y), Some(a)) if (a.y..a.y + a.height).contains(&y) => tree_rows.get((y - a.y) as usize).copied(),
-                _ => None,
-            };
+            let mut row_ids: Vec<roadmap_pane::Hit> = Vec::new();
             if let Err(e) = terminal.draw(|f| {
                 frame_height = f.area().height;
                 let panes;
-                (max_scroll, tree_max_scroll, panes) = draw(f, &app, &sink, hover_id, &mut row_ids);
+                (max_scroll, tree_max_scroll, panes) = draw(f, &app, &sink, &mut row_ids);
                 (tree_area, log_area) = (panes.tree, panes.log);
             }) {
                 break Err(e.into());
@@ -166,12 +161,24 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                 dirty = true;
                 match input {
                     Input::Click(y) => {
-                        // a click inside the tree pane picks the card the row ids name: its details
-                        // expand inside its outline, a second click folds a parent
+                        // a click inside the tree pane: a button row runs its command, any other row
+                        // picks the card it names
                         if let Some(area) = tree_area {
                             if (area.y..area.y + area.height).contains(&y) {
                                 let index = (y - area.y) as usize;
-                                if let Some(&id) = tree_rows.get(index) {
+                                if let Some(hit) = tree_rows.get(index) {
+                                    if let Some(button) = hit.action {
+                                        let line = match button {
+                                            roadmap_pane::Button::Run => format!("run {}", hit.id),
+                                            roadmap_pane::Button::Reassess => format!("reassess {}", hit.id),
+                                            roadmap_pane::Button::ReassessTree => format!("reassess-tree {}", hit.id),
+                                        };
+                                        if execute_line(line, &store, &sink, &mut app).await {
+                                            break Ok(());
+                                        }
+                                        continue;
+                                    }
+                                    let id = hit.id;
                                     if let Some(nodes) = &app.roadmap {
                                         let has_children = nodes.iter().any(|n| n.parent == Some(id));
                                         if app.selected == Some(id) {
@@ -225,26 +232,9 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                         Action::None => {}
                         Action::Quit => break Ok(()),
                         Action::Run(line) => {
-                            sink.push(Kind::Input, line.clone());
-                            match commands::run(&line, &store, &app.model).await {
-                                Ok((out, outcome)) => {
-                                    for l in out {
-                                        sink.push(Kind::Output, l);
-                                    }
-                                    match outcome {
-                                        Outcome::Continue => {}
-                                        Outcome::Clear => sink.clear(),
-                                        Outcome::Quit => break Ok(()),
-                                        Outcome::Model(model) => app.model = model,
-                                        Outcome::ToggleDebug => {
-                                            app.show_debug = !app.show_debug;
-                                            sink.push(Kind::Output, format!("trace lines {}", if app.show_debug { "on" } else { "off" }));
-                                        }
-                                    }
-                                }
-                                Err(e) => sink.push(Kind::Error, format!("{e:#}")),
+                            if execute_line(line, &store, &sink, &mut app).await {
+                                break Ok(());
                             }
-                            app.scroll = 0;
                         }
                     },
                 }
@@ -434,6 +424,43 @@ fn shift_held(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
+/// Runs one command line through the dispatcher, showing the input and the answer in the log.
+/// Returns whether the line stopped the console.
+async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App) -> bool {
+    sink.push(Kind::Input, line.clone());
+    match commands::run(&line, store, &app.model).await {
+        Ok((out, outcome)) => {
+            for l in out {
+                sink.push(Kind::Output, l);
+            }
+            let quit = match outcome {
+                Outcome::Continue => false,
+                Outcome::Clear => {
+                    sink.clear();
+                    false
+                }
+                Outcome::Quit => true,
+                Outcome::Model(model) => {
+                    app.model = model;
+                    false
+                }
+                Outcome::ToggleDebug => {
+                    app.show_debug = !app.show_debug;
+                    sink.push(Kind::Output, format!("trace lines {}", if app.show_debug { "on" } else { "off" }));
+                    false
+                }
+            };
+            app.scroll = 0;
+            quit
+        }
+        Err(e) => {
+            sink.push(Kind::Error, format!("{e:#}"));
+            app.scroll = 0;
+            false
+        }
+    }
+}
+
 /// Draws the console; returns how far back the log can scroll (in rows) and how far back the tree
 /// can, and fills `row_ids` with the node id under every visible tree row. `hover_id` names the
 /// card the pointer rests on. The panes from the top: the status line, the usage pane, the roadmap
@@ -445,7 +472,7 @@ struct Panes {
     log: Option<Rect>,
 }
 
-fn draw(f: &mut Frame, app: &App, sink: &Sink, hover_id: Option<i64>, row_ids: &mut Vec<i64>) -> (usize, usize, Panes) {
+fn draw(f: &mut Frame, app: &App, sink: &Sink, row_ids: &mut Vec<roadmap_pane::Hit>) -> (usize, usize, Panes) {
     let [header, usage, tree, log_card, footer] = pane_layout(app.log_card).areas(f.area());
     // every cell, so even gaps the widgets never touch paint the theme
     use ratatui::widgets::Widget;
@@ -454,7 +481,8 @@ fn draw(f: &mut Frame, app: &App, sink: &Sink, hover_id: Option<i64>, row_ids: &
     draw_usage(f, usage, app);
     let mut tree_max = 0usize;
     if let Some(nodes) = &app.roadmap {
-        let (tree_max_scroll, ids) = roadmap_pane::draw(f, nodes, &app.folded, app.selected, hover_id, app.tree_scroll, tree);
+        // the hover row goes in raw; the pane resolves the card on the layout it draws this frame
+        let (tree_max_scroll, ids) = roadmap_pane::draw(f, nodes, &app.folded, app.selected, app.hover, app.tree_scroll, tree);
         *row_ids = ids;
         tree_max = tree_max_scroll;
     }

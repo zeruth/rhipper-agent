@@ -25,6 +25,8 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "key", usage: "[<paste> | clear]", help: "stores, shows the state of, or clears the OpenRouter key" },
     Spec { name: "ping", usage: "", help: "one round trip to the badge model, through OpenRouter" },
     Spec { name: "run", usage: "<id>", help: "executes one roadmap task on the badge model" },
+    Spec { name: "reassess", usage: "<id>", help: "the model revises the objective and acceptance of one node" },
+    Spec { name: "reassess-tree", usage: "<id>", help: "reassess for the node and its whole subtree" },
     Spec { name: "seed", usage: "", help: "fills the roadmap with the improvement plan of the agent itself" },
     Spec { name: "clear", usage: "", help: "clears the log view" },
     Spec { name: "debug", usage: "", help: "toggles the trace lines in the log; the file copy always runs" },
@@ -153,6 +155,10 @@ pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<
         "run" => {
             let id = args.parse::<i64>().context("usage: run <id>")?;
             return Ok((crate::agent::run(store, id, &model).await?, Outcome::Continue));
+        }
+        "reassess" | "reassess-tree" => {
+            let id = args.parse::<i64>().context(format!("usage: {name} <id>"))?;
+            return Ok((crate::agent::reassess(store, id, &model, name == "reassess-tree").await?, Outcome::Continue));
         }
         "clear" | "cls" => return Ok((out, Outcome::Clear)),
         "debug" => {

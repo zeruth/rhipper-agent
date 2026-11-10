@@ -63,8 +63,76 @@ pub async fn run(store: &Store, id: i64, model: &str) -> anyhow::Result<Vec<Stri
     ])
 }
 
+/// Reassesses one node: the model revises the objective and the acceptance for the work still
+/// ahead, from the node's current text and its notes. With `recursive`, the whole subtree follows,
+/// parent first.
+pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> anyhow::Result<Vec<String>> {
+    let key = api_key()?;
+    let provider = ra_providers::openrouter::OpenRouter::new(key)?;
+    let mut out = Vec::new();
+    let mut queue = vec![id];
+    let mut done = 0usize;
+    while let Some(current) = queue.pop() {
+        let lines = reassess_one(store, &provider, model, current).await?;
+        out.extend(lines);
+        done += 1;
+        if recursive {
+            let kids: Vec<i64> = store.all().await?.iter().filter(|n| n.parent == Some(current)).map(|n| n.id).collect();
+            // the children go back on the stack, so the parent reassesses first
+            queue.extend(kids);
+        }
+    }
+    out.insert(0, format!("{done} node(s) reassessed on {}", short(model)));
+    Ok(out)
+}
+
+/// One reassessment: the model returns two lines, and the store takes them.
+async fn reassess_one(store: &Store, provider: &ra_providers::openrouter::OpenRouter, model: &str, id: i64) -> anyhow::Result<Vec<String>> {
+    let node = store.read(id).await?;
+    let context = context_of(store, &node).await?;
+    let ask = format!(
+        "{context}\n\nThe task above may have drifted from the work still ahead. Revise its objective and its \
+         acceptance so they name the remaining work alone. Reply with exactly two lines and nothing else:\n\
+         objective: <the revised objective, one line>\nacceptance: <the revised acceptance, one line>"
+    );
+    let answer = provider
+        .complete(CompletionRequest {
+            model: model.to_owned(),
+            messages: vec![Message::system(ARCHITECT), Message::user(ask)],
+            temperature: Some(0.2),
+            max_tokens: Some(256),
+        })
+        .await
+        .map_err(map_error)?;
+    let mut objective = None;
+    let mut acceptance = None;
+    for line in answer.text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("objective:") {
+            if !rest.trim().is_empty() {
+                objective = Some(rest.trim().to_owned());
+            }
+        } else if let Some(rest) = line.strip_prefix("acceptance:") {
+            if !rest.trim().is_empty() {
+                acceptance = Some(rest.trim().to_owned());
+            }
+        }
+    }
+    anyhow::ensure!(
+        objective.is_some() || acceptance.is_some(),
+        "#{}: the reassessment held no objective or acceptance line; the answer started with: {}",
+        id,
+        answer.text.lines().next().unwrap_or("")
+    );
+    store.set_details(id, objective.as_deref(), acceptance.as_deref()).await?;
+    Ok(vec![format!("#{} {} revised", node.id, node.title)])
+}
+
 /// The system prompt of a worker session.
 const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. You answer with a plan of the implementation and the code or the changes it names, nothing else.";
+
+/// The system prompt of a reassessment.
+const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done.";
 
 /// The prompt of one task: the node, its ancestors, and its dependencies.
 async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {

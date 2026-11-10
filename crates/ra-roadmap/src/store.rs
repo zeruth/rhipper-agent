@@ -123,6 +123,20 @@ impl Store {
         self.write(nodes).await
     }
 
+    /// Replaces the objective and the acceptance of a node, as a reassessment wrote them. A field
+    /// of `None` keeps its text.
+    pub async fn set_details(&self, id: i64, objective: Option<&str>, acceptance: Option<&str>) -> anyhow::Result<()> {
+        let mut nodes = self.all().await?;
+        let node = node_mut(&mut nodes, id)?;
+        if let Some(objective) = objective {
+            node.objective = Some(objective.to_owned());
+        }
+        if let Some(acceptance) = acceptance {
+            node.acceptance = Some(acceptance.to_owned());
+        }
+        self.write(nodes).await
+    }
+
     /// Writes the nodes back as the `rhipper.md` text. The file is small, so a blocking write stays
     /// fine.
     async fn write(&self, nodes: Vec<Node>) -> anyhow::Result<()> {
