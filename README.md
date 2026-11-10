@@ -20,6 +20,12 @@ execution state and acceptance.
 ## Run
 
 ```powershell
+.\rhipper-agent.ps1
+```
+
+The script builds and launches the console. Without it:
+
+```powershell
 cargo run -p rc -- add task "Write the decoder" --parent 1
 cargo run -p rc -- show
 cargo run -p rc -- console
