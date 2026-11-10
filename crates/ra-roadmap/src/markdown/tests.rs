@@ -86,6 +86,14 @@ fn a_title_may_hold_brackets() {
 }
 
 #[test]
+fn a_multiline_note_survives_the_round_trip() {
+    let mut task = node(5, Some(1), NodeKind::Task, "Notes task");
+    task.notes = Some("first line\nsecond line with a colon: yes\n\\ and a backslash".into());
+    let parsed = parse(&render(std::slice::from_ref(&task))).unwrap();
+    assert_eq!(parsed[0].notes.as_deref(), Some("first line\nsecond line with a colon: yes\n\\ and a backslash"));
+}
+
+#[test]
 fn a_bad_line_names_its_number() {
     let error = parse("- oops").unwrap_err();
     assert!(format!("{error:#}").contains("line 1"), "the error names the line: {error:#}");

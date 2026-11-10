@@ -66,7 +66,7 @@ pub async fn run(store: &Store, id: i64, model: &str) -> anyhow::Result<Vec<Stri
 /// The system prompt of a worker session.
 const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. You answer with a plan of the implementation and the code or the changes it names, nothing else.";
 
-/// The prompt of one task: the node, its ancestors and its dependencies.
+/// The prompt of one task: the node, its ancestors, and its dependencies.
 async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
     let mut text = format!("Task #{}: {}\n", node.id, node.title);
     if let Some(objective) = &node.objective {
@@ -75,9 +75,26 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
     if let Some(acceptance) = &node.acceptance {
         text.push_str(&format!("Acceptance criteria: {acceptance}\n"));
     }
+    // the ancestors: the chain of parents above the task, nearest first
+    let mut parent = node.parent;
+    while let Some(id) = parent {
+        let ancestor = store.read(id).await?;
+        text.push_str(&format!("Under #{} {}: {}\n", ancestor.id, ancestor.title, ancestor.objective.as_deref().unwrap_or("no objective")));
+        parent = ancestor.parent;
+    }
+    // the dependencies, with their own context and the notes of earlier attempts
     for id in &node.depends_on {
         if let Ok(dep) = store.read(*id).await {
-            text.push_str(&format!("Depends on #{} {}: {}\n", dep.id, dep.title, dep.state.serde_name()));
+            text.push_str(&format!(
+                "Depends on #{} {} [{}]: {}\n",
+                dep.id,
+                dep.title,
+                dep.state.serde_name(),
+                dep.objective.as_deref().unwrap_or("no objective")
+            ));
+            if let Some(notes) = &dep.notes {
+                text.push_str(&format!("  notes of #{}: {notes}\n", dep.id));
+            }
         }
     }
     Ok(text)

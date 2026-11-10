@@ -29,6 +29,33 @@ const INDENT: usize = 2;
 /// The extra indent of a detail line under its node line.
 const DETAIL_INDENT: usize = 4;
 
+/// Escapes a detail value onto one line: a newline becomes `\n` and a backslash becomes `\\`.
+fn escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// Reverses [`escape`].
+fn unescape(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Renders the nodes as the text of a `rhipper.md`. The nodes come in tree order: a parent before
 /// its children.
 pub fn render(nodes: &[Node]) -> String {
@@ -70,7 +97,7 @@ fn detail_lines(node: &Node, level: usize) -> Vec<String> {
         [("objective", node.objective.as_deref()), ("acceptance", node.acceptance.as_deref()), ("notes", node.notes.as_deref())]
     {
         if let Some(value) = value.filter(|v| !v.trim().is_empty()) {
-            lines.push(format!("{indent}{field}: {value}"));
+            lines.push(format!("{indent}{field}: {}", escape(value)));
         }
     }
     if !node.depends_on.is_empty() {
@@ -121,12 +148,12 @@ pub fn parse(text: &str) -> anyhow::Result<Vec<Node>> {
         }
         // A detail line belongs to the node above it.
         let (field, value) = line.trim_start().split_once(':').with_context(|| format!("line {number} reads no field"))?;
-        let value = value.trim();
+        let value = unescape(value.trim());
         let node = nodes.last_mut().with_context(|| format!("line {number} has no node above it"))?;
         match field.trim() {
-            "objective" => node.objective = Some(value.to_owned()),
-            "acceptance" => node.acceptance = Some(value.to_owned()),
-            "notes" => node.notes = Some(value.to_owned()),
+            "objective" => node.objective = Some(value),
+            "acceptance" => node.acceptance = Some(value),
+            "notes" => node.notes = Some(value),
             "waits-on" => {
                 node.depends_on = value
                     .split_whitespace()
