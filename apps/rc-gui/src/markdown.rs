@@ -476,6 +476,50 @@ pub(crate) fn render(ui: &mut Ui, text: &str, accent: Color32) {
     });
 }
 
+/// Renders the text a run sends: the lines of the brief each their own paragraph, the indented
+/// rows of the outlines and the file lists as code, and the Markdown of the handoffs as it is.
+/// The prompt is written for a model, one fact a line; joined into paragraphs it would not read.
+pub(crate) fn render_prompt(ui: &mut Ui, text: &str, accent: Color32) {
+    render(ui, &prompt_markdown(text), accent);
+}
+
+/// The prompt as Markdown: a blank after every plain line, a fence around every run of
+/// indented rows, and a fenced block left as it came.
+fn prompt_markdown(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_fence = false;
+    let mut in_rows = false;
+    for line in text.lines() {
+        let fence = kind(line) == Kind::Fence;
+        if in_fence {
+            out.push_str(line);
+            out.push('\n');
+            in_fence = !fence;
+            continue;
+        }
+        let row = line.starts_with("  ") && !line.trim().is_empty();
+        if row != in_rows {
+            out.push_str("```\n");
+            in_rows = row;
+        }
+        if row {
+            out.push_str(line.trim_end());
+            out.push('\n');
+        } else if fence {
+            in_fence = true;
+            out.push_str(line);
+            out.push('\n');
+        } else {
+            out.push_str(line.trim());
+            out.push_str("\n\n");
+        }
+    }
+    if in_rows {
+        out.push_str("```\n");
+    }
+    out
+}
+
 /// Draws one block.
 fn block_ui(ui: &mut Ui, block: &Block, index: usize, accent: Color32, prose: &Prose) {
     match block {
@@ -771,6 +815,20 @@ mod tests {
         assert_eq!(items[3], Item { number: Some("1".to_owned()), depth: 0, spans: vec![text("first")] });
         assert_eq!(items[4].number.as_deref(), Some("2"));
         assert_eq!(blocks[1], Block::Paragraph(vec![text("after")]));
+    }
+
+    #[test]
+    fn a_prompt_keeps_its_lines_apart_and_its_rows_as_code() {
+        let prompt = "Task #3: Title\nObjective: do it\nFiles of the card:\n  src/a.rs\n  src/b.rs\n\nEarlier runs:\n## Handoff 1 · m · implemented\ncheck: ok\n```\nraw\n```\n";
+        let blocks = parse(&prompt_markdown(prompt));
+        assert_eq!(blocks[0], Block::Paragraph(vec![text("Task #3: Title")]));
+        assert_eq!(blocks[1], Block::Paragraph(vec![text("Objective: do it")]));
+        assert_eq!(blocks[2], Block::Paragraph(vec![text("Files of the card:")]));
+        assert_eq!(blocks[3], Block::Code { lang: None, lines: vec!["  src/a.rs".to_owned(), "  src/b.rs".to_owned()] });
+        assert_eq!(blocks[4], Block::Paragraph(vec![text("Earlier runs:")]));
+        assert!(matches!(&blocks[5], Block::Heading { level: 2, .. }));
+        assert_eq!(blocks[6], Block::Paragraph(vec![text("check: ok")]));
+        assert_eq!(blocks[7], Block::Code { lang: None, lines: vec!["raw".to_owned()] });
     }
 
     #[test]

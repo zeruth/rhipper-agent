@@ -80,6 +80,12 @@ impl ClaudeCode {
                 "Bash(pwd*)",
                 "Bash(tree*)",
                 "Bash(mkdir *)",
+                // the text filters a pipe ends in, so a long output can be narrowed
+                "Bash(sort*)",
+                "Bash(uniq*)",
+                "Bash(cut *)",
+                "Bash(paste *)",
+                "Bash(tr *)",
                 "PowerShell(cargo *)",
                 "PowerShell(git status*)",
                 "PowerShell(git diff*)",

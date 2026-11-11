@@ -13,6 +13,8 @@ use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 use ra_usage::{Entry, Totals, UsageStore};
 
+/// The project context file, named where the window and the console speak of it.
+pub use ra_context::PROJECT_FILE;
 use ra_gotchas::{Catalogue, Journal};
 
 use crate::secret;
@@ -406,7 +408,8 @@ async fn save_context(store: &Store, root: &Path, task: &ra_context::TaskContext
         tracing::warn!("the context of #{} was not saved: {e:#}", task.id);
     }
     if let Ok(nodes) = store.all().await {
-        let open: Vec<i64> = nodes.iter().filter(|n| !matches!(n.state, TaskState::Accepted | TaskState::Cancelled)).map(|n| n.id).collect();
+        let open: Vec<i64> =
+            nodes.iter().filter(|n| !matches!(n.state, TaskState::Accepted | TaskState::Cancelled)).map(|n| n.id).collect();
         ra_context::TaskContext::prune(root, &open);
     }
 }
@@ -415,11 +418,23 @@ async fn save_context(store: &Store, root: &Path, task: &ra_context::TaskContext
 /// handoffs so far. For `rc context <id>` and the window.
 pub async fn context_preview(store: &Store, id: i64) -> anyhow::Result<String> {
     let node = store.read(id).await?;
-    let root = store.path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let root = workspace_of(store);
     let mut task = ra_context::TaskContext::open(&root, id);
     task.brief = context_of(store, &node).await?;
     task.outlines = ra_context::outline_files(&root, &node.files);
     Ok(task.prompt())
+}
+
+/// The project context a run sends ahead of the task, as the file beside the roadmap holds
+/// it; empty while there is none. Reads only: a run drafts the file, a preview does not.
+#[must_use]
+pub fn project_context(store: &Store) -> String {
+    ra_context::Project::load(&workspace_of(store)).unwrap_or_default()
+}
+
+/// The workspace: the directory of the roadmap file.
+fn workspace_of(store: &Store) -> PathBuf {
+    store.path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 /// `git status --porcelain` of `root`, or nothing where git has nothing to say.

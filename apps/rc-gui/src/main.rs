@@ -38,11 +38,26 @@ const GOTCHAS_LOG: &str = "var/gotchas.log";
 /// How many of the refused commands the ledger tab lists, the same as `rc gotchas`.
 const UNMATCHED_SHOWN: usize = 20;
 
-/// The two tabs of the card area.
+/// The three tabs of the card area.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Card,
+    Context,
     Ledger,
+}
+
+/// What the context tab shows: the text a run of the card would send, as `rc context <id>`
+/// prints it, and the project context that goes ahead of it. Built when the tab shows a card
+/// it was not built for, and again when a run ends: the handoffs and the outlines move then.
+#[derive(Default)]
+struct ContextView {
+    /// The card the text was built for.
+    id: Option<i64>,
+    text: String,
+    project: String,
+    /// Why the text could not be built, shown in its place.
+    fault: Option<String>,
+    read_at: Option<Instant>,
 }
 
 /// What the ledger tab shows, read the way `rc usage` and `rc gotchas` read it: the usage by
@@ -114,6 +129,7 @@ struct App {
     job_done: mpsc::UnboundedReceiver<()>,
     /// The numbers of the ledger tab and the status bar's ledger badge.
     ledger: Ledger,
+    context: ContextView,
     tab: Tab,
     /// The plan's windows as the harness last reported them, and when they were last read.
     limits: ra_providers::limits::Limits,
@@ -200,6 +216,7 @@ impl App {
             job_tx,
             job_done,
             ledger: Ledger::default(),
+            context: ContextView::default(),
             tab: Tab::Card,
             limits: ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE)),
             limits_read: Instant::now(),
@@ -243,6 +260,20 @@ impl App {
         };
     }
 
+    /// Builds the context tab's text for the selected card: what `rc context <id>` prints, and
+    /// the project context the run sends ahead of it. A card that is not there leaves it empty.
+    fn refresh_context(&mut self) {
+        let id = self.selected;
+        let text = id.map(|id| self.rt.block_on(ra_console::agent::context_preview(&self.store, id)));
+        let (text, fault) = match text {
+            Some(Ok(text)) => (text, None),
+            Some(Err(e)) => (String::new(), Some(format!("{e:#}"))),
+            None => (String::new(), None),
+        };
+        self.context =
+            ContextView { id, text, project: ra_console::agent::project_context(&self.store), fault, read_at: Some(Instant::now()) };
+    }
+
     /// The housekeeping of a frame: the activity of other processes, the roadmap file, the jobs,
     /// and a request to quit from another instance.
     fn tick(&mut self, ctx: &egui::Context) {
@@ -265,15 +296,18 @@ impl App {
             if working.is_some() && working != self.followed {
                 self.select(working);
             }
-            // a run of any instance just started or ended: the ledger and the journal may have moved
+            // a run of any instance just started or ended: the ledger and the journal may have
+            // moved, and the context of the card that ran has a new handoff
             if working != self.followed {
                 self.refresh_ledger();
+                self.context.id = None;
             }
             self.followed = working;
         }
         while self.job_done.try_recv().is_ok() {
             self.job = None;
             self.refresh_ledger();
+            self.context.id = None;
         }
         // the plan's windows, every five seconds: a run of any instance may have moved them
         if self.limits_read.elapsed() >= Duration::from_secs(5) {
@@ -759,8 +793,27 @@ impl App {
             if cards::tab(ui, "CARD", theme::ACCENT, self.tab == Tab::Card) {
                 self.tab = Tab::Card;
             }
+            if cards::tab(ui, "CONTEXT", theme::DEBUG, self.tab == Tab::Context) {
+                self.tab = Tab::Context;
+            }
             if cards::tab(ui, "LEDGER", theme::ONLINE, self.tab == Tab::Ledger) {
                 self.tab = Tab::Ledger;
+            }
+            if self.tab == Tab::Context {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .small_button(RichText::new("↻").color(theme::DEBUG))
+                        .on_hover_text("build the context again from the card and its files")
+                        .clicked()
+                    {
+                        self.context.id = None;
+                    }
+                    if let Some(at) = self.context.read_at.filter(|_| self.context.id.is_some()) {
+                        let secs = at.elapsed().as_secs();
+                        let when = if secs < 5 { "just now".to_owned() } else { format!("{secs}s ago") };
+                        ui.label(RichText::new(format!("built {when} · refreshed when a run ends")).color(theme::DIM).small());
+                    }
+                });
             }
             if self.tab == Tab::Ledger {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -782,8 +835,74 @@ impl App {
         ui.add_space(6.0);
         match self.tab {
             Tab::Card => self.card_view(ui),
+            Tab::Context => self.context_view(ui),
             Tab::Ledger => self.ledger_view(ui),
         }
+    }
+
+    /// The context tab: what a run of the selected card sends, the brief, the outlines of its
+    /// files and the handoffs of its earlier runs, rendered as the notes are; the project
+    /// context folded under a header, since it is the same for every card.
+    fn context_view(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.selected else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.38);
+                ui.label(RichText::new("◆").color(cards::alpha(theme::DEBUG, 120)).size(40.0));
+                ui.label(RichText::new("select a card").color(theme::DIM).size(16.0));
+                ui.label(RichText::new("this tab shows what a run of it would send").color(cards::alpha(theme::DIM, 160)).small());
+            });
+            return;
+        };
+        // built on demand: the outlines read the card's files, so not every frame and not for
+        // a card nobody looks at
+        if self.context.id != Some(id) {
+            self.refresh_context();
+        }
+        let context = &self.context;
+        egui::ScrollArea::vertical().id_salt("context").auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(980.0);
+            cards::card(ui, theme::DIM, false, |ui| {
+                ui.set_width(ui.available_width());
+                egui::CollapsingHeader::new(RichText::new("PROJECT CONTEXT").small().strong().color(theme::DIM))
+                    .id_salt("project-context")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if context.project.is_empty() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "no {} yet; the first run drafts it, or `rc context --init` does",
+                                    ra_console::agent::PROJECT_FILE
+                                ))
+                                .color(theme::DIM),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(format!("sent ahead of every task, from {}", ra_console::agent::PROJECT_FILE))
+                                    .color(theme::DIM)
+                                    .small(),
+                            );
+                            markdown::render(ui, &context.project, theme::DIM);
+                        }
+                    });
+            });
+            ui.add_space(6.0);
+            cards::card(ui, theme::DEBUG, false, |ui| {
+                ui.set_width(ui.available_width());
+                cards::section(ui, "TASK CONTEXT", theme::DEBUG);
+                ui.label(
+                    RichText::new(format!("the brief, the outlines and the handoffs a run of #{id} sends · what `rc context {id}` prints"))
+                        .color(theme::DIM)
+                        .small(),
+                );
+                match &context.fault {
+                    Some(fault) => {
+                        ui.label(RichText::new(fault).color(theme::ERROR_TEXT));
+                    }
+                    None => markdown::render_prompt(ui, &context.text, theme::DEBUG),
+                }
+            });
+            ui.add_space(6.0);
+        });
     }
 
     /// The ledger tab: the usage by model with the total, the gotchas by how often they fired,
