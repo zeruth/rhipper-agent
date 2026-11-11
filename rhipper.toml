@@ -2,8 +2,10 @@
 # the `[role]` table. A key left out keeps the default.
 
 [worker]
-# No turn or context cap: the harness compacts its own context, and a run goes on until it
-# answers (`turns = N` or `context = N` would end it with a handoff and continue fresh).
+# No turn cap: a run goes on until it answers, resuming its session. A turn's cost scales with
+# the context it carries, so a run restarts fresh on a handoff once a turn passes this many
+# input tokens.
+context = 160000
 
 [role]
 # The model of each cheap role a run ends with. A key left out goes to the local server at

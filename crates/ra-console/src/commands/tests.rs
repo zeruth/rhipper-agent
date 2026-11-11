@@ -2452,7 +2452,7 @@ async fn a_rerun_of_a_card_sent_back_starts_fresh_on_the_verdict_without_the_tra
     run("/run 2", &store, &worker).await.unwrap();
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
-    assert!(out.iter().any(|l| l.contains("fresh start: a rerun carries the verdict")), "{}", out.join("\n"));
+    assert!(out.iter().any(|l| l.contains("no session to resume; a rerun carries the verdict")), "{}", out.join("\n"));
     let seen = provider.seen.lock();
     assert_eq!(seen.len(), 4);
     let prompt = &seen[2].messages.last().unwrap().content;
@@ -2468,6 +2468,32 @@ async fn a_rerun_of_a_card_sent_back_starts_fresh_on_the_verdict_without_the_tra
     // the file keeps both runs for the person; the rerun did not pay for them
     let task = ra_context::TaskContext::open(dir.path(), 2);
     assert_eq!(task.handoffs.len(), 2, "{:?}", task.handoffs);
+}
+
+#[tokio::test]
+async fn a_rerun_resumes_the_session_it_came_back_from() {
+    // the person: be generous with --resume unless the topic changes. A worker sent back by the
+    // reviewer answers the points on the session it read the code in, cache and all; the
+    // verdict is its new prompt, the handoffs are not re-sent
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Greet parent 1", &store, &worker()).await.unwrap();
+    let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\nexit code 0\n".to_owned())));
+    let mut first = says("wrote the greeting into hello.rs", vec![]);
+    first.session_id = Some("sess-1".into());
+    let mut again = says("renamed it", vec![]);
+    again.session_id = Some("sess-1".into());
+    let provider = Scripted::new(vec![first, says("needs revision\n- rename greet to salute", vec![]), again, says("accepted", vec![])]);
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(provider.clone()))).with_script(script);
+    run("/run 2", &store, &runner).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("rerun on the session: the verdict")), "{}", out.join("\n"));
+    let seen = provider.seen.lock();
+    assert_eq!(seen[2].resume.as_deref(), Some("sess-1"), "the rerun resumes the session it came back from");
+    let prompt = &seen[2].messages.last().unwrap().content;
+    assert!(prompt.contains("## Review\n") && prompt.contains(")\n- rename greet to salute\n"), "{prompt}");
+    assert!(!prompt.contains("Earlier runs of this task"), "{prompt}");
 }
 
 #[tokio::test]
@@ -2490,7 +2516,7 @@ async fn a_card_sent_back_and_requeued_as_defined_is_still_a_rerun() {
     run("/set 2 defined", &store, &worker).await.unwrap();
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
-    assert!(out.iter().any(|l| l.contains("fresh start: a rerun carries the verdict")), "{}", out.join("\n"));
+    assert!(out.iter().any(|l| l.contains("no session to resume; a rerun carries the verdict")), "{}", out.join("\n"));
     let seen = provider.seen.lock();
     let prompt = &seen[2].messages.last().unwrap().content;
     assert!(prompt.contains("## Review\n") && prompt.contains(")\n- rename greet to salute\n"), "{prompt}");

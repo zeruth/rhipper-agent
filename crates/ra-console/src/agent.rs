@@ -2116,18 +2116,22 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let run_started = std::time::SystemTime::now();
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
-    // a rerun opens a fresh session on the verdict alone: resuming the last session would pay
-    // its whole transcript again for a few lines of judgment. Any other run keeps the session
-    // of the last one, so the harness keeps its context, unless it is stale: then the brief and
-    // the handoffs carry it, and the run says so first
+    // every run of a card resumes the session of the last one, a rerun included: the harness
+    // holds the transcript and the cache holds its context, and a worker that just read the
+    // code answers the verdict from what it knows (the person: be generous with --resume unless
+    // the topic changes). The session is dropped only when it is stale: then the brief and the
+    // handoffs carry it, and the run says so first
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
-    let (resume, fresh) = if rerun.is_some() {
-        (None, Some("  fresh start: a rerun carries the verdict and the failing check, not the transcript".to_owned()))
-    } else {
-        match resume_of(&node, unix_now()) {
-            Ok(resume) => (resume, None),
-            Err(reason) => (None, Some(format!("  fresh start: {reason}; the brief and the handoffs go instead"))),
+    let (resume, fresh) = match resume_of(&node, unix_now()) {
+        Ok(Some(session)) => {
+            let noted = rerun.as_ref().map(|_| "  rerun on the session: the verdict and the failing check ride as the new prompt".to_owned());
+            (Some(session), noted)
         }
+        Ok(None) => (
+            None,
+            rerun.as_ref().map(|_| "  fresh start: no session to resume; a rerun carries the verdict and the failing check".to_owned()),
+        ),
+        Err(reason) => (None, Some(format!("  fresh start: {reason}; the brief and the handoffs go instead"))),
     };
     if let Some(fresh) = &fresh {
         tracing::info!(target: crate::trace::PROGRESS, "{}", fresh.trim_start());
@@ -2679,7 +2683,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let harness = provider.has_own_tools();
     let checks = checks_of(&root, &node);
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
-    let resume = if rerun.is_some() { Err("a rerun starts fresh on the verdict".to_owned()) } else { resume_of(&node, unix_now()) };
+    let resume = resume_of(&node, unix_now());
     let messages = if harness {
         harness_messages(&task, rerun.as_deref(), &project, &root, worker.debug)
     } else {
@@ -4019,8 +4023,8 @@ fn resume_of(node: &Node, now: u64) -> Result<Option<String>, String> {
 }
 
 /// Whether a run of `node` is a rerun: the card came back from its check or its reviewer, or a
-/// fix pass is on it. A rerun opens a fresh session and reads the verdict, not the transcript.
-/// The walk takes only a ready card, so the person re-queues a card sent back with `rc set
+/// fix pass is on it. A rerun resumes the card's session like any run and reads the verdict
+/// as its new prompt, not the handoffs. The walk takes only a ready card, so the person re-queues a card sent back with `rc set
 /// <id> defined`; that erases the state but not the reviewer's block at the head of the notes,
 /// which stands until the next run writes its report: a card whose notes open with a
 /// `needs revision` review is a rerun whatever its state (rhipper-asm #47: the five points
@@ -4039,8 +4043,8 @@ const RERUN_CHECK_LINES: usize = 30;
 /// What a rerun reads in place of the handoffs: the last run's check line, its verdict and the
 /// files it changed, then from the head of the notes the failing check's output, clipped; the
 /// reviewer's points ride in the context's Review section. The reports of the earlier runs stay
-/// in the file: a rerun pays for the judgment, not the transcript. `None` when no run is behind
-/// the card.
+/// in the file: the resumed session holds them, and a rerun without one reads the judgment, not
+/// the transcript. `None` when no run is behind the card.
 fn rerun_block(task: &ra_context::TaskContext, node: &Node) -> Option<String> {
     let last = task.handoffs.last()?;
     let mut text = format!("The last run of this card came back; take it up on these lines, not afresh:\ncheck: {}\n", last.check.trim());
