@@ -327,7 +327,7 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     // is this card's alone
     if bounded {
         // the rows drawn: the folded line stands in for one of the body's when steps hid
-        let rows = body.max(1) as f32;
+        let rows = body.max(1) as u32 as f32;
         let extra = ((room - rows * row) / rows).clamp(0.0, row);
         // on the pixel grid: a fraction of a pixel between rows put the text between pixels,
         // and it snapped up or down a pixel from frame to frame
