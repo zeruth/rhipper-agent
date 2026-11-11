@@ -3991,8 +3991,9 @@ impl Workspace {
     /// card a run is on, then the next ready cards, in the roadmap's own rows; at the right the
     /// latest run's card, live or finished. Returns true when the header asks for the tab.
     #[allow(clippy::too_many_lines)]
-    /// `budget` is the height the card may grow to: the queue adds rows past its six while
-    /// they fit, and the run card takes the queue's height or the budget's, whichever is more.
+    /// `budget` is the height the card grows to: the queue adds rows past its six while they
+    /// fit and then takes the rest of the share as its band, and the run card beside it is
+    /// exactly as tall; the two fill the share together, equally.
     fn dashboard_card(&mut self, ui: &mut egui::Ui, lane: Color32, page: f32, budget: f32) -> bool {
         let nodes = self.roadmap.clone();
         let order = ra_console::agent::walk_order(&nodes, &self.gambits, ra_console::agent::limits_tight(&self.limits));
@@ -4075,10 +4076,10 @@ impl Workspace {
             // width to what it is given, and an open-ended column would grow past the edge
             let right = (total - left - 12.0).max(200.0);
             // the height the two columns may take: the card's share of the window less what
-            // the header above them used, the bubble's own margins and stroke (18) and the
-            // spacing under the card; zero when the window has no spare room, and then the
-            // columns are what they always were
-            let columns = (budget - ui.min_rect().height() - 18.0 - 10.0).max(0.0);
+            // the header above them used, the bubble's own margins and stroke (6 and 3
+            // above and below, 1 of stroke: 20) and the spacing under the card; zero when
+            // the window has no spare room, and then the columns are what they always were
+            let columns = (budget - ui.min_rect().height() - 20.0 - 10.0).max(0.0);
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 let queue = ui.allocate_ui_with_layout(egui::vec2(left, 0.0), Layout::top_down(Align::Min), |ui| {
@@ -4124,11 +4125,16 @@ impl Workspace {
                             }
                         }
                     }
+                    // the queue takes the whole share, rows or not: the band under its last
+                    // row is the column's, so the run card beside it is as tall as the share
+                    let used = ui.min_rect().height();
+                    if columns > used {
+                        ui.allocate_space(egui::vec2(left, columns - used));
+                    }
                 });
-                // the run card is held to the queue's height, or to the card's share of the
-                // window when that is more: it never outgrows the rows beside it unless the
-                // window has the room to spare
-                let room = queue.response.rect.height().max(columns);
+                // the run card is exactly the queue's height: the two columns grow together
+                // into the card's share of the window, and never past it
+                let room = queue.response.rect.height();
                 ui.allocate_ui_with_layout(egui::vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(right);
                     ui.set_max_width(right);

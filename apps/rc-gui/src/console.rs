@@ -193,6 +193,16 @@ fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: us
             let bounded = room.is_some();
             let room = room.unwrap_or_else(|| ui.clip_rect().height());
             run_steps(ui, run, room, bounded);
+            // a bounded card is exactly its room tall, live or finished: the dashboard gives
+            // the run the height of the queue beside it, and the two read as one band. The
+            // frame's margins (8 above and below) and stroke (1.5) come off the room first
+            if bounded {
+                let want = room - 16.0 - 3.0;
+                let used = ui.min_rect().height();
+                if want > used {
+                    ui.allocate_space(egui::vec2(ui.available_width(), want - used));
+                }
+            }
         })
         .response;
     if !run.folded() {
@@ -283,9 +293,9 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let fit = ((room - overhead) / 24.0).floor().max(0.0) as usize;
     let body = if bounded {
-        // the dashboard: the rows the room holds, and no more than the steps there are
-        let rows = fit.max(1);
-        if run.live() { rows } else { rows.min(folded.len().max(1)) }
+        // the dashboard: the rows the room holds, live or finished; the card pads to its
+        // room after them, so a finished run with few steps still fills its band
+        fit.max(1)
     } else if run.live() {
         height.max(fit)
     } else {
@@ -331,7 +341,8 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
             });
         });
     }
-    if run.live() {
+    // a live card in the console keeps its rows open; a bounded card pads to its room instead
+    if run.live() && !bounded {
         for _ in drawn..body {
             ui.label(RichText::new(" ").font(font.clone()));
         }
