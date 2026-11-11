@@ -16,7 +16,11 @@
 //!         acceptance: ...
 //!         waits-on: 2 7
 //!         notes: ...
+//!         assessed: 9f3a0c41d27b6e58
 //! ```
+//!
+//! `assessed:` holds what the last reassessment saw: a fingerprint of its inputs, or the word
+//! `final`, which no reassessment rewrites.
 
 use anyhow::Context;
 
@@ -92,9 +96,12 @@ fn node_line(node: &Node, level: usize) -> String {
 fn detail_lines(node: &Node, level: usize) -> Vec<String> {
     let indent = " ".repeat(level * INDENT + DETAIL_INDENT);
     let mut lines = Vec::new();
-    for (field, value) in
-        [("objective", node.objective.as_deref()), ("acceptance", node.acceptance.as_deref()), ("notes", node.notes.as_deref())]
-    {
+    for (field, value) in [
+        ("objective", node.objective.as_deref()),
+        ("acceptance", node.acceptance.as_deref()),
+        ("notes", node.notes.as_deref()),
+        ("assessed", node.assessed.as_deref()),
+    ] {
         if let Some(value) = value.filter(|v| !v.trim().is_empty()) {
             lines.push(format!("{indent}{field}: {}", escape(value)));
         }
@@ -137,6 +144,7 @@ pub fn parse(text: &str) -> anyhow::Result<Vec<Node>> {
             "objective" => node.objective = Some(value),
             "acceptance" => node.acceptance = Some(value),
             "notes" => node.notes = Some(value),
+            "assessed" => node.assessed = Some(value),
             "waits-on" => {
                 node.depends_on = value
                     .split_whitespace()
@@ -203,6 +211,7 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         assignee,
         complexity,
         notes: None,
+        assessed: None,
     })
 }
 

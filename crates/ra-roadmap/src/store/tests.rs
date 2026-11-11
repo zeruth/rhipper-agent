@@ -78,6 +78,17 @@ async fn set_state_and_assign_round_trip() {
 }
 
 #[tokio::test]
+async fn set_assessed_marks_and_clears() {
+    let (_dir, store) = store().await;
+    let root = store.all().await.unwrap().remove(0).id;
+    let id = store.insert(Some(root), NodeKind::Task, "Task", None, None, 3).await.unwrap();
+    store.set_assessed(id, Some("final")).await.unwrap();
+    assert!(store.read(id).await.unwrap().is_final());
+    store.set_assessed(id, None).await.unwrap();
+    assert!(store.read(id).await.unwrap().assessed.is_none());
+}
+
+#[tokio::test]
 async fn read_names_a_missing_node() {
     let (_dir, store) = store().await;
     let error = store.read(99).await.unwrap_err();

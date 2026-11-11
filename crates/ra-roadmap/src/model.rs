@@ -163,4 +163,18 @@ pub struct Node {
     pub complexity: u8,
     /// The notes of the last execution: findings, blockers, results.
     pub notes: Option<String>,
+    /// What the last reassessment saw: the word [`FINAL`], which no reassessment rewrites, or a
+    /// 16-hex-digit fingerprint of the inputs it judged, so an unchanged node costs no call.
+    #[serde(default)]
+    pub assessed: Option<String>,
+}
+
+/// The `assessed` mark of a node no reassessment rewrites.
+pub const FINAL: &str = "final";
+
+impl Node {
+    /// Whether the node is marked final: reassessment leaves it alone.
+    pub fn is_final(&self) -> bool {
+        self.assessed.as_deref() == Some(FINAL)
+    }
 }

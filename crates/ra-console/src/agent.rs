@@ -286,27 +286,52 @@ fn add_usage(sum: &mut Usage, one: &Usage) {
 /// Reassesses one node: the model revises the objective and the acceptance for the work still
 /// ahead, from the node's current text and its notes. With `recursive`, the whole subtree follows,
 /// parent first.
+///
+/// A node remembers what its last reassessment saw in its `assessed:` line. A node marked final,
+/// or one whose fingerprint still matches, is assessed and unchanged: no model call.
 pub async fn reassess(store: &Store, id: i64, worker: &Worker, recursive: bool) -> anyhow::Result<Vec<String>> {
-    let provider = worker.provider()?;
     let nodes = store.all().await?;
     // one pass over the tree before any call, so the recursion cannot stall midway
     let order: Vec<i64> = if recursive { tree::subtree(&nodes, id).iter().map(|n| n.id).collect() } else { vec![id] };
+    // the provider connects on the first node that needs a call, so an unchanged tree costs nothing
+    let mut provider: Option<Arc<dyn ModelProvider>> = None;
     let mut revised: Vec<String> = Vec::new();
     let mut verified: Vec<String> = Vec::new();
+    let mut unchanged: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut receipts: Vec<String> = Vec::new();
     for current in order {
+        // a fresh read per node: a revision earlier in the pass changes the inputs of its kin
+        let nodes = store.all().await?;
         let Some(node) = nodes.iter().find(|n| n.id == current) else {
             warnings.push(format!("⚠ #{}: no such node", current));
             continue;
         };
+        if node.is_final() {
+            receipts.push(format!("#{} {} [final] assessed and unchanged: no call", node.id, node.title));
+            unchanged.push(format!("#{}", current));
+            continue;
+        }
         // a node whose work is done is verified, not recreated: no model call, no chance to drift
         if matches!(node.state, TaskState::Implemented | TaskState::Accepted) {
             receipts.push(format!("#{} {} [{}] verified: no revision needed", node.id, node.title, node.state));
             verified.push(format!("#{}", current));
             continue;
         }
-        match reassess_one(store, worker, provider.as_ref(), current, &nodes).await {
+        if node.assessed.as_deref() == Some(fingerprint(node, &nodes).as_str()) {
+            receipts.push(format!("#{} {} assessed and unchanged: no call", node.id, node.title));
+            unchanged.push(format!("#{}", current));
+            continue;
+        }
+        let connected = match provider.clone() {
+            Some(connected) => connected,
+            None => {
+                let connected = worker.provider()?;
+                provider = Some(connected.clone());
+                connected
+            }
+        };
+        match reassess_one(store, worker, connected.as_ref(), current, &nodes).await {
             Ok(receipt) => {
                 revised.push(format!("#{}", current));
                 receipts.push(receipt);
@@ -315,10 +340,11 @@ pub async fn reassess(store: &Store, id: i64, worker: &Worker, recursive: bool) 
         }
     }
     let mut out = vec![format!(
-        "✓ {} node(s) reassessed on {} ({} verified): {}",
-        revised.len() + verified.len(),
+        "✓ {} node(s) reassessed on {} ({} verified, {} unchanged): {}",
+        revised.len() + verified.len() + unchanged.len(),
         short(&worker.model),
         verified.len(),
+        unchanged.len(),
         revised.join(" ")
     )];
     out.extend(receipts);
@@ -393,6 +419,11 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
         answer.text.lines().next().unwrap_or("")
     );
     store.set_details(id, objective.as_deref(), acceptance.as_deref()).await?;
+    // the fingerprint of the text as it now stands, changed or not, so the next pass skips it
+    let after = store.all().await?;
+    if let Some(revised) = after.iter().find(|n| n.id == id) {
+        store.set_assessed(id, Some(&fingerprint(revised, &after))).await?;
+    }
 
     // the receipt reads like a patch: an overview line, then the old and the new of each field
     let mut receipt = format!("#{} {}", node.id, node.title);
@@ -423,6 +454,31 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
     Ok(receipt)
 }
 
+/// The fingerprint of what a reassessment of `node` reads: its objective, its acceptance, the
+/// first line of its notes, and each child's id, state and objective. Sixteen hex digits of a
+/// 64-bit FNV-1a hash, stable across builds, so a file written today matches tomorrow.
+pub fn fingerprint(node: &Node, nodes: &[Node]) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    let mut hash = OFFSET;
+    let mut feed = |text: &str| {
+        // a unit separator after each field, so moving text across fields changes the hash
+        for byte in text.bytes().chain(std::iter::once(0x1f)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    feed(node.objective.as_deref().unwrap_or(""));
+    feed(node.acceptance.as_deref().unwrap_or(""));
+    feed(&node.notes.as_deref().map(first_line).unwrap_or_default());
+    for kid in nodes.iter().filter(|n| n.parent == Some(node.id)) {
+        feed(&kid.id.to_string());
+        feed(kid.state.serde_name());
+        feed(kid.objective.as_deref().unwrap_or(""));
+    }
+    format!("{hash:016x}")
+}
+
 /// Whether a revised field is template text the model echoed back, such as `<the revised
 /// objective, one line>`: it opens and closes with angle brackets, so it names no real work.
 fn is_placeholder(value: &str) -> bool {
@@ -439,7 +495,7 @@ fn first_line(text: &str) -> String {
 const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory, check it against the acceptance criteria, and answer with a short report of what you changed and what you verified. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
 
 /// The system prompt of a reassessment.
-const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done.";
+const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done. When the objective and the acceptance already name only the remaining work and are checkable, you answer with the same text rather than rewording it.";
 
 /// The prompt of one task: the node, its ancestors, and its dependencies. One read of the store
 /// serves them all.

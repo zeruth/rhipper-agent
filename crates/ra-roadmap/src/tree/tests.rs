@@ -16,6 +16,7 @@ fn node(id: i64, parent: Option<i64>) -> Node {
         assignee: None,
         complexity: 3,
         notes: None,
+        assessed: None,
     }
 }
 

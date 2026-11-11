@@ -35,6 +35,7 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "run", usage: "<id>", help: "executes one roadmap task on the badge model" },
     Spec { name: "reassess", usage: "<id>", help: "the model revises the objective and acceptance of one node" },
     Spec { name: "reassess-tree", usage: "<id>", help: "reassess for the node and its whole subtree" },
+    Spec { name: "final", usage: "<id> [off]", help: "marks a node final, so no reassessment rewrites it; off clears the mark" },
     Spec { name: "seed", usage: "", help: "fills the roadmap with the improvement plan of the agent itself" },
     Spec { name: "clear", usage: "", help: "clears the log view" },
     Spec { name: "debug", usage: "", help: "toggles the trace lines in the log; the file copy always runs" },
@@ -84,11 +85,12 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             };
             for node in &picked {
                 out.push(format!(
-                    "{}#{} {} [{}]{}",
+                    "{}#{} {} [{}]{}{}",
                     "  ".repeat(tree::depth(&nodes, node.id)),
                     node.id,
                     node.title,
                     node.state,
+                    if node.is_final() { " [final]" } else { "" },
                     match &node.assignee {
                         Some(a) => format!(" ← {}:{}", a.role, a.model),
                         None => String::new(),
@@ -187,6 +189,22 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
         "reassess" | "reassess-tree" => {
             let id = args.parse::<i64>().context(format!("usage: {name} <id>"))?;
             return Ok((agent::reassess(store, id, worker, name == "reassess-tree").await?, Outcome::Continue));
+        }
+        "final" => {
+            let (id_text, flag) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+            let id = id_text.parse::<i64>().context("usage: final <id> [off]")?;
+            match flag.trim() {
+                "" => {
+                    store.set_assessed(id, Some(ra_roadmap::model::FINAL)).await?;
+                    out.push(format!("#{id} is final: no reassessment rewrites it"));
+                }
+                "off" => {
+                    // clearing the mark drops the fingerprint too, so the next reassessment calls
+                    store.set_assessed(id, None).await?;
+                    out.push(format!("#{id} is no longer final"));
+                }
+                _ => anyhow::bail!("usage: final <id> [off]"),
+            }
         }
         "clear" | "cls" => return Ok((out, Outcome::Clear)),
         "debug" => {

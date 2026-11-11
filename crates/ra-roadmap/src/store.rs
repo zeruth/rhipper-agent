@@ -35,6 +35,7 @@ impl Store {
                 assignee: None,
                 complexity: 3,
                 notes: None,
+                assessed: None,
             };
             std::fs::write(path, render(std::slice::from_ref(&root))).with_context(|| format!("cannot write {}", path.display()))?;
         }
@@ -100,6 +101,7 @@ impl Store {
             assignee: None,
             complexity,
             notes: None,
+            assessed: None,
         };
         nodes.insert(position, node);
         self.write(nodes).await?;
@@ -149,6 +151,14 @@ impl Store {
         if let Some(acceptance) = acceptance {
             node.acceptance = Some(acceptance.to_owned());
         }
+        self.write(nodes).await
+    }
+
+    /// Records what the last reassessment of a node saw: a fingerprint, or the word `final`;
+    /// `None` clears the mark, so the next reassessment calls the model again.
+    pub async fn set_assessed(&self, id: i64, assessed: Option<&str>) -> anyhow::Result<()> {
+        let mut nodes = self.all().await?;
+        node_mut(&mut nodes, id)?.assessed = assessed.map(str::to_owned);
         self.write(nodes).await
     }
 

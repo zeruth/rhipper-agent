@@ -190,6 +190,88 @@ async fn run_on_a_bare_model_loops_through_the_tools_and_lands_the_answer() {
     assert_eq!(last[last.len() - 3].tool_call_id.as_deref(), Some("call_1"));
 }
 
+/// The answer of a reassessment that keeps the text: the three lines the prompt asks for.
+fn keeps(objective: &str, acceptance: &str) -> ra_providers::Completion {
+    says(&format!("overview: already sharp\nobjective: {objective}\nacceptance: {acceptance}"), Vec::new())
+}
+
+/// A store with one task, #2, that holds an objective and an acceptance.
+async fn store_with_a_task() -> Store {
+    let store = store().await;
+    store.insert(Some(1), ra_roadmap::model::NodeKind::Task, "T", Some("do it."), Some("it is done."), 3).await.unwrap();
+    store
+}
+
+#[tokio::test]
+async fn a_second_reassess_of_an_unchanged_node_makes_no_call() {
+    let store = store_with_a_task().await;
+    let provider = Scripted::new(vec![keeps("do it.", "it is done.")]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+    let (out, _) = run("reassess 2", &store, &worker).await.unwrap();
+    assert!(out[0].contains("0 unchanged"), "{out:?}");
+    let assessed = store.read(2).await.unwrap().assessed.unwrap();
+    assert_eq!(assessed.len(), 16, "{assessed}");
+    assert!(assessed.chars().all(|c| c.is_ascii_hexdigit()), "{assessed}");
+
+    let (out, _) = run("reassess 2", &store, &worker).await.unwrap();
+    assert_eq!(provider.seen.lock().len(), 1, "the second pass made no call");
+    assert!(out[0].contains("1 unchanged"), "{out:?}");
+    assert!(out.iter().any(|l| l.contains("#2 T assessed and unchanged")), "{out:?}");
+    assert!(!out.iter().any(|l| l.starts_with('⚠')), "{out:?}");
+}
+
+#[tokio::test]
+async fn a_final_node_is_skipped_with_no_call() {
+    let store = store_with_a_task().await;
+    let (out, _) = run("final 2", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["#2 is final: no reassessment rewrites it"]);
+    let (out, _) = run("show", &store, &worker()).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("#2 T [defined] [final]")), "{out:?}");
+
+    let provider = Scripted::new(Vec::new());
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+    // the project above still calls, and the empty script turns that into a warning line
+    let (out, _) = run("reassess-tree 1", &store, &worker).await.unwrap();
+    assert!(provider.seen.lock().iter().all(|r| !r.messages.iter().any(|m| m.content.contains("Task #2:"))), "#2 made no call");
+    assert!(out.iter().any(|l| l.contains("#2 T [final] assessed and unchanged")), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().objective.as_deref(), Some("do it."));
+
+    let (out, _) = run("final 2 off", &store, &worker).await.unwrap();
+    assert_eq!(out, vec!["#2 is no longer final"]);
+    assert!(store.read(2).await.unwrap().assessed.is_none());
+    let (out, _) = run("show", &store, &worker).await.unwrap();
+    assert!(!out.iter().any(|l| l.contains("[final]")), "{out:?}");
+}
+
+#[tokio::test]
+async fn a_final_single_node_makes_no_call() {
+    let store = store_with_a_task().await;
+    run("final 2", &store, &worker()).await.unwrap();
+    let provider = Scripted::new(Vec::new());
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+    let (out, _) = run("reassess 2", &store, &worker).await.unwrap();
+    assert!(provider.seen.lock().is_empty(), "no provider call");
+    assert!(out[0].contains("1 unchanged"), "{out:?}");
+    assert!(store.read(2).await.unwrap().is_final(), "the mark stays");
+}
+
+#[tokio::test]
+async fn editing_the_objective_after_an_assessment_calls_again() {
+    let store = store_with_a_task().await;
+    let provider = Scripted::new(vec![keeps("do it.", "it is done."), keeps("do it twice.", "it is done twice.")]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+    run("reassess 2", &store, &worker).await.unwrap();
+    let first = store.read(2).await.unwrap().assessed.unwrap();
+    store.set_details(2, Some("do it twice."), None).await.unwrap();
+
+    let (out, _) = run("reassess 2", &store, &worker).await.unwrap();
+    assert_eq!(provider.seen.lock().len(), 2, "the edit made the next pass call");
+    assert!(out[0].contains("0 unchanged"), "{out:?}");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.acceptance.as_deref(), Some("it is done twice."));
+    assert_ne!(node.assessed.unwrap(), first, "the fingerprint follows the new text");
+}
+
 #[tokio::test]
 async fn run_on_a_bare_model_fails_the_node_when_the_provider_does() {
     let dir = tempfile::tempdir().unwrap();

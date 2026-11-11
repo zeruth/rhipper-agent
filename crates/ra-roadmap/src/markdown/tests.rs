@@ -16,7 +16,26 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
         assignee: None,
         complexity: 3,
         notes: None,
+        assessed: None,
     }
+}
+
+#[test]
+fn round_trips_the_assessed_line() {
+    // roots, so the render and the parse agree on the depth without a parent in the list
+    let mut task = node(4, None, NodeKind::Task, "Storage");
+    task.assessed = Some("0123456789abcdef".into());
+    let mut done = node(5, None, NodeKind::Task, "Done");
+    done.assessed = Some("final".into());
+    let nodes = vec![task, done];
+    let text = render(&nodes);
+    assert!(text.contains("    assessed: 0123456789abcdef"), "{text}");
+    let parsed = parse(&text).unwrap();
+    assert_eq!(parsed[0].assessed.as_deref(), Some("0123456789abcdef"));
+    assert_eq!(parsed[1].assessed.as_deref(), Some("final"));
+    assert!(parsed[1].is_final());
+    assert!(!parsed[0].is_final());
+    assert_eq!(render(&parsed), text);
 }
 
 #[test]

@@ -226,7 +226,8 @@ async fn show(id: Option<i64>) -> anyhow::Result<()> {
             Some(a) => format!(" ← {}:{}", a.role, a.model),
             None => String::new(),
         };
-        println!("{}#{} {} [{}]{assignee}", indent, node.id, node.title, node.state);
+        let mark = if node.is_final() { " [final]" } else { "" };
+        println!("{}#{} {} [{}]{mark}{assignee}", indent, node.id, node.title, node.state);
         if let Some(objective) = &node.objective {
             println!("{}    {}", indent, objective);
         }
