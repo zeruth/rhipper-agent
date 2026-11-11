@@ -140,3 +140,25 @@ async fn a_scripted_toolbox_answers_a_command_from_the_script() {
     assert!(!tools.check("cargo clippy").await.unwrap().0, "exit code 101 is a failed check");
     assert!(tools.check("rm -rf /").await.is_err(), "the allowlist comes before the script");
 }
+
+#[test]
+fn the_changed_ranges_come_from_the_hunks_and_only_their_warnings_count() {
+    let diff = "diff --git a/crates/probe/src/lib.rs b/crates/probe/src/lib.rs\n--- a/crates/probe/src/lib.rs\n+++ b/crates/probe/src/lib.rs\n@@ -1,0 +2,3 @@\n+a\n+b\n+c\n@@ -40,2 +43 @@\n-x\n-y\n+z\n@@ -60,1 +62,0 @@\n-gone\ndiff --git a/new.rs b/new.rs\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,2 @@\n+n\n+m\n";
+    assert_eq!(
+        changed_ranges(diff),
+        [
+            ("crates/probe/src/lib.rs".to_owned(), 2, 4),
+            ("crates/probe/src/lib.rs".to_owned(), 43, 43),
+            ("crates/probe/src/lib.rs".to_owned(), 62, 62),
+            ("new.rs".to_owned(), 1, 2),
+        ]
+    );
+    // the warning at line 2 is in a hunk; the one at line 9 of another file is not
+    let ranges = changed_ranges(diff);
+    let hits = warnings_within(CLIPPY, &ranges);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].contains("lib.rs:2:9"));
+    // the same warning outside every hunk stays out, slack included
+    assert!(warnings_within(CLIPPY, &[("crates/probe/src/lib.rs".to_owned(), 10, 20)]).is_empty());
+    assert_eq!(warnings_within(CLIPPY, &[("crates/probe/src/lib.rs".to_owned(), 4, 20)]).len(), 1, "two lines of slack");
+}

@@ -1341,7 +1341,17 @@ impl eframe::App for App {
         egui::Panel::top("status")
             .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(8, 6)))
             .show(root, |ui| self.status_bar(ui));
-        // the command line at the very bottom, the console right above it, across the window
+        // the roadmap takes the whole height at the left, the width its rows need up to two
+        // fifths of the window; the console and the command line sit right of it
+        if self.setup.is_none() {
+            let width = self.roadmap_width.min(root.max_rect().width() * 0.4);
+            egui::Panel::left("roadmap")
+                .resizable(false)
+                .exact_size(width)
+                .frame(Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(8, 8)).stroke(Stroke::new(1.0, theme::RULE)))
+                .show(root, |ui| self.roadmap_panel(ui));
+        }
+        // the command line at the bottom, the console right above it
         egui::Panel::bottom("input")
             .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(12, 8)).stroke(Stroke::new(1.0, theme::RULE)))
             .show(root, |ui| self.input_bar(ui));
@@ -1363,13 +1373,6 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(if self.job.is_some() { 60 } else { 250 }));
             return;
         }
-        // the roadmap takes the width its rows need, up to two fifths of the window
-        let width = self.roadmap_width.min(root.max_rect().width() * 0.4);
-        egui::Panel::left("roadmap")
-            .resizable(false)
-            .exact_size(width)
-            .frame(Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(8, 8)))
-            .show(root, |ui| self.roadmap_panel(ui));
         egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(18, 12)))
             .show(root, |ui| self.center(ui));

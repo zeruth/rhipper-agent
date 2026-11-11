@@ -202,6 +202,13 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let claim = r#"{"type":"result","result":"Done, but I couldn't run any tests.","permission_denials":[{"tool_name":"Bash","tool_input":{"command":"make all"}}]}"#;
     let ids: Vec<String> = gotchas_of_event(&catalogue, claim, quiet, &mut tools).into_iter().map(|h| h.id).collect();
     assert_eq!(ids, ["untested-claim", "unmatched-denied"]);
+    // the worker's own words about an edit gone wrong, and an edit tool's miss, each count
+    let words = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Whoops, that edit landed in the wrong place."},{"type":"tool_use","id":"t4","name":"Edit","input":{"file_path":"x.rs"}}]}}"#;
+    let ids: Vec<String> = gotchas_of_event(&catalogue, words, quiet, &mut tools).into_iter().map(|h| h.id).collect();
+    assert_eq!(ids, ["misplaced-edit"]);
+    let missed = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t4","content":"Error: String to replace not found in file."}]}}"#;
+    let ids: Vec<String> = gotchas_of_event(&catalogue, missed, quiet, &mut tools).into_iter().map(|h| h.id).collect();
+    assert_eq!(ids, ["edit-missed"]);
     // a PowerShell denial is judged like a Bash one: a command the catalogue passes is unmatched
     let refused = r#"{"type":"result","result":"done","permission_denials":[{"tool_name":"PowerShell","tool_input":{"command":"cargo clippy -p rc-gui"}}]}"#;
     let ids: Vec<String> = gotchas_of_event(&catalogue, refused, quiet, &mut tools).into_iter().map(|h| h.id).collect();

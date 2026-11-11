@@ -458,6 +458,11 @@ fn gotchas_of_event(
     match event.get("type").and_then(Value::as_str) {
         Some("assistant") => {
             for block in event.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
+                // the worker's own words: an edit it says went wrong is a turn lost
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    hits.extend(catalogue.scan(Where::Text, block.get("text").and_then(Value::as_str).unwrap_or("")));
+                    continue;
+                }
                 if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                     continue;
                 }
@@ -481,15 +486,15 @@ fn gotchas_of_event(
                 if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                     continue;
                 }
-                // only what a shell said; a file the worker read is not the machine talking
-                let shell = block
-                    .get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .and_then(|id| tools.get(id))
-                    .is_some_and(|name| matches!(name.as_str(), "Bash" | "PowerShell"));
-                if shell {
-                    hits.extend(catalogue.scan(Where::Result, &text_of(block.get("content").unwrap_or(&Value::Null))));
-                }
+                // what a shell said, and what an edit tool said; a file the worker read is not
+                // the machine talking
+                let tool = block.get("tool_use_id").and_then(Value::as_str).and_then(|id| tools.get(id)).map(String::as_str);
+                let place = match tool {
+                    Some("Bash" | "PowerShell") => Where::Result,
+                    Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit") => Where::Edit,
+                    _ => continue,
+                };
+                hits.extend(catalogue.scan(place, &text_of(block.get("content").unwrap_or(&Value::Null))));
             }
         }
         Some("result") => {
@@ -519,7 +524,7 @@ fn hook_settings(rc: &Path) -> String {
     serde_json::json!({
         "hooks": {
             "PreToolUse": [{"matcher": "Bash|PowerShell", "hooks": [{"type": "command", "command": command("pre"), "timeout": 10}]}],
-            "PostToolUse": [{"matcher": "Bash|PowerShell", "hooks": [{"type": "command", "command": command("post"), "timeout": 10}]}]
+            "PostToolUse": [{"matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit", "hooks": [{"type": "command", "command": command("post"), "timeout": 10}]}]
         }
     })
     .to_string()

@@ -390,6 +390,54 @@ pub fn warnings_at(output: &str, files: &[String]) -> Vec<String> {
     blocks
 }
 
+/// The lines a unified diff touches, by file: `(path, first, last)` for every hunk, from the
+/// `+++ b/<path>` and `@@ -a,b +c,d @@` headers; a hunk that only removes lines marks the line
+/// it removed them before. The paths come as the diff writes them, with `/`.
+#[must_use]
+pub fn changed_ranges(diff: &str) -> Vec<(String, u32, u32)> {
+    let mut ranges = Vec::new();
+    let mut file: Option<String> = None;
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            let path = path.trim().strip_prefix("b/").unwrap_or(path.trim());
+            file = (path != "/dev/null").then(|| path.to_owned());
+        } else if let Some(rest) = line.strip_prefix("@@ ")
+            && let Some(file) = &file
+            && let Some(added) = rest.split_whitespace().find_map(|w| w.strip_prefix('+'))
+        {
+            let (start, count) = added.split_once(',').map_or((added, "1"), |(s, c)| (s, c));
+            let (Ok(start), Ok(count)) = (start.parse::<u32>(), count.parse::<u32>()) else { continue };
+            ranges.push((file.clone(), start.max(1), start + count.saturating_sub(1).max(0)));
+        }
+    }
+    ranges
+}
+
+/// The diagnostics of a cargo output that point into one of `ranges`: the warnings of the
+/// lines a change touched, not the ones its files had before. A diagnostic's line is the one
+/// its first `-->` names, with two lines of slack either way for one that points at the head
+/// of what grew.
+#[must_use]
+pub fn warnings_within(output: &str, ranges: &[(String, u32, u32)]) -> Vec<String> {
+    let files: Vec<String> = ranges.iter().map(|(f, _, _)| f.clone()).collect();
+    warnings_at(output, &files)
+        .into_iter()
+        .filter(|block| {
+            let Some(at) = block.lines().find_map(|l| l.trim_start().strip_prefix("--> ")) else { return false };
+            // `path:line:col`: the column goes, then the line
+            let Some((rest, _col)) = at.rsplit_once(':') else { return false };
+            let Some((path, line)) = rest.rsplit_once(':') else { return false };
+            let Ok(line) = line.parse::<u32>() else { return false };
+            let path = path.replace('\\', "/");
+            ranges.iter().any(|(f, first, last)| {
+                (f == &path || path.ends_with(&format!("/{f}")) || f.ends_with(&format!("/{path}")))
+                    && line + 2 >= *first
+                    && line <= last.saturating_add(2)
+            })
+        })
+        .collect()
+}
+
 /// Whether a command is on the allowlist: any cargo subcommand, and the git commands that only
 /// read the repository.
 fn allowed(program: &str, args: &[&str]) -> bool {

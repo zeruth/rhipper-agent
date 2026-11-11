@@ -28,8 +28,13 @@ pub const UNMATCHED: &str = "unmatched-denied";
 pub enum Where {
     /// A shell command the worker is about to run.
     Command,
-    /// The text a tool returned.
+    /// The text a shell returned.
     Result,
+    /// What an edit tool answered: a miss, a stale read, a text that was not unique.
+    Edit,
+    /// The worker's own words between its tool calls: an edit it says it got wrong, work it
+    /// says it has to do over.
+    Text,
     /// The worker's final report.
     Answer,
 }

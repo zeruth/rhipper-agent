@@ -80,6 +80,12 @@ fn a_result_and_an_answer_are_scanned_for_their_gotchas() {
     assert_eq!(catalogue.scan(Where::Result, "test result: ok. 12 passed"), []);
     let hits = catalogue.scan(Where::Answer, "I've made the changes, but I couldn't run any tests.");
     assert_eq!(hits[0].id, "untested-claim");
+    // an edit that missed, and a worker that says it put one in the wrong place
+    assert_eq!(catalogue.scan(Where::Edit, "Error: String to replace not found in file.")[0].id, "edit-missed");
+    assert_eq!(catalogue.scan(Where::Edit, "Found 3 matches of the string to replace, but replace_all is false")[0].id, "edit-missed");
+    assert!(catalogue.scan(Where::Edit, "The file x.rs has been updated successfully.").is_empty());
+    assert_eq!(catalogue.scan(Where::Text, "Whoops, that edit landed in the wrong place; let me redo that edit.")[0].id, "misplaced-edit");
+    assert!(catalogue.scan(Where::Text, "Now the edits to main.rs.").is_empty());
     // a command pattern does not fire on a result
     assert!(catalogue.scan(Where::Result, "ls -la").is_empty());
 }

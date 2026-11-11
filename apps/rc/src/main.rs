@@ -282,6 +282,11 @@ fn hook(event: &str) -> anyhow::Result<()> {
             }
         }
         "post" => {
+            // what a shell said is read one way, what an edit tool said another
+            let place = match call.get("tool_name").and_then(serde_json::Value::as_str) {
+                Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit") => ra_gotchas::Where::Edit,
+                _ => ra_gotchas::Where::Result,
+            };
             let response = call.get("tool_response").cloned().unwrap_or_default();
             let text = match &response {
                 serde_json::Value::String(s) => s.clone(),
@@ -291,7 +296,7 @@ fn hook(event: &str) -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
                     .join("\n"),
             };
-            let hits = catalogue.scan(ra_gotchas::Where::Result, &text);
+            let hits = catalogue.scan(place, &text);
             (!hits.is_empty()).then(|| {
                 let context = hits.iter().map(|h| h.message.as_str()).collect::<Vec<_>>().join("; ");
                 serde_json::json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}})

@@ -64,9 +64,11 @@ pub(crate) fn card<R>(ui: &mut Ui, color: Color32, lit: bool, contents: impl FnO
 /// lane so a bubble inside a bubble reads as one, with its glow and its sheen. `lit` brightens
 /// it, for the bubble that holds the selection.
 pub(crate) fn bubble<R>(ui: &mut Ui, color: Color32, lit: bool, contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
+    // dark, with a breath of the lane in it; the outline carries the lane bright, so the depth
+    // reads from the colors the way the console's frames do
     let frame = Frame::new()
-        .fill(theme::mix(theme::PANEL, color, 0.05))
-        .stroke(Stroke::new(1.0, alpha(color, if lit { 210 } else { 95 })))
+        .fill(theme::mix(theme::BG, color, 0.07))
+        .stroke(Stroke::new(1.0, alpha(color, if lit { 245 } else { 175 })))
         .corner_radius(CornerRadius::same(9))
         .inner_margin(Margin::symmetric(8, 6))
         .outer_margin(Margin::symmetric(0, 3));

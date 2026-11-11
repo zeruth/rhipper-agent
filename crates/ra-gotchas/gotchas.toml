@@ -3,7 +3,9 @@
 # the same denied command or error line keeps coming back.
 #
 # where:   command  — a shell command the worker is about to run
-#          result   — the text a tool returned
+#          result   — the text a shell returned
+#          edit     — what an edit tool answered
+#          text     — the worker's own words between its tool calls
 #          answer   — the worker's final report
 # remedy:  hint     — the message goes to the worker: as the reason of a denied command, as
 #                     context after a result, and in the machine notes of later runs
@@ -59,6 +61,20 @@ id = "not-logged-in"
 where = "result"
 pattern = 'Not logged in'
 message = "the harness lost its login: never pass --bare on the subscription route, and run `claude /login` once"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+id = "edit-missed"
+where = "edit"
+pattern = '(?i)string to replace not found|old_string .*not found|not found in (the )?file|has not been read yet|has been modified since|found \d+ matches of the string|must be unique|no changes to make|is identical to'
+message = "an edit missed: its old text was not current or not unique, and the turn went on nothing; Read the lines first, quote them exactly, whitespace included, and make each edit at one place"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+id = "misplaced-edit"
+where = "text"
+pattern = '(?i)\b(whoops|oops|misplaced|wrong (place|spot|location|file|line)|by mistake|accidentally|clobbered|redo (that|the|this) (edit|change)|undo (that|the|this) (edit|change)|that edit (landed|went) (wrong|in the wrong)|let me (fix|undo|revert) (that|my) (edit|change)|i (broke|overwrote|mangled|duplicated))\b'
+message = "an edit landed wrong and cost turns to put right: read the exact region before editing, keep each edit to one place, and look at the file after a large one"
 remedy = { kind = "hint" }
 
 [[gotcha]]

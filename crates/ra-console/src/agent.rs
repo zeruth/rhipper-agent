@@ -490,8 +490,10 @@ struct Lint {
     skipped: Vec<String>,
 }
 
-/// Lints each crate that owns one of `changed` and keeps the diagnostics that point at those
-/// files. Clippy exits 0 on a warning, so the output decides, not the exit code.
+/// Lints each crate that owns one of `changed` and keeps the diagnostics that point into the
+/// lines the change touched (`git diff -U0` of those files; a file git does not know is new,
+/// and all of it counts), not the warnings its files had before. Clippy exits 0 on a warning,
+/// so the output decides, not the exit code.
 async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[String]) -> Lint {
     let mut lint = Lint::default();
     for file in changed {
@@ -501,10 +503,27 @@ async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[Strin
             lint.crates.push(krate);
         }
     }
+    if lint.crates.is_empty() {
+        return lint;
+    }
+    let diff = match toolbox.check(&format!("git diff -U0 HEAD -- {}", changed.join(" "))).await {
+        Ok((_, output)) => output,
+        Err(e) => {
+            lint.skipped.push(format!("git diff · {e:#}"));
+            String::new()
+        }
+    };
+    let mut ranges = ra_tools::changed_ranges(&diff);
+    for file in changed {
+        let known = ranges.iter().any(|(f, _, _)| f == &file.replace('\\', "/"));
+        if !known {
+            ranges.push((file.replace('\\', "/"), 1, u32::MAX - 2));
+        }
+    }
     for krate in &lint.crates {
         let command = format!("cargo clippy -p {krate}");
         match toolbox.check(&command).await {
-            Ok((_, output)) => lint.warnings.extend(ra_tools::warnings_at(&output, changed)),
+            Ok((_, output)) => lint.warnings.extend(ra_tools::warnings_within(&output, &ranges)),
             Err(e) => lint.skipped.push(format!("{command} · {e:#}")),
         }
     }

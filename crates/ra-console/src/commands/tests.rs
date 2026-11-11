@@ -356,7 +356,9 @@ async fn linted_run(at: &str) -> (Vec<String>, ra_roadmap::model::Node, tempfile
     let provider = Scripted::new(vec![says("", vec![write]), says("added extra", vec![])]);
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider).with_script(script);
     let (out, _) = run("run 2", &store, &worker).await.unwrap();
-    assert_eq!(*seen.lock(), ["cargo test --workspace -q", "cargo clippy -p probe"], "the check, then the lint of the crate of the change");
+    // the check, then the lines the change touched (the script's "ok" is no diff, so the new
+    // file counts whole), then the lint of the crate of the change
+    assert_eq!(*seen.lock(), ["cargo test --workspace -q", "git diff -U0 HEAD -- src/extra.rs", "cargo clippy -p probe"]);
     (out, store.read(2).await.unwrap(), dir)
 }
 
