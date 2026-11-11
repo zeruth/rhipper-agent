@@ -46,6 +46,22 @@ enum Tab {
     Ledger,
 }
 
+/// A directory without a roadmap: where the window started, the roadmap-shaped files it found,
+/// the model that would draft or convert, and what is running once a choice is made.
+struct Setup {
+    dir: String,
+    candidates: Vec<PathBuf>,
+    model: String,
+    running: Option<String>,
+}
+
+impl Setup {
+    fn new(root: &Path) -> Self {
+        let dir = std::fs::canonicalize(root).map_or_else(|_| root.display().to_string(), |p| p.display().to_string().replace("\\\\?\\", ""));
+        Self { dir, candidates: ra_console::setup::candidates(root), model: ra_console::setup::SETUP_MODEL.to_owned(), running: None }
+    }
+}
+
 /// What the context tab shows: the text a run of the card would send, as `rc context <id>`
 /// prints it, and the project context that goes ahead of it. Built when the tab shows a card
 /// it was not built for, and again when a run ends: the handoffs and the outlines move then.
@@ -145,6 +161,8 @@ struct App {
     assign_model: String,
     /// What went wrong at start, shown on the splash instead of the workspace.
     fault: Option<String>,
+    /// The choice a directory without a roadmap gets, until it has one.
+    setup: Option<Setup>,
 }
 
 impl App {
@@ -177,13 +195,23 @@ impl App {
         if let Err(e) = ra_console::instance::claim() {
             tracing::warn!("cannot claim the instance: {e:#}");
         }
-        let store = match rt.block_on(Store::open(Path::new("rhipper.md"), "Rhipper Agent")) {
-            Ok(store) => store,
-            Err(e) => {
-                fault = Some(format!("{e:#}"));
-                // a store that cannot open still needs a value; the splash shows the fault
-                rt.block_on(Store::open(&std::env::temp_dir().join("rhipper-agent-fault.md"), "Rhipper Agent")).expect("a temp store")
+        // the directory the window starts in is the project; without a roadmap the window
+        // offers to make one rather than writing a bare file on the quiet
+        let root = Path::new(".");
+        let mut setup = None;
+        let temp_store = || rt.block_on(Store::open(&std::env::temp_dir().join("rhipper-agent-fault.md"), "Rhipper Agent")).expect("a temp store");
+        let store = if ra_console::setup::exists(root) {
+            match rt.block_on(Store::open(Path::new(ra_console::setup::ROADMAP_FILE), "Rhipper Agent")) {
+                Ok(store) => store,
+                Err(e) => {
+                    fault = Some(format!("{e:#}"));
+                    // a store that cannot open still needs a value; the splash shows the fault
+                    temp_store()
+                }
             }
+        } else {
+            setup = Some(Setup::new(root));
+            temp_store()
         };
         let mut worker = Worker::new(ra_console::ui::DEFAULT_MODEL);
         match rt.block_on(UsageStore::open(Path::new("var/usage.db"))) {
@@ -228,9 +256,116 @@ impl App {
             show_debug: false,
             assign_model: String::new(),
             fault,
+            setup,
         };
         app.refresh_ledger();
         app
+    }
+
+    /// Starts making the roadmap the way `mode` says, on the runtime; the console band shows
+    /// the outcome and the window turns into the workspace when the file is there.
+    fn start_setup(&mut self, mode: ra_console::setup::Mode) {
+        let Some(setup) = &mut self.setup else { return };
+        let what = match &mode {
+            ra_console::setup::Mode::Empty => "writing the bare roadmap".to_owned(),
+            ra_console::setup::Mode::Draft => format!("drafting the roadmap with {}", short(&setup.model)),
+            ra_console::setup::Mode::Import(file) => format!("importing {} with {}", file.display(), short(&setup.model)),
+        };
+        setup.running = Some(what.clone());
+        self.job = Some(what.clone());
+        self.sink.push(Kind::Input, what);
+        let mut worker = self.worker.clone();
+        worker.model.clone_from(&setup.model);
+        let (sink, tx) = (self.sink.clone(), self.job_tx.clone());
+        self.rt.spawn(async move {
+            match ra_console::setup::init(Path::new("."), &worker, mode).await {
+                Ok(lines) => {
+                    for l in lines {
+                        sink.push(Kind::Output, l);
+                    }
+                }
+                Err(e) => sink.push(Kind::Error, format!("{e:#}")),
+            }
+            let _ = tx.send(());
+        });
+    }
+
+    /// The setup finished: with a roadmap there now, the window opens it and becomes the
+    /// workspace; without one, the console band says why and the choice stays.
+    fn finish_setup(&mut self) {
+        let Some(setup) = &mut self.setup else { return };
+        setup.running = None;
+        if ra_console::setup::exists(Path::new("."))
+            && let Ok(store) = self.rt.block_on(Store::open(Path::new(ra_console::setup::ROADMAP_FILE), "Rhipper Agent"))
+        {
+            self.store = store;
+            self.setup = None;
+            self.roadmap_seen = None;
+        }
+    }
+
+    /// The choice a directory without a roadmap gets: a draft by a strong model, an import of
+    /// a roadmap-shaped file found here, or the bare project.
+    fn setup_view(&mut self, ui: &mut egui::Ui) {
+        let Some(setup) = &self.setup else { return };
+        let (dir, candidates, running) = (setup.dir.clone(), setup.candidates.clone(), setup.running.clone());
+        let mut picked: Option<ra_console::setup::Mode> = None;
+        egui::ScrollArea::vertical().id_salt("setup").auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(900.0);
+            cards::card(ui, theme::ACCENT, true, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("No roadmap in this directory").font(FontId::proportional(26.0)).color(theme::ACCENT).strong());
+                ui.label(RichText::new(&dir).monospace().color(theme::TEXT));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "The directory a window starts in is its project; this one has no {} yet. Choose how it begins; the file is yours to edit after.",
+                        ra_console::setup::ROADMAP_FILE
+                    ))
+                    .color(theme::DIM),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("model").small().strong().color(theme::DIM));
+                    if let Some(setup) = &mut self.setup {
+                        ui.add(egui::TextEdit::singleline(&mut setup.model).desired_width(240.0).font(TextStyle::Monospace));
+                    }
+                    ui.label(RichText::new("the strongest once per project; a claude-* id runs on Claude Code").color(theme::DIM).small());
+                });
+                ui.add_space(10.0);
+                if let Some(what) = &running {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().color(theme::ACCENT));
+                        ui.label(RichText::new(format!("{what} …")).color(theme::WARN_TEXT));
+                    });
+                    return;
+                }
+                cards::section(ui, "DRAFT", theme::ACCENT);
+                ui.label(RichText::new("the model reads the README, the layout, the manifest and the documents, and answers with milestones and cards").color(theme::DIM).small());
+                if action(ui, "▶  draft a roadmap from this directory", theme::ACCENT) {
+                    picked = Some(ra_console::setup::Mode::Draft);
+                }
+                ui.add_space(8.0);
+                if !candidates.is_empty() {
+                    cards::section(ui, "IMPORT", theme::WARN_TEXT);
+                    ui.label(RichText::new("a roadmap-shaped file found here, converted by the model with every item kept").color(theme::DIM).small());
+                    for file in &candidates {
+                        if action(ui, &format!("⇥  import {}", file.display().to_string().replace('\\', "/")), theme::WARN_TEXT) {
+                            picked = Some(ra_console::setup::Mode::Import(file.clone()));
+                        }
+                    }
+                    ui.add_space(8.0);
+                }
+                cards::section(ui, "EMPTY", theme::DIM);
+                ui.label(RichText::new("the bare project and nothing else; no model call").color(theme::DIM).small());
+                if action(ui, "○  start empty", theme::DIM) {
+                    picked = Some(ra_console::setup::Mode::Empty);
+                }
+            });
+        });
+        if let Some(mode) = picked {
+            self.start_setup(mode);
+        }
     }
 
     /// Reads the ledger and the gotchas again: the same queries as `rc usage` and the same
@@ -314,6 +449,9 @@ impl App {
             self.job = None;
             self.refresh_ledger();
             self.context.id = None;
+            if self.setup.as_ref().is_some_and(|s| s.running.is_some()) {
+                self.finish_setup();
+            }
         }
         // the plan's windows, every five seconds: a run of any instance may have moved them
         if self.limits_read.elapsed() >= Duration::from_secs(5) {
@@ -680,127 +818,38 @@ impl App {
                 parent = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent);
             }
         }
-        let mut hidden_under: Vec<i64> = Vec::new();
-        let mut shown_rows: Vec<i64> = Vec::new();
-        let mut clicked: Option<i64> = None;
-        let mut toggled: Option<i64> = None;
-        let mut command: Option<String> = None;
+        // the column as the console draws it: the project is a bubble, each phase a bubble
+        // inside it with a glowing rule between them, the tasks rows inside their phase, and
+        // the subtasks of a task in a small bubble under it
+        let walk = Walk {
+            searching,
+            matched,
+            holds_shown,
+            hidden: self.hidden_states.clone(),
+            folded: self.folded.clone(),
+            selected: self.selected,
+            scroll_to: self.scroll_to,
+            depths,
+        };
+        let mut out = Walked::default();
         egui::ScrollArea::vertical().id_salt("roadmap").auto_shrink([false, false]).show(ui, |ui| {
-            for node in &nodes {
-                if searching && !matched.contains(&node.id) {
-                    continue;
-                }
-                // a node under a folded ancestor stays out
-                if node.parent.is_some_and(|p| hidden_under.contains(&p)) {
-                    hidden_under.push(node.id);
-                    continue;
-                }
-                if !searching && self.folded.contains(&node.id) {
-                    hidden_under.push(node.id);
-                }
-                // a node in a hidden state stays out, unless it is the structure above a shown
-                // card; the project row always stays
-                if self.hidden_states.contains(&node.state) && node.kind != NodeKind::Project && !holds_shown.contains(&node.id) {
-                    continue;
-                }
-                shown_rows.push(node.id);
-                let depth = depths.get(&node.id).copied().unwrap_or(0);
-                let lane = theme::lane(depth);
-                let has_children = nodes.iter().any(|n| n.parent == Some(node.id));
-                let selected = self.selected == Some(node.id);
-                let row_id = ui.make_persistent_id(("row", node.id));
-                let hovered = ui.ctx().read_response(row_id).is_some_and(|r| r.hovered());
-                let fill = if selected {
-                    cards::alpha(lane, 40)
-                } else if hovered {
-                    cards::alpha(lane, 18)
-                } else {
-                    Color32::TRANSPARENT
-                };
-                let frame = Frame::new()
-                    .fill(fill)
-                    .stroke(Stroke::new(1.0, if selected { cards::alpha(lane, 200) } else { Color32::TRANSPARENT }))
-                    .corner_radius(CornerRadius::same(7))
-                    .inner_margin(Margin::symmetric(6, 4));
-                let response = frame
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.add_space(depth as f32 * 16.0);
-                            let arrow = if !has_children {
-                                "  "
-                            } else if !searching && self.folded.contains(&node.id) {
-                                "▸"
-                            } else {
-                                "▾"
-                            };
-                            if ui.add(egui::Label::new(RichText::new(arrow).color(theme::DIM)).sense(egui::Sense::click())).clicked()
-                                && has_children
-                            {
-                                toggled = Some(node.id);
-                            }
-                            ui.label(RichText::new(cards::kind_mark(node.kind)).color(lane));
-                            ui.label(RichText::new(format!("#{}", node.id)).color(theme::DIM).small());
-                            let title =
-                                RichText::new(&node.title).color(if selected { theme::TEXT } else { theme::mix(theme::TEXT, lane, 0.45) });
-                            ui.label(if matches!(node.kind, NodeKind::Project | NodeKind::Milestone) {
-                                title.strong().size(15.0)
-                            } else {
-                                title
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                cards::badge(ui, &node.state.to_string(), theme::state_color(node.state));
-                                if node.is_final() {
-                                    cards::badge(ui, "final", theme::WARN);
-                                }
-                                if let Some(a) = &node.assignee {
-                                    cards::badge_marked(ui, "◉", short(&a.model), theme::TRACE).on_hover_text(&a.model);
-                                }
-                                if node.kind == NodeKind::Task || node.kind == NodeKind::Subtask {
-                                    cards::priority(ui, node.complexity);
-                                }
-                                if selected && node.kind != NodeKind::Project {
-                                    if ui.small_button(RichText::new("▶").color(theme::ACCENT)).on_hover_text("run this card").clicked() {
-                                        command = Some(format!("run {}", node.id));
-                                    }
-                                    if ui
-                                        .small_button(RichText::new("↻").color(theme::WARN_TEXT))
-                                        .on_hover_text("reassess this card")
-                                        .clicked()
-                                    {
-                                        command = Some(format!("reassess {}", node.id));
-                                    }
-                                }
-                            });
-                        });
-                    })
-                    .response
-                    .interact(egui::Sense::click());
-                ui.ctx().memory_mut(|m| m.data.insert_temp(row_id, ()));
-                let response = response.on_hover_ui(|ui| cards::tooltip(ui, node, lane));
-                if self.scroll_to == Some(node.id) {
-                    response.scroll_to_me(None);
-                }
-                if response.clicked() {
-                    clicked = Some(node.id);
-                }
-                if response.double_clicked() && has_children {
-                    toggled = Some(node.id);
-                }
+            ui.set_width(ui.available_width());
+            for root in nodes.iter().filter(|n| n.parent.is_none()) {
+                draw_bubble(ui, &nodes, root, &walk, &mut out);
             }
         });
-        self.visible_rows = shown_rows;
+        self.visible_rows = out.shown;
         self.scroll_to = None;
-        if let Some(id) = toggled {
-            if !self.folded.remove(&id) {
-                self.folded.insert(id);
-            }
+        if let Some(id) = out.toggled
+            && !self.folded.remove(&id)
+        {
+            self.folded.insert(id);
         }
-        if let Some(id) = clicked {
-            let next = if self.selected == Some(id) && toggled.is_none() { None } else { Some(id) };
+        if let Some(id) = out.clicked {
+            let next = if self.selected == Some(id) && out.toggled.is_none() { None } else { Some(id) };
             self.select(next);
         }
-        if let Some(line) = command {
+        if let Some(line) = out.command {
             self.submit(ui.ctx(), line);
         }
     }
@@ -1038,7 +1087,9 @@ impl App {
                         .small(),
                     );
                     for command in ledger.unmatched.iter().rev().take(UNMATCHED_SHOWN).rev() {
-                        ui.label(RichText::new(command).monospace().color(theme::TEXT));
+                        // one line each, the whole command on hover
+                        ui.add(egui::Label::new(RichText::new(command).monospace().color(theme::TEXT)).truncate())
+                            .on_hover_text(command.as_str());
                     }
                 });
                 ui.add_space(6.0);
@@ -1207,7 +1258,12 @@ impl App {
                 job.wrap.max_width = wrap_width;
                 ui.fonts_mut(|f| f.layout_job(job))
             };
+            // a single-line edit gives its focus up on Enter before anyone can ask, so the
+            // focus is read before the widget draws: that is the frame the line is submitted
+            let id = egui::Id::unique("command-line");
+            let had_focus = ui.memory(|m| m.has_focus(id));
             let edit = egui::TextEdit::singleline(&mut self.input)
+                .id(id)
                 .hint_text(
                     RichText::new("type a command (help lists them) · arrows walk the roadmap, Enter runs the selected card")
                         .color(theme::DIM)
@@ -1218,7 +1274,7 @@ impl App {
                 .lock_focus(true)
                 .layouter(&mut layouter);
             let response = ui.add(edit);
-            if response.has_focus() {
+            if had_focus || response.has_focus() {
                 if self.input.is_empty() && self.browsing.is_none() {
                     // an empty line hands its keys to the roadmap: the arrows walk and fold the
                     // rows, Enter runs the selected card, Escape clears the search
@@ -1230,14 +1286,16 @@ impl App {
                 // the history: Up and Down while the line has text, Ctrl+Up and Ctrl+Down always
                 let (enter, up, down, tab) = ui.input_mut(|i| {
                     (
-                        i.consume_key(Modifiers::NONE, Key::Enter),
+                        i.consume_key(Modifiers::NONE, Key::Enter) || i.key_pressed(Key::Enter),
                         i.consume_key(Modifiers::NONE, Key::ArrowUp) | i.consume_key(Modifiers::COMMAND, Key::ArrowUp),
                         i.consume_key(Modifiers::NONE, Key::ArrowDown) | i.consume_key(Modifiers::COMMAND, Key::ArrowDown),
                         i.consume_key(Modifiers::NONE, Key::Tab),
                     )
                 });
-                if enter {
+                if enter && !self.input.trim().is_empty() {
                     submitted = Some(std::mem::take(&mut self.input));
+                    // the line keeps the keyboard after a command
+                    response.request_focus();
                 }
                 if up && !self.history.is_empty() {
                     let i = match self.browsing {
@@ -1297,6 +1355,14 @@ impl eframe::App for App {
                     console::draw(ui, &self.sink, self.show_debug);
                 });
             });
+        if self.setup.is_some() {
+            // no roadmap yet: the choice takes the place of the roadmap and the card
+            egui::CentralPanel::default()
+                .frame(Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(18, 12)))
+                .show(root, |ui| self.setup_view(ui));
+            ctx.request_repaint_after(Duration::from_millis(if self.job.is_some() { 60 } else { 250 }));
+            return;
+        }
         // the roadmap takes the width its rows need, up to two fifths of the window
         let width = self.roadmap_width.min(root.max_rect().width() * 0.4);
         egui::Panel::left("roadmap")
@@ -1336,6 +1402,185 @@ fn measure_roadmap(ctx: &egui::Context, nodes: &[Node]) -> f32 {
     widest + 24.0
 }
 
+/// What the roadmap column's walk reads this frame: the search, the chips and the structure
+/// they keep, the folds, the selection, and the depth of every node.
+struct Walk {
+    searching: bool,
+    matched: HashSet<i64>,
+    holds_shown: HashSet<i64>,
+    hidden: HashSet<TaskState>,
+    folded: HashSet<i64>,
+    selected: Option<i64>,
+    scroll_to: Option<i64>,
+    depths: std::collections::HashMap<i64, usize>,
+}
+
+/// What the walk brings back: the rows shown top to bottom (what the arrow keys walk), and
+/// what the pointer did.
+#[derive(Default)]
+struct Walked {
+    shown: Vec<i64>,
+    clicked: Option<i64>,
+    toggled: Option<i64>,
+    command: Option<String>,
+}
+
+impl Walk {
+    /// Whether a node shows at all: the search keeps its matches and their ancestors; a hidden
+    /// chip takes its nodes unless a shown card sits below; the project always shows.
+    fn shows(&self, node: &Node) -> bool {
+        if self.searching && !self.matched.contains(&node.id) {
+            return false;
+        }
+        !(self.hidden.contains(&node.state) && node.kind != NodeKind::Project && !self.holds_shown.contains(&node.id))
+    }
+
+    /// Whether a node's children are folded away; a search opens everything.
+    fn is_folded(&self, id: i64) -> bool {
+        !self.searching && self.folded.contains(&id)
+    }
+}
+
+/// One node of the roadmap column. A project, a milestone or a section is a bubble: its header
+/// row, then its children inside, the bubbles of its phases parted by a glowing rule. A task is a
+/// row; its subtasks, when it has any, sit in a small bubble under it.
+fn draw_bubble(ui: &mut egui::Ui, nodes: &[Node], node: &Node, walk: &Walk, out: &mut Walked) {
+    if !walk.shows(node) {
+        return;
+    }
+    out.shown.push(node.id);
+    let depth = walk.depths.get(&node.id).copied().unwrap_or(0);
+    let lane = theme::lane(depth);
+    let children: Vec<&Node> = nodes.iter().filter(|n| n.parent == Some(node.id)).collect();
+    let folded = walk.is_folded(node.id);
+    if matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
+        header_row(ui, nodes, node, &children, lane, walk, out);
+        if !folded && children.iter().any(|c| walk.shows(c)) {
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.vertical(|ui| {
+                    cards::bubble(ui, theme::lane(depth + 1), false, |ui| {
+                        for child in &children {
+                            draw_bubble(ui, nodes, child, walk, out);
+                        }
+                    });
+                });
+            });
+        }
+        return;
+    }
+    // a bubble is lit while it or one of its own rows is the selection
+    let lit = walk.selected == Some(node.id) || children.iter().any(|c| walk.selected == Some(c.id));
+    cards::bubble(ui, lane, lit, |ui| {
+        header_row(ui, nodes, node, &children, lane, walk, out);
+        if folded {
+            return;
+        }
+        let mut first = true;
+        for child in &children {
+            if !walk.shows(child) {
+                continue;
+            }
+            // a rule between the bubbles, not before the first and never between two rows
+            if !first && !matches!(child.kind, NodeKind::Task | NodeKind::Subtask) {
+                cards::divider(ui, theme::lane(depth + 1));
+            }
+            first = false;
+            draw_bubble(ui, nodes, child, walk, out);
+        }
+    });
+}
+
+/// The header row of a bubble, or the row of a task: the fold arrow, the kind's mark, the id and
+/// the title; at the right the badges, the progress of a bubble, and the run and reassess
+/// buttons of the selected card. The row selects on click and folds on double click.
+fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node], lane: Color32, walk: &Walk, out: &mut Walked) {
+    let has_children = !children.is_empty();
+    let selected = walk.selected == Some(node.id);
+    let row_id = ui.make_persistent_id(("row", node.id));
+    let hovered = ui.ctx().read_response(row_id).is_some_and(|r| r.hovered());
+    let fill = if selected {
+        cards::alpha(lane, 44)
+    } else if hovered {
+        cards::alpha(lane, 18)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let frame = Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, if selected { cards::alpha(lane, 200) } else { Color32::TRANSPARENT }))
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(6, 3));
+    let response = frame
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let arrow = if !has_children {
+                    "  "
+                } else if walk.is_folded(node.id) {
+                    "▸"
+                } else {
+                    "▾"
+                };
+                if ui.add(egui::Label::new(RichText::new(arrow).color(theme::DIM)).sense(egui::Sense::click())).clicked() && has_children {
+                    out.toggled = Some(node.id);
+                }
+                ui.label(RichText::new(cards::kind_mark(node.kind)).color(lane));
+                ui.label(RichText::new(format!("#{}", node.id)).color(theme::DIM).small());
+                let title = RichText::new(&node.title).color(if selected { theme::TEXT } else { theme::mix(theme::TEXT, lane, 0.45) });
+                ui.label(match node.kind {
+                    NodeKind::Project => title.strong().size(16.0),
+                    NodeKind::Milestone => title.strong().size(15.0),
+                    NodeKind::Section => title.strong(),
+                    _ => title,
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    cards::badge(ui, &node.state.to_string(), theme::state_color(node.state));
+                    if node.is_final() {
+                        cards::badge(ui, "final", theme::WARN);
+                    }
+                    if let Some(a) = &node.assignee {
+                        cards::badge_marked(ui, "◉", short(&a.model), theme::TRACE).on_hover_text(&a.model);
+                    }
+                    if matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
+                        cards::priority(ui, node.complexity);
+                    } else {
+                        // the progress of a bubble: the cards accepted of the cards under it
+                        let cards_under: Vec<&Node> =
+                            tree::subtree(nodes, node.id).into_iter().filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask)).collect();
+                        if !cards_under.is_empty() {
+                            let done = cards_under.iter().filter(|n| n.state == TaskState::Accepted).count();
+                            let color = if done == cards_under.len() { theme::ONLINE } else { theme::DIM };
+                            ui.label(RichText::new(format!("{done}/{}", cards_under.len())).small().color(color))
+                                .on_hover_text("cards accepted of the cards under it");
+                        }
+                    }
+                    if selected && node.kind != NodeKind::Project {
+                        if ui.small_button(RichText::new("▶").color(theme::ACCENT)).on_hover_text("run this card").clicked() {
+                            out.command = Some(format!("run {}", node.id));
+                        }
+                        if ui.small_button(RichText::new("↻").color(theme::WARN_TEXT)).on_hover_text("reassess this card").clicked() {
+                            out.command = Some(format!("reassess {}", node.id));
+                        }
+                    }
+                });
+            });
+        })
+        .response
+        .interact(egui::Sense::click());
+    ui.ctx().memory_mut(|m| m.data.insert_temp(row_id, ()));
+    let response = response.on_hover_ui(|ui| cards::tooltip(ui, node, lane));
+    if walk.scroll_to == Some(node.id) {
+        response.scroll_to_me(None);
+    }
+    if response.clicked() {
+        out.clicked = Some(node.id);
+    }
+    if response.double_clicked() && has_children {
+        out.toggled = Some(node.id);
+    }
+}
+
 /// The rows a search keeps: every node whose title or id contains `needle` (lowercase, trimmed),
 /// and every ancestor of one, so a hit keeps its place in the tree. A `#` in front of a number
 /// is allowed, the way ids are written.
@@ -1373,7 +1618,10 @@ fn text_card(ui: &mut egui::Ui, name: &str, value: Option<&str>, color: Color32)
 
 /// A cell of a grid with its text against the right edge, the way numbers line up.
 fn cell_right(ui: &mut egui::Ui, text: RichText) {
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    // one text line tall: a layout given the cell's available height would take the rest of
+    // the panel and stretch every row of the grid with it
+    let height = ui.text_style_height(&TextStyle::Body);
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), height), Layout::right_to_left(Align::Center), |ui| {
         ui.label(text);
     });
 }

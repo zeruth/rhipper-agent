@@ -43,6 +43,7 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "reassess-tree", usage: "<id>", help: "reassess for the node and its whole subtree" },
     Spec { name: "final", usage: "<id> [off]", help: "marks a node final, so no reassessment rewrites it; off clears the mark" },
     Spec { name: "seed", usage: "", help: "fills the roadmap with the improvement plan of the agent itself" },
+    Spec { name: "install", usage: "[dir]", help: "installs this build (rc and rc-gui) into a directory on the path; the running instances keep going" },
     Spec { name: "clear", usage: "", help: "clears the log view" },
     Spec { name: "debug", usage: "", help: "toggles the trace lines in the log; the file copy always runs" },
     Spec { name: "quit", usage: "", help: "stops the console (also exit, or Ctrl+C twice)" },
@@ -228,6 +229,10 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
                 }
                 _ => anyhow::bail!("usage: final <id> [off]"),
             }
+        }
+        "install" => {
+            let dir = (!args.is_empty()).then(|| std::path::PathBuf::from(args));
+            out.extend(crate::install::install(dir.as_deref())?);
         }
         "clear" | "cls" => return Ok((out, Outcome::Clear)),
         "debug" => {

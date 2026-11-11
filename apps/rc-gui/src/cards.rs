@@ -60,6 +60,38 @@ pub(crate) fn card<R>(ui: &mut Ui, color: Color32, lit: bool, contents: impl FnO
     response
 }
 
+/// A bubble of the roadmap column: a card with a tighter margin, tinted a little toward its
+/// lane so a bubble inside a bubble reads as one, with its glow and its sheen. `lit` brightens
+/// it, for the bubble that holds the selection.
+pub(crate) fn bubble<R>(ui: &mut Ui, color: Color32, lit: bool, contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
+    let frame = Frame::new()
+        .fill(theme::mix(theme::PANEL, color, 0.05))
+        .stroke(Stroke::new(1.0, alpha(color, if lit { 210 } else { 95 })))
+        .corner_radius(CornerRadius::same(9))
+        .inner_margin(Margin::symmetric(8, 6))
+        .outer_margin(Margin::symmetric(0, 3));
+    let painter = ui.painter().clone();
+    let slot = painter.add(egui::Shape::Noop);
+    let response = frame.show(ui, contents);
+    let rect = response.response.rect;
+    let spread = if lit { 8.0 } else { 4.0 };
+    let shape = RectShape::filled(rect.expand(spread * 0.5), CornerRadius::same(11), alpha(color, if lit { 80 } else { 30 }))
+        .with_blur_width(spread * 2.0);
+    painter.set(slot, shape);
+    sheen(&painter, rect, 8);
+    response
+}
+
+/// A glowing rule across the width, between the bubbles of two phases.
+pub(crate) fn divider(ui: &mut Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 14.0), egui::Sense::hover());
+    let y = rect.center().y;
+    let line = Rect::from_min_max(egui::pos2(rect.left() + 10.0, y - 0.5), egui::pos2(rect.right() - 10.0, y + 0.5));
+    let painter = ui.painter();
+    painter.add(RectShape::filled(line.expand2(egui::vec2(0.0, 3.0)), CornerRadius::same(3), alpha(color, 70)).with_blur_width(8.0));
+    painter.rect_filled(line, CornerRadius::ZERO, alpha(color, 170));
+}
+
 /// A badge: a small pill with `text` in `color` on a tinted field.
 pub(crate) fn badge(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
     Frame::new()

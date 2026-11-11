@@ -85,6 +85,22 @@ pub struct CompletionRequest {
     /// The harness session to resume, so a later run of the same task keeps its context; a
     /// provider without sessions ignores it.
     pub resume: Option<String>,
+    /// The most turns a worker run may take; `None` leaves the provider's own cap. A harness
+    /// enforces it itself; for a bare model the caller's tool loop does. It stays on when the
+    /// dollar budget is off: on a subscription the turns are the cost.
+    pub max_turns: Option<u32>,
+}
+
+/// The turn cap of a run on a node of `complexity`, when nothing names one: c1 15, c2 25, c3 40,
+/// c4 60, c5 90. An out-of-range complexity takes the nearest end.
+pub fn turns_for(complexity: u8) -> u32 {
+    match complexity {
+        0 | 1 => 15,
+        2 => 25,
+        3 => 40,
+        4 => 60,
+        _ => 90,
+    }
 }
 
 /// One answer, with the usage the provider reported.
@@ -92,6 +108,9 @@ pub struct CompletionRequest {
 pub struct Completion {
     pub text: String,
     pub usage: Usage,
+    /// The turns the run took, as a harness reports them; one from a provider that answers a
+    /// single completion.
+    pub turns: u64,
     /// The tool calls the answer asks for; empty means a plain answer.
     pub tool_calls: Vec<ToolCall>,
     /// The harness session the answer came from, for a later run to resume; `None` from a

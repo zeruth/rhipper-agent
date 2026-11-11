@@ -196,5 +196,6 @@ fn request() -> CompletionRequest {
         workspace: None,
         budget_usd: None,
         resume: None,
+        max_turns: None,
     }
 }

@@ -1,9 +1,11 @@
-# Builds and launches the Rhipper Agent console from the repo root.
+# Builds, installs and launches the Rhipper Agent console from the repo root.
 #
 # The console paints in 24-bit color, which the legacy console host cannot show, so outside
 # Windows Terminal the script reopens itself in a Windows Terminal tab when one is installed.
-# A console that is still running is told to quit first (through var/console.quit) and stopped
-# when it does not, so the build never finds the binary locked; no model sees any of this.
+# The build is installed (`rc install`) into a directory on the path and the console runs from
+# there, so a running instance never locks target/ against the next build. A console that is
+# still running is told to quit first (through var/console.quit) and stopped when it does not;
+# no model sees any of this.
 
 Set-Location $PSScriptRoot
 # a launcher's NO_COLOR would strip the theme; the console is color or nothing
@@ -27,4 +29,9 @@ if (Test-Path $pidFile) {
     }
     Remove-Item $quitFile -Force -ErrorAction SilentlyContinue
 }
-cargo run -p rc -- console --replace
+
+cargo build -q -p rc -p rc-gui
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& .\target\debug\rc.exe install
+$installed = Join-Path $env:LOCALAPPDATA 'Programs\rhipper\rc.exe'
+& $installed console --replace

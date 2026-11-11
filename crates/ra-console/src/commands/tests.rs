@@ -244,7 +244,7 @@ impl ra_providers::ModelProvider for Scripted {
 
 fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Completion {
     let usage = ra_providers::Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 0, cost_usd: Some(0.01) };
-    ra_providers::Completion { text: text.to_owned(), usage, tool_calls: calls, session_id: None, gotchas: Vec::new() }
+    ra_providers::Completion { text: text.to_owned(), usage, turns: 1, tool_calls: calls, session_id: None, gotchas: Vec::new() }
 }
 
 #[tokio::test]
@@ -264,7 +264,8 @@ async fn run_on_a_bare_model_loops_through_the_tools_and_lands_the_answer() {
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
 
     let (out, _) = run("run 2", &store, &worker).await.unwrap();
-    assert!(out[0].contains("3 turn(s), 2 tool call(s)"), "{out:?}");
+    // a c3 task: 40 turns
+    assert!(out[0].contains("turns 3/40, 2 tool call(s)"), "{out:?}");
     assert!(out[0].contains("$0.03"), "{out:?}");
     assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "hello from the worker\n");
     let node = store.read(2).await.unwrap();
@@ -508,6 +509,45 @@ async fn a_second_run_of_a_node_resumes_its_session() {
     let seen = script.seen.lock();
     assert_eq!(seen[0].resume, None, "a first run has nothing to resume");
     assert_eq!(seen[1].resume.as_deref(), Some("sess-1"), "the second run resumes the first");
+}
+
+#[tokio::test]
+async fn the_turn_cap_follows_the_complexity_and_the_run_line_names_the_turns_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    // c3: a 40-turn cap, and the harness reports what it used of it
+    run("add task T parent 1", &store, &worker()).await.unwrap();
+    let mut answer = says("done", vec![]);
+    answer.turns = 12;
+    let script = Scripted::new(vec![answer]);
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
+    let (out, _) = run("run 2", &store, &runner).await.unwrap();
+    assert!(out[0].contains("turns 12/40"), "{out:?}");
+    assert_eq!(script.seen.lock()[0].max_turns, Some(40));
+
+    // budgets off leaves the cap on; --turns overrides the complexity
+    run("add task U parent 1", &store, &worker()).await.unwrap();
+    let script = Scripted::new(vec![says("done", vec![])]);
+    let runner =
+        Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone()))).with_budgets(false).with_turns(Some(12));
+    let (out, _) = run("run 3", &store, &runner).await.unwrap();
+    assert!(out[0].contains("turns 1/12"), "{out:?}");
+    let seen = script.seen.lock();
+    assert_eq!(seen[0].budget_usd, None);
+    assert_eq!(seen[0].max_turns, Some(12));
+}
+
+#[tokio::test]
+async fn a_bare_model_stops_at_the_turn_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task T parent 1", &store, &worker()).await.unwrap();
+    let read = |n: &str| ra_providers::ToolCall { id: n.into(), name: "list_dir".into(), arguments: r#"{"path":"."}"#.into() };
+    let provider = Scripted::new(vec![says("looking", vec![read("c1")]), says("still", vec![read("c2")]), says("never reached", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_turns(Some(2));
+    let error = run("run 2", &store, &runner).await.unwrap_err();
+    assert!(format!("{error:#}").contains("2 turns"), "{error:#}");
+    assert_eq!(provider.seen.lock().len(), 2);
 }
 
 #[tokio::test]

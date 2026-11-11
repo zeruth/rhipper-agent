@@ -164,7 +164,8 @@ impl ClaudeCode {
         if request.workspace.is_some() {
             // a worker: the file tools and the allowed shell commands, inside the workspace
             args.extend(["--permission-mode".to_owned(), "acceptEdits".to_owned()]);
-            args.extend(["--max-turns".to_owned(), self.max_turns.to_string()]);
+            // the card's cap when the request carries one, else the provider's
+            args.extend(["--max-turns".to_owned(), request.max_turns.unwrap_or(self.max_turns).to_string()]);
             if !self.allowed_shell.is_empty() {
                 args.push("--allowedTools".to_owned());
                 args.extend(self.allowed_shell.iter().cloned());
@@ -430,7 +431,7 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
         cost_usd: parsed.total_cost_usd,
     });
     let session_id = parsed.session_id.filter(|s| !s.trim().is_empty());
-    Ok(Completion { text, usage, tool_calls: Vec::new(), session_id, gotchas: Vec::new() })
+    Ok(Completion { text, usage, turns: parsed.num_turns, tool_calls: Vec::new(), session_id, gotchas: Vec::new() })
 }
 
 /// The gotchas one stream event shows: a command about to run that the catalogue would refuse

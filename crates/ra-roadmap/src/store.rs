@@ -112,6 +112,54 @@ impl Store {
         Ok(id)
     }
 
+    /// Renames a node.
+    pub async fn rename(&self, id: i64, title: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!title.trim().is_empty(), "a title is not empty");
+        let mut nodes = self.all().await?;
+        node_mut(&mut nodes, id)?.title = title.trim().to_owned();
+        self.write(nodes).await
+    }
+
+    /// Adds the items of an outline under `parent`: a milestone under the parent, a section
+    /// under the last milestone, a task under the last section or milestone, a subtask under the
+    /// last task. When the parent is the project and the outline names a title, the project
+    /// takes it. Returns the ids added, in order.
+    pub async fn import(&self, parent: i64, outline: &crate::outline::Outline) -> anyhow::Result<Vec<i64>> {
+        use crate::outline::Item;
+        let root = self.read(parent).await?;
+        if let Some(title) = &outline.title
+            && root.kind == NodeKind::Project
+        {
+            self.rename(parent, title).await?;
+        }
+        let (mut milestone, mut section, mut task) = (None, None, None);
+        let mut ids = Vec::new();
+        for Item { kind, title, complexity, done, objective, acceptance, files } in &outline.items {
+            let under = match kind {
+                NodeKind::Project | NodeKind::Milestone => parent,
+                NodeKind::Section => milestone.unwrap_or(parent),
+                NodeKind::Task => section.or(milestone).unwrap_or(parent),
+                NodeKind::Subtask => task.or(section).or(milestone).unwrap_or(parent),
+            };
+            let kind = if *kind == NodeKind::Project { NodeKind::Milestone } else { *kind };
+            let id = self.insert(Some(under), kind, title, objective.as_deref(), acceptance.as_deref(), *complexity).await?;
+            if !files.is_empty() {
+                self.set_files(id, files).await?;
+            }
+            if *done {
+                self.set_state(id, TaskState::Accepted).await?;
+            }
+            match kind {
+                NodeKind::Milestone => (milestone, section, task) = (Some(id), None, None),
+                NodeKind::Section => (section, task) = (Some(id), None),
+                NodeKind::Task => task = Some(id),
+                _ => {}
+            }
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
     /// Adds a dependency: `id` waits for `waits_for`.
     pub async fn depend_on(&self, id: i64, waits_for: i64) -> anyhow::Result<()> {
         let mut nodes = self.all().await?;

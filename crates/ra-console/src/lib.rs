@@ -5,11 +5,13 @@
 
 pub mod agent;
 pub mod commands;
+pub mod install;
 pub mod instance;
 pub mod logs;
 pub mod mcp;
 pub mod roadmap_pane;
 pub mod secret;
+pub mod setup;
 pub mod theme;
 pub mod trace;
 pub mod ui;

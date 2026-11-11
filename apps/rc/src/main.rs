@@ -76,9 +76,13 @@ enum Command {
         /// (c1 0.25, c2 0.50, c3 1.00, c4 2.00, c5 5.00) while budgets are on.
         #[arg(long)]
         budget: Option<f64>,
-        /// No cap at all: the run spends what it needs. RHIPPER_BUDGETS=off does the same everywhere.
+        /// No dollar cap: the run spends what it needs. RHIPPER_BUDGETS=off does the same everywhere.
         #[arg(long)]
         no_budget: bool,
+        /// The most turns the run may take; left out, the node's complexity sets it
+        /// (c1 15, c2 25, c3 40, c4 60, c5 90), budgets on or off.
+        #[arg(long)]
+        turns: Option<u32>,
     },
     /// Starts the console over the orchestrator.
     Console {
@@ -104,6 +108,24 @@ enum Command {
     },
     /// The gotchas that fired, by id, and the refused commands no gotcha names yet.
     Gotchas,
+    /// Makes this directory a project: drafts rhipper.md with a strong model from what the directory shows, imports a roadmap-shaped file, or starts empty.
+    Init {
+        /// A roadmap-shaped file (ROADMAP.md, TODO.md, a plan) the model converts, keeping every item.
+        #[arg(long)]
+        import: Option<PathBuf>,
+        /// The bare project and nothing else, no model call.
+        #[arg(long)]
+        empty: bool,
+        /// The model that drafts or converts.
+        #[arg(long, default_value = ra_console::setup::SETUP_MODEL)]
+        model: String,
+    },
+    /// Installs this build (rc and rc-gui) into a directory on the path, so the running instances never lock target/.
+    Install {
+        /// The directory; left out, %LOCALAPPDATA%\Programs\rhipper on Windows, ~/.local/bin elsewhere.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// The context a run carries: the project's (rhipper.context.md), or a task's with the outlines of its files and its handoffs.
     Context {
         /// The task; left out, the project context.
@@ -146,17 +168,18 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             usage().await
         }
-        Command::Run { id, model, budget, no_budget } => {
+        Command::Run { id, model, budget, no_budget, turns } => {
             plain_tracing()?;
             if let Some(budget) = budget {
                 anyhow::ensure!(budget.is_finite() && budget > 0.0, "the budget is a positive number of dollars");
             }
+            anyhow::ensure!(turns != Some(0), "the turn cap is at least one");
             let store = open_store().await?;
             let picked = match model {
                 Some(model) => model,
                 None => store.read(id).await?.assignee.map_or_else(|| ra_console::ui::DEFAULT_MODEL.to_owned(), |a| a.model),
             };
-            let mut worker = Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget);
+            let mut worker = Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns);
             if no_budget {
                 worker = worker.with_budgets(false);
             }
@@ -171,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Mcp { roadmap } => {
             plain_tracing()?;
+            ensure_roadmap(&roadmap)?;
             let store = Store::open(&roadmap, "Rhipper Agent").await?;
             let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
             ra_console::mcp::serve(store, worker).await
@@ -179,6 +203,25 @@ async fn main() -> anyhow::Result<()> {
         // a hook answers fast and stays silent on anything it cannot judge; no trace file either
         Command::Hook { event } => hook(&event),
         Command::Gotchas => gotchas(),
+        Command::Init { import, empty, model } => {
+            plain_tracing()?;
+            let mode = match (import, empty) {
+                (Some(file), _) => ra_console::setup::Mode::Import(file),
+                (None, true) => ra_console::setup::Mode::Empty,
+                (None, false) => ra_console::setup::Mode::Draft,
+            };
+            let worker = Worker::new(model).with_ledger(open_ledger().await?);
+            for line in ra_console::setup::init(Path::new("."), &worker, mode).await? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Command::Install { dir } => {
+            for line in ra_console::install::install(dir.as_deref())? {
+                println!("{line}");
+            }
+            Ok(())
+        }
         Command::Context { id, init } => {
             plain_tracing()?;
             context(id, init).await
@@ -350,7 +393,18 @@ fn plain_tracing() -> anyhow::Result<()> {
 }
 
 async fn open_store() -> anyhow::Result<Store> {
+    ensure_roadmap(&store_path())?;
     Store::open(&store_path(), "Rhipper Agent").await
+}
+
+/// A command over a roadmap needs one: a directory without it is told what `rc init` does,
+/// rather than getting a bare file on the quiet.
+fn ensure_roadmap(roadmap: &Path) -> anyhow::Result<()> {
+    if roadmap.is_file() {
+        return Ok(());
+    }
+    let root = roadmap.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    anyhow::bail!("{}", ra_console::setup::hint(root).join("\n"))
 }
 
 async fn show(id: Option<i64>) -> anyhow::Result<()> {
@@ -426,6 +480,7 @@ async fn set(id: i64, state: TaskState) -> anyhow::Result<()> {
 async fn console(roadmap: PathBuf, replace: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all("var")?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open("var/console.log")?;
+    ensure_roadmap(&roadmap)?;
     let store = Store::open(&roadmap, "Rhipper Agent").await?;
     if !ra_console::ui::is_terminal() {
         anyhow::bail!("the console needs a terminal");

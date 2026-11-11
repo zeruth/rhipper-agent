@@ -77,6 +77,9 @@ pub struct Worker {
     /// `RHIPPER_BUDGETS=off` is in the environment, `--no-budget` was passed, or `budgets off`
     /// was typed: a subscription has no bill to guard.
     pub budgets: bool,
+    /// The turn cap of a run, from `--turns`; `None` takes it from the node's complexity. It
+    /// holds whether budgets are on or off: on a subscription the turns are the cost.
+    pub turns: Option<u32>,
     /// What answers the commands of a run instead of the shell; the tests script the check and
     /// the lint with it.
     script: Option<ra_tools::Script>,
@@ -93,8 +96,16 @@ impl Worker {
             budget: None,
             budgets: !std::env::var("RHIPPER_BUDGETS")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
+            turns: None,
             script: None,
         }
+    }
+
+    /// The same worker, with every run capped at `turns` turns instead of the complexity's.
+    #[must_use]
+    pub fn with_turns(mut self, turns: Option<u32>) -> Self {
+        self.turns = turns;
+        self
     }
 
     /// The same worker, with `script` answering every command a run makes instead of the shell.
@@ -183,7 +194,7 @@ impl Worker {
 
     /// Books one completion against the tally and the ledger. A ledger that cannot be written is
     /// a warning, not a failed run: the answer already came back.
-    async fn record(&self, node: Option<i64>, usage: &Usage) {
+    pub(crate) async fn record(&self, node: Option<i64>, usage: &Usage) {
         let entry = Entry {
             model: self.model.clone(),
             node,
@@ -255,6 +266,7 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
             workspace: None,
             budget_usd: None,
             resume: None,
+            max_turns: None,
         })
         .await
         .map_err(map_error)?;
@@ -315,6 +327,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     let dirty_before = git_status(&root).await;
     // an explicit budget, else the complexity's while budgets are on, else none at all
     let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
+    // an explicit turn cap, else the complexity's: it stays on with budgets off
+    let cap = worker.turns.unwrap_or_else(|| ra_providers::turns_for(node.complexity));
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
     let session = if provider.has_own_tools() {
@@ -340,6 +354,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
                 budget_usd: budget,
                 // the session of the last run of this node, so the harness keeps its context
                 resume: node.session.clone(),
+                max_turns: Some(cap),
             })
             .await
             .map_err(map_error);
@@ -351,14 +366,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
                     // kept on the node: the next run of it resumes this session
                     store.set_session(id, Some(session)).await?;
                 }
-                Ok(Session { text: answer.text, usage: answer.usage, calls: 0, turns: 1 })
+                Ok(Session { text: answer.text, usage: answer.usage, calls: 0, turns: answer.turns, cap })
             }
             Err(error) => Err(error),
         }
     } else {
         // a bare model reads the project context at the head of its task
         let context = if project.is_empty() { context } else { format!("The project:\n{project}\n\n{context}") };
-        tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref(), budget).await
+        tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref(), budget, cap).await
     };
     // the handoff of this run, for the next one of the card; the done cards' files go
     let handoff = |outcome: &str, check: &str, report: &str, changed: Vec<String>| ra_context::Handoff {
@@ -439,13 +454,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     save_context(store, &root, &task).await;
     let mut lines = vec![
         format!(
-            "{} #{} {} {} on {} · {} turn(s), {} tool call(s) · in {} out {} · {}",
+            "{} #{} {} {} on {} · turns {}/{}, {} tool call(s) · in {} out {} · {}",
             if passed { "✓" } else { "✗" },
             id,
             node.title,
             if passed { "implemented" } else { "needs revision" },
             short(&worker.model),
             session.turns,
+            session.cap,
             session.calls,
             session.usage.prompt_tokens,
             session.usage.completion_tokens,
@@ -567,16 +583,14 @@ fn machine_notes(workspace: &Path) -> String {
 }
 
 /// What one worker session came to: the final answer, the usage summed over its turns, and how
-/// much it did.
+/// much it did of the turns it had.
 struct Session {
     text: String,
     usage: Usage,
     calls: usize,
-    turns: usize,
+    turns: u64,
+    cap: u32,
 }
-
-/// The most turns a tool loop takes before it stops the worker.
-const MAX_TURNS: usize = 40;
 
 /// The dollar budget of a run on a node of `complexity`, when `--budget` names none: c1 $0.25,
 /// c2 $0.50, c3 $1.00, c4 $2.00, c5 $5.00. An out-of-range complexity takes the nearest end.
@@ -595,7 +609,7 @@ pub fn budget_for(complexity: u8) -> f64 {
 struct OverBudget {
     budget: f64,
     spent: f64,
-    turns: usize,
+    turns: u32,
     calls: usize,
 }
 
@@ -612,8 +626,8 @@ impl std::fmt::Display for OverBudget {
 impl std::error::Error for OverBudget {}
 
 /// The tool loop of a bare model: the model answers with tool calls, the toolbox executes them in
-/// the workspace, the results go back, until the model answers in words, the turns run out, or
-/// the summed cost crosses `budget`.
+/// the workspace, the results go back, until the model answers in words, the `cap` turns run out,
+/// or the summed cost crosses `budget`.
 async fn tool_loop(
     provider: &dyn ModelProvider,
     worker: &Worker,
@@ -621,13 +635,14 @@ async fn tool_loop(
     context: String,
     workspace: Option<&Path>,
     budget: Option<f64>,
+    cap: u32,
 ) -> anyhow::Result<Session> {
     let workspace = workspace.context("the worker has no workspace to act in")?;
     let toolbox = worker.toolbox(workspace)?;
     let mut messages = vec![Message::system(SYSTEM), Message::user(context)];
     let mut usage = Usage::default();
     let mut calls = 0usize;
-    for turn in 1..=MAX_TURNS {
+    for turn in 1..=cap {
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
@@ -638,6 +653,7 @@ async fn tool_loop(
                 workspace: Some(workspace.to_path_buf()),
                 budget_usd: budget,
                 resume: None,
+                max_turns: Some(cap),
             })
             .await
             .map_err(map_error)?;
@@ -645,7 +661,7 @@ async fn tool_loop(
         worker.record(Some(id), &answer.usage).await;
         add_usage(&mut usage, &answer.usage);
         if answer.tool_calls.is_empty() {
-            return Ok(Session { text: answer.text, usage, calls, turns: turn });
+            return Ok(Session { text: answer.text, usage, calls, turns: u64::from(turn), cap });
         }
         // the budget is checked before the tools run: the work it would pay for is not done
         if let Some((budget, spent)) = budget.zip(usage.cost_usd).filter(|(budget, spent)| spent > budget) {
@@ -659,7 +675,7 @@ async fn tool_loop(
             calls += 1;
         }
     }
-    anyhow::bail!("the worker made {calls} tool call(s) in {MAX_TURNS} turns without finishing; the task may need splitting")
+    anyhow::bail!("the worker made {calls} tool call(s) in {cap} turns without finishing; raise the cap with --turns or split the task")
 }
 
 /// Adds one completion's usage to a running sum.
@@ -779,6 +795,7 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
             workspace: None,
             budget_usd: None,
             resume: None,
+            max_turns: None,
         })
         .await
         .map_err(map_error)?;
@@ -935,7 +952,7 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
 }
 
 /// Maps a provider error to a refusal that names what to do.
-fn map_error(error: ProviderError) -> anyhow::Error {
+pub(crate) fn map_error(error: ProviderError) -> anyhow::Error {
     match error {
         ProviderError::Auth(_) => anyhow::anyhow!("the provider refused the key: check OPENROUTER_API_KEY, or set one with key <paste>"),
         ProviderError::UnknownModel(model) => anyhow::anyhow!("the provider knows no model {model}"),

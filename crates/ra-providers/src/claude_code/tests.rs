@@ -2,6 +2,7 @@
 //! the real binary.
 
 use super::*;
+use crate::turns_for;
 
 fn request(workspace: Option<PathBuf>) -> CompletionRequest {
     CompletionRequest {
@@ -13,7 +14,29 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
         workspace,
         budget_usd: None,
         resume: None,
+        max_turns: None,
     }
+}
+
+#[test]
+fn the_turn_cap_follows_the_complexity_unless_the_request_names_one() {
+    assert_eq!([1, 2, 3, 4, 5].map(turns_for), [15, 25, 40, 60, 90]);
+    for complexity in 1..=5 {
+        let mut worker = request(Some(PathBuf::from(".")));
+        worker.max_turns = Some(turns_for(complexity));
+        let args = ClaudeCode::new().args(&worker);
+        let cap = turns_for(complexity).to_string();
+        assert!(args.windows(2).any(|w| w == ["--max-turns", cap.as_str()]), "c{complexity}: {args:?}");
+    }
+    // `rc run --turns 12` overrides the complexity; a request without a cap takes the provider's
+    let mut worker = request(Some(PathBuf::from(".")));
+    worker.max_turns = Some(12);
+    let args = ClaudeCode::new().with_max_turns(60).args(&worker);
+    assert!(args.windows(2).any(|w| w == ["--max-turns", "12"]), "{args:?}");
+    // the cap stays on without a budget: the turns are the cost on a subscription
+    assert!(!args.contains(&"--max-budget-usd".to_owned()), "{args:?}");
+    let json = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":12,"result":"done","session_id":"s"}"#;
+    assert_eq!(parse_result(json).unwrap().turns, 12);
 }
 
 #[test]

@@ -8,5 +8,6 @@
 
 pub mod markdown;
 pub mod model;
+pub mod outline;
 pub mod store;
 pub mod tree;
