@@ -380,10 +380,6 @@ struct App {
     gauges: Gauges,
     /// The tokens the runs took, from every open project's ledger, for the row under them.
     tokens: TokenGauges,
-    /// What the dashboard's cards overshot the room under the gauges by last frame, from the
-    /// spacing egui puts around them: taken off the growing cards' shares this frame, so the
-    /// cards end exactly at the bottom and no scroll bar appears for a few pixels.
-    dash_slack: f32,
 }
 
 /// One reading of the machine: the cpu's share in use (0 to 1) and the bytes of memory and of
@@ -740,7 +736,6 @@ impl App {
             down: "close",
             gauges: Gauges::start(&projects[0]),
             tokens: TokenGauges::default(),
-            dash_slack: 0.0,
         };
         for project in projects {
             app.open(&cc.egui_ctx, project);
@@ -1191,9 +1186,13 @@ impl App {
             let small: Vec<bool> = self.tabs.iter().map(Workspace::dashboard_small).collect();
             let kept: f32 = self.tabs.iter().zip(&small).filter(|(_, s)| **s).map(|(t, _)| t.dash_height).sum();
             let growing = small.iter().filter(|s| !**s).count().max(1) as f32;
-            let any_growing = small.iter().any(|s| !*s);
-            let budget = ((left - kept - 10.0 * (count - 1.0) - self.dash_slack) / growing).max(0.0);
-            let shown = egui::ScrollArea::vertical().id_salt("dashboard").auto_shrink([false, false]).show(ui, |ui| {
+            // what every card costs beyond its own height: the spacing egui puts after a
+            // widget and the space added under it. Computed, not measured and fed back: a
+            // correction loop integrated a sub-pixel residual every frame, the shares crept,
+            // and a row flipped in or out about once a second
+            let between = ui.spacing().item_spacing.y + 10.0;
+            let budget = ((left - kept - between * count) / growing).floor().max(0.0);
+            egui::ScrollArea::vertical().id_salt("dashboard").auto_shrink([false, false]).show(ui, |ui| {
                 // the page's width, handed down: a card holds itself to it, so nothing in it
                 // takes the room a scroll area's content would otherwise be allowed
                 ui.set_width(page);
@@ -1206,13 +1205,6 @@ impl App {
                     ui.add_space(10.0);
                 }
             });
-            // what the cards came to against the room: the shares are linear in it, so the
-            // next frame's shares, less this overshoot, end on the bottom edge. Only while a
-            // card grows: cards at their natural height leave the room they leave
-            if any_growing {
-                let over = shown.content_size.y - left;
-                self.dash_slack = (self.dash_slack + over).clamp(-40.0, 400.0);
-            }
         });
         if let Some(i) = open {
             self.active = i;
@@ -4076,7 +4068,7 @@ impl Workspace {
         let job = self.job.clone();
         // the rows read as in the column: the running card first, then the next ready ones
         let mut rows: Vec<i64> = running.into_iter().collect();
-        rows.extend(order.iter().copied().filter(|id| Some(*id) != running).take(if running.is_some() { 5 } else { 6 }));
+        rows.extend(order.iter().copied().filter(|id| Some(*id) != running).take(6));
         // the ready cards past the six: the queue adds them one by one while the card's share
         // of the window has room for another row
         let extra: Vec<i64> = order.iter().copied().filter(|id| Some(*id) != running && !rows.contains(id)).collect();

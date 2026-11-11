@@ -58,6 +58,11 @@ pub(crate) fn draw(ui: &mut Ui, sink: &Sink, show_debug: bool) {
 /// follow the work, never the page.
 const DASHBOARD_ROWS: f32 = 3.0;
 
+/// The height one step row came to on the dashboard last frame, as f32 bits: the field, its
+/// badge and the spacing under it, measured rather than estimated, since the badge's own
+/// padding is not the font's. Zero until a row was drawn.
+static ROW_PITCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// The latest run's card alone, the live one before a finished one, for the dashboard, in
 /// `room` points of height at most (the queue beside it sets it); `false` when the session
 /// has run nothing yet.
@@ -302,7 +307,11 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     // line, the field's margins (2 above and below) and the spacing between rows. A constant
     // of 24 here drew a row or two short and padded the rest blank. The folded line, when
     // the steps overflow, takes one of the rows. The console keeps its clip arithmetic
-    let row = if bounded { ui.fonts_mut(|f| f.row_height(&font)) + 4.0 + ui.spacing().item_spacing.y } else { 24.0 };
+    // a bounded card's row pitch is what the rows measured last frame (the field, the badge
+    // in it and the spacing under it), 24 until one was drawn: an estimate from the font
+    // ran short of the badge's own padding, the card overflowed its share, and the shares
+    // hunted
+    let row = if bounded { f32::from_bits(ROW_PITCH.load(std::sync::atomic::Ordering::Relaxed)).max(24.0) } else { 24.0 };
     let overhead = if bounded { 0.0 } else { 136.0 };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let fit = ((room - overhead) / row).floor().max(0.0) as usize;
@@ -320,13 +329,15 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     // a bounded card spreads what is left under a whole number of rows between them, so the
     // rows end on the card's bottom edge instead of a part of a row short of it; the spacing
     // is this card's alone
+    let mut added = 0.0;
     if bounded {
         let rows = (body + usize::from(hidden > 0)) as f32;
         let extra = ((room - rows * row) / rows).clamp(0.0, row);
         // on the pixel grid: a fraction of a pixel between rows put the text between pixels,
         // and it snapped up or down a pixel from frame to frame
         let ppp = ui.pixels_per_point();
-        ui.spacing_mut().item_spacing.y += (extra * ppp).floor() / ppp;
+        added = (extra * ppp).floor() / ppp;
+        ui.spacing_mut().item_spacing.y += added;
     }
     // the entries that fell off the top fold into one line, which takes a row of its own
     let skip = if hidden > 0 { hidden + 1 } else { 0 };
@@ -344,6 +355,7 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     }
     let shown: Vec<(&str, usize)> = folded.into_iter().skip(skip).collect();
     let drawn = shown.len();
+    let rows_top = ui.min_rect().max.y;
     // every step on a dark field of its own, a code line's: the tool's badge, the text, the
     // count of its repeats; the worker's own words sit on the card itself
     let field = theme::mix(theme::bg(), theme::deep(), 0.6);
@@ -366,6 +378,13 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
                 }
             });
         });
+    }
+    // what a row came to, spacing included and the spread taken off, for next frame's count
+    if bounded && drawn > 0 {
+        let pitch = (ui.min_rect().max.y - rows_top) / drawn as f32 - added;
+        if pitch.is_finite() && pitch > 0.0 {
+            ROW_PITCH.store(pitch.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
     }
     // a live card in the console keeps its rows open; a bounded card pads to its room instead
     if run.live() && !bounded {
