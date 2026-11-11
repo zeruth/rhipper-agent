@@ -58,7 +58,8 @@ enum Command {
     },
     /// One round trip to a model: the answer and the usage.
     Ping {
-        /// The model: a claude-* id runs on Claude Code, vendor/model on OpenRouter.
+        /// The model: a claude-* id runs on Claude Code, local/<name> on the local server at
+        /// RHIPPER_LOCAL_URL, vendor/model on OpenRouter.
         #[arg(long, default_value = ra_console::ui::DEFAULT_MODEL)]
         model: String,
     },

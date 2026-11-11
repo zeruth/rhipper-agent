@@ -42,7 +42,10 @@ The model decides the route. A bare Claude id such as `claude-opus-5-5` runs on 
 Code (`claude -p`), on the machine's own login, so a subscription pays for the work; the harness
 brings its own tools and acts in the directory of the roadmap file. A vendor-prefixed id such as
 `z-ai/glm-5.3-flash` goes through OpenRouter with the key from `OPENROUTER_API_KEY` or the
-console's `key` command; a bare model gets the `ra-tools` toolbox and runs through the tool loop.
+console's `key` command. A `local/<name>` id goes to a local OpenAI-compatible server such as
+llama.cpp at `RHIPPER_LOCAL_URL` (default `http://127.0.0.1:8080/v1`), with no key; the id goes
+out as typed, which a single-model server ignores. A bare model on either route gets the `ra-tools`
+toolbox and runs through the tool loop.
 
 A node can name its own model (`assign <id> <model>`), the files its change lands in (`files <id>
 <path>...`, which the worker reads first), and a budget comes from its complexity (c1 $0.25 up to

@@ -15,6 +15,73 @@ fn a_model_id_routes_by_its_vendor_prefix() {
     assert_eq!(Route::of("opus"), Route::ClaudeCode);
     assert_eq!(Route::of("z-ai/glm-5.3-flash"), Route::OpenRouter);
     assert_eq!(Route::of("anthropic/claude-sonnet-5.5"), Route::OpenRouter);
+    assert_eq!(Route::of("local/qwen3"), Route::Local);
+    // only the prefix routes locally: a vendor named local-something is still OpenRouter
+    assert_eq!(Route::of("local-ai/qwen3"), Route::OpenRouter);
+    assert_eq!(Route::of("local"), Route::ClaudeCode);
+}
+
+#[tokio::test]
+async fn a_ping_on_the_local_route_with_nothing_listening_names_the_url() {
+    // a port that was just freed, so the test never depends on what runs on 8080 here
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
+    drop(listener);
+    // the env lock covers the variable for the whole ping, as the secret tests do for the key
+    let guard = crate::secret::ENV_LOCK.lock();
+    let before = std::env::var(ra_providers::openrouter::LOCAL_URL_VAR).ok();
+    // SAFETY: the test holds the env lock; no parallel test reads the variable
+    unsafe { std::env::set_var(ra_providers::openrouter::LOCAL_URL_VAR, &url) };
+    let error = run("ping", &store().await, &Worker::new("local/x")).await.unwrap_err();
+    // SAFETY: still under the env lock
+    unsafe {
+        match before {
+            Some(value) => std::env::set_var(ra_providers::openrouter::LOCAL_URL_VAR, value),
+            None => std::env::remove_var(ra_providers::openrouter::LOCAL_URL_VAR),
+        }
+    }
+    drop(guard);
+    let text = format!("{error:#}");
+    assert!(text.contains("the provider is unreachable"), "{text}");
+    assert!(text.contains(&url), "{text}");
+}
+
+#[tokio::test]
+async fn a_local_model_pings_a_server_on_the_loopback() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        if let Ok((mut socket, _)) = listener.accept() {
+            let mut buffer = [0u8; 4096];
+            let _ = socket.read(&mut buffer);
+            let body =
+                r#"{"choices":[{"message":{"content":"pong","role":"assistant"}}],"usage":{"prompt_tokens":7,"completion_tokens":1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+        }
+    });
+    let guard = crate::secret::ENV_LOCK.lock();
+    let before = std::env::var(ra_providers::openrouter::LOCAL_URL_VAR).ok();
+    // SAFETY: the test holds the env lock; no parallel test reads the variable
+    unsafe { std::env::set_var(ra_providers::openrouter::LOCAL_URL_VAR, &url) };
+    let worker = Worker::new("local/qwen3");
+    let result = run("ping", &store().await, &worker).await;
+    // SAFETY: still under the env lock
+    unsafe {
+        match before {
+            Some(value) => std::env::set_var(ra_providers::openrouter::LOCAL_URL_VAR, value),
+            None => std::env::remove_var(ra_providers::openrouter::LOCAL_URL_VAR),
+        }
+    }
+    drop(guard);
+    let (out, _) = result.unwrap();
+    assert_eq!(out[0], "qwen3 says: pong");
+    assert!(out[1].contains("in 7 out 1"), "{out:?}");
+    assert_eq!(worker.route(), crate::agent::Route::Local);
 }
 
 async fn store() -> Store {
@@ -70,7 +137,7 @@ async fn assign_sets_and_clears_the_model_of_a_node() {
     let store = store().await;
     run("add task T parent 1", &store, &worker()).await.unwrap();
     let (out, _) = run("assign 2 claude-haiku-4-5", &store, &worker()).await.unwrap();
-    assert_eq!(out, vec!["#2 runs on claude-haiku-4-5 through ClaudeCode"]);
+    assert_eq!(out, vec!["#2 runs on claude-haiku-4-5 through Claude Code"]);
     assert_eq!(store.read(2).await.unwrap().assignee.unwrap().model, "claude-haiku-4-5");
     let (out, _) = run("assign 2 none", &store, &worker()).await.unwrap();
     assert_eq!(out, vec!["#2 runs on the badge model"]);

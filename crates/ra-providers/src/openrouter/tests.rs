@@ -7,12 +7,19 @@ use std::net::TcpListener;
 
 /// The path a test answers on: it waits for one request and replies with `status` and `body`.
 fn serve(status_line: &'static str, body: &'static str) -> String {
+    serve_capturing(status_line, body).0
+}
+
+/// [`serve`], with the raw request the server read handed back on the channel.
+fn serve_capturing(status_line: &'static str, body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         if let Ok((mut socket, _)) = listener.accept() {
             let mut buffer = [0u8; 4096];
-            let _ = socket.read(&mut buffer);
+            let read = socket.read(&mut buffer).unwrap_or(0);
+            let _ = sender.send(String::from_utf8_lossy(&buffer[..read]).into_owned());
             let response = format!(
                 "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
@@ -20,7 +27,15 @@ fn serve(status_line: &'static str, body: &'static str) -> String {
             let _ = socket.write_all(response.as_bytes());
         }
     });
-    format!("http://127.0.0.1:{port}")
+    (format!("http://127.0.0.1:{port}"), receiver)
+}
+
+/// A URL on 127.0.0.1 with nothing listening: the port of a listener that was just dropped.
+fn closed_port() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}/v1")
 }
 
 fn model() -> &'static str {
@@ -113,6 +128,45 @@ async fn a_tool_call_answer_with_no_text_is_not_a_refusal() {
     let answer = provider.complete(request()).await.unwrap();
     assert!(answer.text.is_empty());
     assert_eq!(answer.tool_calls.len(), 1);
+}
+
+#[tokio::test]
+async fn a_local_server_answers_a_ping_without_a_key() {
+    let (base, request_seen) = serve_capturing("HTTP/1.1 200 OK", r#"{"choices":[{"message":{"content":"pong","role":"assistant"}}]}"#);
+    // a trailing slash on the root reaches the same endpoint
+    let provider = OpenRouter::at(&format!("{base}/v1/"), "").unwrap();
+    assert_eq!(provider.base_url(), format!("{base}/v1"));
+    let mut request = request();
+    request.model = "local/qwen3".to_owned();
+    let answer = provider.complete(request).await.unwrap();
+    assert_eq!(answer.text, "pong");
+    let raw = request_seen.recv().unwrap();
+    assert!(raw.starts_with("POST /v1/chat/completions "), "{raw}");
+    assert!(!raw.to_ascii_lowercase().contains("authorization:"), "an empty key sends no header: {raw}");
+}
+
+#[tokio::test]
+async fn a_key_goes_out_as_a_bearer_header() {
+    let (base, request_seen) = serve_capturing("HTTP/1.1 200 OK", r#"{"choices":[{"message":{"content":"pong","role":"assistant"}}]}"#);
+    OpenRouter::at(&base, "sk-or-test").unwrap().complete(request()).await.unwrap();
+    assert!(request_seen.recv().unwrap().contains("authorization: Bearer sk-or-test"), "the key rides as a bearer token");
+}
+
+#[tokio::test]
+async fn nothing_listening_is_unreachable_and_names_the_url() {
+    let base = closed_port();
+    let provider = OpenRouter::at(&base, "").unwrap();
+    let error = provider.complete(request()).await.unwrap_err();
+    assert!(matches!(error, ProviderError::Unavailable(_)), "{error}");
+    assert!(format!("{error}").contains(&format!("{base}/chat/completions")), "{error}");
+}
+
+#[test]
+fn the_local_url_defaults_to_llama_cpp_and_reads_the_variable() {
+    // the variable is read, not set, by this test: the default holds unless the machine sets it
+    let expected = std::env::var(LOCAL_URL_VAR).ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| DEFAULT_LOCAL_URL.to_owned());
+    assert_eq!(local_url(), expected.trim());
+    assert_eq!(DEFAULT_LOCAL_URL, "http://127.0.0.1:8080/v1");
 }
 
 #[test]

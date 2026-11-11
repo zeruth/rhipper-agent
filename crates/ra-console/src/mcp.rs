@@ -102,7 +102,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "details",
-            "Sets the objective, the acceptance, the notes or the model of a node; a field left out keeps its text. The model is per-node routing: a claude-* id runs on Claude Code, vendor/model on OpenRouter; an empty string clears it.",
+            "Sets the objective, the acceptance, the notes or the model of a node; a field left out keeps its text. The model is per-node routing: a claude-* id runs on Claude Code, local/<name> on the local OpenAI-compatible server, vendor/model on OpenRouter; an empty string clears it.",
             json!({
                 "id": id,
                 "objective": {"type": "string"},

@@ -30,7 +30,7 @@ const PROMPT: &str = "❯ ";
 /// Rows a mouse wheel notch scrolls.
 const WHEEL_ROWS: usize = 3;
 /// The model the console starts with; `model` swaps it. A bare Claude id runs on the local
-/// Claude Code; a vendor-prefixed id goes through OpenRouter.
+/// Claude Code; `local/<name>` goes to the local server; a vendor-prefixed id goes through OpenRouter.
 pub const DEFAULT_MODEL: &str = "claude-fable-5-1";
 
 /// Whether stdout is a terminal; the console needs one.
@@ -802,11 +802,7 @@ fn status_line(app: &App) -> Line<'static> {
     // the plan's windows, colored by how full they are
     if app.limits.fresh() {
         for (name, window) in &app.limits.windows {
-            let label = match name.as_str() {
-                "five_hour" => "5h",
-                "seven_day" => "week",
-                other => other,
-            };
+            let label = ra_providers::limits::label(name);
             let color = if window.utilization >= 0.8 {
                 theme::ERROR_TEXT
             } else if window.utilization >= 0.5 {

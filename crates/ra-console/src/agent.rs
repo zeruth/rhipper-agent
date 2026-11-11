@@ -24,18 +24,35 @@ const GOTCHAS_LOG: &str = "var/gotchas.log";
 /// How many of the latest hits the machine notes of a run draw on.
 const RECENT_HITS: usize = 30;
 
-/// Where a model id routes: a bare Claude id runs on the local Claude Code; an id with a vendor
-/// prefix, such as `z-ai/glm-5.3-flash`, goes through OpenRouter.
+/// Where a model id routes: a bare Claude id runs on the local Claude Code; `local/<name>` goes to
+/// the local OpenAI-compatible server at `RHIPPER_LOCAL_URL`; any other id with a vendor prefix,
+/// such as `z-ai/glm-5.3-flash`, goes through OpenRouter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     ClaudeCode,
     OpenRouter,
+    Local,
 }
 
 impl Route {
     /// The route of a model id.
     pub fn of(model: &str) -> Self {
-        if model.contains('/') { Self::OpenRouter } else { Self::ClaudeCode }
+        if model.starts_with("local/") {
+            Self::Local
+        } else if model.contains('/') {
+            Self::OpenRouter
+        } else {
+            Self::ClaudeCode
+        }
+    }
+
+    /// The name of the route for a log line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::OpenRouter => "OpenRouter",
+            Self::Local => "the local server",
+        }
     }
 }
 
@@ -142,7 +159,7 @@ impl Worker {
 
     /// The provider of the badge model, connected on the first call. OpenRouter needs the key
     /// from the credential store or the environment, and a missing one is the error; Claude Code
-    /// needs only its own login.
+    /// needs only its own login; the local server needs no key, only to be running.
     pub fn provider(&self) -> anyhow::Result<Arc<dyn ModelProvider>> {
         let route = self.route();
         let mut slot = self.provider.lock();
@@ -164,6 +181,8 @@ impl Worker {
                 Arc::new(harness)
             }
             Route::OpenRouter => Arc::new(ra_providers::openrouter::OpenRouter::new(secret::api_key()?)?),
+            // the same wire format as OpenRouter, at the local URL and with no key
+            Route::Local => Arc::new(ra_providers::openrouter::OpenRouter::local()?),
         };
         *slot = Some((route, provider.clone()));
         Ok(provider)

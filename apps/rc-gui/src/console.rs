@@ -125,7 +125,16 @@ fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: us
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(title).strong().color(theme::TEXT));
+                // the task and the model as badges, the way the status bar wears them
+                match title.rsplit_once(" · ") {
+                    Some((task, model)) => {
+                        crate::cards::badge_marked(ui, "◇", task, theme::TRACE);
+                        crate::cards::badge_marked(ui, "◉", model, theme::ACCENT);
+                    }
+                    None => {
+                        crate::cards::badge_marked(ui, "◇", title, theme::TRACE);
+                    }
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // the height of the card, two rows a notch, by the buttons or the wheel
                     if ui.small_button("▾").on_hover_text("fewer rows").clicked() {

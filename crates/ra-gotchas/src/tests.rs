@@ -15,7 +15,10 @@ fn the_seed_parses_and_names_every_entry_once() {
 #[test]
 fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
     let catalogue = Catalogue::seed();
-    for command in ["ls -la crates", "wc -l src/*.rs", "cd foo", "Get-ChildItem -Recurse"] {
+    // the read-only tools pass now; a change of directory and the PowerShell cmdlets still teach
+    assert_eq!(catalogue.command("ls -la crates", Conditions::default()), Verdict::Pass);
+    assert_eq!(catalogue.command("wc -l src/*.rs", Conditions::default()), Verdict::Pass);
+    for command in ["cd foo", "Get-ChildItem -Recurse", "python x.py"] {
         match catalogue.command(command, Conditions::default()) {
             Verdict::Deny { id, reason } => {
                 assert_eq!(id, "shell-outside-allowlist", "{command}");

@@ -89,15 +89,20 @@ impl Limits {
     pub fn summary(&self) -> Vec<String> {
         self.windows
             .iter()
-            .map(|(name, window)| {
-                let label = match name.as_str() {
-                    "five_hour" => "5h",
-                    "seven_day" => "week",
-                    other => other,
-                };
-                format!("{label} {:.0}% · resets in {}", window.utilization * 100.0, until(window.resets_at))
-            })
+            .map(|(name, window)| format!("{} {:.0}% · resets in {}", label(name), window.utilization * 100.0, until(window.resets_at)))
             .collect()
+    }
+}
+
+/// The short name of a window, for a badge: `5h`, `week`, `week+overage`.
+pub fn label(name: &str) -> &str {
+    match name {
+        "five_hour" => "5h",
+        "seven_day" => "week",
+        "seven_day_overage_included" => "week+overage",
+        "seven_day_opus" => "week opus",
+        "seven_day_sonnet" => "week sonnet",
+        other => other,
     }
 }
 

@@ -1,5 +1,8 @@
 //! The OpenRouter adapter: one HTTP POST to `chat/completions` per completion. It maps the HTTP
 //! statuses to the provider errors so a caller can retry the transient ones.
+//!
+//! The same adapter serves a local OpenAI-compatible server such as llama.cpp: [`OpenRouter::local`]
+//! points it at the URL from `RHIPPER_LOCAL_URL` with no key.
 
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -8,12 +11,17 @@ use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvi
 
 /// The API root of the public service.
 const BASE_URL: &str = "https://openrouter.ai/api/v1";
+/// The environment variable that names the local server's API root.
+pub const LOCAL_URL_VAR: &str = "RHIPPER_LOCAL_URL";
+/// The API root of a local server when the variable is unset: llama.cpp's default port.
+pub const DEFAULT_LOCAL_URL: &str = "http://127.0.0.1:8080/v1";
 /// What the requests say they are.
 const USER_AGENT: &str = concat!("rhipper-agent/", env!("CARGO_PKG_VERSION"));
 
 /// The OpenRouter provider.
 pub struct OpenRouter {
     client: reqwest::Client,
+    /// The bearer key; empty sends no `Authorization` header, as a local server needs none.
     key: String,
     /// The API root; the tests point it at a local server.
     base_url: String,
@@ -25,10 +33,31 @@ impl OpenRouter {
         Self::at(BASE_URL, key)
     }
 
-    /// Builds the provider against another base URL, for tests.
-    pub fn at(base_url: &str, key: impl Into<String>) -> anyhow::Result<Self> {
-        Ok(Self { client: reqwest::Client::builder().user_agent(USER_AGENT).build()?, key: key.into(), base_url: base_url.to_owned() })
+    /// Builds the provider against the local server at [`local_url`], with no key.
+    pub fn local() -> anyhow::Result<Self> {
+        Self::at(&local_url(), "")
     }
+
+    /// Builds the provider against another base URL, for tests and local servers. A trailing slash
+    /// is dropped, so `http://host/v1/` and `http://host/v1` reach the same endpoint.
+    pub fn at(base_url: &str, key: impl Into<String>) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder().user_agent(USER_AGENT).build()?,
+            key: key.into(),
+            base_url: base_url.trim_end_matches('/').to_owned(),
+        })
+    }
+
+    /// The API root the provider posts to.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+/// The API root of the local server: `RHIPPER_LOCAL_URL` when it is set to something, else
+/// [`DEFAULT_LOCAL_URL`].
+pub fn local_url() -> String {
+    std::env::var(LOCAL_URL_VAR).ok().map(|u| u.trim().to_owned()).filter(|u| !u.is_empty()).unwrap_or_else(|| DEFAULT_LOCAL_URL.to_owned())
 }
 
 /// The wire format of one chat message. Content is optional because tool messages may carry it
@@ -189,16 +218,15 @@ impl OpenRouter {
             tools: request.tools.iter().map(|t| to_wire_tool(t)).collect(),
         };
         let url = format!("{}/chat/completions", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.key)
-            .json(&wire)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        let mut post = self.client.post(&url).json(&wire);
+        if !self.key.is_empty() {
+            post = post.bearer_auth(&self.key);
+        }
+        // the URL is in the error on purpose: a local server that is not running is the usual
+        // cause, and the message says where the console looked
+        let response = post.send().await.map_err(|e| ProviderError::Unavailable(format!("cannot reach {url}: {e}")))?;
         let status = response.status();
-        let body = response.text().await.map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        let body = response.text().await.map_err(|e| ProviderError::Unavailable(format!("{url} dropped the answer: {e}")))?;
         match status {
             StatusCode::OK => {
                 let parsed: WireResponse = serde_json::from_str(&body)

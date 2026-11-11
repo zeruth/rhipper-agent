@@ -64,6 +64,8 @@ struct App {
     /// The card last seen in progress; a new one takes the view, so a run started over MCP or
     /// from the command line shows here as it starts.
     followed: Option<i64>,
+    /// The states whose tasks the roadmap column leaves out; the chips above it toggle them.
+    hidden_states: HashSet<TaskState>,
     folded: HashSet<i64>,
     input: String,
     history: Vec<String>,
@@ -145,6 +147,7 @@ impl App {
             roadmap_width: 360.0,
             selected: None,
             followed: None,
+            hidden_states: HashSet::new(),
             folded: HashSet::new(),
             input: String::new(),
             history: Vec::new(),
@@ -345,11 +348,7 @@ impl App {
                 // the plan's windows, colored by how full they are
                 if self.limits.fresh() {
                     for (name, window) in self.limits.windows.iter().rev() {
-                        let label = match name.as_str() {
-                            "five_hour" => "5h",
-                            "seven_day" => "week",
-                            other => other,
-                        };
+                        let label = ra_providers::limits::label(name);
                         let color = if window.utilization >= 0.8 {
                             theme::ERROR_TEXT
                         } else if window.utilization >= 0.5 {
@@ -397,6 +396,23 @@ impl App {
                 ui.label(RichText::new(format!("{} cards", self.roadmap.len())).small().color(theme::DIM));
             });
         });
+        // the filters: one chip per state the roadmap holds; a dim chip hides its tasks
+        let present: Vec<TaskState> = TaskState::ALL.into_iter().filter(|s| self.roadmap.iter().any(|n| n.state == *s)).collect();
+        if present.len() > 1 {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for state in present {
+                    let on = !self.hidden_states.contains(&state);
+                    if cards::chip(ui, &state.to_string(), theme::state_color(state), on) {
+                        if on {
+                            self.hidden_states.insert(state);
+                        } else {
+                            self.hidden_states.remove(&state);
+                        }
+                    }
+                }
+            });
+        }
         ui.add_space(4.0);
         let depths = tree::depths(&self.roadmap);
         let nodes = self.roadmap.clone();
@@ -413,6 +429,10 @@ impl App {
                 }
                 if self.folded.contains(&node.id) {
                     hidden_under.push(node.id);
+                }
+                // a task in a hidden state stays out; the structure above it stays
+                if matches!(node.kind, NodeKind::Task | NodeKind::Subtask) && self.hidden_states.contains(&node.state) {
+                    continue;
                 }
                 let depth = depths.get(&node.id).copied().unwrap_or(0);
                 let lane = theme::lane(depth);

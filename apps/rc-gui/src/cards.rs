@@ -90,6 +90,21 @@ pub(crate) fn badge_marked(ui: &mut Ui, mark: &str, text: &str, color: Color32) 
         .response
 }
 
+/// A filter chip: a badge that is lit while `on` and dim while off, and reports a click.
+pub(crate) fn chip(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
+    let response = Frame::new()
+        .fill(alpha(color, if on { 40 } else { 8 }))
+        .stroke(Stroke::new(1.0, alpha(color, if on { 180 } else { 60 })))
+        .corner_radius(CornerRadius::same(9))
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).color(if on { color } else { alpha(theme::DIM, 170) }).small().strong());
+        })
+        .response
+        .interact(egui::Sense::click());
+    response.on_hover_text(if on { "shown · click to hide" } else { "hidden · click to show" }).clicked()
+}
+
 /// The priority of a card as five dots, `complexity` of them lit, warm to hot.
 pub(crate) fn priority(ui: &mut Ui, complexity: u8) -> egui::Response {
     let lit = usize::from(complexity.clamp(1, 5));

@@ -2,8 +2,9 @@
 //! vendor behind it. The orchestrator and the workers know only [`ModelProvider`]; swapping
 //! GLM for Claude or a local model changes no caller.
 //!
-//! Two providers so far: Claude Code, the local harness on a Claude subscription, and OpenRouter,
-//! the aggregator for every other vendor.
+//! Two adapters so far: Claude Code, the local harness on a Claude subscription, and OpenRouter,
+//! the aggregator for every other vendor. The OpenRouter adapter also serves a local
+//! OpenAI-compatible server such as llama.cpp, with another base URL and no key.
 
 pub mod claude_code;
 pub mod limits;

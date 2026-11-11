@@ -49,17 +49,26 @@ impl ClaudeCode {
         Self {
             binary: PathBuf::from("claude"),
             max_turns: 60,
-            // the same commands through either shell: the harness picks PowerShell on Windows
-            // at times, and a rule for one shell does not cover the other
+            // the build, the read-only git commands, and the read-only shell: a denied `ls` costs a
+            // turn and teaches nothing. Bash only: the PowerShell tool wraps every command in a
+            // prelude no rule can match, so the worker does not get it at all
             allowed_shell: [
                 "Bash(cargo *)",
                 "Bash(git status*)",
                 "Bash(git diff*)",
                 "Bash(git log*)",
-                "PowerShell(cargo *)",
-                "PowerShell(git status*)",
-                "PowerShell(git diff*)",
-                "PowerShell(git log*)",
+                "Bash(git show*)",
+                "Bash(ls*)",
+                "Bash(cat *)",
+                "Bash(head *)",
+                "Bash(tail *)",
+                "Bash(wc *)",
+                "Bash(grep *)",
+                "Bash(rg *)",
+                "Bash(find *)",
+                "Bash(pwd*)",
+                "Bash(tree*)",
+                "Bash(mkdir *)",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -131,6 +140,9 @@ impl ClaudeCode {
                 args.push("--allowedTools".to_owned());
                 args.extend(self.allowed_shell.iter().cloned());
             }
+            // no PowerShell tool: every one of its commands is refused here, and a worker that
+            // keeps trying it spends its turns on nothing
+            args.extend(["--disallowedTools".to_owned(), "PowerShell".to_owned()]);
             if let Some(rc) = &self.hooks {
                 args.extend(["--settings".to_owned(), hook_settings(rc)]);
             }

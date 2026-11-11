@@ -136,20 +136,26 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     assert_eq!(settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "\"C:\\tools\\rc.exe\" hook post");
     // a chat completion carries no hooks
     assert!(!ClaudeCode::new().with_gotchas("rc", Catalogue::seed()).args(&request(None)).contains(&"--settings".to_owned()));
-    assert!(ClaudeCode::new().new_allowed().iter().any(|r| r == "PowerShell(cargo *)"));
+    assert!(ClaudeCode::new().new_allowed().iter().any(|r| r == "Bash(ls*)"));
+    assert!(!ClaudeCode::new().new_allowed().iter().any(|r| r.starts_with("PowerShell")));
+    assert!(args.windows(2).any(|w| w == ["--disallowedTools", "PowerShell"]), "{args:?}");
+    assert!(!ClaudeCode::new().args(&request(None)).contains(&"--disallowedTools".to_owned()));
 
     let quiet = Conditions::default();
-    let denied = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la crates"}}]}}"#;
+    let denied = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cd crates && ls"}}]}}"#;
     let hits = gotchas_of_event(&catalogue, denied, quiet);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, "shell-outside-allowlist");
-    assert_eq!(hits[0].excerpt, "ls -la crates");
+    assert_eq!(hits[0].excerpt, "cd crates && ls");
+    // a read-only command is allowed now, and no hit
+    let listing = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la crates"}}]}}"#;
+    assert!(gotchas_of_event(&catalogue, listing, quiet).is_empty());
     let fine =
         r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap"}}]}}"#;
     assert!(gotchas_of_event(&catalogue, fine, quiet).is_empty());
     let locked = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"error: failed to remove file `rc.exe`\nAccess is denied. (os error 5)"}]}}"#;
     assert_eq!(gotchas_of_event(&catalogue, locked, quiet)[0].id, "binary-locked-result");
-    let claim = r#"{"type":"result","result":"Done, but I couldn't run any tests.","permission_denials":[{"tool_name":"Bash","tool_input":{"command":"python x.py"}}]}"#;
+    let claim = r#"{"type":"result","result":"Done, but I couldn't run any tests.","permission_denials":[{"tool_name":"Bash","tool_input":{"command":"make all"}}]}"#;
     let ids: Vec<String> = gotchas_of_event(&catalogue, claim, quiet).into_iter().map(|h| h.id).collect();
     assert_eq!(ids, ["untested-claim", "unmatched-denied"]);
 }

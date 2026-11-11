@@ -32,7 +32,7 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "model",
         usage: "<id>",
-        help: "the model of the next worker session: a claude-* id runs on Claude Code, vendor/model on OpenRouter",
+        help: "the model of the next worker session: a claude-* id runs on Claude Code, local/<name> on the local server, vendor/model on OpenRouter",
     },
     Spec { name: "assign", usage: "<id> <model|none>", help: "the model one node runs on, over the badge; none clears it" },
     Spec { name: "budgets", usage: "[on|off]", help: "whether a run is capped by its card's complexity; off on a subscription" },
@@ -205,7 +205,7 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
                 (model != "none").then(|| ra_roadmap::model::Assignment { model: model.to_owned(), role: "implementer".to_owned() });
             store.assign(id, assignment.as_ref()).await?;
             out.push(match &assignment {
-                Some(a) => format!("#{id} runs on {} through {:?}", a.model, agent::Route::of(&a.model)),
+                Some(a) => format!("#{id} runs on {} through {}", a.model, agent::Route::of(&a.model).name()),
                 None => format!("#{id} runs on the badge model"),
             });
         }
@@ -235,12 +235,8 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             return Ok((out, Outcome::ToggleDebug));
         }
         "model" => {
-            anyhow::ensure!(!args.is_empty(), "usage: model <id>, such as claude-opus-5-5 or z-ai/glm-5.3-flash");
-            let route = match agent::Route::of(args) {
-                agent::Route::ClaudeCode => "Claude Code",
-                agent::Route::OpenRouter => "OpenRouter",
-            };
-            out.push(format!("the next worker session runs on {args} through {route}"));
+            anyhow::ensure!(!args.is_empty(), "usage: model <id>, such as claude-opus-5-5, local/qwen3 or z-ai/glm-5.3-flash");
+            out.push(format!("the next worker session runs on {args} through {}", agent::Route::of(args).name()));
             return Ok((out, Outcome::Model(args.to_owned())));
         }
         "budgets" => {
