@@ -111,6 +111,7 @@ pub async fn probe_at(base_url: &str) -> Result<Probe, String> {
         budget_usd: None,
         resume: None,
         max_turns: Some(1),
+        max_context: None,
         effort: None,
     };
     let started = Instant::now();
@@ -145,6 +146,7 @@ pub async fn ask(
         budget_usd: None,
         resume: None,
         max_turns: Some(1),
+        max_context: None,
         effort: Some("low".to_owned()),
     };
     let answer = tokio::time::timeout(ANSWER_TIMEOUT, provider.complete(request))

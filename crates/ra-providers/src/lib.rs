@@ -94,6 +94,11 @@ pub struct CompletionRequest {
     /// enforces it itself; for a bare model the caller's tool loop does. It stays on when the
     /// dollar budget is off: on a subscription the turns are the cost.
     pub max_turns: Option<u32>,
+    /// The most input tokens one turn of a worker run may carry, cached or not; `None` sets no
+    /// cap. A harness that shows its turns go by stops the run after the turn that crosses it
+    /// and reports [`ProviderError::ContextOut`]: the turns past that point would each read
+    /// the whole context again, and a fresh session reads less.
+    pub max_context: Option<u64>,
     /// The effort the run asks of the model, `low`, `medium` or `high`; `None` leaves the
     /// provider's own setting. A harness with the knob passes it on; a bare model ignores it.
     pub effort: Option<String>,
@@ -195,6 +200,11 @@ pub enum ProviderError {
     /// like any run's, the turns and the session.
     #[error("the harness ran out of turns (error_max_turns)")]
     TurnsOut(Box<Completion>),
+    /// A harness run stopped after a turn whose input passed the request's `max_context`: `size`
+    /// is that turn's input. The completion is what the stream showed up to then, the usage
+    /// summed over its turns, for the caller to book like any run's.
+    #[error("the context cap of {cap} tokens ended the run at a turn of {size}")]
+    ContextOut { completion: Box<Completion>, cap: u64, size: u64 },
     /// Anything else.
     #[error("{0}")]
     Other(String),

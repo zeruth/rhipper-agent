@@ -22,6 +22,9 @@ pub const REVIEWER: &str = "reviewer";
 /// The role of the architect that splits a milestone or a section into cards.
 pub const PLANNER: &str = "planner";
 
+/// The input tokens a turn may carry when the project's `[worker] context` names no count.
+pub const DEFAULT_CONTEXT: u64 = 120_000;
+
 /// The complexities a rule is for: one, or a range with both ends in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
@@ -102,7 +105,8 @@ impl fmt::Display for Rule {
 /// check = ".\\gw.ps1 :core:test"         # the check of a card whose acceptance names none
 /// lint = ""                             # the lint after a passed check; empty is none, absent is clippy
 /// turns = 20                            # a run ends after this many turns and the card goes on in a fresh session
-/// check_timeout = 1800                  # the seconds a check or the lint may run; 1200 without it
+/// context = 120000                      # and after a turn whose input passes this many tokens; 120000 without it
+/// check_timeout = 1800                 # the seconds a check or the lint may run; 1200 without it
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -127,6 +131,11 @@ pub struct WorkerConfig {
     /// run goes on until it answers.
     #[serde(default)]
     pub turns: Option<u32>,
+    /// The input tokens a turn may carry before the run ends the same way: a session's turns
+    /// cost by the context they carry, and the turn cap alone let one reach 150k to 270k tokens
+    /// a turn (rhipper-asm #47, #107). Absent or zero, [`DEFAULT_CONTEXT`].
+    #[serde(default)]
+    pub context: Option<u64>,
     /// The seconds a card's check, or its lint, may run before it is stopped and counts as
     /// failed; absent or zero, the agent's twenty minutes. A suite that builds and runs every
     /// reference program outgrows that (rhipper-asm #69), and the project says so here.
@@ -152,6 +161,13 @@ impl WorkerConfig {
     #[must_use]
     pub fn turns(&self) -> Option<u32> {
         self.turns.filter(|turns| *turns > 0)
+    }
+
+    /// The input tokens a turn may carry before the run ends and the card continues fresh: the
+    /// table's count when positive, else [`DEFAULT_CONTEXT`].
+    #[must_use]
+    pub fn context(&self) -> u64 {
+        self.context.filter(|tokens| *tokens > 0).unwrap_or(DEFAULT_CONTEXT)
     }
 
     /// The project's lint: `None` leaves the lint to the agent, `Some("")` turns it off.

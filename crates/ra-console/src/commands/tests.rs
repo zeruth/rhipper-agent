@@ -608,13 +608,24 @@ async fn a_project_turn_cap_ends_the_run_with_a_handoff_and_the_walk_takes_the_c
     assert!(prompt.contains("the turn cap of 2 ended the run"), "{prompt}");
 }
 
-/// A harness whose script may end a run out of turns: each completion pops the next outcome,
-/// an answer or the `error_max_turns` the harness reports with the run's usage.
-struct CappedHarness(parking_lot::Mutex<Vec<Result<ra_providers::Completion, ra_providers::ProviderError>>>);
+/// A harness whose script may end a run out of turns or of context: each completion pops the
+/// next outcome, an answer or the error the harness reports with the run's usage, and keeps the
+/// request it was asked.
+struct CappedHarness {
+    script: parking_lot::Mutex<Vec<Result<ra_providers::Completion, ra_providers::ProviderError>>>,
+    requests: parking_lot::Mutex<Vec<ra_providers::CompletionRequest>>,
+}
+
+impl CappedHarness {
+    fn new(script: Vec<Result<ra_providers::Completion, ra_providers::ProviderError>>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { script: parking_lot::Mutex::new(script), requests: parking_lot::Mutex::new(Vec::new()) })
+    }
+}
 
 impl ra_providers::ModelProvider for CappedHarness {
-    fn complete(&self, _request: ra_providers::CompletionRequest) -> ra_providers::CompletionFuture<'_> {
-        let next = self.0.lock().pop();
+    fn complete(&self, request: ra_providers::CompletionRequest) -> ra_providers::CompletionFuture<'_> {
+        self.requests.lock().push(request);
+        let next = self.script.lock().pop();
         Box::pin(async move { next.unwrap_or_else(|| Err(ra_providers::ProviderError::Other("the script ran out".into()))) })
     }
 
@@ -642,9 +653,7 @@ async fn a_harness_run_the_turn_cap_ends_books_its_usage_and_the_card_sums_its_s
     ];
     let script = vec![Ok(says("done", vec![])), Err(ra_providers::ProviderError::TurnsOut(Box::new(capped)))];
     let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
-    let runner = Worker::new("claude-opus-5-5")
-        .with_provider(std::sync::Arc::new(CappedHarness(parking_lot::Mutex::new(script))))
-        .with_ledger(ledger);
+    let runner = Worker::new("claude-opus-5-5").with_provider(CappedHarness::new(script)).with_ledger(ledger);
 
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(out[0].starts_with("↻ #2 Probe continues on claude-opus-5-5 · turns 2/2, 0 tool call(s) · in 1000 out 52 · avg"), "{out:?}");
@@ -666,6 +675,65 @@ async fn a_harness_run_the_turn_cap_ends_books_its_usage_and_the_card_sums_its_s
     let card = by_node.iter().find(|(node, _)| *node == Some(2)).map(|(_, totals)| totals).unwrap();
     assert_eq!((card.calls, card.prompt_tokens, card.completion_tokens, card.turns), (2, 1100, 62, 3));
     assert!((card.cost_usd.unwrap() - 1.26).abs() < 1e-9, "{:?}", card.cost_usd);
+}
+
+#[tokio::test]
+async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_names_the_cap_and_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    git_ok(dir.path(), &["init", "-q"]);
+    // no rhipper.toml: the default cap of 120k stands, and no turn cap does
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // the stream showed five turns, the last of 131k input, before the harness stopped the run
+    let mut capped = says("editing the store", vec![]);
+    capped.turns = 5;
+    capped.usage = ra_providers::Usage {
+        prompt_tokens: 400_000,
+        completion_tokens: 500,
+        cached_tokens: 390_000,
+        cost_usd: None,
+        cost_computed: false,
+    };
+    capped.turn_usage = (1..=5).map(|n| ra_providers::TurnUsage { input_tokens: n * 26_200, output_tokens: 100 }).collect();
+    let script = vec![
+        Ok(says("done", vec![])),
+        Err(ra_providers::ProviderError::ContextOut { completion: Box::new(capped), cap: 120_000, size: 131_000 }),
+    ];
+    let harness = CappedHarness::new(script);
+    let runner =
+        Worker::new("claude-opus-5-5").with_provider(harness.clone()).with_ledger(ra_usage::UsageStore::in_memory().await.unwrap());
+
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(out[0].starts_with("↻ #2 Probe continues on claude-opus-5-5 · turns 5, 0 tool call(s) · in 400000 out 500 · avg"), "{out:?}");
+    assert!(
+        out[0].ends_with("the context cap of 120k tokens (a turn of 131k) ended the run; the card continues in a fresh session"),
+        "{out:?}"
+    );
+    assert_eq!(harness.requests.lock().last().unwrap().max_context, Some(120_000), "the default cap went with the request");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::InProgress);
+    assert_eq!(node.session, None, "the next run starts fresh");
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    assert_eq!(task.handoffs.len(), 1);
+    assert_eq!(task.handoffs[0].outcome, "continues");
+    assert!(
+        task.handoffs[0].check.starts_with("no check: the context cap of 120k tokens (a turn of 131k) ended the run"),
+        "{}",
+        task.handoffs[0].check
+    );
+    assert!(
+        task.handoffs[0].report.starts_with("the context cap of 120k tokens (a turn of 131k) ended the run after 5 turn(s)"),
+        "{}",
+        task.handoffs[0].report
+    );
+    assert!(task.handoffs[0].report.ends_with("editing the store"), "{}", task.handoffs[0].report);
+    // the session is booked, and the walk finishes the card in a fresh one
+    let calls = runner.calls_of(Some(2)).await.unwrap();
+    assert_eq!((calls.len(), calls[0].prompt_tokens, calls[0].turns), (1, 400_000, 5));
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    assert!(out[0].starts_with("✓ #2 Probe implemented on claude-opus-5-5"), "{out:?}");
+    assert!(harness.requests.lock().last().unwrap().resume.is_none());
 }
 
 /// A one-crate Cargo project in `dir` whose single test passes or fails.

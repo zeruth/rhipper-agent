@@ -288,6 +288,9 @@ impl ClaudeCode {
         let mut reads: Vec<String> = Vec::new();
         // the tokens of each assistant turn, as the events show them
         let mut turns = TurnTally::default();
+        // the project's context cap, and the size of the turn that crossed it once one did
+        let mut watch = ContextWatch::new(request.max_context);
+        let mut crossed: Option<u64> = None;
         // which tool each call id belongs to, so only a shell's output is read for gotchas
         let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         // a console holds the binary while var/console.pid is in the workspace
@@ -301,6 +304,14 @@ impl ClaudeCode {
                     tracing::info!(target: "ra::progress", "{step}");
                 }
                 turns.note(&line);
+                if let Some(size) = watch.note(&line, &turns) {
+                    // the turns past this one would each read the whole context again: the
+                    // child stops here and the caller continues the task in a fresh session
+                    tracing::info!(target: "ra::progress", "⏹ the context cap: a turn of {size} tokens");
+                    crossed = Some(size);
+                    let _ = child.start_kill();
+                    break;
+                }
                 reads.extend(reads_of(&line, request.workspace.as_deref()));
                 if let Some(catalogue) = &self.catalogue {
                     // where the hit showed, from the event that carried it
@@ -361,6 +372,11 @@ impl ClaudeCode {
                 completion.turn_usage = turns.into_turns();
                 completion.reads = reads;
             })
+        } else if let Some((size, cap)) = crossed.zip(request.max_context) {
+            let mut completion = turns.completion();
+            completion.gotchas = gotchas;
+            completion.reads = reads;
+            Err(ProviderError::ContextOut { completion: Box::new(completion), cap, size })
         } else {
             let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).next_back().unwrap_or(last_line.trim());
             let reason = if reason.is_empty() { "no output" } else { reason };
@@ -408,6 +424,10 @@ impl Stream {
 #[derive(Default)]
 struct TurnTally {
     turns: Vec<(Option<String>, TurnUsage)>,
+    /// The cached share of each turn's input, for the usage of a run that ends without a result.
+    cached: Vec<u64>,
+    /// The text blocks of the last turn, the worker's words when the run ends without a result.
+    said: Vec<String>,
 }
 
 impl TurnTally {
@@ -425,14 +445,88 @@ impl TurnTally {
             output_tokens: count("output_tokens"),
         };
         let id = event.pointer("/message/id").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let text = event
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty());
         match self.turns.last_mut() {
-            Some((last, booked)) if id.is_some() && *last == id => *booked = turn,
-            _ => self.turns.push((id, turn)),
+            Some((last, booked)) if id.is_some() && *last == id => {
+                *booked = turn;
+                if let Some(cached) = self.cached.last_mut() {
+                    *cached = count("cache_read_input_tokens");
+                }
+                self.said.extend(text);
+            }
+            _ => {
+                self.turns.push((id, turn));
+                self.cached.push(count("cache_read_input_tokens"));
+                self.said = text.collect();
+            }
+        }
+    }
+
+    /// The input of the last turn, when the stream showed one.
+    fn last_input(&self) -> Option<u64> {
+        self.turns.last().map(|(_, turn)| turn.input_tokens)
+    }
+
+    /// The completion of a run stopped before its result: the usage summed over the turns the
+    /// stream showed, at no reported cost, and the last turn's words.
+    fn completion(self) -> Completion {
+        let turns = u64::try_from(self.turns.len()).unwrap_or(u64::MAX);
+        let usage = Usage {
+            prompt_tokens: self.turns.iter().map(|(_, turn)| turn.input_tokens).sum(),
+            completion_tokens: self.turns.iter().map(|(_, turn)| turn.output_tokens).sum(),
+            cached_tokens: self.cached.iter().sum(),
+            cost_usd: None,
+            cost_computed: false,
+        };
+        Completion {
+            text: self.said.join("\n"),
+            usage,
+            turns,
+            turn_usage: self.into_turns(),
+            tool_calls: Vec::new(),
+            session_id: None,
+            gotchas: Vec::new(),
+            reads: Vec::new(),
         }
     }
 
     fn into_turns(self) -> Vec<TurnUsage> {
         self.turns.into_iter().map(|(_, turn)| turn).collect()
+    }
+}
+
+/// Watches a stream for the turn whose input passes the context cap. The run stops after that
+/// turn, once its tool results are in, so an edit in flight lands and the handoff can name it;
+/// a result that comes first means the run finished on its own and stands.
+struct ContextWatch {
+    cap: Option<u64>,
+    /// The input of the turn that crossed the cap, once one has.
+    crossed: Option<u64>,
+}
+
+impl ContextWatch {
+    fn new(cap: Option<u64>) -> Self {
+        Self { cap, crossed: None }
+    }
+
+    /// Reads one event after the tally has: the size of the crossing turn once the run may
+    /// stop, `None` while it goes on.
+    fn note(&mut self, line: &str, turns: &TurnTally) -> Option<u64> {
+        let cap = self.cap?;
+        if line.contains(r#""type":"assistant""#) {
+            if let Some(input) = turns.last_input().filter(|input| *input > cap) {
+                self.crossed = Some(input);
+            }
+            return None;
+        }
+        self.crossed.filter(|_| line.contains(r#""type":"user""#))
     }
 }
 

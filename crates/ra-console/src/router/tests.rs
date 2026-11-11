@@ -34,6 +34,13 @@ fn the_worker_table_allows_a_projects_commands_in_both_shells_and_sets_its_envir
 }
 
 #[test]
+fn the_context_cap_is_the_tables_count_and_120k_without_it() {
+    assert_eq!(Router::parse("[worker]\ncontext = 80000\n").unwrap().worker.context(), 80_000);
+    assert_eq!(WorkerConfig::default().context(), 120_000);
+    assert_eq!(Router::parse("[worker]\ncontext = 0\n").unwrap().worker.context(), 120_000, "zero is the default");
+}
+
+#[test]
 fn the_check_timeout_is_the_tables_seconds_and_the_agents_default_without_it() {
     let router = Router::parse("[worker]\ncheck_timeout = 1800\n").unwrap();
     assert_eq!(router.worker.check_timeout(), std::time::Duration::from_secs(1800));

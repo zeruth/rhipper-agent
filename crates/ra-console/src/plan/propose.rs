@@ -96,6 +96,7 @@ pub async fn propose(root: &Path, worker: &Worker, lines: &[Line]) -> anyhow::Re
             budget_usd: None,
             resume: None,
             max_turns: Some(1),
+            max_context: None,
             effort: Some(ra_roadmap::model::Effort::default().to_string()),
         })
         .await

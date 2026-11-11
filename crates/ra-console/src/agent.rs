@@ -514,6 +514,7 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
             budget_usd: None,
             resume: None,
             max_turns: None,
+            max_context: None,
             effort: None,
         })
         .await
@@ -1130,6 +1131,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
             budget_usd: None,
             resume: None,
             max_turns: Some(1),
+            max_context: None,
             effort: Some(Effort::default().to_string()),
         })
         .await;
@@ -1365,6 +1367,7 @@ pub async fn plan(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Pla
             budget_usd: None,
             resume: None,
             max_turns: Some(1),
+            max_context: None,
             effort: Some(Effort::default().to_string()),
         })
         .await
@@ -2144,6 +2147,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 budget_usd: budget,
                 resume,
                 max_turns: caps.limit(),
+                max_context: Some(caps.context),
                 effort: Some(effort.to_string()),
             })
             .await;
@@ -2183,12 +2187,29 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                         turns: u64::from(restart),
                         turn_usage: answer.turn_usage,
                         cap: Some(restart),
-                        capped: Some(restart),
+                        capped: Some(Capped::Turns(restart)),
                         reads: answer.reads,
                         biggest: None,
                     }),
                     None => Err(map_error(ProviderError::TurnsOut(answer))),
                 }
+            }
+            // the project's context cap ended the run after the turn that crossed it: booked
+            // and continued like one the turn cap ended
+            Err(ProviderError::ContextOut { completion: answer, cap, size }) => {
+                worker.record(Some(id), &answer.usage, answer.turns).await;
+                gotcha_hits.clone_from(&answer.gotchas);
+                Ok(Session {
+                    text: answer.text,
+                    usage: answer.usage,
+                    calls: 0,
+                    turns: answer.turns,
+                    turn_usage: answer.turn_usage,
+                    cap: caps.limit(),
+                    capped: Some(Capped::Context { cap, size }),
+                    reads: answer.reads,
+                    biggest: None,
+                })
             }
             Err(error) => Err(map_error(error)),
         }
@@ -2235,15 +2256,16 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             noted.push(format!("  notes-for #{to}: left on its context"));
         }
     }
-    // the project's turn cap ended the run: no check, no verdict, the card stays in progress
-    // with a handoff of what was done and what is left, and its session is dropped so the next
-    // run, which the walk starts right away, opens on a small context again
+    // the project's turn or context cap ended the run: no check, no verdict, the card stays in
+    // progress with a handoff of what was done and what is left, and its session is dropped so
+    // the next run, which the walk starts right away, opens on a small context again
     if let Some(cap) = session.capped {
         store.set_session(id, None, unix_now()).await?;
         let changed = run_changed(&acting, &dirty_before, &git_status(&acting).await, run_started);
         let report = capped_report(cap, &session, &changed, &node);
         store.set_notes(id, &report).await?;
-        let why = format!("the turn cap of {cap} ended the run; the card continues in a fresh session");
+        let why = format!("{cap} ended the run; the card continues in a fresh session");
+        let turns = session.cap.map_or_else(|| session.turns.to_string(), |limit| format!("{}/{limit}", session.turns));
         let mut last = handoff("continues", &format!("no check: {why}"), &report, changed);
         if let Some(branch) = &worker.branch {
             last.check = format!("{} · branch {branch}", last.check);
@@ -2252,10 +2274,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         save_context(store, &root, &task).await;
         let sizes = turn_sizes(&session);
         let mut lines = vec![format!(
-            "↻ #{id} {} continues on {} · turns {}/{cap}, {} tool call(s) · in {} out {} · {sizes} · {} · {why}",
+            "↻ #{id} {} continues on {} · turns {turns}, {} tool call(s) · in {} out {} · {sizes} · {} · {why}",
             node.title,
             short(&worker.model),
-            session.turns,
             session.calls,
             session.usage.prompt_tokens,
             session.usage.completion_tokens,
@@ -2488,14 +2509,40 @@ struct Prepared {
     effort: Effort,
 }
 
-/// The turn caps of a run; nothing caps a run by default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The caps of a run; no turn cap stands by default, and the context cap is the project's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Caps {
     /// The hard cap, when `--turns` named one: a run that reaches it failed.
     hard: Option<u32>,
     /// The project's `[worker] turns`, when it names one: the run ends there with a handoff and
     /// the card continues in a fresh session.
     restart: Option<u32>,
+    /// The project's `[worker] context`: a harness run ends the same way after a turn whose
+    /// input passes this many tokens.
+    context: u64,
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Self { hard: None, restart: None, context: crate::router::DEFAULT_CONTEXT }
+    }
+}
+
+/// What ended a run short of its answer so the card continues in a fresh session: the project's
+/// turn cap, or its context cap at the size of the turn that crossed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capped {
+    Turns(u32),
+    Context { cap: u64, size: u64 },
+}
+
+impl std::fmt::Display for Capped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Turns(cap) => write!(f, "the turn cap of {cap}"),
+            Self::Context { cap, size } => write!(f, "the context cap of {} tokens (a turn of {})", kilo(*cap), kilo(*size)),
+        }
+    }
 }
 
 impl Caps {
@@ -2541,7 +2588,12 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // an explicit budget, else the complexity's while budgets are on, else none at all; a turn
     // cap only when one was asked for. No limit stands by default: the person asked for none
     let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
-    let caps = Caps { hard: worker.turns, restart: crate::router::Router::load(&root).ok().and_then(|router| router.worker.turns()) };
+    let router = crate::router::Router::load(&root).ok();
+    let caps = Caps {
+        hard: worker.turns,
+        restart: router.as_ref().and_then(|router| router.worker.turns()),
+        context: router.as_ref().map_or(crate::router::DEFAULT_CONTEXT, |router| router.worker.context()),
+    };
     let effort = worker.effort.unwrap_or(node.effort);
     Ok(Prepared { workspace, root, task, project, budget, caps, effort })
 }
@@ -2643,6 +2695,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
         budget_usd: budget,
         resume: resume.clone().unwrap_or_default(),
         max_turns: caps.limit(),
+        max_context: Some(caps.context),
         effort: Some(effort.to_string()),
     };
     let mut lines = vec![
@@ -2653,10 +2706,11 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             worker.route().name()
         ),
         format!(
-            "  budget {} · turn cap {}{} · resume {} · {}",
+            "  budget {} · turn cap {}{} · fresh session past {} tokens a turn · resume {} · {}",
             budget.map_or_else(|| "none".to_owned(), |b| format!("${b:.2}")),
             caps.hard.map_or_else(|| "none".to_owned(), |c| c.to_string()),
             caps.restart.map_or_else(String::new, |r| format!(" · fresh session after {r} turns")),
+            kilo(caps.context),
             match resume {
                 Ok(Some(session)) => session,
                 Ok(None) => "none".to_owned(),
@@ -3175,9 +3229,9 @@ struct Session {
     turn_usage: Vec<TurnUsage>,
     /// The turn cap the run had, when it had one.
     cap: Option<u32>,
-    /// The project's turn cap that ended the run, when one did: the card continues in a fresh
+    /// The project's cap that ended the run, when one did: the card continues in a fresh
     /// session instead of being judged.
-    capped: Option<u32>,
+    capped: Option<Capped>,
     /// The files the run read, one entry per read, relative to the workspace.
     reads: Vec<String>,
     /// The tool call whose answer was the largest and its size in characters, when the loop
@@ -3198,9 +3252,9 @@ fn call_summary(call: &ra_providers::ToolCall) -> String {
 /// The report a run its cap ended leaves for the next run of the card, which starts fresh: how
 /// it ended, what changed, what the worker said and did, and what is left, which is the whole
 /// acceptance since no check ran.
-fn capped_report(cap: u32, session: &Session, changed: &[String], node: &Node) -> String {
+fn capped_report(cap: Capped, session: &Session, changed: &[String], node: &Node) -> String {
     let mut text = format!(
-        "the turn cap of {cap} ended the run after {} turn(s), {} tool call(s); the card continues in a fresh session\n",
+        "{cap} ended the run after {} turn(s), {} tool call(s); the card continues in a fresh session\n",
         session.turns, session.calls
     );
     if changed.is_empty() {
@@ -3398,7 +3452,7 @@ async fn tool_loop(
                 turns: u64::from(restart),
                 turn_usage,
                 cap: limit,
-                capped: Some(restart),
+                capped: Some(Capped::Turns(restart)),
                 reads,
                 biggest,
             });
@@ -3414,6 +3468,7 @@ async fn tool_loop(
                 budget_usd: budget,
                 resume: None,
                 max_turns: limit,
+                max_context: None,
                 effort: None,
             })
             .await
@@ -3612,6 +3667,7 @@ async fn reassess_one(
             budget_usd: None,
             resume: None,
             max_turns: None,
+            max_context: None,
             effort: None,
         })
         .await
@@ -4137,6 +4193,10 @@ pub(crate) fn map_error(error: ProviderError) -> anyhow::Error {
         ProviderError::TurnsOut(answer) => anyhow::anyhow!(
             "the run failed: the worker ran out of turns after {} turn(s) without finishing; raise the cap with --turns or split the task",
             answer.turns
+        ),
+        ProviderError::ContextOut { completion, cap, size } => anyhow::anyhow!(
+            "the run failed: the context cap of {cap} tokens ended the run at a turn of {size} after {} turn(s) without finishing",
+            completion.turns
         ),
         ProviderError::Other(text) => anyhow::anyhow!("the run failed: {text}"),
     }

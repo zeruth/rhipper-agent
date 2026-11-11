@@ -268,6 +268,7 @@ async fn outline_from_model(worker: &Worker, root: &Path, import: Option<&str>, 
             budget_usd: None,
             resume: None,
             max_turns: None,
+            max_context: None,
             effort: None,
         })
         .await
