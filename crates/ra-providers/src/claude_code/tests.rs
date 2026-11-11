@@ -142,21 +142,30 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     assert!(!ClaudeCode::new().args(&request(None)).contains(&"--disallowedTools".to_owned()));
 
     let quiet = Conditions::default();
-    let denied = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cd crates && ls"}}]}}"#;
-    let hits = gotchas_of_event(&catalogue, denied, quiet);
+    let mut tools = std::collections::HashMap::new();
+    let denied =
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cd crates && ls"}}]}}"#;
+    let hits = gotchas_of_event(&catalogue, denied, quiet, &mut tools);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, "shell-outside-allowlist");
     assert_eq!(hits[0].excerpt, "cd crates && ls");
     // a read-only command is allowed now, and no hit
-    let listing = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la crates"}}]}}"#;
-    assert!(gotchas_of_event(&catalogue, listing, quiet).is_empty());
+    let listing =
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls -la crates"}}]}}"#;
+    assert!(gotchas_of_event(&catalogue, listing, quiet, &mut tools).is_empty());
+    // a file the worker reads may quote any error; only a shell's output counts
+    let reading =
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Read","input":{"file_path":"rhipper.md"}}]}}"#;
+    assert!(gotchas_of_event(&catalogue, reading, quiet, &mut tools).is_empty());
+    let quoted = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"notes: Not logged in · Please run /login"}]}}"#;
+    assert!(gotchas_of_event(&catalogue, quoted, quiet, &mut tools).is_empty());
     let fine =
         r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap"}}]}}"#;
-    assert!(gotchas_of_event(&catalogue, fine, quiet).is_empty());
-    let locked = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"error: failed to remove file `rc.exe`\nAccess is denied. (os error 5)"}]}}"#;
-    assert_eq!(gotchas_of_event(&catalogue, locked, quiet)[0].id, "binary-locked-result");
+    assert!(gotchas_of_event(&catalogue, fine, quiet, &mut tools).is_empty());
+    let locked = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"error: failed to remove file `rc.exe`\nAccess is denied. (os error 5)"}]}}"#;
+    assert_eq!(gotchas_of_event(&catalogue, locked, quiet, &mut tools)[0].id, "binary-locked-result");
     let claim = r#"{"type":"result","result":"Done, but I couldn't run any tests.","permission_denials":[{"tool_name":"Bash","tool_input":{"command":"make all"}}]}"#;
-    let ids: Vec<String> = gotchas_of_event(&catalogue, claim, quiet).into_iter().map(|h| h.id).collect();
+    let ids: Vec<String> = gotchas_of_event(&catalogue, claim, quiet, &mut tools).into_iter().map(|h| h.id).collect();
     assert_eq!(ids, ["untested-claim", "unmatched-denied"]);
 }
 

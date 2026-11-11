@@ -189,6 +189,8 @@ impl ClaudeCode {
         let mut result: Option<String> = None;
         let mut last_line = String::new();
         let mut gotchas: Vec<Hit> = Vec::new();
+        // which tool each call id belongs to, so only a shell's output is read for gotchas
+        let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         // a console holds the binary while var/console.pid is in the workspace
         let conditions = Conditions { console_running: request.workspace.as_deref().is_some_and(|w| w.join("var/console.pid").exists()) };
         if let Some(pipe) = child.stdout.take() {
@@ -206,7 +208,7 @@ impl ClaudeCode {
                     } else {
                         Where::Answer
                     };
-                    for hit in gotchas_of_event(catalogue, &line, conditions) {
+                    for hit in gotchas_of_event(catalogue, &line, conditions, &mut tools) {
                         tracing::info!(target: "ra::progress", "⚠ {}: {}", hit.id, hit.excerpt);
                         // the journal is written here, as the hits come, so a run that ends badly
                         // still counts them
@@ -403,10 +405,16 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
 }
 
 /// The gotchas one stream event shows: a command about to run that the catalogue would refuse
-/// or rewrite, a tool result with a known error in it, the final answer with a claim in it, and
+/// or rewrite, a shell result with a known error in it, the final answer with a claim in it, and
 /// a command the harness refused that no gotcha names (`unmatched-denied`, for the catalogue
-/// to grow).
-fn gotchas_of_event(catalogue: &Catalogue, line: &str, conditions: Conditions) -> Vec<Hit> {
+/// to grow). `tools` remembers which tool each call id belongs to, across events, so only the
+/// output of a shell is scanned: a file the worker reads may quote any error there is.
+fn gotchas_of_event(
+    catalogue: &Catalogue,
+    line: &str,
+    conditions: Conditions,
+    tools: &mut std::collections::HashMap<String, String>,
+) -> Vec<Hit> {
     use serde_json::Value;
     let Ok(event) = serde_json::from_str::<Value>(line) else { return Vec::new() };
     let text_of = |value: &Value| -> String {
@@ -423,6 +431,9 @@ fn gotchas_of_event(catalogue: &Catalogue, line: &str, conditions: Conditions) -
                 if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                     continue;
                 }
+                if let (Some(id), Some(name)) = (block.get("id").and_then(Value::as_str), block.get("name").and_then(Value::as_str)) {
+                    tools.insert(id.to_owned(), name.to_owned());
+                }
                 if !matches!(block.get("name").and_then(Value::as_str), Some("Bash" | "PowerShell")) {
                     continue;
                 }
@@ -437,7 +448,16 @@ fn gotchas_of_event(catalogue: &Catalogue, line: &str, conditions: Conditions) -
         }
         Some("user") => {
             for block in event.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
-                if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    continue;
+                }
+                // only what a shell said; a file the worker read is not the machine talking
+                let shell = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| tools.get(id))
+                    .is_some_and(|name| matches!(name.as_str(), "Bash" | "PowerShell"));
+                if shell {
                     hits.extend(catalogue.scan(Where::Result, &text_of(block.get("content").unwrap_or(&Value::Null))));
                 }
             }
