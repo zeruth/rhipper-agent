@@ -180,20 +180,31 @@ fn launch(project: Option<&Path>) -> anyhow::Result<PathBuf> {
     if let Some(project) = project {
         command.arg(project).current_dir(project);
     }
+    detach(&mut command);
+    command.spawn().with_context(|| format!("cannot start {}", gui.display()))?;
+    Ok(gui)
+}
+
+/// Makes a command run on its own: no stdio of this process, its own process group, and on
+/// Windows no console and none of this process's inheritable handles, so the shell that asked
+/// does not wait on it and a window or a session that started it can go while it keeps going.
+/// The window starts a walk this way, and `rc open` the window.
+pub fn detach(command: &mut std::process::Command) {
     command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        // a hidden console rather than none: a console child of a process without one (the
+        // harness under a walk the window started) would open an empty console window of its
+        // own; under a hidden one it inherits that and shows nothing
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         // the shell's pipes came to this process as inheritable handles, and a child inherits
         // every inheritable handle whatever its own stdio is set to; the shell would then wait
-        // on the window for the pipe to close. They are made private before the spawn.
+        // on the child for the pipe to close. They are made private before the spawn.
         keep_std_handles_private();
     }
-    command.spawn().with_context(|| format!("cannot start {}", gui.display()))?;
-    Ok(gui)
 }
 
 /// Clears the inherit flag on this process's standard handles, so a detached child does not

@@ -59,8 +59,12 @@ ended (then do the pass), a note the person left. `rc pair` prints the last twen
 ## The cycle (what this session does for every card)
 
 1. **Run**: `rc run <id>` (foreground ~3–10 min; run it in the background and wait for the
-   notification) or `rc run --all` to walk every ready card in order. No flags needed: nothing
-   caps a run by default; debug mode is on.
+   notification), or **`rc walk`** to walk every ready card in order. `rc walk` does not run
+   the walk in your shell: the window that has the project starts it as a process of its own
+   (detached, hours long, survives a window restart and your session's tool limits), and the
+   tab shows it. `rc walk --stop` ends it after its current card; a second `rc walk` while one
+   runs says so and does nothing. Never `Start-Process rc run --all` yourself. No flags
+   needed: nothing caps a run by default; debug mode is on.
 2. **Read the result**: the run's lines (✓/✗, the check, `lint: N warning(s)`, `↯` look-back
    bullets), then `git diff --stat` and the diff of the files the handoff names.
 3. **Lint**: a card comes back `needs_revision` when clippy warns on lines the run changed. The

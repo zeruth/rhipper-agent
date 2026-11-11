@@ -426,6 +426,10 @@ pub async fn run_next(store: &Store, worker: &Worker) -> anyhow::Result<Vec<Stri
 pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
     let mut lines = Vec::new();
     let mut ran = 0;
+    // one walk per project: the lock is held for the whole of it
+    let Some(_lock) = take_walk_lock(&workspace_of(store)) else {
+        anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
+    };
     loop {
         let nodes = store.all().await?;
         let root = workspace_of(store);
@@ -462,6 +466,82 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
 
 /// The file a `stop` leaves for a walk, which reads it between runs.
 const WALK_STOP: &str = "var/walk.stop";
+/// The file `rc walk` leaves for the window, which starts the walk as its own process.
+const WALK_START: &str = "var/walk.start";
+/// The file a running walk holds open for exclusive use, so a second one does not start.
+const WALK_LOCK: &str = "var/walk.lock";
+
+/// The lock a running walk holds; dropping it lets the next walk start.
+pub struct WalkLock(#[allow(dead_code)] std::fs::File);
+
+/// Takes the project's walk lock: `None` while a walk runs there. On Windows the file is opened
+/// with no sharing, which a second opener cannot do; elsewhere a pid file stands in.
+#[must_use]
+pub fn take_walk_lock(root: &Path) -> Option<WalkLock> {
+    let _ = std::fs::create_dir_all(root.join("var"));
+    let path = root.join(WALK_LOCK);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(&path).ok()?;
+        Some(WalkLock(file))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && pid != std::process::id()
+            && Path::new(&format!("/proc/{pid}")).exists()
+        {
+            return None;
+        }
+        let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path).ok()?;
+        use std::io::Write;
+        let _ = write!(file, "{}", std::process::id());
+        Some(WalkLock(file))
+    }
+}
+
+/// Whether a walk is running in the project right now.
+#[must_use]
+pub fn walk_running(root: &Path) -> bool {
+    take_walk_lock(root).is_none()
+}
+
+/// Asks the window that has the project to start the walk: leaves the file its tick reads.
+#[must_use]
+pub fn request_walk(root: &Path) -> String {
+    let _ = std::fs::create_dir_all(root.join("var"));
+    match std::fs::write(root.join(WALK_START), "") {
+        Ok(()) => "the window starts the walk; its cards land in the project's tab and in var/pair.log".to_owned(),
+        Err(e) => format!("cannot ask the window to start the walk: {e}"),
+    }
+}
+
+/// Whether `rc walk` asked for a walk; the request is consumed.
+#[must_use]
+pub fn walk_requested(root: &Path) -> bool {
+    let path = root.join(WALK_START);
+    path.exists() && std::fs::remove_file(path).is_ok()
+}
+
+/// Starts the walk as a process of its own in `root`, detached from whoever asked: the
+/// installed `rc run --all`, or the one beside this binary. Returns the process id.
+///
+/// # Errors
+/// When a walk is running already, or `rc` cannot start.
+pub fn spawn_walk(root: &Path, debug: bool) -> anyhow::Result<u32> {
+    anyhow::ensure!(!walk_running(root), "a walk is already running in this project");
+    let rc = std::env::current_exe()?.with_file_name(format!("rc{}", std::env::consts::EXE_SUFFIX));
+    let mut command = std::process::Command::new(&rc);
+    command.args(["run", "--all"]).current_dir(root);
+    if !debug {
+        command.arg("--no-debug");
+    }
+    crate::hub::detach(&mut command);
+    let child = command.spawn().map_err(|e| anyhow::anyhow!("cannot start {}: {e}", rc.display()))?;
+    Ok(child.id())
+}
 
 /// Asks the walk to stop after the task it is in: leaves the file it reads between runs. A
 /// walk that is not running finds the file at its next start and stops after one card, so the
@@ -648,6 +728,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     // reads what the last one spent against what the card was sized at
     let verdict = estimate_verdict(estimate_of(&node), &session.usage, session.turns);
     check_line = format!("{check_line} · {verdict}");
+    // what to do with the build, on the same line: the window restarts on the milestone commit,
+    // not per card
+    if let Some(advice) = build_advice(&changed) {
+        check_line = format!("{check_line} · {advice}");
+    }
     // the warnings ride in their own section of the handoff, not at the head of its report: the
     // notes lead with them, the next run gets them in its machine notes
     let mut last = handoff(
@@ -1134,6 +1219,23 @@ pub fn estimate_of(node: &Node) -> Estimate {
 fn estimate_verdict(estimate: Estimate, usage: &Usage, turns: u64) -> String {
     let side = if estimate.is_over(usage.prompt_tokens + usage.completion_tokens, turns) { "over" } else { "under" };
     format!("{side} the estimate of {estimate}")
+}
+
+/// What to do with the build after a run, from the files it changed, for the run line and the
+/// handoff: a change to the window's own code (`apps/rc-gui`, or the `ra-console` code it links)
+/// shows only after `rc restart`, which waits for the milestone commit, when a phase's cards are
+/// done and committed together, or for the person's ask; a change to `rc` or the other crates is
+/// live for the next run after an `rc install` at any time; a run that touched no Rust code says
+/// nothing.
+fn build_advice(changed: &[String]) -> Option<&'static str> {
+    let path = |p: &String| p.replace('\\', "/");
+    if changed.iter().map(path).any(|p| p.starts_with("apps/rc-gui/") || p.starts_with("crates/ra-console/")) {
+        Some("window: restart on the milestone commit")
+    } else if changed.iter().map(path).any(|p| p.starts_with("apps/rc/") || p.starts_with("crates/")) {
+        Some("rc: install any time, no restart")
+    } else {
+        None
+    }
 }
 
 /// A run stopped because its summed cost crossed its budget. Its text is the note on the node.

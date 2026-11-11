@@ -99,3 +99,20 @@ fn an_output_without_failed_tests_is_its_tail_alone() {
     assert_eq!(failure.failed, 0);
     assert_eq!(failure.text, "error[E0425]: cannot find value `x`\n --> src/lib.rs:1:1\nerror: could not compile");
 }
+
+#[test]
+fn the_build_advice_tells_the_window_from_rc_from_neither() {
+    let files = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    // the window's own code, or the console code it links, waits for the milestone commit
+    assert_eq!(
+        build_advice(&files(&["apps/rc-gui/src/ui.rs", "crates/ra-roadmap/src/store.rs"])),
+        Some("window: restart on the milestone commit")
+    );
+    assert_eq!(build_advice(&files(&["crates\\ra-console\\src\\agent.rs"])), Some("window: restart on the milestone commit"));
+    // rc and the other crates are live for the next run after an install
+    assert_eq!(build_advice(&files(&["apps/rc/src/main.rs"])), Some("rc: install any time, no restart"));
+    assert_eq!(build_advice(&files(&["crates/ra-roadmap/src/store.rs", "README.md"])), Some("rc: install any time, no restart"));
+    // neither says nothing
+    assert_eq!(build_advice(&files(&[".claude/skills/rhipper-pair/SKILL.md", "rhipper.md"])), None);
+    assert_eq!(build_advice(&[]), None);
+}

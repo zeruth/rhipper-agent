@@ -44,6 +44,12 @@ pub fn quit_requested(root: &Path) -> bool {
     quit.exists() && std::fs::remove_file(quit).is_ok()
 }
 
+/// Whether a console or a window's tab claims the project right now.
+#[must_use]
+pub fn claimed(root: &Path) -> bool {
+    running_pid(root).is_some()
+}
+
 /// The pid in the project's pid file, when there is one.
 fn running_pid(root: &Path) -> Option<u32> {
     std::fs::read_to_string(pid_file(root)).ok()?.trim().parse().ok()

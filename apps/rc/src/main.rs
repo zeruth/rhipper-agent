@@ -220,6 +220,14 @@ enum Command {
     },
     /// Quits the window and starts the installed one again on the same tabs: how a new build comes up after `rc install`.
     Restart,
+    /// Starts the walk (`rc run --all`) as a process of its own: through the window that has the project, else detached from here. `--stop` ends a walk after its current card.
+    Walk {
+        /// The project directory; this one when left out.
+        dir: Option<PathBuf>,
+        /// Ends the running walk after the card it is in.
+        #[arg(long)]
+        stop: bool,
+    },
     /// An observation for the next runs: what slowed one, a quirk of the machine, a direction. The workers read the latest with their own look-backs.
     Note {
         /// The note, one line.
@@ -393,6 +401,23 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Restart => {
             println!("{}", ra_console::hub::restart()?);
+            Ok(())
+        }
+        Command::Walk { dir, stop } => {
+            let dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            if stop {
+                println!("{}", ra_console::agent::stop_walk(&dir));
+            } else if ra_console::agent::walk_running(&dir) {
+                println!("a walk is already running in {}; `rc walk --stop` ends it after its current card", dir.display());
+            } else if ra_console::instance::claimed(&dir) && ra_console::hub::window_running() {
+                // the window has the project: it starts the walk, so the tab shows it from its
+                // first line and the walk is nobody's child but the system's
+                println!("{}", ra_console::agent::request_walk(&dir));
+            } else {
+                let pid = ra_console::agent::spawn_walk(&dir, true)?;
+                println!("walk started in {} (pid {pid}); `rc pair` and var/activity.log follow it", dir.display());
+            }
             Ok(())
         }
         Command::Pair => {
