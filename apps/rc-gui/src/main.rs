@@ -2032,10 +2032,12 @@ impl Workspace {
             self.rt.spawn(self.local.clone().probe_local());
         }
         // the plan's windows, every five seconds: a run of any instance may have moved them
+        // under the project's root: the relative path read against the window's working
+        // directory, which is no project's, and the pill never moved after the first read
         if self.limits_read.elapsed() >= Duration::from_secs(5) {
-            self.limits = ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE));
+            self.limits = ra_providers::limits::Limits::load(&self.root.join(ra_providers::claude_code::LIMITS_FILE));
             self.limits_read = Instant::now();
-            self.week = ra_providers::limits::Week::load(Path::new(ra_providers::claude_code::LIMITS_LOG));
+            self.week = ra_providers::limits::Week::load(&self.root.join(ra_providers::claude_code::LIMITS_LOG));
             // the week's pill aims at the new value and glows for a moment when it moved
             #[allow(clippy::cast_possible_truncation)]
             let target = self.limits.windows.get("seven_day").map_or(0.0, |w| w.utilization as f32);

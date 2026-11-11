@@ -194,18 +194,18 @@ fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: us
             // finished one shrinks to its cap. Room given is a bound: the card never grows
             // past it, whatever its own height setting
             let bounded = room.is_some();
-            // a bounded card hands the rows what is left under its title once the frame's
-            // margins and stroke (16 and 3) are off the room; the console hands the clip
-            let room = match room {
-                Some(room) => room - 19.0 - ui.min_rect().height(),
+            // a bounded card's content is its room less the frame's margins (8 above and
+            // below) and stroke (1.5); the rows get what is left of that under the title.
+            // The console hands the clip
+            let want = room.map(|room| (room - 19.0).floor());
+            let rows_room = match want {
+                Some(want) => want - ui.min_rect().height(),
                 None => ui.clip_rect().height(),
             };
-            run_steps(ui, run, room, bounded);
+            run_steps(ui, run, rows_room, bounded);
             // a bounded card is exactly its room tall, live or finished: the dashboard gives
-            // the run the height of the queue beside it, and the two read as one band. The
-            // frame's margins (8 above and below) and stroke (1.5) come off the room first
-            if bounded {
-                let want = room - 16.0 - 3.0;
+            // the run the height of the queue beside it, and the two read as one band
+            if let Some(want) = want {
                 let used = ui.min_rect().height();
                 if want > used {
                     ui.allocate_space(egui::vec2(ui.available_width(), want - used));
@@ -323,7 +323,10 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     if bounded {
         let rows = (body + usize::from(hidden > 0)) as f32;
         let extra = ((room - rows * row) / rows).clamp(0.0, row);
-        ui.spacing_mut().item_spacing.y += extra;
+        // on the pixel grid: a fraction of a pixel between rows put the text between pixels,
+        // and it snapped up or down a pixel from frame to frame
+        let ppp = ui.pixels_per_point();
+        ui.spacing_mut().item_spacing.y += (extra * ppp).floor() / ppp;
     }
     // the entries that fell off the top fold into one line, which takes a row of its own
     let skip = if hidden > 0 { hidden + 1 } else { 0 };
