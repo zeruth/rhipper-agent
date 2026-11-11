@@ -49,6 +49,113 @@ pub fn with_direction(project: &str, direction: &[String]) -> String {
     text
 }
 
+/// The headings of the sections every run keeps, whatever its card names: the build, the
+/// conventions and the person's standing direction. A heading matches when it contains one of
+/// these, case aside.
+const KEPT_SECTIONS: [&str; 3] = ["build", "convention", "standing direction"];
+
+/// The project context cut to a card: the title and lead, the sections whose heading is in
+/// [`KEPT_SECTIONS`], the sections whose text names one of the card's files or crates, and the
+/// layout section with the lines of the other crates dropped (a line that names a path in
+/// backticks and none of the card's; a line that names no path stays). A card with no files
+/// keeps the whole context, and so does one with a file outside any crate (`gw.ps1`,
+/// `src/main.rs`): nothing says which part of it the worker needs.
+#[must_use]
+pub fn cut_to(project: &str, files: &[String]) -> String {
+    if files.is_empty() || files.iter().any(|f| crate_of(f).is_empty()) {
+        return project.to_owned();
+    }
+    let names = names_of(files);
+    let matches_name = |line: &str| names.iter().any(|n| line.contains(n.as_str()));
+    let mut out = String::new();
+    for section in sections_of(project) {
+        let heading = section.lines().next().unwrap_or_default();
+        let lower = heading.to_lowercase();
+        let keep = if !heading.starts_with("## ") || KEPT_SECTIONS.iter().any(|k| lower.contains(k)) {
+            Some(section.clone())
+        } else if lower.contains("layout") {
+            let lines: Vec<&str> = section.lines().filter(|l| !(l.starts_with("- ") && names_path(l)) || matches_name(l)).collect();
+            Some(lines.join("\n"))
+        } else {
+            section.lines().any(matches_name).then(|| section.clone())
+        };
+        if let Some(text) = keep {
+            out.push_str(text.trim_end());
+            out.push_str("\n\n");
+        }
+    }
+    format!("{}\n", out.trim_end())
+}
+
+/// The context split at its `## ` headings: the lead before the first, then each section with
+/// its heading as its first line.
+fn sections_of(project: &str) -> Vec<String> {
+    let mut sections: Vec<String> = Vec::new();
+    for line in project.lines() {
+        if line.starts_with("## ") || sections.is_empty() {
+            sections.push(String::new());
+        }
+        let last = sections.last_mut().expect("a section was just pushed");
+        last.push_str(line);
+        last.push('\n');
+    }
+    sections
+}
+
+/// What a layout line or a section names a card by: each file, the crate path of each file
+/// without its trailing slash (`crates/ra-tools`) and the crate's bare name (`ra-tools`).
+fn names_of(files: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+    for file in files {
+        names.push(file.clone());
+        let prefix = crate_of(file);
+        let prefix = prefix.trim_end_matches('/');
+        if !prefix.is_empty() {
+            names.push(prefix.to_owned());
+            if let Some(bare) = prefix.rsplit('/').next() {
+                names.push(bare.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// Whether a line names a path in backticks: a layout line of a crate or a directory.
+fn names_path(line: &str) -> bool {
+    line.split('`').skip(1).step_by(2).any(|token| token.contains('/') && !token.contains(' '))
+}
+
+/// `notes` with the lines already said by `known` dropped, so a fact rides once in a prompt:
+/// a line is said when, letters and digits alone and case aside, it is a line of `known` or an
+/// earlier line of `notes`. A heading whose lines all went goes with them.
+#[must_use]
+pub fn dedupe_notes(notes: &str, known: &str) -> String {
+    let said = |text: &str| text.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_lowercase();
+    // line by line, not the context as one string: a short bullet is not said by a substring
+    let mut seen: Vec<String> = known.lines().map(said).filter(|key| !key.is_empty()).collect();
+    let mut blocks: Vec<String> = Vec::new();
+    // a block is a heading and its bullets; one whose bullets all went goes with them
+    for block in notes.split("\n\n") {
+        let mut kept: Vec<&str> = Vec::new();
+        let mut bullets = 0;
+        for line in block.lines() {
+            if let Some(text) = line.strip_prefix("- ") {
+                let key = said(text);
+                if key.is_empty() || seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                bullets += 1;
+            }
+            kept.push(line);
+        }
+        if bullets > 0 {
+            blocks.push(kept.join("\n"));
+        }
+    }
+    blocks.join("\n\n")
+}
+
 /// How many items an outline names before it counts the rest.
 const OUTLINE_ROOM: usize = 60;
 

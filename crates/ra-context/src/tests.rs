@@ -19,6 +19,61 @@ fn the_standing_direction_rides_after_the_project_context() {
     assert!(with_direction("", &direction).starts_with(DIRECTION_HEADING));
 }
 
+const PROJECT: &str = "# P\n\nA project.\n\n## Layout\n\n- `crates/ra-roadmap` — the roadmap\n- `crates/ra-providers` — the providers\n- `crates/ra-tools` — the tools a bare model gets\n- `crates/ra-usage` — the ledger\n- `crates/ra-gotchas` — the catalogue\n- `crates/ra-context` — the context; `ra-tools` reads it for the outline\n- `apps/rc` — the CLI\n- the hub directory (`hub::dir()`) is shared by every project\n\n## Build and checks\n\n- `cargo test -p x`\n\n## Conventions\n\n- match the code\n\n## The window\n\nThe egui window in `apps/rc-gui`.\n\n## The toolbox\n\nWhat `ra-tools` allows.\n\n## The person's standing direction\n- g1 Local first {w3}\n";
+
+#[test]
+fn the_project_context_is_cut_to_the_card_s_crates_and_a_card_without_files_keeps_it_whole() {
+    assert_eq!(cut_to(PROJECT, &[]), PROJECT);
+    let cut = cut_to(PROJECT, &["crates/ra-tools/src/lib.rs".to_owned()]);
+    // eight layout lines, three kept: the crate's own, the one that names it and the one with no path
+    let layout: Vec<&str> =
+        cut.lines().filter(|l| l.starts_with("- `crates") || l.starts_with("- `apps") || l.starts_with("- the hub")).collect();
+    assert_eq!(
+        layout,
+        [
+            "- `crates/ra-tools` — the tools a bare model gets",
+            "- `crates/ra-context` — the context; `ra-tools` reads it for the outline",
+            "- the hub directory (`hub::dir()`) is shared by every project"
+        ],
+        "{cut}"
+    );
+    // the lead, the build, the conventions and the direction ride whatever the card names
+    for kept in [
+        "# P\n\nA project.\n",
+        "## Build and checks\n\n- `cargo test -p x`",
+        "## Conventions\n\n- match the code",
+        "## The person's standing direction\n- g1 Local first {w3}\n",
+    ] {
+        assert!(cut.contains(kept), "{cut}");
+    }
+    // another section rides when it names the crate and not otherwise
+    assert!(cut.contains("## The toolbox\n\nWhat `ra-tools` allows."), "{cut}");
+    assert!(!cut.contains("## The window"), "{cut}");
+    // a file at the root names no crate and keeps the whole layout
+    assert!(cut_to(PROJECT, &["gw.ps1".to_owned()]).contains("- `crates/ra-usage`"));
+}
+
+#[test]
+fn the_machine_notes_drop_what_the_project_context_or_an_earlier_note_already_says() {
+    let project = "## Build\n- Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through `tail`.\n";
+    let notes = "About this machine, from earlier runs:\n- Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through tail\n- an edit missed: Read the lines first\n\nWhat earlier runs here said:\n- an edit missed: Read the lines first\n- (the person) the card named no files";
+    assert_eq!(
+        dedupe_notes(notes, project),
+        "About this machine, from earlier runs:\n- an edit missed: Read the lines first\n\nWhat earlier runs here said:\n- (the person) the card named no files"
+    );
+    // a heading whose every line went goes with them, and nothing known leaves nothing
+    assert_eq!(
+        dedupe_notes(
+            "About this machine:\n- Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through tail",
+            project
+        ),
+        ""
+    );
+    assert_eq!(dedupe_notes("", project), "");
+    // a short bullet inside a longer line of the context is not said by it
+    assert_eq!(dedupe_notes("About this machine:\n- run cargo", project), "About this machine:\n- run cargo");
+}
+
 #[test]
 fn a_rust_outline_names_the_items_with_their_lines() {
     let text = outline(Path::new("crates/x/src/store.rs"), SOURCE);
