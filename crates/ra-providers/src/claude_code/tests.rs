@@ -17,7 +17,9 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
 #[test]
 fn a_chat_request_runs_with_no_tools_and_one_turn() {
     let args = ClaudeCode::new().args(&request(None));
-    assert_eq!(&args[..5], ["-p", "--output-format", "json", "--no-session-persistence", "--bare"]);
+    assert_eq!(&args[..4], ["-p", "--output-format", "json", "--no-session-persistence"]);
+    // --bare would drop the OAuth login the subscription route runs on
+    assert!(!args.contains(&"--bare".to_owned()), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--model", "claude-opus-5-5"]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--system-prompt", "You answer in one word."]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--tools", ""]), "{args:?}");
@@ -28,7 +30,7 @@ fn a_chat_request_runs_with_no_tools_and_one_turn() {
 #[test]
 fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
     let args = ClaudeCode::new().with_max_turns(7).args(&request(Some(PathBuf::from("."))));
-    assert!(args.contains(&"--bare".to_owned()), "{args:?}");
+    assert!(!args.contains(&"--bare".to_owned()), "{args:?}");
     assert!(args.contains(&"--no-session-persistence".to_owned()), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--max-turns", "7"]), "{args:?}");
@@ -68,6 +70,12 @@ fn an_error_result_maps_its_status() {
     assert!(matches!(parse_result(json).unwrap_err(), ProviderError::Unavailable(_)));
     let json = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}"#;
     assert!(matches!(parse_result(json).unwrap_err(), ProviderError::Other(text) if text.contains("error_max_turns")));
+}
+
+#[test]
+fn a_logged_out_harness_is_an_auth_error_even_without_a_status() {
+    let json = r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":null,"terminal_reason":"api_error","result":"Not logged in · Please run /login"}"#;
+    assert!(matches!(parse_result(json).unwrap_err(), ProviderError::Auth(text) if text.contains("Not logged in")));
 }
 
 #[test]

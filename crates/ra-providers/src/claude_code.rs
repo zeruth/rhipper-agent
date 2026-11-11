@@ -57,8 +57,9 @@ impl ClaudeCode {
     /// The command-line arguments of one request. The prompt goes on stdin, so its length is no
     /// concern of the argument list.
     fn args(&self, request: &CompletionRequest) -> Vec<String> {
-        // --bare: a headless worker needs none of the hooks, plugins and skills of an interactive session
-        let mut args = ["-p", "--output-format", "json", "--no-session-persistence", "--bare"].map(str::to_owned).to_vec();
+        // not --bare: it skips the hooks and plugins, but it also skips the OAuth login the
+        // subscription route runs on (card #11 found out)
+        let mut args = ["-p", "--output-format", "json", "--no-session-persistence"].map(str::to_owned).to_vec();
         args.extend(["--model".to_owned(), request.model.clone()]);
         let system = system_prompt(&request.messages);
         if !system.is_empty() {
@@ -101,15 +102,16 @@ impl ClaudeCode {
         let output = child.wait_with_output().await.map_err(|e| ProviderError::Other(format!("claude did not finish: {e}")))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // a result on stdout names the reason itself, exit code or not; only without one does the
+        // exit code speak, with the last line either stream said
+        let has_result = stdout.trim_start().starts_with('{');
         parse_result(&stdout).map_err(|parse| {
-            if output.status.success() {
+            if output.status.success() || has_result {
                 parse
             } else {
-                ProviderError::Other(format!(
-                    "claude exited with {}: {}",
-                    output.status,
-                    snippet(stderr.trim().lines().last().unwrap_or(""))
-                ))
+                let reason =
+                    stderr.lines().chain(stdout.lines()).map(str::trim).filter(|l| !l.is_empty()).next_back().unwrap_or("no output");
+                ProviderError::Other(format!("claude exited with {}: {}", output.status, snippet(reason)))
             }
         })
     }
@@ -181,6 +183,8 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
     if parsed.is_error {
         let what = format!("{} ({})", text.trim(), parsed.subtype.as_deref().unwrap_or("error"));
         return Err(match parsed.api_error_status {
+            // a missing login comes with no status at all
+            _ if text.contains("Not logged in") => ProviderError::Auth(what),
             Some(401 | 403) => ProviderError::Auth(what),
             Some(404) => ProviderError::UnknownModel(what),
             Some(429 | 500..=599) => ProviderError::Unavailable(what),
