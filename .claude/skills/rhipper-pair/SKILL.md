@@ -40,9 +40,12 @@ console per project: a newcomer in the same directory replaces the other.
    second run.
 4. **Test**: `cargo test --workspace -q`.
 5. **Build + install + relaunch**: `cargo build -q -p rc -p rc-gui; .\target\debug\rc.exe install`
-   then close the window (`(Get-Process rc-gui).CloseMainWindow()`) and start
+   then close **this project's** window with `rc stop` run in the project directory (it asks
+   the window named in `var/console.pid` to quit; never `Get-Process rc-gui | CloseMainWindow`,
+   which closes every project's window on the machine, other sessions' included) and start
    `%LOCALAPPDATA%\Programs\rhipper\rc-gui.exe` with the project as working directory. The
-   installed binaries never lock `target/`; installing over a running window is fine.
+   installed binaries never lock `target/`; installing over a running window is fine, and the
+   other projects' windows keep running the old build until their own relaunch.
 6. **Commit** with a message that says the card, the model, the cost line, what the worker did
    and what you fixed (the git log is the review record), with `git commit -F <scratchpad file>`.
 7. **Accept**: `rc set <id> accepted`. Accept a milestone when its cards are.
