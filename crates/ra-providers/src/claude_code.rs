@@ -57,7 +57,8 @@ impl ClaudeCode {
     /// The command-line arguments of one request. The prompt goes on stdin, so its length is no
     /// concern of the argument list.
     fn args(&self, request: &CompletionRequest) -> Vec<String> {
-        let mut args = vec!["-p".to_owned(), "--output-format".to_owned(), "json".to_owned(), "--no-session-persistence".to_owned()];
+        // --bare: a headless worker needs none of the hooks, plugins and skills of an interactive session
+        let mut args = ["-p", "--output-format", "json", "--no-session-persistence", "--bare"].map(str::to_owned).to_vec();
         args.extend(["--model".to_owned(), request.model.clone()]);
         let system = system_prompt(&request.messages);
         if !system.is_empty() {

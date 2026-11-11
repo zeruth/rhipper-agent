@@ -17,7 +17,7 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
 #[test]
 fn a_chat_request_runs_with_no_tools_and_one_turn() {
     let args = ClaudeCode::new().args(&request(None));
-    assert_eq!(&args[..4], ["-p", "--output-format", "json", "--no-session-persistence"]);
+    assert_eq!(&args[..5], ["-p", "--output-format", "json", "--no-session-persistence", "--bare"]);
     assert!(args.windows(2).any(|w| w == ["--model", "claude-opus-5-5"]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--system-prompt", "You answer in one word."]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--tools", ""]), "{args:?}");
@@ -28,6 +28,8 @@ fn a_chat_request_runs_with_no_tools_and_one_turn() {
 #[test]
 fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
     let args = ClaudeCode::new().with_max_turns(7).args(&request(Some(PathBuf::from("."))));
+    assert!(args.contains(&"--bare".to_owned()), "{args:?}");
+    assert!(args.contains(&"--no-session-persistence".to_owned()), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--max-turns", "7"]), "{args:?}");
     let at = args.iter().position(|a| a == "--allowedTools").unwrap();
