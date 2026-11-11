@@ -151,6 +151,9 @@ struct WireUsage {
     #[serde(default)]
     #[serde(rename = "prompt_tokens_details")]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// The cost in credits, which OpenRouter prices in dollars.
+    #[serde(default)]
+    cost: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -218,6 +221,7 @@ impl OpenRouter {
                         prompt_tokens: u.prompt_tokens,
                         completion_tokens: u.completion_tokens,
                         cached_tokens: u.prompt_tokens_details.map_or(0, |d| d.cached_tokens),
+                        cost_usd: u.cost,
                     })
                     .unwrap_or_default();
                 Ok(Completion { text, usage, tool_calls })

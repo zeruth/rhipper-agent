@@ -24,9 +24,13 @@ pub const COMMANDS: &[Spec] = &[
     },
     Spec { name: "depend", usage: "<id> <id>...", help: "makes the first node wait for the others" },
     Spec { name: "set", usage: "<id> <state>", help: "sets the state: the twelve lifecycle names" },
-    Spec { name: "model", usage: "<id>", help: "the model of the next worker session, an OpenRouter id" },
+    Spec {
+        name: "model",
+        usage: "<id>",
+        help: "the model of the next worker session: a claude-* id runs on Claude Code, vendor/model on OpenRouter",
+    },
     Spec { name: "key", usage: "[<paste> | clear]", help: "stores, shows the state of, or clears the OpenRouter key" },
-    Spec { name: "ping", usage: "", help: "one round trip to the badge model, through OpenRouter" },
+    Spec { name: "ping", usage: "", help: "one round trip to the badge model" },
     Spec { name: "run", usage: "<id>", help: "executes one roadmap task on the badge model" },
     Spec { name: "reassess", usage: "<id>", help: "the model revises the objective and acceptance of one node" },
     Spec { name: "reassess-tree", usage: "<id>", help: "reassess for the node and its whole subtree" },
@@ -172,8 +176,12 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             return Ok((out, Outcome::ToggleDebug));
         }
         "model" => {
-            anyhow::ensure!(!args.is_empty(), "usage: model <openrouter id>, such as z-ai/glm-5.3-flash");
-            out.push(format!("the next worker session runs on {args}"));
+            anyhow::ensure!(!args.is_empty(), "usage: model <id>, such as claude-opus-5-5 or z-ai/glm-5.3-flash");
+            let route = match agent::Route::of(args) {
+                agent::Route::ClaudeCode => "Claude Code",
+                agent::Route::OpenRouter => "OpenRouter",
+            };
+            out.push(format!("the next worker session runs on {args} through {route}"));
             return Ok((out, Outcome::Model(args.to_owned())));
         }
         "quit" | "exit" | "shutdown" | "stop" => return Ok((out, Outcome::Quit)),

@@ -2,6 +2,7 @@
 //! one roadmap task to the badge model and records what came back. The functions talk to a
 //! [`ModelProvider`] through a [`Worker`], never to a vendor.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -12,14 +13,30 @@ use ra_roadmap::tree;
 
 use crate::secret;
 
+/// Where a model id routes: a bare Claude id runs on the local Claude Code; an id with a vendor
+/// prefix, such as `z-ai/glm-5.3-flash`, goes through OpenRouter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    ClaudeCode,
+    OpenRouter,
+}
+
+impl Route {
+    /// The route of a model id.
+    pub fn of(model: &str) -> Self {
+        if model.contains('/') { Self::OpenRouter } else { Self::ClaudeCode }
+    }
+}
+
 /// The console's handle on a worker session: the model of the badge and the provider behind it.
 /// The provider connects on first use and stays for the session; the clones in the background
-/// jobs share it. [`Worker::forget`] drops it when the key changes.
+/// jobs share it. A model on another route reconnects, and [`Worker::forget`] drops the provider
+/// when the key changes.
 #[derive(Clone)]
 pub struct Worker {
     /// The model the next session runs on, as the badge holds it.
     pub model: String,
-    provider: Arc<Mutex<Option<Arc<dyn ModelProvider>>>>,
+    provider: Arc<Mutex<Option<(Route, Arc<dyn ModelProvider>)>>>,
 }
 
 impl Worker {
@@ -28,15 +45,27 @@ impl Worker {
         Self { model: model.into(), provider: Arc::new(Mutex::new(None)) }
     }
 
-    /// The provider, connected on the first call: the key comes from the credential store or the
-    /// environment, and a missing one is the error.
+    /// The route of the badge model.
+    pub fn route(&self) -> Route {
+        Route::of(&self.model)
+    }
+
+    /// The provider of the badge model, connected on the first call. OpenRouter needs the key
+    /// from the credential store or the environment, and a missing one is the error; Claude Code
+    /// needs only its own login.
     pub fn provider(&self) -> anyhow::Result<Arc<dyn ModelProvider>> {
+        let route = self.route();
         let mut slot = self.provider.lock();
-        if let Some(provider) = slot.as_ref() {
-            return Ok(provider.clone());
+        if let Some((connected, provider)) = slot.as_ref() {
+            if *connected == route {
+                return Ok(provider.clone());
+            }
         }
-        let provider: Arc<dyn ModelProvider> = Arc::new(ra_providers::openrouter::OpenRouter::new(secret::api_key()?)?);
-        *slot = Some(provider.clone());
+        let provider: Arc<dyn ModelProvider> = match route {
+            Route::ClaudeCode => Arc::new(ra_providers::claude_code::ClaudeCode::new()),
+            Route::OpenRouter => Arc::new(ra_providers::openrouter::OpenRouter::new(secret::api_key()?)?),
+        };
+        *slot = Some((route, provider.clone()));
         Ok(provider)
     }
 
@@ -56,6 +85,7 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
             temperature: Some(0.0),
             max_tokens: Some(16),
             tools: Vec::new(),
+            workspace: None,
         })
         .await
         .map_err(map_error)?;
@@ -76,13 +106,17 @@ pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<
     store.set_state(id, TaskState::InProgress).await?;
 
     let context = context_of(store, &node).await?;
+    // the worker acts in the directory of the roadmap file: the project it describes
+    let workspace =
+        store.path().parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
     let answer = provider
         .complete(CompletionRequest {
             model: worker.model.clone(),
             messages: vec![Message::system(SYSTEM), Message::user(context)],
             temperature: Some(0.4),
-            max_tokens: Some(1024),
+            max_tokens: Some(4096),
             tools: Vec::new(),
+            workspace,
         })
         .await;
     let answer = match answer {
@@ -185,6 +219,7 @@ async fn reassess_one(store: &Store, provider: &dyn ModelProvider, model: &str, 
             temperature: Some(0.2),
             max_tokens: Some(512),
             tools: Vec::new(),
+            workspace: None,
         })
         .await
         .map_err(map_error)?;
@@ -256,8 +291,9 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").chars().take(200).collect()
 }
 
-/// The system prompt of a worker session.
-const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. You answer with a plan of the implementation and the code or the changes it names, nothing else.";
+/// The system prompt of a worker session. A harness with tools implements in the workspace; a
+/// bare model answers with the plan and the changes.
+const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory, check it against the acceptance criteria, and answer with a short report of what you changed and what you verified. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
 
 /// The system prompt of a reassessment.
 const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done.";

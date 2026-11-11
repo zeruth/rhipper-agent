@@ -54,6 +54,12 @@ enum Command {
         /// The state: one of the twelve lifecycle names.
         state: TaskState,
     },
+    /// One round trip to a model: the answer and the usage.
+    Ping {
+        /// The model: a claude-* id runs on Claude Code, vendor/model on OpenRouter.
+        #[arg(long, default_value = ra_console::ui::DEFAULT_MODEL)]
+        model: String,
+    },
     /// Starts the console over the orchestrator.
     Console {
         /// The roadmap file.
@@ -81,6 +87,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Set { id, state } => {
             plain_tracing()?;
             set(id, state).await
+        }
+        Command::Ping { model } => {
+            plain_tracing()?;
+            for line in ra_console::agent::ping(&ra_console::agent::Worker::new(model)).await? {
+                println!("{line}");
+            }
+            Ok(())
         }
         Command::Console { roadmap } => console(roadmap).await,
     }

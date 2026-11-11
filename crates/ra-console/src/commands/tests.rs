@@ -3,9 +3,18 @@
 use super::*;
 use ra_roadmap::store::Store;
 
-/// The worker of the tests, on the badge model; no test talks to a network.
+/// The worker of the tests, on an OpenRouter model; no test talks to a network.
 fn worker() -> Worker {
     Worker::new("z-ai/glm-5.3-flash")
+}
+
+#[test]
+fn a_model_id_routes_by_its_vendor_prefix() {
+    use crate::agent::Route;
+    assert_eq!(Route::of("claude-opus-5-5"), Route::ClaudeCode);
+    assert_eq!(Route::of("opus"), Route::ClaudeCode);
+    assert_eq!(Route::of("z-ai/glm-5.3-flash"), Route::OpenRouter);
+    assert_eq!(Route::of("anthropic/claude-sonnet-5.5"), Route::OpenRouter);
 }
 
 async fn store() -> Store {

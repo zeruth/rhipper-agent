@@ -2,11 +2,14 @@
 //! vendor behind it. The orchestrator and the workers know only [`ModelProvider`]; swapping
 //! GLM for Claude or a local model changes no caller.
 //!
-//! The OpenRouter adapter is the first provider and the aggregator for the others.
+//! Two providers so far: Claude Code, the local harness on a Claude subscription, and OpenRouter,
+//! the aggregator for every other vendor.
 
+pub mod claude_code;
 pub mod openrouter;
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use serde::Deserialize;
@@ -71,6 +74,9 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     /// The tools the model may call; empty sends no tools.
     pub tools: Vec<ToolSpec>,
+    /// The directory the worker may act in. `None` is a pure chat completion; a provider with
+    /// tools of its own, such as Claude Code, runs them inside this directory and nowhere else.
+    pub workspace: Option<PathBuf>,
 }
 
 /// One answer, with the usage the provider reported.
@@ -89,6 +95,9 @@ pub struct Usage {
     pub completion_tokens: u64,
     /// The tokens served from the provider cache, when it reports them.
     pub cached_tokens: u64,
+    /// The cost in dollars as the provider reported it; `None` when it reports none. On a
+    /// subscription this is the list price of the call, not a charge.
+    pub cost_usd: Option<f64>,
 }
 
 /// The errors of a provider call, with the ones a caller can retry marked.

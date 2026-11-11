@@ -139,5 +139,6 @@ fn request() -> CompletionRequest {
         temperature: Some(0.0),
         max_tokens: Some(16),
         tools: Vec::new(),
+        workspace: None,
     }
 }

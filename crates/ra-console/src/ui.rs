@@ -28,8 +28,9 @@ const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const PROMPT: &str = "❯ ";
 /// Rows a mouse wheel notch scrolls.
 const WHEEL_ROWS: usize = 3;
-/// The model the console starts with; `model` swaps it.
-pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
+/// The model the console starts with; `model` swaps it. A bare Claude id runs on the local
+/// Claude Code; a vendor-prefixed id goes through OpenRouter.
+pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 
 /// Whether stdout is a terminal; the console needs one.
 pub fn is_terminal() -> bool {
