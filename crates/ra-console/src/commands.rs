@@ -2,7 +2,7 @@
 //! goes through the orchestrator, which the console drives through the same store.
 
 use anyhow::Context;
-use ra_roadmap::model::{NodeKind, TaskState};
+use ra_roadmap::model::{Effort, NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 
@@ -40,7 +40,8 @@ pub const COMMANDS: &[Spec] = &[
         help: "the model of the next worker session: a claude-* id runs on Claude Code, local/<name> on the local server, vendor/model on OpenRouter",
     },
     Spec { name: "assign", usage: "<id> <model|none>", help: "the model one node runs on, over the badge; none clears it" },
-    Spec { name: "budgets", usage: "[on|off]", help: "whether a run is capped by its card's complexity; off on a subscription" },
+    Spec { name: "budgets", usage: "[on|off]", help: "whether a run is capped in dollars by its card's complexity; off unless turned on" },
+    Spec { name: "effort", usage: "<id> <low|medium|high>", help: "the effort a run of the card asks of its model; medium when unset" },
     Spec { name: "key", usage: "[<paste> | clear]", help: "stores, shows the state of, or clears the OpenRouter key" },
     Spec { name: "ping", usage: "", help: "one round trip to the badge model" },
     Spec {
@@ -178,6 +179,13 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             } else {
                 out.push(format!("#{id} is now {state}"));
             }
+        }
+        "effort" => {
+            let (id_text, level_text) = args.split_once(char::is_whitespace).context("usage: effort <id> <low|medium|high>")?;
+            let id = id_text.parse::<i64>().context("the id is a node id")?;
+            let effort: Effort = level_text.parse()?;
+            store.set_effort(id, effort).await?;
+            out.push(format!("#{id} runs at {effort} effort"));
         }
         "remove" | "rm" => {
             let (id_text, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));

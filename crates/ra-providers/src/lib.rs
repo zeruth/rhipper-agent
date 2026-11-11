@@ -89,6 +89,9 @@ pub struct CompletionRequest {
     /// enforces it itself; for a bare model the caller's tool loop does. It stays on when the
     /// dollar budget is off: on a subscription the turns are the cost.
     pub max_turns: Option<u32>,
+    /// The effort the run asks of the model, `low`, `medium` or `high`; `None` leaves the
+    /// provider's own setting. A harness with the knob passes it on; a bare model ignores it.
+    pub effort: Option<String>,
 }
 
 /// The turn cap of a run on a node of `complexity`, when nothing names one: c1 15, c2 25, c3 40,

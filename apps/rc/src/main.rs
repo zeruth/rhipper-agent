@@ -79,17 +79,17 @@ enum Command {
         /// The model for this run; left out, the node's own model, else the default.
         #[arg(long)]
         model: Option<String>,
-        /// The most dollars the run may spend; left out, the node's complexity sets it
-        /// (c1 0.25, c2 0.50, c3 1.00, c4 2.00, c5 5.00) while budgets are on.
+        /// The most dollars the run may spend; none unless given. With budgets on (RHIPPER_BUDGETS=on, or
+        /// `budgets on` in the console) the node's complexity caps a run (c1 0.25 … c5 5.00) instead.
         #[arg(long)]
         budget: Option<f64>,
-        /// No dollar cap: the run spends what it needs. RHIPPER_BUDGETS=off does the same everywhere.
-        #[arg(long)]
-        no_budget: bool,
-        /// The most turns the run may take; left out, the node's complexity sets it
-        /// (c1 15, c2 25, c3 40, c4 60, c5 90), budgets on or off.
+        /// The most turns the run may take; none unless given.
         #[arg(long)]
         turns: Option<u32>,
+        /// The effort the run asks of the model: low, medium or high; left out, the card's own,
+        /// medium when it names none.
+        #[arg(long)]
+        effort: Option<ra_roadmap::model::Effort>,
         /// Prints what the run would send (the system messages, the task context, the harness
         /// command line) and calls no model; the card keeps its state and its session.
         #[arg(long)]
@@ -185,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             usage().await
         }
-        Command::Run { id, model, budget, no_budget, turns, dry } => {
+        Command::Run { id, model, budget, turns, effort, dry } => {
             plain_tracing()?;
             if let Some(budget) = budget {
                 anyhow::ensure!(budget.is_finite() && budget > 0.0, "the budget is a positive number of dollars");
@@ -196,10 +196,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(model) => model,
                 None => store.read(id).await?.assignee.map_or_else(|| ra_console::ui::DEFAULT_MODEL.to_owned(), |a| a.model),
             };
-            let mut worker = Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns);
-            if no_budget {
-                worker = worker.with_budgets(false);
-            }
+            let worker = Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns).with_effort(effort);
             let lines = if dry {
                 ra_console::agent::dry_run(&store, id, &worker).await?
             } else {

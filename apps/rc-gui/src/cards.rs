@@ -275,6 +275,9 @@ pub(crate) fn tooltip(ui: &mut Ui, node: &Node, lane: Color32) {
         section(ui, "NOTES", theme::DIM);
         ui.label(RichText::new(first.chars().take(240).collect::<String>()).color(theme::DIM).italics());
     }
+    // the glow under it, and a bold outline in the lane on top: the tooltip stands over the
+    // rows behind it
     let rect = ui.min_rect().expand(6.0);
-    painter.set(slot, RectShape::filled(rect.expand(7.0), CornerRadius::same(12), alpha(lane, 40)).with_blur_width(28.0));
+    painter.set(slot, RectShape::filled(rect.expand(7.0), CornerRadius::same(12), alpha(lane, 60)).with_blur_width(28.0));
+    painter.rect_stroke(rect, CornerRadius::same(9), Stroke::new(2.0, alpha(lane, 255)), egui::StrokeKind::Outside);
 }

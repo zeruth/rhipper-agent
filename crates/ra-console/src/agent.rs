@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use parking_lot::Mutex;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError, Usage};
-use ra_roadmap::model::{Node, NodeKind, TaskState};
+use ra_roadmap::model::{Effort, Node, NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 use ra_usage::{Entry, Totals, UsageStore};
@@ -74,12 +74,16 @@ pub struct Worker {
     /// The dollar budget of a run, from `--budget`; `None` takes it from the node's complexity.
     pub budget: Option<f64>,
     /// Whether a run without an explicit budget takes one from the node's complexity. On unless
-    /// `RHIPPER_BUDGETS=off` is in the environment, `--no-budget` was passed, or `budgets off`
-    /// was typed: a subscription has no bill to guard.
+    /// Off unless `RHIPPER_BUDGETS=on` is in the environment or `budgets on` was typed: nothing
+    /// caps a run by default, and a subscription has no bill to guard. `--budget` caps one run
+    /// either way.
     pub budgets: bool,
     /// The turn cap of a run, from `--turns`; `None` takes it from the node's complexity. It
     /// holds whether budgets are on or off: on a subscription the turns are the cost.
     pub turns: Option<u32>,
+    /// The effort of a run, from `--effort`; `None` takes the card's own, medium when it names
+    /// none.
+    pub effort: Option<Effort>,
     /// What answers the commands of a run instead of the shell; the tests script the check and
     /// the lint with it.
     script: Option<ra_tools::Script>,
@@ -94,9 +98,10 @@ impl Worker {
             ledger: None,
             tally: Arc::new(Mutex::new(Totals::default())),
             budget: None,
-            budgets: !std::env::var("RHIPPER_BUDGETS")
-                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
+            budgets: std::env::var("RHIPPER_BUDGETS")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes")),
             turns: None,
+            effort: None,
             script: None,
         }
     }
@@ -105,6 +110,13 @@ impl Worker {
     #[must_use]
     pub fn with_turns(mut self, turns: Option<u32>) -> Self {
         self.turns = turns;
+        self
+    }
+
+    /// The same worker, with every run at `effort` instead of the card's.
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<Effort>) -> Self {
+        self.effort = effort;
         self
     }
 
@@ -234,7 +246,8 @@ impl Worker {
                 let mut harness = ra_providers::claude_code::ClaudeCode::new();
                 // the project's catalogue when it has one; the seed otherwise, written by the
                 // hook in the run's own directory, not here (a test runs where no var/ belongs)
-                let catalogue = if Path::new(GOTCHAS_FILE).exists() { Catalogue::load(Path::new(GOTCHAS_FILE)) } else { Ok(Catalogue::seed()) };
+                let catalogue =
+                    if Path::new(GOTCHAS_FILE).exists() { Catalogue::load(Path::new(GOTCHAS_FILE)) } else { Ok(Catalogue::seed()) };
                 match (std::env::current_exe(), catalogue) {
                     (Ok(rc), Ok(catalogue)) => harness = harness.with_gotchas(rc, catalogue),
                     (_, Err(e)) => tracing::warn!("the gotchas are off: {e:#}"),
@@ -270,6 +283,7 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
             budget_usd: None,
             resume: None,
             max_turns: None,
+            effort: None,
         })
         .await
         .map_err(map_error)?;
@@ -313,7 +327,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     let provider = worker.provider()?;
     store.set_state(id, TaskState::InProgress).await?;
 
-    let Prepared { workspace, root, mut task, project, budget, cap } = prepare(store, &node, worker, true).await?;
+    let Prepared { workspace, root, mut task, project, budget, cap, effort } = prepare(store, &node, worker, true).await?;
     let workspace_dir = workspace.clone();
     // what is dirty before the run, so the handoff names only what the run changed
     let dirty_before = git_status(&root).await;
@@ -333,7 +347,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
                 budget_usd: budget,
                 // the session of the last run of this node, so the harness keeps its context
                 resume: node.session.clone(),
-                max_turns: Some(cap),
+                max_turns: cap,
+                effort: Some(effort.to_string()),
             })
             .await
             .map_err(map_error);
@@ -436,16 +451,18 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     }
     task.record(handoff(if passed { "implemented" } else { "needs revision" }, check_line.trim(), &report, changed));
     save_context(store, &root, &task).await;
+    let turns = match session.cap {
+        Some(cap) => format!("{}/{cap}", session.turns),
+        None => session.turns.to_string(),
+    };
     let mut lines = vec![
         format!(
-            "{} #{} {} {} on {} · turns {}/{}, {} tool call(s) · in {} out {} · {}",
+            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · in {} out {} · {}",
             if passed { "✓" } else { "✗" },
             id,
             node.title,
             if passed { "implemented" } else { "needs revision" },
             short(&worker.model),
-            session.turns,
-            session.cap,
             session.calls,
             session.usage.prompt_tokens,
             session.usage.completion_tokens,
@@ -474,7 +491,10 @@ struct Prepared {
     /// The project context; empty while there is none.
     project: String,
     budget: Option<f64>,
-    cap: u32,
+    /// The turn cap, when `--turns` named one; nothing caps a run by default.
+    cap: Option<u32>,
+    /// The effort the run asks of the model: `--effort` when it was passed, else the card's.
+    effort: Effort,
 }
 
 /// Builds what a run of `node` sends. The context of the task is the brief of the card, the
@@ -491,11 +511,12 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     task.outlines = ra_context::outline_files(&root, &node.files);
     let project =
         if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
-    // an explicit budget, else the complexity's while budgets are on, else none at all
+    // an explicit budget, else the complexity's while budgets are on, else none at all; a turn
+    // cap only when one was asked for. No limit stands by default: the person asked for none
     let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
-    // an explicit turn cap, else the complexity's: it stays on with budgets off
-    let cap = worker.turns.unwrap_or_else(|| ra_providers::turns_for(node.complexity));
-    Ok(Prepared { workspace, root, task, project, budget, cap })
+    let cap = worker.turns;
+    let effort = worker.effort.unwrap_or(node.effort);
+    Ok(Prepared { workspace, root, task, project, budget, cap, effort })
 }
 
 /// The messages of a harness run: the worker's role, the project context and the machine notes
@@ -531,7 +552,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; run a task");
     let provider = worker.provider()?;
-    let Prepared { workspace, root, task, project, budget, cap } = prepare(store, &node, worker, false).await?;
+    let Prepared { workspace, root, task, project, budget, cap, effort } = prepare(store, &node, worker, false).await?;
     let harness = provider.has_own_tools();
     let messages = if harness {
         harness_messages(&task, &project, &root)
@@ -547,7 +568,8 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
         workspace,
         budget_usd: budget,
         resume: node.session.clone(),
-        max_turns: Some(cap),
+        max_turns: cap,
+        effort: Some(effort.to_string()),
     };
     let mut lines = vec![
         format!(
@@ -557,8 +579,9 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             worker.route().name()
         ),
         format!(
-            "  budget {} · turn cap {cap} · resume {} · check: {}",
+            "  budget {} · turn cap {} · resume {} · check: {}",
             budget.map_or_else(|| "none".to_owned(), |b| format!("${b:.2}")),
+            cap.map_or_else(|| "none".to_owned(), |c| c.to_string()),
             node.session.as_deref().unwrap_or("none"),
             check_command(node.acceptance.as_deref())
         ),
@@ -568,7 +591,8 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
         // the effort and the allowed tools, named before the argument list buries them
         let effort = argument(command, "--effort").unwrap_or("the harness default");
         let allowed = arguments(command, "--allowedTools");
-        lines.push(format!("  effort {effort} · allowed tools: {}", if allowed.is_empty() { "none".to_owned() } else { allowed.join(" ") }));
+        lines
+            .push(format!("  effort {effort} · allowed tools: {}", if allowed.is_empty() { "none".to_owned() } else { allowed.join(" ") }));
     } else {
         let names: Vec<String> = request.tools.iter().map(|t| t.name.clone()).collect();
         lines.push(format!("  effort: none, a bare model · tools: {} · temperature 0.2", names.join(" ")));
@@ -766,7 +790,8 @@ struct Session {
     usage: Usage,
     calls: usize,
     turns: u64,
-    cap: u32,
+    /// The turn cap the run had, when it had one.
+    cap: Option<u32>,
 }
 
 /// The dollar budget of a run on a node of `complexity`, when `--budget` names none: c1 $0.25,
@@ -803,8 +828,8 @@ impl std::fmt::Display for OverBudget {
 impl std::error::Error for OverBudget {}
 
 /// The tool loop of a bare model: the model answers with tool calls, the toolbox executes them in
-/// the workspace, the results go back, until the model answers in words, the `cap` turns run out,
-/// or the summed cost crosses `budget`.
+/// the workspace, the results go back, until the model answers in words, the `cap` turns run out
+/// when there is one, or the summed cost crosses `budget` when there is one.
 async fn tool_loop(
     provider: &dyn ModelProvider,
     worker: &Worker,
@@ -812,14 +837,21 @@ async fn tool_loop(
     context: String,
     workspace: Option<&Path>,
     budget: Option<f64>,
-    cap: u32,
+    cap: Option<u32>,
 ) -> anyhow::Result<Session> {
     let workspace = workspace.context("the worker has no workspace to act in")?;
     let toolbox = worker.toolbox(workspace)?;
     let mut messages = vec![Message::system(SYSTEM), Message::user(context)];
     let mut usage = Usage::default();
     let mut calls = 0usize;
-    for turn in 1..=cap {
+    let mut turn = 0u32;
+    loop {
+        turn += 1;
+        if let Some(cap) = cap
+            && turn > cap
+        {
+            anyhow::bail!("the worker made {calls} tool call(s) in {cap} turns without finishing; raise the cap with --turns or split the task");
+        }
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
@@ -830,7 +862,8 @@ async fn tool_loop(
                 workspace: Some(workspace.to_path_buf()),
                 budget_usd: budget,
                 resume: None,
-                max_turns: Some(cap),
+                max_turns: cap,
+                effort: None,
             })
             .await
             .map_err(map_error)?;
@@ -852,7 +885,6 @@ async fn tool_loop(
             calls += 1;
         }
     }
-    anyhow::bail!("the worker made {calls} tool call(s) in {cap} turns without finishing; raise the cap with --turns or split the task")
 }
 
 /// Adds one completion's usage to a running sum.
@@ -973,6 +1005,7 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
             budget_usd: None,
             resume: None,
             max_turns: None,
+            effort: None,
         })
         .await
         .map_err(map_error)?;

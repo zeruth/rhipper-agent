@@ -132,6 +132,61 @@ fn name_list<T: std::fmt::Display>(items: &[T]) -> String {
     }
 }
 
+/// The effort a run of a card asks of its model: how hard the harness thinks before it acts.
+/// Medium is the efficient setting for the routine card; a hard one asks for more, a chore for
+/// less. The Claude Code provider passes it as `--effort`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl Effort {
+    /// Every level, from the least.
+    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
+
+    /// The name the store persists, and the harness takes.
+    #[must_use]
+    pub fn serde_name(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    /// The next level up, wrapping round to the least: a click on the badge cycles them.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Low,
+        }
+    }
+}
+
+impl std::fmt::Display for Effort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.serde_name())
+    }
+}
+
+impl std::str::FromStr for Effort {
+    type Err = anyhow::Error;
+
+    /// The level of its name; the error lists the names.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|level| level.serde_name() == text.trim().to_ascii_lowercase())
+            .ok_or_else(|| anyhow::anyhow!("the effort is {}", name_list(&Self::ALL)))
+    }
+}
+
 /// Who executes a task, as a model id plus the role it plays. The router resolves it; the roadmap
 /// only records the assignment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +224,9 @@ pub struct Node {
     pub assignee: Option<Assignment>,
     /// Complexity 1..=5, for the router and the cost model.
     pub complexity: u8,
+    /// The effort a run asks of the model; medium when the card names none.
+    #[serde(default)]
+    pub effort: Effort,
     /// The notes of the last execution: findings, blockers, results.
     pub notes: Option<String>,
     /// What the last reassessment saw: the word [`FINAL`], which no reassessment rewrites, or a

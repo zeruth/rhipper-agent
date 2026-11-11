@@ -46,7 +46,9 @@ impl Outline {
     pub fn summary(&self) -> String {
         let count = |kind: NodeKind| self.items.iter().filter(|i| i.kind == kind).count();
         let mut parts = Vec::new();
-        for (kind, name) in [(NodeKind::Milestone, "milestone"), (NodeKind::Section, "section"), (NodeKind::Task, "task"), (NodeKind::Subtask, "subtask")] {
+        for (kind, name) in
+            [(NodeKind::Milestone, "milestone"), (NodeKind::Section, "section"), (NodeKind::Task, "task"), (NodeKind::Subtask, "subtask")]
+        {
             let n = count(kind);
             if n > 0 {
                 parts.push(format!("{n} {name}{}", if n == 1 { "" } else { "s" }));

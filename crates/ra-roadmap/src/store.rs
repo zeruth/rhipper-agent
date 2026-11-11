@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::markdown::{self, render};
-use crate::model::{Assignment, Node, NodeKind, TaskState};
+use crate::model::{Assignment, Effort, Node, NodeKind, TaskState};
 use crate::tree;
 
 /// The store over one `rhipper.md`.
@@ -36,6 +36,7 @@ impl Store {
                 state: TaskState::Defined,
                 assignee: None,
                 complexity: 3,
+                effort: Effort::default(),
                 notes: None,
                 assessed: None,
             };
@@ -107,6 +108,7 @@ impl Store {
             state: TaskState::Defined,
             assignee: None,
             complexity,
+            effort: Effort::default(),
             notes: None,
             assessed: None,
         };
@@ -230,7 +232,20 @@ impl Store {
         self.write(nodes).await
     }
 
+    /// Sets the effort a run of a node asks of its model.
+    ///
+    /// # Errors
+    /// When the node is not there or the file cannot be written.
+    pub async fn set_effort(&self, id: i64, effort: Effort) -> anyhow::Result<()> {
+        let mut nodes = self.all().await?;
+        node_mut(&mut nodes, id)?.effort = effort;
+        self.write(nodes).await
+    }
+
     /// Records the notes of the last execution on a node.
+    ///
+    /// # Errors
+    /// When the node is not there or the file cannot be written.
     pub async fn set_notes(&self, id: i64, notes: &str) -> anyhow::Result<()> {
         let mut nodes = self.all().await?;
         node_mut(&mut nodes, id)?.notes = Some(notes.to_owned());

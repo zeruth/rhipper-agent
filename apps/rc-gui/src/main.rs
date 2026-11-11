@@ -61,7 +61,8 @@ struct Setup {
 
 impl Setup {
     fn new(root: &Path) -> Self {
-        let dir = std::fs::canonicalize(root).map_or_else(|_| root.display().to_string(), |p| p.display().to_string().replace("\\\\?\\", ""));
+        let dir =
+            std::fs::canonicalize(root).map_or_else(|_| root.display().to_string(), |p| p.display().to_string().replace("\\\\?\\", ""));
         Self { dir, candidates: ra_console::setup::candidates(root), model: ra_console::setup::SETUP_MODEL.to_owned(), running: None }
     }
 }
@@ -201,7 +202,8 @@ impl App {
         // offers to make one rather than writing a bare file on the quiet
         let root = Path::new(".");
         let mut setup = None;
-        let temp_store = || rt.block_on(Store::open(&std::env::temp_dir().join("rhipper-agent-fault.md"), "Rhipper Agent")).expect("a temp store");
+        let temp_store =
+            || rt.block_on(Store::open(&std::env::temp_dir().join("rhipper-agent-fault.md"), "Rhipper Agent")).expect("a temp store");
         let store = if ra_console::setup::exists(root) {
             match rt.block_on(Store::open(Path::new(ra_console::setup::ROADMAP_FILE), "Rhipper Agent")) {
                 Ok(store) => store,
@@ -372,9 +374,8 @@ impl App {
     /// Reads the ledger and the gotchas again: the same queries as `rc usage` and the same
     /// journal as `rc gotchas`, so the tab shows their numbers.
     fn refresh_ledger(&mut self) {
-        let (all_time, by_model, by_node) = self
-            .rt
-            .block_on(async { (self.worker.all_time().await, self.worker.by_model().await, self.worker.by_node().await) });
+        let (all_time, by_model, by_node) =
+            self.rt.block_on(async { (self.worker.all_time().await, self.worker.by_model().await, self.worker.by_node().await) });
         let catalogue = match Catalogue::load(Path::new(GOTCHAS_FILE)) {
             Ok(catalogue) => Some(catalogue),
             Err(e) => {
@@ -808,7 +809,8 @@ impl App {
         // the structure a hidden chip still needs: the ancestors of every card that stays shown;
         // a milestone in a hidden state with nothing shown under it goes with its cards
         let mut holds_shown: HashSet<i64> = HashSet::new();
-        for node in nodes.iter().filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && !self.hidden_states.contains(&n.state)) {
+        for node in nodes.iter().filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && !self.hidden_states.contains(&n.state))
+        {
             let mut parent = node.parent;
             while let Some(id) = parent {
                 if !holds_shown.insert(id) {
@@ -831,12 +833,25 @@ impl App {
             depths,
         };
         let mut out = Walked::default();
-        egui::ScrollArea::vertical().id_salt("roadmap").auto_shrink([false, false]).show(ui, |ui| {
+        let scroll = egui::ScrollArea::vertical().id_salt("roadmap").auto_shrink([false, false]).show(ui, |ui| {
             ui.set_width(ui.available_width());
             for root in nodes.iter().filter(|n| n.parent.is_none()) {
                 draw_bubble(ui, &nodes, root, &walk, &mut out);
             }
         });
+        // while a tooltip is open the rest of the column steps back: a shade over everything
+        // but the row it belongs to; the tooltip itself is on its own layer above
+        if let Some(row) = out.tooltip_row {
+            let area = scroll.inner_rect;
+            let shade = cards::alpha(theme::BG, 150);
+            let painter = ui.painter();
+            if row.top() > area.top() {
+                painter.rect_filled(egui::Rect::from_min_max(area.min, egui::pos2(area.right(), row.top())), CornerRadius::ZERO, shade);
+            }
+            if row.bottom() < area.bottom() {
+                painter.rect_filled(egui::Rect::from_min_max(egui::pos2(area.left(), row.bottom()), area.max), CornerRadius::ZERO, shade);
+            }
+        }
         self.visible_rows = out.shown;
         self.scroll_to = None;
         if let Some(id) = out.toggled
@@ -1153,6 +1168,13 @@ impl App {
                     let model =
                         node.assignee.as_ref().map_or_else(|| format!("{} (badge)", short(&self.worker.model)), |a| a.model.clone());
                     cards::badge_marked(ui, "◉", &model, theme::TRACE).on_hover_text("the model a run of this card uses");
+                    // a click steps the effort up, high wrapping round to low
+                    let effort = cards::badge_marked(ui, "⚡", &node.effort.to_string(), theme::WARN_TEXT)
+                        .interact(egui::Sense::click())
+                        .on_hover_text(format!("the effort a run asks of the model; click for {}", node.effort.next()));
+                    if effort.clicked() {
+                        command = Some(format!("effort {} {}", node.id, node.effort.next()));
+                    }
                     if node.is_final() {
                         cards::badge(ui, "final", theme::WARN).on_hover_text("never reassessed");
                     }
@@ -1230,9 +1252,10 @@ impl App {
                         || if current.is_empty() { "the badge model".to_owned() } else { current.to_owned() },
                         |(_, name)| (*name).to_owned(),
                     );
-                    egui::ComboBox::from_id_salt(("model", node.id)).selected_text(RichText::new(shown).color(theme::TRACE)).width(220.0).show_ui(
-                        ui,
-                        |ui| {
+                    egui::ComboBox::from_id_salt(("model", node.id))
+                        .selected_text(RichText::new(shown).color(theme::TRACE))
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
                             if ui.selectable_label(current.is_empty(), "the badge model").clicked() && !current.is_empty() {
                                 command = Some(format!("assign {} none", node.id));
                             }
@@ -1241,8 +1264,7 @@ impl App {
                                     command = Some(format!("assign {} {id}", node.id));
                                 }
                             }
-                        },
-                    );
+                        });
                     ui.label(RichText::new("strongest first · a claude-* id runs on Claude Code").color(theme::DIM).small());
                 });
                 if let Some(session) = &node.session {
@@ -1434,6 +1456,8 @@ struct Walked {
     clicked: Option<i64>,
     toggled: Option<i64>,
     command: Option<String>,
+    /// The row whose tooltip is open, so the rest of the column can step back.
+    tooltip_row: Option<egui::Rect>,
 }
 
 impl Walk {
@@ -1522,63 +1546,67 @@ fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node]
         .stroke(Stroke::new(1.0, if selected { cards::alpha(lane, 200) } else { Color32::TRANSPARENT }))
         .corner_radius(CornerRadius::same(7))
         .inner_margin(Margin::symmetric(6, 3));
-    let inner = frame
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let arrow = if !has_children {
-                    "  "
-                } else if walk.is_folded(node.id) {
-                    "▸"
-                } else {
-                    "▾"
-                };
-                if ui.add(egui::Label::new(RichText::new(arrow).color(theme::DIM)).sense(egui::Sense::click())).clicked() && has_children {
-                    out.toggled = Some(node.id);
+    let inner = frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let arrow = if !has_children {
+                "  "
+            } else if walk.is_folded(node.id) {
+                "▸"
+            } else {
+                "▾"
+            };
+            if ui.add(egui::Label::new(RichText::new(arrow).color(theme::DIM)).sense(egui::Sense::click())).clicked() && has_children {
+                out.toggled = Some(node.id);
+            }
+            ui.label(RichText::new(cards::kind_mark(node.kind)).color(lane));
+            ui.label(RichText::new(format!("#{}", node.id)).color(theme::DIM).small());
+            let title = RichText::new(&node.title).color(if selected { theme::TEXT } else { theme::mix(theme::TEXT, lane, 0.45) });
+            ui.label(match node.kind {
+                NodeKind::Project => title.strong().size(16.0),
+                NodeKind::Milestone => title.strong().size(15.0),
+                NodeKind::Section => title.strong(),
+                _ => title,
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                cards::badge(ui, &node.state.to_string(), theme::state_color(node.state));
+                if node.is_final() {
+                    cards::badge(ui, "final", theme::WARN);
                 }
-                ui.label(RichText::new(cards::kind_mark(node.kind)).color(lane));
-                ui.label(RichText::new(format!("#{}", node.id)).color(theme::DIM).small());
-                let title = RichText::new(&node.title).color(if selected { theme::TEXT } else { theme::mix(theme::TEXT, lane, 0.45) });
-                ui.label(match node.kind {
-                    NodeKind::Project => title.strong().size(16.0),
-                    NodeKind::Milestone => title.strong().size(15.0),
-                    NodeKind::Section => title.strong(),
-                    _ => title,
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    cards::badge(ui, &node.state.to_string(), theme::state_color(node.state));
-                    if node.is_final() {
-                        cards::badge(ui, "final", theme::WARN);
+                if let Some(a) = &node.assignee {
+                    cards::badge_marked(ui, "◉", short(&a.model), theme::TRACE).on_hover_text(&a.model);
+                }
+                if matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
+                    cards::priority(ui, node.complexity);
+                } else {
+                    // the progress of a bubble: the cards accepted of the cards under it
+                    let cards_under: Vec<&Node> = tree::subtree(nodes, node.id)
+                        .into_iter()
+                        .filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask))
+                        .collect();
+                    if !cards_under.is_empty() {
+                        let done = cards_under.iter().filter(|n| n.state == TaskState::Accepted).count();
+                        let color = if done == cards_under.len() { theme::ONLINE } else { theme::DIM };
+                        ui.label(RichText::new(format!("{done}/{}", cards_under.len())).small().color(color))
+                            .on_hover_text("cards accepted of the cards under it");
                     }
-                    if let Some(a) = &node.assignee {
-                        cards::badge_marked(ui, "◉", short(&a.model), theme::TRACE).on_hover_text(&a.model);
+                }
+                if selected && node.kind != NodeKind::Project {
+                    if ui.small_button(RichText::new("▶").color(theme::ACCENT)).on_hover_text("run this card").clicked() {
+                        out.command = Some(format!("run {}", node.id));
                     }
-                    if matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
-                        cards::priority(ui, node.complexity);
-                    } else {
-                        // the progress of a bubble: the cards accepted of the cards under it
-                        let cards_under: Vec<&Node> =
-                            tree::subtree(nodes, node.id).into_iter().filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask)).collect();
-                        if !cards_under.is_empty() {
-                            let done = cards_under.iter().filter(|n| n.state == TaskState::Accepted).count();
-                            let color = if done == cards_under.len() { theme::ONLINE } else { theme::DIM };
-                            ui.label(RichText::new(format!("{done}/{}", cards_under.len())).small().color(color))
-                                .on_hover_text("cards accepted of the cards under it");
-                        }
+                    if ui.small_button(RichText::new("↻").color(theme::WARN_TEXT)).on_hover_text("reassess this card").clicked() {
+                        out.command = Some(format!("reassess {}", node.id));
                     }
-                    if selected && node.kind != NodeKind::Project {
-                        if ui.small_button(RichText::new("▶").color(theme::ACCENT)).on_hover_text("run this card").clicked() {
-                            out.command = Some(format!("run {}", node.id));
-                        }
-                        if ui.small_button(RichText::new("↻").color(theme::WARN_TEXT)).on_hover_text("reassess this card").clicked() {
-                            out.command = Some(format!("reassess {}", node.id));
-                        }
-                    }
-                });
+                }
             });
         });
+    });
     // the row's own id, so the next frame reads this frame's hover for the fill
     let response = ui.interact(inner.response.rect, row_id, egui::Sense::click());
+    if egui::Tooltip::was_tooltip_open_last_frame(ui.ctx(), response.id) {
+        out.tooltip_row = Some(response.rect);
+    }
     let response = response.on_hover_ui(|ui| cards::tooltip(ui, node, lane));
     if walk.scroll_to == Some(node.id) {
         response.scroll_to_me(None);

@@ -133,7 +133,9 @@ async fn a_cancelled_card_is_removed_on_set_and_on_open() {
     store.set_state(a, TaskState::Cancelled).await.unwrap();
     assert!(store.read(a).await.is_err(), "a cancelled card does not stay");
     // an older file with a cancelled card loses it when it opens
-    let text = std::fs::read_to_string(&path).unwrap().replace(&format!("{b} ‹task› B {{c2}} [defined]"), &format!("{b} ‹task› B {{c2}} [cancelled]"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace(&format!("{b} ‹task› B {{c2}} [defined]"), &format!("{b} ‹task› B {{c2}} [cancelled]"));
     assert!(text.contains("[cancelled]"), "{text}");
     std::fs::write(&path, text).unwrap();
     let again = Store::open(&path, "Test").await.unwrap();

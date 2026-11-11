@@ -15,7 +15,26 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
         budget_usd: None,
         resume: None,
         max_turns: None,
+        effort: None,
     }
+}
+
+#[test]
+fn the_effort_follows_the_card_and_stays_medium_without_one() {
+    let worker = request(Some(PathBuf::from(".")));
+    let args = ClaudeCode::new().args(&worker);
+    assert!(args.windows(2).any(|w| w == ["--effort", "medium"]), "{args:?}");
+    let mut hard = request(Some(PathBuf::from(".")));
+    hard.effort = Some("high".to_owned());
+    let args = ClaudeCode::new().args(&hard);
+    assert!(args.windows(2).any(|w| w == ["--effort", "high"]), "{args:?}");
+    assert_eq!(args.iter().filter(|a| *a == "--effort").count(), 1, "{args:?}");
+    // the card's level wins over the provider's; a blank one does not
+    let args = ClaudeCode::new().with_effort("low").args(&hard);
+    assert!(args.windows(2).any(|w| w == ["--effort", "high"]), "{args:?}");
+    hard.effort = Some(" ".to_owned());
+    let args = ClaudeCode::new().with_effort("low").args(&hard);
+    assert!(args.windows(2).any(|w| w == ["--effort", "low"]), "{args:?}");
 }
 
 #[test]

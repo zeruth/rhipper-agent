@@ -1,7 +1,7 @@
 //! The tests of the markdown format: round trips, the inline fields and the error cases.
 
 use super::*;
-use crate::model::{Assignment, NodeKind, TaskState};
+use crate::model::{Assignment, Effort, NodeKind, TaskState};
 
 fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
     Node {
@@ -17,9 +17,27 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
         state: TaskState::Defined,
         assignee: None,
         complexity: 3,
+        effort: Effort::default(),
         notes: None,
         assessed: None,
     }
+}
+
+#[test]
+fn round_trips_the_effort_line_and_leaves_medium_out() {
+    let mut hard = node(8, None, NodeKind::Task, "Hard task");
+    hard.effort = Effort::High;
+    let routine = node(9, None, NodeKind::Task, "Routine task");
+    let nodes = vec![hard, routine];
+    let text = render(&nodes);
+    assert!(text.contains("    effort: high"), "{text}");
+    assert_eq!(text.matches("effort:").count(), 1, "medium writes no line:\n{text}");
+    let parsed = parse(&text).unwrap();
+    assert_eq!(parsed[0].effort, Effort::High);
+    assert_eq!(parsed[1].effort, Effort::Medium);
+    assert_eq!(render(&parsed), text);
+    let error = parse("- 1 ‹task› T\n    effort: extreme").unwrap_err();
+    assert!(format!("{error:#}").contains("low, medium or high"), "{error:#}");
 }
 
 #[test]

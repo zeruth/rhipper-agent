@@ -34,8 +34,9 @@ const WORKER_SETTING_SOURCES: &str = "project,local";
 pub struct ClaudeCode {
     /// The command; `claude` on the path unless told otherwise.
     binary: PathBuf,
-    /// The most turns a worker run may take before the harness stops it.
-    max_turns: u32,
+    /// The most turns a worker run may take before the harness stops it, when a request names
+    /// no cap of its own; `None`, the default, caps nothing.
+    max_turns: Option<u32>,
     /// The shell commands a worker may run, as Claude Code permission rules such as `Bash(cargo *)`.
     allowed_shell: Vec<String>,
     /// The effort the harness asks of the model: `medium` unless told otherwise, the efficient
@@ -59,7 +60,7 @@ impl ClaudeCode {
     pub fn new() -> Self {
         Self {
             binary: PathBuf::from("claude"),
-            max_turns: 60,
+            max_turns: None,
             // the build, the read-only git commands, and the read-only shell in both shells: a
             // denied `ls` costs a turn and teaches nothing. A pipe is judged by its parts, so
             // `cargo test 2>&1 | tail -20` passes and keeps the output short
@@ -128,9 +129,9 @@ impl ClaudeCode {
         self
     }
 
-    /// The most turns a worker run may take.
+    /// The most turns a worker run may take, when a request names none of its own.
     pub fn with_max_turns(mut self, turns: u32) -> Self {
-        self.max_turns = turns;
+        self.max_turns = Some(turns);
         self
     }
 
@@ -152,7 +153,9 @@ impl ClaudeCode {
             // run of the task to resume
             args.push("--no-session-persistence".to_owned());
         }
-        args.extend(["--model".to_owned(), request.model.clone(), "--effort".to_owned(), self.effort.clone()]);
+        // the card's effort when the request carries one, else the provider's
+        let effort = request.effort.as_deref().map(str::trim).filter(|e| !e.is_empty()).unwrap_or(&self.effort);
+        args.extend(["--model".to_owned(), request.model.clone(), "--effort".to_owned(), effort.to_owned()]);
         if let Some(session) = request.resume.as_deref().filter(|s| !s.trim().is_empty()) {
             // the harness picks up where the last run of the task left off, its context intact
             args.extend(["--resume".to_owned(), session.trim().to_owned()]);
@@ -164,8 +167,10 @@ impl ClaudeCode {
         if request.workspace.is_some() {
             // a worker: the file tools and the allowed shell commands, inside the workspace
             args.extend(["--permission-mode".to_owned(), "acceptEdits".to_owned()]);
-            // the card's cap when the request carries one, else the provider's
-            args.extend(["--max-turns".to_owned(), request.max_turns.unwrap_or(self.max_turns).to_string()]);
+            // a cap only when the request or the provider names one; none stands by default
+            if let Some(cap) = request.max_turns.or(self.max_turns) {
+                args.extend(["--max-turns".to_owned(), cap.to_string()]);
+            }
             if !self.allowed_shell.is_empty() {
                 args.push("--allowedTools".to_owned());
                 args.extend(self.allowed_shell.iter().cloned());

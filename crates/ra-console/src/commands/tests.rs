@@ -264,8 +264,8 @@ async fn run_on_a_bare_model_loops_through_the_tools_and_lands_the_answer() {
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
 
     let (out, _) = run("run 2", &store, &worker).await.unwrap();
-    // a c3 task: 40 turns
-    assert!(out[0].contains("turns 3/40, 2 tool call(s)"), "{out:?}");
+    // no cap by default: the line names the turns used alone
+    assert!(out[0].contains("turns 3, 2 tool call(s)"), "{out:?}");
     assert!(out[0].contains("$0.03"), "{out:?}");
     assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "hello from the worker\n");
     let node = store.read(2).await.unwrap();
@@ -540,20 +540,20 @@ async fn a_second_run_of_a_node_resumes_its_session() {
 }
 
 #[tokio::test]
-async fn the_turn_cap_follows_the_complexity_and_the_run_line_names_the_turns_used() {
+async fn no_turn_cap_stands_by_default_and_turns_sets_one() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
-    // c3: a 40-turn cap, and the harness reports what it used of it
+    // nothing caps a run by default; the harness reports the turns it took
     run("add task T parent 1", &store, &worker()).await.unwrap();
     let mut answer = says("done", vec![]);
     answer.turns = 12;
     let script = Scripted::new(vec![answer]);
     let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
     let (out, _) = run("run 2", &store, &runner).await.unwrap();
-    assert!(out[0].contains("turns 12/40"), "{out:?}");
-    assert_eq!(script.seen.lock()[0].max_turns, Some(40));
+    assert!(out[0].contains("turns 12,"), "{out:?}");
+    assert_eq!(script.seen.lock()[0].max_turns, None, "nothing caps a run by default");
 
-    // budgets off leaves the cap on; --turns overrides the complexity
+    // --turns caps one run, and the line names the cap
     run("add task U parent 1", &store, &worker()).await.unwrap();
     let script = Scripted::new(vec![says("done", vec![])]);
     let runner =
@@ -563,6 +563,34 @@ async fn the_turn_cap_follows_the_complexity_and_the_run_line_names_the_turns_us
     let seen = script.seen.lock();
     assert_eq!(seen[0].budget_usd, None);
     assert_eq!(seen[0].max_turns, Some(12));
+}
+
+#[tokio::test]
+async fn the_effort_follows_the_card_and_the_flag_overrides_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task T parent 1", &store, &worker()).await.unwrap();
+    // a fresh card runs at medium
+    let script = Scripted::new(vec![says("done", vec![])]);
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
+    run("run 2", &store, &runner).await.unwrap();
+    assert_eq!(script.seen.lock()[0].effort.as_deref(), Some("medium"));
+    // `effort` sets the card, and the file carries it
+    let (out, _) = run("effort 2 high", &store, &worker()).await.unwrap();
+    assert!(out[0].contains("high"), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().effort, ra_roadmap::model::Effort::High);
+    let script = Scripted::new(vec![says("done", vec![])]);
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
+    run("run 2", &store, &runner).await.unwrap();
+    assert_eq!(script.seen.lock()[0].effort.as_deref(), Some("high"));
+    // --effort overrides the card for one run
+    let script = Scripted::new(vec![says("done", vec![])]);
+    let runner = Worker::new("claude-opus-5-5")
+        .with_provider(std::sync::Arc::new(Harness(script.clone())))
+        .with_effort(Some(ra_roadmap::model::Effort::Low));
+    run("run 2", &store, &runner).await.unwrap();
+    assert_eq!(script.seen.lock()[0].effort.as_deref(), Some("low"));
+    assert!(run("effort 2 extreme", &store, &worker()).await.is_err());
 }
 
 #[tokio::test]
@@ -582,7 +610,7 @@ async fn a_bare_model_stops_at_the_turn_cap() {
 async fn a_run_past_its_budget_stops_and_fails_the_node_with_a_note() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
-    // c3: a $1.00 budget
+    // with budgets on, a c3 card has a $1.00 budget; off by default, nothing caps the run
     run("add task T parent 1", &store, &worker()).await.unwrap();
     let read = |n: &str| ra_providers::ToolCall { id: n.into(), name: "list_dir".into(), arguments: r#"{"path":"."}"#.into() };
     let costly = |calls| {
@@ -591,7 +619,7 @@ async fn a_run_past_its_budget_stops_and_fails_the_node_with_a_note() {
         answer
     };
     let provider = Scripted::new(vec![costly(vec![read("c1")]), costly(vec![read("c2")]), says("never reached", vec![])]);
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_budgets(true);
     let error = run("run 2", &store, &runner).await.unwrap_err();
     assert!(format!("{error:#}").contains("budget"), "{error:#}");
     assert_eq!(provider.seen.lock().len(), 2, "the loop stopped at the turn that crossed the budget");

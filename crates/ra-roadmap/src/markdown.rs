@@ -16,6 +16,7 @@
 //!         acceptance: ...
 //!         files: crates/ra-roadmap/src/store.rs crates/ra-console/src/agent.rs
 //!         waits-on: 2 7
+//!         effort: high
 //!         notes: ...
 //!         assessed: 9f3a0c41d27b6e58
 //! ```
@@ -23,12 +24,15 @@
 //! `files:` lists the workspace-relative paths a task touches, space-separated, so a worker reads
 //! them first. A path holds no space.
 //!
+//! `effort:` is `low`, `medium` or `high`, what a run asks of the model; a card without the line
+//! runs at medium, so the line is written only for another level.
+//!
 //! `assessed:` holds what the last reassessment saw: a fingerprint of its inputs, or the word
 //! `final`, which no reassessment rewrites.
 
 use anyhow::Context;
 
-use crate::model::{Assignment, Node, NodeKind, TaskState};
+use crate::model::{Assignment, Effort, Node, NodeKind, TaskState};
 use crate::tree::depths;
 
 /// The indent of one hierarchy level, in spaces.
@@ -120,6 +124,9 @@ fn detail_lines(node: &Node, level: usize) -> Vec<String> {
         let ids: Vec<String> = node.depends_on.iter().map(|id| id.to_string()).collect();
         lines.push(format!("{indent}waits-on: {}", ids.join(" ")));
     }
+    if node.effort != Effort::default() {
+        lines.push(format!("{indent}effort: {}", node.effort));
+    }
     lines
 }
 
@@ -157,6 +164,7 @@ pub fn parse(text: &str) -> anyhow::Result<Vec<Node>> {
             "assessed" => node.assessed = Some(value),
             "files" => node.files = value.split_whitespace().map(str::to_owned).collect(),
             "session" => node.session = Some(value),
+            "effort" => node.effort = value.parse().with_context(|| format!("line {number}"))?,
             "waits-on" => {
                 node.depends_on = value
                     .split_whitespace()
@@ -224,6 +232,7 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         state,
         assignee,
         complexity,
+        effort: Effort::default(),
         notes: None,
         assessed: None,
     })
