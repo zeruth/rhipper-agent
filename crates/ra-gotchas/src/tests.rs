@@ -15,10 +15,11 @@ fn the_seed_parses_and_names_every_entry_once() {
 #[test]
 fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
     let catalogue = Catalogue::seed();
-    // the read-only tools pass now; a change of directory and the PowerShell cmdlets still teach
+    // the read-only commands of both shells pass; a change of directory and a runtime still teach
     assert_eq!(catalogue.command("ls -la crates", Conditions::default()), Verdict::Pass);
     assert_eq!(catalogue.command("wc -l src/*.rs", Conditions::default()), Verdict::Pass);
-    for command in ["cd foo", "Get-ChildItem -Recurse", "python x.py"] {
+    assert_eq!(catalogue.command("Get-ChildItem -Recurse crates", Conditions::default()), Verdict::Pass);
+    for command in ["cd foo", "Set-Location crates", "python x.py"] {
         match catalogue.command(command, Conditions::default()) {
             Verdict::Deny { id, reason } => {
                 assert_eq!(id, "shell-outside-allowlist", "{command}");
@@ -28,15 +29,13 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
         }
     }
     assert_eq!(catalogue.command("git status --short", Conditions::default()), Verdict::Pass);
-    // a pipe or a redirect after cargo is refused as a whole; the plain command passes
-    assert!(
-        matches!(catalogue.command("cargo test -p ra-gotchas 2>&1 | tail -15", Conditions::default()), Verdict::Deny { id, .. } if id == "shell-pipe")
-    );
-    assert!(
-        matches!(catalogue.command("cargo test -p x > out.txt 2>&1", Conditions::default()), Verdict::Deny { id, .. } if id == "shell-pipe")
-    );
+    // a pipe through tail keeps the output short; the harness judges its parts
+    assert_eq!(catalogue.command("cargo test -p ra-gotchas 2>&1 | tail -15", Conditions::default()), Verdict::Pass);
     assert_eq!(catalogue.command("cargo test -p ra-gotchas", Conditions::default()), Verdict::Pass);
-    assert!(matches!(catalogue.command("powershell.exe -NoProfile -File x.ps1", Conditions::default()), Verdict::Deny { .. }));
+    // a shell inside a shell is no way around the allowlist
+    for command in ["powershell.exe -NoProfile -File x.ps1", "sh var/check.sh", "bash -c 'cargo test'"] {
+        assert!(matches!(catalogue.command(command, Conditions::default()), Verdict::Deny { .. }), "{command}");
+    }
 }
 
 #[test]

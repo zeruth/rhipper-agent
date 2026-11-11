@@ -15,22 +15,8 @@
 [[gotcha]]
 id = "shell-outside-allowlist"
 where = "command"
-pattern = '^\s*(cd|dir|Get-ChildItem|Get-Content|Select-String|Set-Location|Start-Process|powershell(\.exe)?|pwsh|cmd(\.exe)?|python|pip|npm|node)\b|^\s*git\s+-C\b'
-message = "the shell here runs cargo, the read-only git commands and the read-only tools (ls, cat, grep, find); read files with Read, search with Grep and Glob, and start from the files on the card"
-remedy = { kind = "hint" }
-
-[[gotcha]]
-id = "shell-pipe"
-where = "command"
-pattern = '^\s*cargo\b[^|>]*(\||>)'
-message = "a pipe or a redirect after cargo is refused as a whole here; run the cargo command plainly, its output comes back to you"
-remedy = { kind = "hint" }
-
-[[gotcha]]
-id = "shell-chain"
-where = "command"
-pattern = '(&&|\|\||;)\s*(cargo|git)\b'
-message = "a chained command is refused as a whole; run cargo and git as single commands"
+pattern = '^\s*(cd|Set-Location|Start-Process|powershell(\.exe)?|pwsh|cmd(\.exe)?|sh|bash|python|pip|npm|node)\b|^\s*git\s+-C\b'
+message = "the shells here run cargo, the read-only git commands and the read-only listing and reading commands, from the workspace directory; read files with Read, search with Grep and Glob, start from the files on the card, and pipe a long output through tail"
 remedy = { kind = "hint" }
 
 [[gotcha]]
@@ -48,17 +34,10 @@ message = "the binary is held by a running console; run cargo with -p <crate> or
 remedy = { kind = "hint" }
 
 [[gotcha]]
-id = "powershell-wrapped"
-where = "command"
-pattern = '^\s*\$__claude_shell_log\b'
-message = "the PowerShell tool wraps every command in a prelude the allowlist cannot read, so nothing of it is ever allowed here; run cargo and git through Bash"
-remedy = { kind = "hint" }
-
-[[gotcha]]
 id = "powershell-not-allowed"
 where = "result"
 pattern = 'Command name is a dynamic expression|PowerShell.*not allowed|permission.*PowerShell'
-message = "the PowerShell tool is outside the allowlist on this machine; run cargo and git through Bash"
+message = "the PowerShell tool refused the command; the same cargo or git command runs through Bash"
 remedy = { kind = "hint" }
 
 [[gotcha]]

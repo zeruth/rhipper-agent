@@ -52,8 +52,11 @@ fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
     assert!(args.windows(2).any(|w| w == ["--max-turns", "7"]), "{args:?}");
     let at = args.iter().position(|a| a == "--allowedTools").unwrap();
     assert_eq!(args[at + 1], "Bash(cargo *)");
-    // a worker gets the built-in list without PowerShell, never the empty list of a chat
+    // a worker gets the built-in list, never the empty list of a chat, and the project's
+    // settings only: the user's hooks are for their own sessions
     assert!(!args.windows(2).any(|w| w == ["--tools", ""]), "{args:?}");
+    assert!(args.windows(2).any(|w| w == ["--setting-sources", "project,local"]), "{args:?}");
+    assert!(!ClaudeCode::new().args(&request(None)).contains(&"--setting-sources".to_owned()));
 }
 
 #[test]
@@ -138,13 +141,17 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     // a chat completion carries no hooks
     assert!(!ClaudeCode::new().with_gotchas("rc", Catalogue::seed()).args(&request(None)).contains(&"--settings".to_owned()));
     assert!(ClaudeCode::new().new_allowed().iter().any(|r| r == "Bash(ls*)"));
-    assert!(!ClaudeCode::new().new_allowed().iter().any(|r| r.starts_with("PowerShell")));
-    assert!(args.windows(2).any(|w| w == ["--disallowedTools", "PowerShell"]), "{args:?}");
+    assert!(ClaudeCode::new().new_allowed().iter().any(|r| r == "PowerShell(cargo *)"));
+    // both shells, the file tools, no subagents
     assert!(
-        args.windows(2).any(|w| w[0] == "--tools" && w[1].contains("Bash") && w[1].contains("Edit") && !w[1].contains("PowerShell")),
+        args.windows(2).any(|w| w[0] == "--tools"
+            && w[1].contains("Bash")
+            && w[1].contains("PowerShell")
+            && w[1].contains("Edit")
+            && !w[1].split(',').any(|t| t == "Task")),
         "{args:?}"
     );
-    assert!(!ClaudeCode::new().args(&request(None)).contains(&"--disallowedTools".to_owned()));
+    assert!(!args.contains(&"--disallowedTools".to_owned()), "{args:?}");
 
     let quiet = Conditions::default();
     let mut tools = std::collections::HashMap::new();
@@ -172,10 +179,10 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let claim = r#"{"type":"result","result":"Done, but I couldn't run any tests.","permission_denials":[{"tool_name":"Bash","tool_input":{"command":"make all"}}]}"#;
     let ids: Vec<String> = gotchas_of_event(&catalogue, claim, quiet, &mut tools).into_iter().map(|h| h.id).collect();
     assert_eq!(ids, ["untested-claim", "unmatched-denied"]);
-    // a PowerShell denial is the wrapper, whatever the command
-    let wrapped = r#"{"type":"result","result":"done","permission_denials":[{"tool_name":"PowerShell","tool_input":{"command":"cargo clippy -p rc-gui"}}]}"#;
-    let ids: Vec<String> = gotchas_of_event(&catalogue, wrapped, quiet, &mut tools).into_iter().map(|h| h.id).collect();
-    assert_eq!(ids, ["powershell-wrapped"]);
+    // a PowerShell denial is judged like a Bash one: a command the catalogue passes is unmatched
+    let refused = r#"{"type":"result","result":"done","permission_denials":[{"tool_name":"PowerShell","tool_input":{"command":"cargo clippy -p rc-gui"}}]}"#;
+    let ids: Vec<String> = gotchas_of_event(&catalogue, refused, quiet, &mut tools).into_iter().map(|h| h.id).collect();
+    assert_eq!(ids, ["unmatched-denied"]);
 }
 
 #[test]

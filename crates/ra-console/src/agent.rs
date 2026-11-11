@@ -709,7 +709,7 @@ fn first_line(text: &str) -> String {
 
 /// The system prompt of a worker session. A harness with tools implements in the workspace; a
 /// bare model answers with the plan and the changes.
-const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory, check it against the acceptance criteria, and answer with a short report of what you changed and what you verified. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
+const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory, check it against the acceptance criteria, and answer with a short report of what you changed and what you verified. Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through tail. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
 
 /// The system prompt of a reassessment.
 const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done. When the objective and the acceptance already name only the remaining work and are checkable, you answer with the same text rather than rewording it.";
