@@ -1171,9 +1171,9 @@ impl App {
             // ran off the right edge. The margins and the scroll bar come off the content rect.
             let page = (ctx.content_rect().width() - 36.0 - 14.0).min(ui.available_width()).max(400.0);
             self.gauges.row(ui, page);
-            ui.add_space(10.0);
+            ui.add_space(4.0);
             self.tokens.row(ui, page);
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             // the height left under the gauges, shared out among the project cards: a card
             // whose queue and run would leave it empty grows into its share, so a tall window
             // shows more of the queue and more of the run, not a blank band under the cards.
@@ -4070,7 +4070,7 @@ impl Workspace {
         let mut rows: Vec<i64> = running.into_iter().collect();
         rows.extend(order.iter().copied().filter(|id| Some(*id) != running).take(6));
         // the ready cards past the six: the queue adds them one by one while the card's share
-        // of the window has room for another row
+        // of the window has room for another row (a very tall window)
         let extra: Vec<i64> = order.iter().copied().filter(|id| Some(*id) != running && !rows.contains(id)).collect();
         let walk = Walk {
             searching: false,
@@ -4145,8 +4145,13 @@ impl Workspace {
                     if rows.is_empty() {
                         ui.label(RichText::new("no card is ready").color(theme::dim()).italics());
                     }
-                    let mut shown = rows.clone();
-                    let mut extra = extra.iter().copied();
+                    // the rows: the running card and three ready ones whatever the room, then
+                    // more while a row fits the card's share, six ready ones at most. Three
+                    // projects fit a maximized window at any height this way: a small window
+                    // shows three cards a project, a tall one six
+                    let must = usize::from(running.is_some()) + 3;
+                    let mut shown: Vec<i64> = rows.iter().copied().take(must).collect();
+                    let mut extra = rows.iter().copied().skip(must).chain(extra.iter().copied());
                     let mut rank = 0;
                     while rank < shown.len() {
                         let id = shown[rank];
@@ -4171,7 +4176,7 @@ impl Workspace {
                             });
                         });
                         rank += 1;
-                        // past the six, one more ready card while a row of the height the
+                        // past the three, one more ready card while a row of the height the
                         // rows so far averaged still fits the card's share
                         if rank == shown.len() {
                             let used = ui.min_rect().height();

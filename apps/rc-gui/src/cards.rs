@@ -264,8 +264,8 @@ pub(crate) fn gauge(ui: &mut Ui, name: &str, value: &str, samples: &[f32], color
                 badge(ui, value, color);
             });
         });
-        ui.add_space(4.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(inner, 44.0), egui::Sense::hover());
+        ui.add_space(2.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(inner, 34.0), egui::Sense::hover());
         let painter = ui.painter();
         let plot = rect.shrink2(egui::vec2(0.0, 2.0));
         painter.hline(plot.x_range(), plot.top(), Stroke::new(1.0, alpha(color, 60)));
