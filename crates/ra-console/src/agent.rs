@@ -159,11 +159,24 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
 
 /// Runs one roadmap task: builds the context from the node, its ancestors and its dependencies,
 /// sends it to the model, and writes the answer and the state back. A failed call leaves the node
-/// failed, not in progress.
+/// failed, not in progress. The run announces its start and its outcome on the progress channel,
+/// so the console draws its steps in a bubble of their own.
 pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
     // the node first, so a bad id or a project is named before the key matters
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != NodeKind::Project, "#{} is a project; run a task", id);
+    tracing::info!(target: crate::trace::PROGRESS, "{}#{} {} · {}", crate::logs::RUN_START, id, node.title, short(&worker.model));
+    let outcome = run_task(store, node, worker).await;
+    match &outcome {
+        Ok((_, cost)) => tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, cost_text(*cost)),
+        Err(e) => tracing::info!(target: crate::trace::PROGRESS, "{}✗ {}", crate::logs::RUN_END, first_line(&format!("{e:#}"))),
+    }
+    outcome.map(|(lines, _)| lines)
+}
+
+/// The work of [`run`], with the cost of the session beside the log lines.
+async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<(Vec<String>, Option<f64>)> {
+    let id = node.id;
     let provider = worker.provider()?;
     store.set_state(id, TaskState::InProgress).await?;
 
@@ -203,9 +216,10 @@ pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<
     };
     store.set_notes(id, &session.text).await?;
     store.set_state(id, TaskState::Implemented).await?;
-    Ok(vec![
+    let lines = vec![
         format!(
-            "✓ #{} implemented on {} · {} turn(s), {} tool call(s) · in {} out {} · {}",
+            "✓ #{} {} implemented on {} · {} turn(s), {} tool call(s) · in {} out {} · {}",
+            id,
             node.title,
             short(&worker.model),
             session.turns,
@@ -215,7 +229,8 @@ pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<
             cost_text(session.usage.cost_usd)
         ),
         "  the full answer is in the notes of the card in rhipper.md".to_owned(),
-    ])
+    ];
+    Ok((lines, session.usage.cost_usd))
 }
 
 /// What one worker session came to: the final answer, the usage summed over its turns, and how

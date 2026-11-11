@@ -20,9 +20,9 @@ pub enum Kind {
     Diff,
     /// A logged event, at a level.
     Log(tracing::Level),
-    /// One step of a worker's work: a file it read or edited, a command it ran, a note on what
-    /// it does next. One compact row each, no bubble.
-    Progress,
+    /// A worker run: one bubble that holds the run's steps, its live state and its outcome. The
+    /// line's text is the run's title; the rest lives in [`Run`], found by the line's `run` id.
+    Run,
     /// A failure.
     Error,
 }
@@ -32,6 +32,39 @@ pub enum Kind {
 pub struct Line {
     pub kind: Kind,
     pub text: String,
+    /// The run a [`Kind::Run`] line draws.
+    pub run: Option<u64>,
+}
+
+/// A progress line that opens a run: the rest of the line is its title.
+pub const RUN_START: &str = "\u{25c6}start ";
+/// A progress line that closes the open run: the rest of the line is its outcome.
+pub const RUN_END: &str = "\u{25c6}end ";
+
+/// The rows a run bubble shows of its steps, unless the wheel changed it.
+pub const RUN_HEIGHT: u16 = 6;
+/// The fewest and the most rows the wheel gives a run bubble.
+pub const RUN_HEIGHT_RANGE: (u16, u16) = (2, 30);
+
+/// One worker run as the log draws it.
+#[derive(Debug, Clone)]
+pub struct Run {
+    /// The steps of the work, oldest first.
+    pub steps: Vec<String>,
+    pub started: std::time::Instant,
+    /// How long the run took, once it finished.
+    pub took: Option<std::time::Duration>,
+    /// The outcome, `✓ $0.12` or `✗ reason`, once the run finished.
+    pub outcome: Option<String>,
+    /// The rows of steps the bubble shows.
+    pub height: u16,
+}
+
+impl Run {
+    /// Whether the run is still going.
+    pub fn live(&self) -> bool {
+        self.outcome.is_none()
+    }
 }
 
 /// The sink the UI and the logging drain share.
@@ -42,6 +75,8 @@ pub struct Sink {
 
 struct Inner {
     lines: Mutex<Vec<Line>>,
+    /// The runs, by id, and the id the next one takes.
+    runs: Mutex<(std::collections::HashMap<u64, Run>, u64)>,
     /// Bumped on every push, so the UI knows when to redraw.
     version: AtomicU64,
     passthrough: Mutex<bool>,
@@ -49,14 +84,90 @@ struct Inner {
 
 impl Sink {
     pub fn new() -> Self {
-        Self { inner: Arc::new(Inner { lines: Mutex::new(Vec::new()), version: AtomicU64::new(0), passthrough: Mutex::new(false) }) }
+        Self {
+            inner: Arc::new(Inner {
+                lines: Mutex::new(Vec::new()),
+                runs: Mutex::new((std::collections::HashMap::new(), 1)),
+                version: AtomicU64::new(0),
+                passthrough: Mutex::new(false),
+            }),
+        }
+    }
+
+    /// Takes one progress line: a start marker opens a run, an end marker closes the newest
+    /// live one, and any other line is a step of the newest live run, which a step without one
+    /// opens untitled.
+    pub fn progress(&self, text: &str) {
+        if let Some(title) = text.strip_prefix(RUN_START) {
+            self.open_run(title);
+        } else if let Some(outcome) = text.strip_prefix(RUN_END) {
+            if let Some(id) = self.live_run() {
+                self.close_run(id, outcome);
+            }
+        } else {
+            let id = self.live_run().unwrap_or_else(|| self.open_run("worker"));
+            if let Some(run) = self.inner.runs.lock().0.get_mut(&id) {
+                run.steps.push(text.to_owned());
+            }
+            self.bump();
+        }
+    }
+
+    /// Opens a run with its title and returns its id.
+    pub fn open_run(&self, title: &str) -> u64 {
+        let id = {
+            let mut runs = self.inner.runs.lock();
+            let id = runs.1;
+            runs.1 += 1;
+            let run = Run { steps: Vec::new(), started: std::time::Instant::now(), took: None, outcome: None, height: RUN_HEIGHT };
+            runs.0.insert(id, run);
+            id
+        };
+        self.push_line(Line { kind: Kind::Run, text: title.to_owned(), run: Some(id) });
+        id
+    }
+
+    /// Closes a run with its outcome.
+    pub fn close_run(&self, id: u64, outcome: &str) {
+        if let Some(run) = self.inner.runs.lock().0.get_mut(&id) {
+            run.took = Some(run.started.elapsed());
+            run.outcome = Some(outcome.to_owned());
+        }
+        self.bump();
+    }
+
+    /// The newest run that is still going.
+    pub fn live_run(&self) -> Option<u64> {
+        self.inner.runs.lock().0.iter().filter(|(_, r)| r.live()).map(|(id, _)| *id).max()
+    }
+
+    /// A copy of one run, for the draw.
+    pub fn run(&self, id: u64) -> Option<Run> {
+        self.inner.runs.lock().0.get(&id).cloned()
+    }
+
+    /// Grows or shrinks a run bubble by `rows`, within [`RUN_HEIGHT_RANGE`].
+    pub fn resize_run(&self, id: u64, rows: i32) {
+        if let Some(run) = self.inner.runs.lock().0.get_mut(&id) {
+            let (low, high) = RUN_HEIGHT_RANGE;
+            run.height = u16::try_from((i32::from(run.height) + rows).clamp(i32::from(low), i32::from(high))).unwrap_or(RUN_HEIGHT);
+        }
+        self.bump();
+    }
+
+    fn bump(&self) {
+        self.inner.version.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Appends one line and wakes the UI.
     pub fn push(&self, kind: Kind, text: impl Into<String>) {
-        let text: String = text.into();
+        self.push_line(Line { kind, text: text.into(), run: None });
+    }
+
+    fn push_line(&self, line: Line) {
+        let text = line.text.clone();
         let mut lines = self.inner.lines.lock();
-        lines.push(Line { kind, text: text.clone() });
+        lines.push(line);
         if lines.len() > 10_000 {
             let drop = lines.len() - 10_000;
             lines.drain(..drop);
@@ -94,5 +205,47 @@ impl Sink {
 impl Default for Sink {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steps_land_in_the_open_run_and_a_closed_run_keeps_its_outcome() {
+        let sink = Sink::new();
+        sink.progress(&format!("{RUN_START}#15 Files · opus-5-5"));
+        sink.progress("Read crates/store.rs");
+        sink.progress("$ cargo test");
+        let first = sink.live_run().unwrap();
+        sink.progress(&format!("{RUN_END}✓ $0.12"));
+        assert_eq!(sink.live_run(), None);
+        let run = sink.run(first).unwrap();
+        assert_eq!(run.steps, ["Read crates/store.rs", "$ cargo test"]);
+        assert_eq!(run.outcome.as_deref(), Some("✓ $0.12"));
+        assert!(run.took.is_some());
+        // the bubble is one line of the log, titled
+        sink.with_lines(|lines| {
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].kind, Kind::Run);
+            assert_eq!(lines[0].text, "#15 Files · opus-5-5");
+        });
+    }
+
+    #[test]
+    fn a_step_without_a_run_opens_one_and_the_height_clamps() {
+        let sink = Sink::new();
+        sink.progress("Grep fn insert");
+        let id = sink.live_run().unwrap();
+        assert_eq!(sink.run(id).unwrap().steps, ["Grep fn insert"]);
+        sink.resize_run(id, -100);
+        assert_eq!(sink.run(id).unwrap().height, RUN_HEIGHT_RANGE.0);
+        sink.resize_run(id, 100);
+        assert_eq!(sink.run(id).unwrap().height, RUN_HEIGHT_RANGE.1);
+        // an end with no live run is ignored
+        sink.progress(&format!("{RUN_END}✓"));
+        sink.progress(&format!("{RUN_END}✓"));
+        assert!(sink.run(id).unwrap().outcome.is_some());
     }
 }

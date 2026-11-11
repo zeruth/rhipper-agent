@@ -12,7 +12,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use tokio::sync::mpsc;
@@ -146,6 +146,9 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
     let mut frame_height: u16 = 24;
     // the node under every visible tree row, as the last draw laid them out
     let mut tree_rows: Vec<roadmap_pane::Hit> = Vec::new();
+    // the panes and the run under every visible log row, as the last draw laid them out
+    let mut panes = Panes::default();
+    let mut log_rows: Vec<Option<u64>> = Vec::new();
     let result = loop {
         let version = sink.version();
         if version != app.seen {
@@ -162,8 +165,7 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
             let mut row_ids: Vec<roadmap_pane::Hit> = Vec::new();
             if let Err(e) = terminal.draw(|f| {
                 frame_height = f.area().height;
-                let panes;
-                (max_scroll, tree_max_scroll, panes) = draw(f, &app, &sink, &mut row_ids);
+                (max_scroll, tree_max_scroll, panes) = draw(f, &app, &sink, &mut row_ids, &mut log_rows);
                 (tree_area, log_area) = (panes.tree, panes.log);
             }) {
                 break Err(e.into());
@@ -192,7 +194,12 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                         Action::None
                     }
                     Input::Wheel(rows, y) => {
-                        on_wheel(&mut app, rows, y, Panes { tree: tree_area, log: log_area }, frame_height);
+                        // over a run bubble, the wheel sizes that bubble and nothing else
+                        let run = panes.log_text.filter(|area| contains_row(*area, y)).and_then(|area| log_rows.get(usize::from(y - area.y)).copied().flatten());
+                        match run {
+                            Some(id) => sink.resize_run(id, rows),
+                            None => on_wheel(&mut app, rows, y, panes, frame_height),
+                        }
                         Action::None
                     }
                     Input::Key(key) => on_key(&mut app, key),
@@ -225,8 +232,9 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                     app.marquee = (app.marquee + 1) % (app.worker.model.chars().count() + 3);
                     dirty = true;
                 }
-                // the working status flashes while a call is in flight
-                if app.job.is_some() && app.ticks % 2 == 0 {
+                // the working status flashes while a call is in flight, and a live run's border
+                // hums along every tick
+                if (app.job.is_some() && app.ticks % 2 == 0) || sink.live_run().is_some() {
                     dirty = true;
                 }
                 // the roadmap pane follows the file, an outside edit included; the mtime says
@@ -332,7 +340,7 @@ fn tail_activity(offset: &mut u64, sink: &Sink) -> bool {
     let Some(end) = bytes.iter().rposition(|b| *b == b'\n') else { return false };
     *offset += end as u64 + 1;
     for line in String::from_utf8_lossy(&bytes[..end]).lines().filter(|l| !l.trim().is_empty()) {
-        sink.push(Kind::Progress, line.to_owned());
+        sink.progress(line);
     }
     true
 }
@@ -572,13 +580,21 @@ async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, j
 struct Panes {
     tree: Option<Rect>,
     log: Option<Rect>,
+    /// The rows of the log itself, inside the card, where the run bubbles are.
+    log_text: Option<Rect>,
 }
 
 /// Draws the console; returns how far back the log can scroll (in rows), how far back the tree
 /// can, and the panes, and fills `row_ids` with the node under every visible tree row. The panes
 /// from the top: the status line, the usage pane, the roadmap tree, the log card with its prompt,
 /// and the footer.
-fn draw(f: &mut Frame, app: &App, sink: &Sink, row_ids: &mut Vec<roadmap_pane::Hit>) -> (usize, usize, Panes) {
+fn draw(
+    f: &mut Frame,
+    app: &App,
+    sink: &Sink,
+    row_ids: &mut Vec<roadmap_pane::Hit>,
+    log_rows: &mut Vec<Option<u64>>,
+) -> (usize, usize, Panes) {
     let [header, usage, tree, log_card, footer] = pane_layout(app.log_card).areas(f.area());
     // every cell, so even gaps the widgets never touch paint the theme
     use ratatui::widgets::Widget;
@@ -600,7 +616,7 @@ fn draw(f: &mut Frame, app: &App, sink: &Sink, row_ids: &mut Vec<roadmap_pane::H
     let inner =
         Rect { x: log_card.x + 1, y: log_card.y + 1, width: log_card.width.saturating_sub(2), height: log_card.height.saturating_sub(2) };
     let [log, status, prompt] = Layout::vertical([Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
-    let max_scroll = draw_log(f, app, sink, log);
+    let max_scroll = draw_log(f, app, sink, log, log_rows);
     if let Some(job) = &app.job {
         // the working status flashes while a slow call is in flight
         let spinner = SPINNER[usize::try_from(app.ticks % SPINNER.len() as u32).unwrap_or(0)];
@@ -615,7 +631,7 @@ fn draw(f: &mut Frame, app: &App, sink: &Sink, row_ids: &mut Vec<roadmap_pane::H
     }
     draw_prompt(f, app, prompt);
     f.render_widget(Paragraph::new(footer_line(app, footer.width)).style(Style::new().bg(theme::BG)), footer);
-    (max_scroll, tree_max, Panes { tree: Some(tree), log: Some(log_card) })
+    (max_scroll, tree_max, Panes { tree: Some(tree), log: Some(log_card), log_text: Some(log) })
 }
 
 /// The vertical pane layout for a log-card height, so the draw and the hit-testing agree on it.
@@ -768,12 +784,14 @@ fn status_line(app: &App) -> Line<'static> {
     ])
 }
 
-/// Draws the log at the app's scroll; returns how far back it can scroll.
-fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect) -> usize {
+/// Draws the log at the app's scroll; returns how far back it can scroll, and fills `row_runs`
+/// with the run under every visible row, top to bottom, so the wheel finds the bubble it is over.
+fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect, row_runs: &mut Vec<Option<u64>>) -> usize {
     let (height, width) = (area.height as usize, area.width as usize);
     let want = height + app.scroll;
-    let (mut visible, all) = sink.with_lines(|lines| {
+    let (mut visible, mut tags, all) = sink.with_lines(|lines| {
         let mut taken: Vec<Line<'static>> = Vec::new();
+        let mut tags: Vec<Option<u64>> = Vec::new();
         let mut all = true;
         for (i, line) in lines.iter().rev().enumerate() {
             // the trace lines stay out of the log until debug turns them on
@@ -782,8 +800,12 @@ fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect) -> usize {
             }
             // the lane index counts forward from the oldest line, so a bubble keeps its color
             let lane_index = lines.len() - 1 - i;
-            let mut r = rows_of(line, width, lane_index);
+            let mut r = match (line.kind, line.run.and_then(|id| sink.run(id))) {
+                (Kind::Run, Some(run)) => run_rows(&line.text, &run, width, lane_index, app.ticks),
+                _ => rows_of(line, width, lane_index),
+            };
             r.reverse();
+            tags.extend(std::iter::repeat_n(line.run, r.len()));
             taken.extend(r);
             if taken.len() >= want && i + 1 < lines.len() {
                 all = false;
@@ -791,7 +813,8 @@ fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect) -> usize {
             }
         }
         taken.reverse();
-        (taken, all)
+        tags.reverse();
+        (taken, tags, all)
     });
     let total = visible.len();
     let max_scroll = if all { total.saturating_sub(height) } else { usize::MAX };
@@ -799,12 +822,146 @@ fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect) -> usize {
     let end = total - scroll;
     let start = end.saturating_sub(height);
     let mut shown: Vec<Line<'static>> = visible.drain(start..end).collect();
+    *row_runs = tags.drain(start..end).collect();
     // newest at the bottom, like a terminal
     while shown.len() < height {
         shown.insert(0, Line::raw(""));
+        row_runs.insert(0, None);
     }
     f.render_widget(Paragraph::new(shown), area);
     max_scroll
+}
+
+/// The half-width of the light band that flows along a live run's border, in cells.
+const HUM_BAND: usize = 10;
+
+/// A worker run as a bubble: the title and the clock (or the outcome) in the top border, the
+/// latest steps inside at the run's height, and, while the run is live, a soft band of light
+/// that flows along the top border to the right and along the bottom to the left.
+fn run_rows(title: &str, run: &crate::logs::Run, width: usize, lane_index: usize, ticks: u32) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(4).max(8);
+    let span = room + 4;
+    let lane = theme::lane(1 + lane_index % (theme::LANE_COUNT - 1));
+    let failed = run.outcome.as_deref().is_some_and(|o| o.starts_with('✗'));
+    let base = if failed {
+        theme::ACCENT
+    } else if run.live() {
+        theme::dim_lane(1 + lane_index % (theme::LANE_COUNT - 1))
+    } else {
+        lane
+    };
+    // where the band is: it walks one cell a tick and wraps with a gap, so it reads as a flow
+    let lap = span + HUM_BAND * 2;
+    let at = (ticks as usize) % lap;
+    let glow = |x: usize, forward: bool| -> Color {
+        if !run.live() {
+            return base;
+        }
+        let pos = if forward { at } else { lap - 1 - at };
+        let distance = (x + HUM_BAND).abs_diff(pos);
+        if distance >= HUM_BAND {
+            return base;
+        }
+        // a soft falloff: the square of the closeness, so the edges of the band fade in
+        let near = 1.0 - distance as f32 / HUM_BAND as f32;
+        theme::mix(base, lane, near * near)
+    };
+    let clock = |d: std::time::Duration| {
+        let s = d.as_secs();
+        if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) } else { format!("{s}s") }
+    };
+    let status = match (&run.outcome, run.took) {
+        (Some(outcome), Some(took)) => format!("{outcome} · {}", clock(took)),
+        (Some(outcome), None) => outcome.clone(),
+        (None, _) => format!("{} · {} steps", clock(run.started.elapsed()), run.steps.len()),
+    };
+    // the top border as cells: corners, the title from the left, the status from the right
+    let mut top: Vec<char> = std::iter::once('╭').chain(std::iter::repeat_n('─', span - 2)).chain(std::iter::once('╮')).collect();
+    let status_text = format!(" {status} ");
+    let status_len = status_text.chars().count().min(span.saturating_sub(4));
+    let title_room = span.saturating_sub(status_len + 6);
+    let title_text = format!(" {} ", short_title(title, title_room.saturating_sub(2)));
+    for (i, c) in title_text.chars().enumerate().take(title_room) {
+        top[2 + i] = c;
+    }
+    for (i, c) in status_text.chars().take(status_len).enumerate() {
+        top[span - 2 - status_len + i] = c;
+    }
+    let title_end = 2 + title_text.chars().count().min(title_room);
+    let status_start = span - 2 - status_len;
+    let top_line = Line::from(
+        top.into_iter()
+            .enumerate()
+            .map(|(x, c)| {
+                let style = if (2..title_end).contains(&x) {
+                    Style::new().fg(theme::TEXT).bold()
+                } else if (status_start..span - 2).contains(&x) {
+                    Style::new().fg(if failed {
+                        theme::ERROR_TEXT
+                    } else if run.live() {
+                        theme::WARN_TEXT
+                    } else {
+                        lane
+                    })
+                } else {
+                    Style::new().fg(glow(x, true))
+                };
+                Span::styled(c.to_string(), style)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut rows = vec![top_line];
+    // the body: a live run keeps its height, a finished one shrinks to its steps
+    let height = usize::from(run.height);
+    let body = if run.live() { height } else { height.min(run.steps.len().max(1)) };
+    let mut shown: Vec<(String, Style)> = Vec::new();
+    let hidden = run.steps.len().saturating_sub(body);
+    if hidden > 0 {
+        shown.push((format!("⋯ {} earlier step{}", hidden + 1, if hidden == 0 { "" } else { "s" }), Style::new().fg(theme::DIM).italic()));
+    }
+    let skip = if hidden > 0 { hidden + 1 } else { 0 };
+    for step in run.steps.iter().skip(skip) {
+        let style = if step.starts_with("$ ") {
+            Style::new().fg(theme::WARN_TEXT)
+        } else if step.starts_with("… ") {
+            Style::new().fg(theme::TEXT).italic()
+        } else {
+            Style::new().fg(theme::DIM)
+        };
+        shown.push((step.clone(), style));
+    }
+    if run.steps.is_empty() {
+        shown.push((if run.live() { "starting…" } else { "no steps" }.to_owned(), Style::new().fg(theme::DIM).italic()));
+    }
+    let side = Style::new().fg(if run.live() { base } else { lane });
+    for i in 0..body {
+        let (text, style) = shown.get(i).cloned().unwrap_or_default();
+        let marker = if text.is_empty() { "  " } else { "▸ " };
+        let text = short_title(&text, room.saturating_sub(2));
+        let pad = " ".repeat(room.saturating_sub(2 + text.chars().count()));
+        rows.push(Line::from(vec![
+            Span::styled("│ ", side),
+            Span::styled(marker, Style::new().fg(if run.live() { theme::ACCENT } else { theme::DIM }).bg(theme::PANEL)),
+            Span::styled(text, style.bg(theme::PANEL)),
+            Span::styled(pad, Style::new().bg(theme::PANEL)),
+            Span::styled(" │", side),
+        ]));
+    }
+    // the bottom border flows the other way, so the band reads as a loop
+    let bottom: Vec<Span<'static>> = (0..span)
+        .map(|x| {
+            let c = if x == 0 {
+                '╰'
+            } else if x == span - 1 {
+                '╯'
+            } else {
+                '─'
+            };
+            Span::styled(c.to_string(), Style::new().fg(glow(x, false)))
+        })
+        .collect();
+    rows.push(Line::from(bottom));
+    rows
 }
 
 /// The spinner frames of the working status.
@@ -815,14 +972,6 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// error and the banner stay red. A diff entry colors its lines like a patch: `+` green, `-` red,
 /// commentary in the bubble's color.
 fn rows_of(line: &crate::logs::Line, width: usize, lane_index: usize) -> Vec<Line<'static>> {
-    if line.kind == Kind::Progress {
-        // a step of the work: one dim row under the bubble of the run, clipped to the width
-        let room = width.saturating_sub(4).max(4);
-        return vec![Line::from(vec![
-            Span::styled("  ▸ ", Style::new().fg(theme::ACCENT)),
-            Span::styled(short_title(&line.text, room), Style::new().fg(theme::DIM)),
-        ])];
-    }
     let (border, text) = match line.kind {
         Kind::Input => (theme::ACCENT, theme::TEXT),
         Kind::Output | Kind::Diff => {
@@ -835,7 +984,7 @@ fn rows_of(line: &crate::logs::Line, width: usize, lane_index: usize) -> Vec<Lin
         Kind::Log(tracing::Level::WARN) => (theme::WARN, theme::WARN_TEXT),
         Kind::Log(tracing::Level::DEBUG) => (theme::DEBUG, theme::DEBUG),
         Kind::Log(tracing::Level::TRACE) => (theme::TRACE, theme::TRACE),
-        Kind::Log(_) | Kind::Progress => (theme::DIM, theme::TEXT),
+        Kind::Log(_) | Kind::Run => (theme::DIM, theme::TEXT),
     };
     let border_style = Style::new().fg(border);
     let text_style = Style::new().fg(text).bg(theme::PANEL);

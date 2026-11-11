@@ -56,7 +56,7 @@ impl<S: tracing::Subscriber> Layer<S> for Bridge {
         event.record(&mut visitor);
         // a progress line reads as work, not as a trace
         if event.metadata().target() == PROGRESS {
-            self.sink.push(Kind::Progress, visitor.text);
+            self.sink.progress(&visitor.text);
         } else {
             self.sink.push(Kind::Log(*event.metadata().level()), visitor.text);
         }

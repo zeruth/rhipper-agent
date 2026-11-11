@@ -47,6 +47,19 @@ pub fn lane(depth: usize) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// The color `t` of the way from `from` to `to`, `t` in 0..=1; a color that is not RGB comes
+/// back as `to`.
+pub fn mix(from: Color, to: Color, t: f32) -> Color {
+    match (from, to) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let t = t.clamp(0.0, 1.0);
+            let step = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+            Color::Rgb(step(r1, r2), step(g1, g2), step(b1, b2))
+        }
+        _ => to,
+    }
+}
+
 /// The lane color of a depth, dimmed toward the background for the cards out of the hover chain.
 pub fn dim_lane(depth: usize) -> Color {
     let (r, g, b) = LANES[depth % LANES.len()];
