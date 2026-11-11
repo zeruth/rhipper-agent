@@ -24,6 +24,9 @@ pub struct Entry {
     pub cached_tokens: u64,
     /// The cost in dollars as the provider reported it; `None` when it reported none.
     pub cost_usd: Option<f64>,
+    /// Whether the cost was computed from the model's list prices rather than reported, so a
+    /// reader knows which rows the provider's bill will not match to the cent.
+    pub cost_computed: bool,
     /// The assistant turns the completion took: one from a bare model, what the harness
     /// reports from a run.
     pub turns: u64,
@@ -52,6 +55,8 @@ pub struct Call {
     pub completion_tokens: u64,
     pub cached_tokens: u64,
     pub cost_usd: Option<f64>,
+    /// Whether the cost was computed from list prices rather than reported.
+    pub cost_computed: bool,
 }
 
 /// One row as the dashboard's token gauges read it: when it was written, the tokens in and
@@ -131,15 +136,21 @@ impl UsageStore {
                 completion_tokens integer not null,
                 cached_tokens integer not null,
                 cost_usd real,
-                turns integer not null default 1
+                turns integer not null default 1,
+                cost_computed integer not null default 0
             )",
         )
         .execute(&self.pool)
         .await?;
-        // a ledger from before the turn count: its rows read as one turn each
+        // a ledger from before the turn count reads as one turn each; one from before the
+        // computed mark reads as reported throughout
         let columns = sqlx::query("pragma table_info(usage)").fetch_all(&self.pool).await?;
-        if !columns.iter().any(|c| c.get::<String, _>("name") == "turns") {
+        let has = |name: &str| columns.iter().any(|c| c.get::<String, _>("name") == name);
+        if !has("turns") {
             sqlx::query("alter table usage add column turns integer not null default 1").execute(&self.pool).await?;
+        }
+        if !has("cost_computed") {
+            sqlx::query("alter table usage add column cost_computed integer not null default 0").execute(&self.pool).await?;
         }
         Ok(())
     }
@@ -150,7 +161,8 @@ impl UsageStore {
     /// When the row cannot be written.
     pub async fn record(&self, entry: &Entry) -> anyhow::Result<()> {
         sqlx::query(
-            "insert into usage (model, node, prompt_tokens, completion_tokens, cached_tokens, cost_usd, turns) values (?, ?, ?, ?, ?, ?, ?)",
+            "insert into usage (model, node, prompt_tokens, completion_tokens, cached_tokens, cost_usd, turns, cost_computed) \
+             values (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&entry.model)
         .bind(entry.node)
@@ -159,6 +171,7 @@ impl UsageStore {
         .bind(i64::try_from(entry.cached_tokens)?)
         .bind(entry.cost_usd)
         .bind(i64::try_from(entry.turns)?)
+        .bind(entry.cost_computed)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -242,7 +255,7 @@ impl UsageStore {
     /// When the query fails.
     pub async fn calls_of(&self, node: Option<i64>) -> anyhow::Result<Vec<Call>> {
         let rows = sqlx::query(
-            "select at, model, turns, prompt_tokens, completion_tokens, cached_tokens, cost_usd from usage \
+            "select at, model, turns, prompt_tokens, completion_tokens, cached_tokens, cost_usd, cost_computed from usage \
              where node is ? order by id desc",
         )
         .bind(node)
@@ -260,6 +273,7 @@ impl UsageStore {
                     completion_tokens: count("completion_tokens"),
                     cached_tokens: count("cached_tokens"),
                     cost_usd: row.get("cost_usd"),
+                    cost_computed: row.get("cost_computed"),
                 }
             })
             .collect())

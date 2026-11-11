@@ -22,6 +22,26 @@ fn a_model_id_routes_by_its_vendor_prefix() {
 }
 
 #[tokio::test]
+async fn a_short_name_resolves_to_the_current_claude_id_wherever_a_model_is_typed() {
+    use crate::agent::{ALIASES, Route, resolve};
+    for (alias, id) in ALIASES {
+        assert_eq!(resolve(alias), id);
+        assert_eq!(Route::of(id), Route::ClaudeCode, "{id}");
+    }
+    assert_eq!(resolve("Haiku "), "claude-haiku-4-5-20251001");
+    assert_eq!(resolve("z-ai/glm-5.3-flash"), "z-ai/glm-5.3-flash");
+    assert_eq!(Worker::new("haiku").model, "claude-haiku-4-5-20251001");
+    let store = store().await;
+    let (out, outcome) = run("/model opus", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["the next worker session runs on claude-opus-5-5 through Claude Code"]);
+    assert!(matches!(outcome, Outcome::Model(model) if model == "claude-opus-5-5"));
+    run("/add task T parent 1", &store, &worker()).await.unwrap();
+    let (out, _) = run("/assign 2 sonnet", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["#2 runs on claude-sonnet-5-5 through Claude Code"]);
+    assert_eq!(store.read(2).await.unwrap().assignee.unwrap().model, "claude-sonnet-5-5");
+}
+
+#[tokio::test]
 async fn a_ping_on_the_local_route_with_nothing_listening_names_the_url() {
     // a port that was just freed, so the test never depends on what runs on 8080 here
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -116,6 +136,7 @@ async fn usage_prints_the_ledger_by_card_summed_up_the_tree() {
         completion_tokens: 10,
         cached_tokens: 0,
         cost_usd: Some(cost),
+        cost_computed: false,
         turns: 2,
     };
     // two calls on A, one on C, one on a card the roadmap lost, one outside any card
@@ -389,7 +410,8 @@ impl ra_providers::ModelProvider for Scripted {
 }
 
 fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Completion {
-    let usage = ra_providers::Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 0, cost_usd: Some(0.01) };
+    let usage =
+        ra_providers::Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 0, cost_usd: Some(0.01), cost_computed: false };
     ra_providers::Completion {
         text: text.to_owned(),
         usage,
@@ -540,6 +562,86 @@ async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_depend
     assert_eq!(script.seen.lock().len(), 3);
 }
 
+/// One git command in `dir`, which must succeed; the identity is given so a commit needs none
+/// configured on the machine.
+fn git_ok(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[tokio::test]
+async fn run_parallel_runs_two_cards_at_once_in_two_worktrees_that_both_end_implemented() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    git_ok(dir.path(), &["init", "-q"]);
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "probe"]);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    for title in ["A", "B"] {
+        run(&format!("/add task {title} parent 1"), &store, &worker()).await.unwrap();
+    }
+    // each run writes its own file: the workspace of each is the worktree, not the project. The
+    // two runs overlap in an order the test does not fix, so the answer follows the request
+    // rather than a script: a write first, `done` once the tool result is in the messages
+    let script = std::sync::Arc::new(ByTurn { seen: parking_lot::Mutex::new(0) });
+    let check: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(check);
+
+    let out = crate::agent::run_parallel(&store, &runner, 2, false).await.unwrap();
+    let ran: Vec<&String> = out.iter().filter(|l| l.starts_with('✓')).collect();
+    assert_eq!(ran.len(), 2, "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 2 card(s) · no card is ready");
+    for id in [2, 3] {
+        assert_eq!(store.read(id).await.unwrap().state, ra_roadmap::model::TaskState::Implemented, "{out:?}");
+        // the worktree is a git worktree on the card's branch, and the worker's file is in it
+        let worktree = dir.path().join("var").join("worktrees").join(id.to_string());
+        assert!(worktree.join(".git").is_file(), "{} is not a worktree", worktree.display());
+        assert_eq!(git_ok(&worktree, &["branch", "--show-current"]), format!("card/{id}"));
+        assert_eq!(std::fs::read_to_string(worktree.join("made.txt")).unwrap(), "by the worker\n");
+        // the handoff and the check line name the branch
+        let context = ra_context::TaskContext::open(dir.path(), id);
+        let handoff = context.handoffs.last().unwrap();
+        assert!(handoff.check.contains(&format!("branch card/{id}")), "{}", handoff.check);
+        assert_eq!(handoff.changed, vec!["made.txt".to_owned()], "{out:?}");
+    }
+    assert!(out.iter().any(|l| l.contains("branch card/2")), "{out:?}");
+    // the project itself was left alone
+    assert!(!dir.path().join("made.txt").exists());
+    // the four completions went out as two runs of two turns, overlapping
+    assert_eq!(*script.seen.lock(), 4);
+    assert!(crate::agent::worktree_list(dir.path()).unwrap().iter().any(|l| l.starts_with("#2 · card/2")));
+}
+
+/// A provider that answers by the turn of the request: a `write_file` of `made.txt` on the
+/// first turn of a run, `done` once a tool result is in the messages; it counts the requests.
+struct ByTurn {
+    seen: parking_lot::Mutex<usize>,
+}
+
+impl ra_providers::ModelProvider for ByTurn {
+    fn complete(&self, request: ra_providers::CompletionRequest) -> ra_providers::CompletionFuture<'_> {
+        *self.seen.lock() += 1;
+        let answered = request.messages.iter().any(|m| m.role == "tool");
+        let answer = if answered {
+            says("done", vec![])
+        } else {
+            let write = ra_providers::ToolCall {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"made.txt","content":"by the worker\n"}"#.into(),
+            };
+            says("", vec![write])
+        };
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
 /// Leaves the plan's five-hour window at `utilization` in the project's `var/limits.json`, seen
 /// just now, so it is the latest reading on the machine.
 fn plan_at(root: &std::path::Path, utilization: f64) {
@@ -547,6 +649,42 @@ fn plan_at(root: &std::path::Path, utilization: f64) {
     let mut limits = ra_providers::limits::Limits { status: "allowed".to_owned(), seen_at: now, ..Default::default() };
     limits.windows.insert("five_hour".to_owned(), ra_providers::limits::Window { utilization, resets_at: now + 3600 });
     limits.save(&root.join(ra_providers::claude_code::LIMITS_FILE)).unwrap();
+}
+
+/// Leaves the plan's week at `utilization` in the project's `var/limits.json`, seen just now,
+/// resetting in six days and a half hour, so a slow suite still reads `6d 0h`.
+fn week_at(root: &std::path::Path, utilization: f64) {
+    let now = crate::agent::unix_now();
+    let mut limits = ra_providers::limits::Limits { status: "allowed".to_owned(), seen_at: now, ..Default::default() };
+    let resets_at = now + 6 * 86_400 + 1800;
+    limits.windows.insert(ra_providers::limits::WEEK.to_owned(), ra_providers::limits::Window { utilization, resets_at });
+    limits.save(&root.join(ra_providers::claude_code::LIMITS_FILE)).unwrap();
+}
+
+#[tokio::test]
+async fn a_claude_run_past_the_weeks_threshold_is_refused_with_the_room_and_the_reset_unless_forced() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    week_at(dir.path(), 0.95);
+    let script = Scripted::new(vec![says("did it", vec![])]);
+    // a claude-* pick past 90%: refused before any token goes, naming the room and the reset
+    let runner = Worker::new("claude-sonnet-5-5").with_provider(script.clone());
+    let err = format!("{:#}", crate::agent::run(&store, 2, &runner).await.unwrap_err());
+    assert!(err.contains("week is at 95%") && err.contains("past the 90% threshold"), "{err}");
+    assert!(err.contains("5% left · resets in 6d 0h") && err.contains("--force"), "{err}");
+    assert!(script.seen.lock().is_empty());
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
+    // another route is not the plan's
+    assert!(Worker::new("z-ai/glm-5.3-flash").steered_by_plan(dir.path()).await.is_ok());
+    // the project's own threshold stands above the week: room
+    std::fs::write(dir.path().join("rhipper.toml"), "[plan]\nthreshold = 0.97\n").unwrap();
+    assert_eq!(crate::agent::plan_threshold(dir.path()), 0.97);
+    assert!(runner.steered_by_plan(dir.path()).await.is_ok());
+    // forced, the run goes ahead on the badge model
+    std::fs::remove_file(dir.path().join("rhipper.toml")).unwrap();
+    assert!(runner.steered_by_plan(dir.path()).await.is_err());
+    assert_eq!(runner.clone().with_force(true).steered_by_plan(dir.path()).await.unwrap().model, "claude-sonnet-5-5");
 }
 
 #[tokio::test]
@@ -650,6 +788,87 @@ async fn in_debug_mode_the_run_keeps_the_worker_s_look_back_for_the_next_one() {
     assert_eq!(crate::retro::recent(dir.path(), 10).len(), 2);
 }
 
+#[tokio::test]
+async fn a_reviewer_with_points_leaves_the_card_needs_revision_with_the_points_first_in_its_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    store.set_notes(2, "wrote hello.txt and read it back").await.unwrap();
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    let reviewer = Scripted::new(vec![says("needs_revision\n- hello.txt: the greeting lacks a newline\n- no test covers it", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(reviewer.clone());
+
+    let (out, _) = run("/review 2", &store, &runner).await.unwrap();
+    assert!(out[0].starts_with("✗ #2 Probe needs revision · 2 point(s) by glm-5.3-flash"), "{out:?}");
+    assert_eq!(out[1], "  - hello.txt: the greeting lacks a newline");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
+    assert_eq!(
+        node.notes.as_deref(),
+        Some(
+            "review by z-ai/glm-5.3-flash: needs revision\n- hello.txt: the greeting lacks a newline\n- no test covers it\n\nwrote hello.txt and read it back"
+        )
+    );
+    // the reviewer read the acceptance and the worker's report, with no tools and no workspace
+    let seen = reviewer.seen.lock();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].tools.is_empty() && seen[0].workspace.is_none());
+    assert!(seen[0].messages[1].content.contains("Acceptance:"), "{}", seen[0].messages[1].content);
+    assert!(seen[0].messages[1].content.contains("wrote hello.txt and read it back"), "{}", seen[0].messages[1].content);
+}
+
+#[tokio::test]
+async fn a_reviewer_that_accepts_moves_the_card_to_accepted_and_the_verdict_leads_the_notes() {
+    let store = store().await;
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let reviewer = Scripted::new(vec![says("Accepted.", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(reviewer);
+    let (out, _) = run("/review 2", &store, &runner).await.unwrap();
+    assert!(out[0].starts_with("✓ #2 Probe accepted by glm-5.3-flash"), "{out:?}");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Accepted);
+    assert_eq!(node.notes.as_deref(), Some("review by z-ai/glm-5.3-flash: accepted"));
+    use crate::agent::{Verdict, verdict_of};
+    assert_eq!(verdict_of("needs revision\n* a\n* b"), Verdict::NeedsRevision(vec!["a".into(), "b".into()]));
+    assert_eq!(verdict_of("the diff misses the test"), Verdict::NeedsRevision(vec!["the diff misses the test".into()]));
+}
+
+#[tokio::test]
+async fn a_planners_cards_are_added_under_the_milestone_only_on_confirmation() {
+    let store = store().await;
+    run("/add milestone M parent 1", &store, &worker()).await.unwrap();
+    store.set_details(2, Some("ship the greeting"), None).await.unwrap();
+    run("/add task Old parent 2", &store, &worker()).await.unwrap();
+    let planner = Scripted::new(vec![says(
+        "```\n- Write the greeting {c2}\n  objective: hello.txt holds the greeting\n  acceptance: `cargo test -p greet` passes\n  files: src/greet.rs hello.txt\n- Test it {c1}\n  objective: a test reads it back\n  acceptance: `cargo test -p greet` passes\n- Document it\n  the README names the file\n```",
+        vec![],
+    )]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(planner.clone());
+
+    let plan = crate::agent::plan(&store, 2, &runner).await.unwrap();
+    assert!(plan.preview()[0].starts_with("3 tasks proposed under #2 M by glm-5.3-flash"), "{:?}", plan.preview());
+    // nothing is added until the person says so
+    assert_eq!(store.all().await.unwrap().len(), 3);
+    // the planner read the context of the milestone and the card already under it, with no tools
+    let seen = planner.seen.lock();
+    assert!(seen[0].tools.is_empty() && seen[0].workspace.is_none());
+    assert!(seen[0].messages[1].content.contains("ship the greeting"), "{}", seen[0].messages[1].content);
+    assert!(seen[0].messages[1].content.contains("#3 task Old"), "{}", seen[0].messages[1].content);
+    drop(seen);
+
+    let out = plan.add(&store).await.unwrap();
+    assert_eq!(out.last().unwrap(), "added 3 tasks under #2 M");
+    let nodes = store.all().await.unwrap();
+    assert_eq!(nodes.len(), 6);
+    let first = nodes.iter().find(|n| n.id == 4).unwrap();
+    assert_eq!((first.parent, first.kind, first.complexity), (Some(2), ra_roadmap::model::NodeKind::Task, 2));
+    assert_eq!(first.objective.as_deref(), Some("hello.txt holds the greeting"));
+    assert_eq!(first.acceptance.as_deref(), Some("`cargo test -p greet` passes"));
+    assert_eq!(first.files, vec!["src/greet.rs".to_owned(), "hello.txt".to_owned()]);
+    let third = nodes.iter().find(|n| n.id == 6).unwrap();
+    assert_eq!((third.title.as_str(), third.complexity, third.objective.as_deref()), ("Document it", 3, Some("the README names the file")));
+}
+
 /// The report of the role tests: an answer, and a look back whose bullet lost its tag.
 const ROLE_REPORT: &str = "wrote the greeting into hello.txt and verified it by cargo test\n\n## Faster next time\n- Select-String after a native pipe is refused here; grep in Bash works\n";
 
@@ -722,6 +941,28 @@ async fn without_a_local_server_the_roles_make_no_call_and_the_rule_based_path_s
     assert!(out.iter().any(|l| l.contains("↯ Select-String")), "{out:?}");
     assert!(!crate::retro::recent(dir.path(), 1)[0].machine);
     assert!(crate::hub::own_digest(dir.path()).unwrap().last.unwrap().starts_with("✓ #2 Probe implemented"));
+}
+
+#[tokio::test]
+async fn a_notes_for_line_lands_on_the_other_card_and_leaves_this_cards_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    run("/add task Next parent 1", &store, &worker()).await.unwrap();
+    let report = "wrote hello.txt\nnotes-for #3: the greeting lives in hello.txt\nnotes-for #99: nobody\n";
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(report, vec![])]));
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    // the card's own notes and handoff lose the lines
+    assert_eq!(store.read(2).await.unwrap().notes.as_deref(), Some("wrote hello.txt\n"));
+    assert_eq!(ra_context::TaskContext::open(dir.path(), 2).handoffs.last().unwrap().report, "wrote hello.txt");
+    // the other card got a handoff from this one; the unknown card got a line instead
+    let next = ra_context::TaskContext::open(dir.path(), 3);
+    let note = next.handoffs.last().unwrap();
+    assert_eq!(note.outcome, "note from #2");
+    assert_eq!(note.report, "the greeting lives in hello.txt");
+    assert!(out.iter().any(|l| l.contains("notes-for #3: left on its context")), "{out:?}");
+    assert!(out.iter().any(|l| l.contains("notes-for #99 dropped")), "{out:?}");
 }
 
 #[tokio::test]

@@ -44,7 +44,10 @@ async fn the_tool_table_lists_every_tool_with_a_schema() {
     let mut worker = Worker::new("claude-opus-5-5");
     let reply = send(&store, &mut worker, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await.unwrap();
     let names: Vec<&str> = reply["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["show", "add", "details", "set", "depend", "run", "reassess", "model", "ping", "usage"]);
+    assert_eq!(
+        names,
+        ["show", "add", "details", "set", "depend", "run", "reassess", "model", "ping", "usage", "context", "gotchas", "handoffs"]
+    );
     assert!(reply["result"]["tools"].as_array().unwrap().iter().all(|t| t["inputSchema"]["type"] == "object"));
 }
 
@@ -105,4 +108,77 @@ async fn the_model_tool_swaps_the_badge() {
     assert_eq!(worker.model, "z-ai/glm-5.3-flash");
     let reply = send(&store, &mut worker, call(2, "model", json!({}))).await.unwrap();
     assert!(text_of(&reply).contains("z-ai/glm-5.3-flash"));
+}
+
+#[tokio::test]
+async fn the_context_tool_reads_the_project_file_and_a_card_preview() {
+    let (dir, store) = store().await;
+    let mut worker = Worker::new("claude-opus-5-5");
+    // no project file yet: an error answer, not a protocol error
+    let reply = send(&store, &mut worker, call(1, "context", json!({}))).await.unwrap();
+    assert_eq!(reply["result"]["isError"], true);
+    std::fs::write(dir.path().join(agent::PROJECT_FILE), "# Rhipper\n\nA roadmap-driven orchestrator.\n").unwrap();
+    let reply = send(&store, &mut worker, call(2, "context", json!({}))).await.unwrap();
+    assert_eq!(reply["result"]["isError"], false);
+    let text = text_of(&reply);
+    assert!(text.starts_with(&format!("{} · 3 lines", agent::PROJECT_FILE)), "{text}");
+    assert!(text.contains("A roadmap-driven orchestrator."), "{text}");
+    send(&store, &mut worker, call(3, "add", json!({"kind": "task", "title": "Decode nop", "parent": 1, "objective": "one byte"})))
+        .await
+        .unwrap();
+    let reply = send(&store, &mut worker, call(4, "context", json!({"id": 2}))).await.unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{}", text_of(&reply));
+    let text = text_of(&reply);
+    assert!(text.starts_with("context #2 · "), "{text}");
+    assert!(text.contains("Decode nop"), "{text}");
+}
+
+#[tokio::test]
+async fn the_gotchas_tool_counts_the_hits_and_lists_the_unmatched_commands() {
+    let (dir, store) = store().await;
+    let mut worker = Worker::new("claude-opus-5-5");
+    let reply = send(&store, &mut worker, call(1, "gotchas", json!({}))).await.unwrap();
+    assert!(text_of(&reply).starts_with("no gotcha has fired yet"), "{}", text_of(&reply));
+    let catalogue = ra_gotchas::Catalogue::load(&dir.path().join("var/gotchas.toml")).unwrap();
+    let first = &catalogue.entries[0];
+    let log = dir.path().join("var/gotchas.log");
+    let journal = ra_gotchas::Journal::at(&log);
+    let hit = ra_gotchas::Hit { id: first.id.clone(), message: first.message.clone(), excerpt: "x".into() };
+    journal.record(Some(2), ra_gotchas::Where::Command, &hit).unwrap();
+    journal.record(Some(2), ra_gotchas::Where::Command, &hit).unwrap();
+    let denied = ra_gotchas::Hit { id: ra_gotchas::UNMATCHED.into(), message: String::new(), excerpt: "rm -rf build".into() };
+    journal.record(None, ra_gotchas::Where::Command, &denied).unwrap();
+    let reply = send(&store, &mut worker, call(2, "gotchas", json!({}))).await.unwrap();
+    let text = text_of(&reply);
+    assert!(text.contains(&format!("{:<26} {:>5}  {}", first.id, 2, first.message)), "{text}");
+    assert!(text.contains(&format!("{:<26} {:>5}  a refused command", ra_gotchas::UNMATCHED, 1)), "{text}");
+    assert!(text.ends_with("refused commands no gotcha names, newest last:\n  rm -rf build"), "{text}");
+}
+
+#[tokio::test]
+async fn the_handoffs_tool_lists_the_runs_of_a_card() {
+    let (dir, store) = store().await;
+    let mut worker = Worker::new("claude-opus-5-5");
+    let reply = send(&store, &mut worker, call(1, "handoffs", json!({"id": 9}))).await.unwrap();
+    assert_eq!(reply["result"]["isError"], true);
+    send(&store, &mut worker, call(2, "add", json!({"kind": "task", "title": "Decode nop", "parent": 1}))).await.unwrap();
+    let reply = send(&store, &mut worker, call(3, "handoffs", json!({"id": 2}))).await.unwrap();
+    assert_eq!(text_of(&reply), "#2 · 0 handoff(s)");
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    task.brief = "the card".into();
+    task.record(ra_context::Handoff {
+        when: 1_700_000_000,
+        model: "z-ai/glm-5.3-flash".into(),
+        outcome: "needs revision".into(),
+        check: "cargo test -p x · failed".into(),
+        changed: vec!["src/nop.rs".into()],
+        report: "Decoded the byte.\nThe test is missing.".into(),
+        warnings: vec!["warning: unused variable `x`".into()],
+    });
+    task.save(dir.path()).unwrap();
+    let reply = send(&store, &mut worker, call(4, "handoffs", json!({"id": 2}))).await.unwrap();
+    let text = text_of(&reply);
+    assert!(text.starts_with("#2 · 1 handoff(s)\n## Handoff 1700000000 · z-ai/glm-5.3-flash · needs revision\n"), "{text}");
+    assert!(text.contains("check: cargo test -p x · failed\nchanged: src/nop.rs\nDecoded the byte.\nThe test is missing."), "{text}");
+    assert!(text.ends_with("### Warnings\nwarning: unused variable `x`"), "{text}");
 }

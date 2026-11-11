@@ -415,6 +415,26 @@ impl TaskContext {
         self.handoffs.drain(..excess);
     }
 
+    /// Leaves a word from the run of card `from` on card `to`'s file, as a handoff from another
+    /// card: the next run of `to` reads it with its own. Only the handoffs of the file survive
+    /// this; the run of `to` sets the brief and the outlines afresh anyway.
+    ///
+    /// # Errors
+    /// When the file cannot be written.
+    pub fn leave_note(workspace: &Path, to: i64, from: i64, model: &str, when: u64, text: &str) -> anyhow::Result<()> {
+        let mut task = Self::open(workspace, to);
+        task.record(Handoff {
+            when,
+            model: model.to_owned(),
+            outcome: format!("note from #{from}"),
+            check: format!("no check: a word left by the run of #{from}"),
+            changed: Vec::new(),
+            report: text.to_owned(),
+            warnings: Vec::new(),
+        });
+        task.save(workspace)
+    }
+
     /// Writes the file.
     ///
     /// # Errors
@@ -582,6 +602,46 @@ pub fn changed_between(before: &str, after: &str) -> Vec<String> {
     changed.sort();
     changed.dedup();
     changed
+}
+
+/// The prefix of a report line addressed to another card: `notes-for #<id>: …`.
+const NOTES_FOR: &str = "notes-for #";
+
+/// Splits the `notes-for #<id>: …` lines out of a worker's report: the report without them,
+/// and the notes by card in the order the report first named each, several lines to one card
+/// joined. A bullet mark before the prefix is allowed; a line without an id or a text stays in
+/// the report, and a report without any comes back as it was.
+#[must_use]
+pub fn notes_for(report: &str) -> (String, Vec<(i64, String)>) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut notes: Vec<(i64, String)> = Vec::new();
+    for line in report.lines() {
+        let bare = line.trim().trim_start_matches(['-', '*', ' ']);
+        let parsed = bare.get(..NOTES_FOR.len()).filter(|p| p.eq_ignore_ascii_case(NOTES_FOR)).and_then(|_| {
+            let (id, text) = bare[NOTES_FOR.len()..].split_once(':')?;
+            let id = id.trim().parse::<i64>().ok()?;
+            let text = text.trim();
+            (!text.is_empty()).then(|| (id, text.to_owned()))
+        });
+        match parsed {
+            Some((id, text)) => match notes.iter_mut().find(|(to, _)| *to == id) {
+                Some((_, held)) => {
+                    held.push('\n');
+                    held.push_str(&text);
+                }
+                None => notes.push((id, text)),
+            },
+            None => kept.push(line),
+        }
+    }
+    if notes.is_empty() {
+        return (report.to_owned(), notes);
+    }
+    let mut rest = kept.join("\n");
+    if report.ends_with('\n') {
+        rest.push('\n');
+    }
+    (rest, notes)
 }
 
 /// A text clipped to `room` characters with an ellipsis.

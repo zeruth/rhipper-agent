@@ -164,6 +164,10 @@ pub struct Usage {
     /// The cost in dollars as the provider reported it; `None` when it reports none. On a
     /// subscription this is the list price of the call, not a charge.
     pub cost_usd: Option<f64>,
+    /// Whether the cost was computed here from the model's list prices because the provider
+    /// reported none; a local model's zero is computed too. The ledger marks such a row.
+    #[serde(default)]
+    pub cost_computed: bool,
 }
 
 /// The errors of a provider call, with the ones a caller can retry marked.

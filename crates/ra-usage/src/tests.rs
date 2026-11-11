@@ -3,7 +3,27 @@
 use super::*;
 
 fn entry(model: &str, node: Option<i64>, cost: Option<f64>) -> Entry {
-    Entry { model: model.to_owned(), node, prompt_tokens: 100, completion_tokens: 10, cached_tokens: 40, cost_usd: cost, turns: 1 }
+    Entry {
+        model: model.to_owned(),
+        node,
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        cached_tokens: 40,
+        cost_usd: cost,
+        cost_computed: false,
+        turns: 1,
+    }
+}
+
+#[tokio::test]
+async fn a_computed_cost_is_marked_as_such_and_a_reported_one_is_not() {
+    let store = UsageStore::in_memory().await.unwrap();
+    store.record(&entry("claude-opus-5-5", Some(3), Some(0.25))).await.unwrap();
+    store.record(&Entry { cost_computed: true, ..entry("z-ai/glm-5.3-flash", Some(3), Some(0.002)) }).await.unwrap();
+    let calls = store.calls_of(Some(3)).await.unwrap();
+    assert_eq!(calls.iter().map(|c| (c.cost_usd, c.cost_computed)).collect::<Vec<_>>(), [(Some(0.002), true), (Some(0.25), false)]);
+    // the sums do not tell the two apart: the computed cost is the best figure there is
+    assert_eq!(store.totals().await.unwrap().cost_usd, Some(0.252));
 }
 
 #[tokio::test]

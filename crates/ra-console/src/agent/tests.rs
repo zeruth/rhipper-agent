@@ -132,6 +132,7 @@ fn the_plan_guard_holds_a_run_when_two_roots_together_reach_the_cap_and_names_th
     let reading = |name: &str, utilization: f64, seen_at: u64, live: bool| PlanReading {
         name: name.to_owned(),
         five_hour: Some(ra_providers::limits::Window { utilization, resets_at: now + 3600 }),
+        seven_day: None,
         seen_at,
         live,
     };
@@ -139,7 +140,7 @@ fn the_plan_guard_holds_a_run_when_two_roots_together_reach_the_cap_and_names_th
     let alpha = reading("alpha", 0.8, now - 600, false);
     assert_eq!(plan_hold(&[alpha.clone()], "alpha", now), None);
     // a run live in beta counts for a share the readings do not show yet: together they reach the cap
-    let beta_live = PlanReading { name: "beta".to_owned(), five_hour: None, seen_at: 0, live: true };
+    let beta_live = PlanReading { name: "beta".to_owned(), five_hour: None, seven_day: None, seen_at: 0, live: true };
     let hold = plan_hold(&[alpha.clone(), beta_live.clone()], "alpha", now).expect("held");
     assert!(hold.starts_with("hold: the plan's five-hour window is at 80% as alpha last saw it, with a run live in beta"), "{hold}");
     // a project's own live run is not another project's
@@ -161,6 +162,7 @@ fn the_window_is_tight_under_a_quarter_left_by_the_latest_reading_of_any_project
     let reading = |name: &str, utilization: f64, seen_at: u64, resets_at: u64| PlanReading {
         name: name.to_owned(),
         five_hour: Some(ra_providers::limits::Window { utilization, resets_at }),
+        seven_day: None,
         seen_at,
         live: false,
     };
@@ -174,4 +176,38 @@ fn the_window_is_tight_under_a_quarter_left_by_the_latest_reading_of_any_project
     // a window that reset, or no reading, is room
     assert!(!plan_tight_in(&[reading("alpha", 0.9, now - 60, now - 1)], now));
     assert!(!plan_tight_in(&[], now));
+}
+
+#[test]
+fn the_doctor_lays_the_checks_out_as_a_table_and_names_the_required_ones_that_failed() {
+    let checks = vec![
+        Check::new("claude", true, Ok("2.1.0 (Claude Code), logged in through claude.ai".to_owned())),
+        Check::new("local server", false, Err("nothing answers at http://127.0.0.1:8080/v1".to_owned())),
+        Check::new("roadmap", true, Err("no rhipper.md; `rc init` makes one".to_owned())),
+    ];
+    let table = Check::table(&checks);
+    assert_eq!(table[0], "   check           found");
+    assert_eq!(table[1], "✓  claude          2.1.0 (Claude Code), logged in through claude.ai");
+    // a failed optional check is a dash, not a cross: it blocks nothing
+    assert_eq!(table[2], "–  local server    nothing answers at http://127.0.0.1:8080/v1");
+    assert_eq!(table[3], "✗  roadmap         no rhipper.md; `rc init` makes one");
+    assert_eq!(Check::blocking(&checks), vec!["roadmap"]);
+    assert!(Check::blocking(&checks[..2]).is_empty());
+}
+
+#[tokio::test]
+async fn the_doctor_reads_the_roadmap_and_opens_the_ledger_of_a_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    // no roadmap is a failure that names the remedy; a roadmap that parses is counted
+    assert!(roadmap_check(dir.path()).unwrap_err().contains("`rc init` makes one"));
+    std::fs::write(dir.path().join(crate::setup::ROADMAP_FILE), "- 1 ‹project› P\n  - 2 ‹task› T {c1}\n    objective: a goal\n").unwrap();
+    assert!(roadmap_check(dir.path()).unwrap().ends_with("parses, 2 nodes"));
+    std::fs::write(dir.path().join(crate::setup::ROADMAP_FILE), "- 1 ‹project› P\nnot a line the roadmap knows\n").unwrap();
+    assert!(roadmap_check(dir.path()).unwrap_err().contains("does not parse"));
+    // the ledger is made under var/ when there is none, and opens empty
+    assert!(ledger_check(dir.path()).await.unwrap().ends_with("opens, 0 calls"));
+    assert!(dir.path().join("var").join("usage.db").is_file());
+    // the settings line names the sources a worker loads and what the project has for them
+    let settings = settings_check(dir.path()).unwrap();
+    assert!(settings.starts_with("a worker loads project,local: .claude/settings.json absent"));
 }

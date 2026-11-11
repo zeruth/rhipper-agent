@@ -33,7 +33,7 @@ const WORKER_TOOLS: &str = "Bash,PowerShell,Read,Edit,Write,Glob,Grep,TodoWrite,
 /// hooks are written for their interactive sessions (on this machine one denies Bash outright
 /// and another wraps every PowerShell command in a logging prelude no rule can read), and a
 /// worker that inherits them has no shell at all. The gotcha hooks come in by `--settings`.
-const WORKER_SETTING_SOURCES: &str = "project,local";
+pub const WORKER_SETTING_SOURCES: &str = "project,local";
 
 /// The Claude Code provider.
 pub struct ClaudeCode {
@@ -91,6 +91,9 @@ impl ClaudeCode {
                 "Bash(pwd*)",
                 "Bash(tree*)",
                 "Bash(mkdir *)",
+                // a word to the log, and the one more git question that only reads
+                "Bash(echo *)",
+                "Bash(git check-ignore*)",
                 // the text filters a pipe ends in, so a long output can be narrowed
                 "Bash(sort*)",
                 "Bash(uniq*)",
@@ -109,6 +112,8 @@ impl ClaudeCode {
                 "PowerShell(Test-Path *)",
                 "PowerShell(Get-Location*)",
                 "PowerShell(New-Item *)",
+                "PowerShell(Write-Output *)",
+                "PowerShell(git check-ignore*)",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -206,7 +211,13 @@ impl ClaudeCode {
         }
         let system = system_prompt(&request.messages);
         if !system.is_empty() {
-            args.extend(["--system-prompt".to_owned(), system]);
+            // a worker's system prompt goes by file: on the command line it ran past Windows'
+            // limit (os error 206) once the project context, the other projects' digests and
+            // the machine notes were in it; a chat completion's short one stays inline
+            match request.workspace.as_deref().and_then(|dir| write_system_prompt(dir, &system).ok()) {
+                Some(path) => args.extend(["--system-prompt-file".to_owned(), path.display().to_string()]),
+                None => args.extend(["--system-prompt".to_owned(), system]),
+            }
         }
         if request.workspace.is_some() {
             // a worker: the file tools and the allowed shell commands, inside the workspace, and
@@ -569,9 +580,20 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
         completion_tokens: u.output_tokens,
         cached_tokens: u.cache_read_input_tokens,
         cost_usd: parsed.total_cost_usd,
+        cost_computed: false,
     });
     let session_id = parsed.session_id.filter(|s| !s.trim().is_empty());
     Ok(Completion { text, usage, turns: parsed.num_turns, turn_usage: Vec::new(), tool_calls: Vec::new(), session_id, gotchas: Vec::new() })
+}
+
+/// Writes a run's system prompt under the workspace's `var/runs`, one file per process, so two
+/// runs in one project do not overwrite each other's; returns the path.
+fn write_system_prompt(workspace: &Path, text: &str) -> std::io::Result<PathBuf> {
+    let dir = workspace.join("var").join("runs");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("system-{}.md", std::process::id()));
+    std::fs::write(&path, text)?;
+    Ok(path)
 }
 
 /// The program a permission rule names: `python` of `Bash(python *)`, `gw.ps1` of

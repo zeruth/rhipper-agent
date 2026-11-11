@@ -182,6 +182,76 @@ async fn a_key_goes_out_as_a_bearer_header() {
     assert!(request_seen.recv().unwrap().contains("authorization: Bearer sk-or-test"), "the key rides as a bearer token");
 }
 
+/// An answer that carries its tokens and no cost, as a local server sends every one and the
+/// public service some.
+const UNCOSTED: &str =
+    r#"{"choices":[{"message":{"content":"pong","role":"assistant"}}],"usage":{"prompt_tokens":1000,"completion_tokens":500}}"#;
+
+/// The public model list with its prices as decimal strings per token, and a model without any.
+const PRICED_MODELS: &str = r#"{"data":[{"id":"z-ai/glm-5.3-flash","pricing":{"prompt":"0.000002","completion":"0.000004"}},{"id":"free/one","pricing":{"prompt":"0","completion":"0"}},{"id":"local-file"}]}"#;
+
+fn prices_fixture(read_at: u64) -> Prices {
+    let mut models = BTreeMap::new();
+    models.insert(model().to_owned(), Price { prompt: 0.000_001, completion: 0.000_002 });
+    Prices { read_at, models }
+}
+
+#[tokio::test]
+async fn an_answer_without_a_cost_is_priced_from_a_fresh_prices_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prices.json");
+    prices_fixture(now()).save(&path).unwrap();
+    // the server answers the completion only: a fresh file is not refetched
+    let base = serve("HTTP/1.1 200 OK", UNCOSTED);
+    let provider = OpenRouter::at(&base, "test").unwrap().with_prices_at(&path);
+    let answer = provider.complete(request()).await.unwrap();
+    let cost = answer.usage.cost_usd.expect("priced from the file");
+    assert!((cost - 0.002).abs() < 1e-12, "{cost}");
+    assert!(answer.usage.cost_computed, "the usage says the cost was computed");
+    assert_eq!(answer.usage.prompt_tokens, 1000);
+}
+
+#[tokio::test]
+async fn a_stale_prices_file_is_read_again_from_the_endpoint_and_rewritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prices.json");
+    prices_fixture(now() - PRICES_FOR.as_secs() - 1).save(&path).unwrap();
+    let base = serve_routes(vec![("/v1/models", PRICED_MODELS), ("/v1/chat/completions", UNCOSTED)]);
+    let provider = OpenRouter::at(&base, "test").unwrap().with_prices_at(&path);
+    let answer = provider.complete(request()).await.unwrap();
+    // the endpoint's prices, not the file's: 1000 × 0.000002 + 500 × 0.000004
+    let cost = answer.usage.cost_usd.expect("priced from the endpoint");
+    assert!((cost - 0.004).abs() < 1e-12, "{cost}");
+    assert!(answer.usage.cost_computed);
+    let written = Prices::load(&path).expect("the file was rewritten");
+    assert!(written.fresh_at(now()));
+    assert_eq!(written.models.keys().collect::<Vec<_>>(), ["free/one", model()], "a model without a price is left out");
+    assert_eq!(written.models["free/one"], Price::default());
+}
+
+#[tokio::test]
+async fn a_reported_cost_stays_as_reported_and_a_local_answer_is_free() {
+    let base = serve(
+        "HTTP/1.1 200 OK",
+        r#"{"choices":[{"message":{"content":"pong","role":"assistant"}}],"usage":{"prompt_tokens":10,"completion_tokens":2,"cost":0.5}}"#,
+    );
+    let answer = OpenRouter::at(&base, "test").unwrap().complete(request()).await.unwrap();
+    assert_eq!((answer.usage.cost_usd, answer.usage.cost_computed), (Some(0.5), false));
+    // a local server prices nothing, and nothing is what it costs
+    let base = serve("HTTP/1.1 200 OK", UNCOSTED);
+    let answer = OpenRouter::at(&base, "").unwrap().complete(request()).await.unwrap();
+    assert_eq!((answer.usage.cost_usd, answer.usage.cost_computed), (Some(0.0), true));
+}
+
+#[test]
+fn a_model_the_prices_do_not_list_keeps_no_cost() {
+    let prices = prices_fixture(now());
+    let usage = Usage { prompt_tokens: 1, completion_tokens: 1, ..Usage::default() };
+    assert_eq!(prices.cost("other/model", &usage), None);
+    assert!(prices.cost(model(), &usage).is_some());
+    assert!(!prices_fixture(0).fresh_at(now()), "a list from the epoch is stale");
+}
+
 #[tokio::test]
 async fn nothing_listening_is_unreachable_and_names_the_url() {
     let base = closed_port();

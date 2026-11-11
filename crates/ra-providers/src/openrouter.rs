@@ -1,16 +1,23 @@
-//! The OpenRouter adapter: one HTTP POST to `chat/completions` per completion. It maps the HTTP
+//! The `OpenRouter` adapter: one HTTP POST to `chat/completions` per completion. It maps the HTTP
 //! statuses to the provider errors so a caller can retry the transient ones.
 //!
 //! The same adapter serves a local OpenAI-compatible server such as llama.cpp: [`OpenRouter::local`]
 //! points it at the URL from `RHIPPER_LOCAL_URL` with no key. [`LocalProbe`] asks that server for
 //! its model list in the background, so a status dot can say whether it is up without a model call.
+//!
+//! Not every route prices its answers: a local server never does, and `OpenRouter` leaves the cost
+//! out of some. [`Prices`] holds the list prices per token from the models endpoint, read once a
+//! day into `var/prices.json`, and an answer without a cost is priced from them and marked as
+//! computed in the ledger; a local model is free.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvider, ProviderError, ToolCall, ToolSpec, Usage};
 
@@ -25,36 +32,134 @@ const USER_AGENT: &str = concat!("rhipper-agent/", env!("CARGO_PKG_VERSION"));
 /// How long a probe of the local server waits: it answers from memory or not at all.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the status dots of the console and the window probe the local server.
-pub const PROBE_EVERY: Duration = Duration::from_secs(60);
+pub const PROBE_EVERY: Duration = Duration::from_mins(1);
+/// How long the public model list may take: hundreds of models with their prices.
+const LIST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Where a project keeps the prices, relative to its root.
+pub const PRICES_FILE: &str = "var/prices.json";
+/// How long a read of the prices serves before the models endpoint is asked again.
+pub const PRICES_FOR: Duration = Duration::from_hours(24);
 
-/// The OpenRouter provider.
+/// The `OpenRouter` provider.
 pub struct OpenRouter {
     client: reqwest::Client,
     /// The bearer key; empty sends no `Authorization` header, as a local server needs none.
     key: String,
     /// The API root; the tests point it at a local server.
     base_url: String,
+    /// Where the prices are kept between runs; `None` keeps them for this provider only.
+    prices_path: Option<PathBuf>,
+    /// The prices read so far, shared by the completions of this provider.
+    prices: Mutex<Option<Arc<Prices>>>,
+}
+
+/// The list prices of the models a route offers, per token and in dollars, with the time they
+/// were read. `OpenRouter`'s `models` endpoint names them; a local server lists none.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Prices {
+    /// When the list was read, in seconds since the epoch.
+    pub read_at: u64,
+    /// The price of each model, by id.
+    pub models: BTreeMap<String, Price>,
+}
+
+/// What one token costs a model, in dollars: read and written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Price {
+    pub prompt: f64,
+    pub completion: f64,
+}
+
+impl Prices {
+    /// The prices in the file at `path`; `None` when there is no file or it is not a price list.
+    #[must_use]
+    pub fn load(path: &Path) -> Option<Self> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    }
+
+    /// Writes the prices to `path`.
+    ///
+    /// # Errors
+    /// When the file cannot be written.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::write(path, serde_json::to_string_pretty(self).map_err(std::io::Error::other)?)
+    }
+
+    /// Whether the list was read within [`PRICES_FOR`] of `now`.
+    #[must_use]
+    pub fn fresh_at(&self, now: u64) -> bool {
+        now.saturating_sub(self.read_at) < PRICES_FOR.as_secs()
+    }
+
+    /// The list price of `usage` on `model`: every prompt token at the prompt price, cached or
+    /// not, and every completion token at the completion price; `None` for a model not listed.
+    #[must_use]
+    pub fn cost(&self, model: &str, usage: &Usage) -> Option<f64> {
+        let price = self.models.get(model)?;
+        // the token counts are far below 2^53, so the conversion is exact
+        #[allow(clippy::cast_precision_loss)]
+        let tokens = |n: u64| n as f64;
+        Some(tokens(usage.prompt_tokens) * price.prompt + tokens(usage.completion_tokens) * price.completion)
+    }
+
+    /// The prices of the models the endpoint listed, at `now`; a model without a parsable price
+    /// is left out, and prices from a list without none, as a local server's, are an empty list.
+    fn from_wire(models: Vec<WireModel>, now: u64) -> Self {
+        let models = models
+            .into_iter()
+            .filter_map(|m| {
+                let pricing = m.pricing?;
+                let per_token = |text: Option<String>| text?.trim().parse::<f64>().ok();
+                Some((m.id, Price { prompt: per_token(pricing.prompt)?, completion: per_token(pricing.completion)? }))
+            })
+            .collect();
+        Self { read_at: now, models }
+    }
+}
+
+/// Seconds since the epoch, 0 on a clock set before it.
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 impl OpenRouter {
-    /// Builds the provider from an OpenRouter API key.
+    /// Builds the provider from an `OpenRouter` API key.
+    ///
+    /// # Errors
+    /// When the HTTP client cannot be built.
     pub fn new(key: impl Into<String>) -> anyhow::Result<Self> {
         Self::at(BASE_URL, key)
     }
 
     /// Builds the provider against the local server at [`local_url`], with no key.
+    ///
+    /// # Errors
+    /// When the HTTP client cannot be built.
     pub fn local() -> anyhow::Result<Self> {
         Self::at(&local_url(), "")
     }
 
     /// Builds the provider against another base URL, for tests and local servers. A trailing slash
     /// is dropped, so `http://host/v1/` and `http://host/v1` reach the same endpoint.
+    ///
+    /// # Errors
+    /// When the HTTP client cannot be built.
     pub fn at(base_url: &str, key: impl Into<String>) -> anyhow::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder().user_agent(USER_AGENT).build()?,
             key: key.into(),
             base_url: base_url.trim_end_matches('/').to_owned(),
+            prices_path: None,
+            prices: Mutex::new(None),
         })
+    }
+
+    /// Keeps the prices in the file at `path` between runs: a fresh file is read instead of the
+    /// endpoint, and a read of the endpoint is written there when its directory exists.
+    #[must_use]
+    pub fn with_prices_at(mut self, path: impl Into<PathBuf>) -> Self {
+        self.prices_path = Some(path.into());
+        self
     }
 
     /// The API root the provider posts to.
@@ -69,9 +174,18 @@ impl OpenRouter {
 
     /// The ids the server offers, from `GET models`. A local server lists the files it loaded;
     /// `ping` names them when a model is unknown to it.
+    ///
+    /// # Errors
+    /// When the server does not answer, or answers with something other than a model list.
     pub async fn models(&self) -> Result<Vec<String>, ProviderError> {
+        Ok(self.fetch_models().await?.into_iter().map(|m| m.id).collect())
+    }
+
+    /// The models endpoint as it answers: the ids, and the prices where the route has them. A
+    /// local server answers from memory within the probe's timeout; the public list takes longer.
+    async fn fetch_models(&self) -> Result<Vec<WireModel>, ProviderError> {
         let url = format!("{}/models", self.base_url);
-        let mut get = self.client.get(&url).timeout(PROBE_TIMEOUT);
+        let mut get = self.client.get(&url).timeout(if self.is_local() { PROBE_TIMEOUT } else { LIST_TIMEOUT });
         if !self.is_local() {
             get = get.bearer_auth(&self.key);
         }
@@ -83,7 +197,53 @@ impl OpenRouter {
         }
         let parsed: WireModels = serde_json::from_str(&body)
             .map_err(|e| ProviderError::Other(format!("unparsable model list: {e}; body starts with: {}", snippet(&body))))?;
-        Ok(parsed.data.into_iter().map(|m| m.id).collect())
+        Ok(parsed.data)
+    }
+
+    /// The prices of the route: the ones read within the day, from memory or the file, else a
+    /// read of the endpoint, written to the file when there is one. When the endpoint cannot be
+    /// read, a stale list serves rather than none, and `None` is only no list at all.
+    pub async fn prices(&self) -> Option<Arc<Prices>> {
+        let now = now();
+        let held = self.prices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        if let Some(prices) = &held
+            && prices.fresh_at(now)
+        {
+            return Some(Arc::clone(prices));
+        }
+        let on_disk = self.prices_path.as_deref().and_then(Prices::load).map(Arc::new);
+        if let Some(prices) = &on_disk
+            && prices.fresh_at(now)
+        {
+            *self.prices.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(prices));
+            return Some(Arc::clone(prices));
+        }
+        let fetched = match self.fetch_models().await {
+            Ok(models) => Arc::new(Prices::from_wire(models, now)),
+            Err(e) => {
+                tracing::warn!("the prices cannot be read from {}: {e}", self.base_url);
+                return held.or(on_disk);
+            }
+        };
+        if let Some(path) = &self.prices_path
+            && path.parent().is_none_or(|dir| dir.as_os_str().is_empty() || dir.exists())
+            && let Err(e) = fetched.save(path)
+        {
+            tracing::warn!("the prices cannot be written to {}: {e}", path.display());
+        }
+        *self.prices.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&fetched));
+        Some(fetched)
+    }
+
+    /// Fills in the cost of an answer the route did not price: nothing on a local server, the
+    /// list price of the tokens on `OpenRouter`; the usage says the cost was computed. An answer
+    /// on a model without a listed price keeps no cost.
+    async fn price(&self, model: &str, usage: &mut Usage) {
+        let cost = if self.is_local() { Some(0.0) } else { self.prices().await.and_then(|p| p.cost(model, usage)) };
+        if let Some(cost) = cost {
+            usage.cost_usd = Some(cost);
+            usage.cost_computed = true;
+        }
     }
 
     /// The text of an unknown-model error. On a local server it goes on to name what the server
@@ -94,7 +254,8 @@ impl OpenRouter {
             && let Ok(models) = self.models().await
             && !models.is_empty()
         {
-            text.push_str(&format!("; the server at {} offers: {}", self.base_url, models.join(", ")));
+            use std::fmt::Write as _;
+            let _ = write!(text, "; the server at {} offers: {}", self.base_url, models.join(", "));
         }
         text
     }
@@ -143,6 +304,17 @@ struct WireModels {
 #[derive(Deserialize)]
 struct WireModel {
     id: String,
+    /// The list prices, which OpenRouter sends as decimal strings; a local server sends none.
+    #[serde(default)]
+    pricing: Option<WirePricing>,
+}
+
+#[derive(Deserialize)]
+struct WirePricing {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    completion: Option<String>,
 }
 
 /// The API root of the local server: `RHIPPER_LOCAL_URL` when it is set to something, else
@@ -334,15 +506,19 @@ impl OpenRouter {
                         snippet(&body)
                     )));
                 }
-                let usage = parsed
+                let mut usage = parsed
                     .usage
                     .map(|u| Usage {
                         prompt_tokens: u.prompt_tokens,
                         completion_tokens: u.completion_tokens,
                         cached_tokens: u.prompt_tokens_details.map_or(0, |d| d.cached_tokens),
                         cost_usd: u.cost,
+                        cost_computed: false,
                     })
                     .unwrap_or_default();
+                if usage.cost_usd.is_none() {
+                    self.price(&request.model, &mut usage).await;
+                }
                 Ok(Completion {
                     text,
                     usage,

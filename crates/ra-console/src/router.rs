@@ -16,6 +16,12 @@ pub const ROUTES_FILE: &str = "rhipper.toml";
 /// The role of the worker that implements a card; a rule without a role is for it.
 pub const IMPLEMENTER: &str = "implementer";
 
+/// The role of the second model that reads a card's diff against its acceptance.
+pub const REVIEWER: &str = "reviewer";
+
+/// The role of the architect that splits a milestone or a section into cards.
+pub const PLANNER: &str = "planner";
+
 /// The complexities a rule is for: one, or a range with both ends in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
@@ -204,8 +210,30 @@ impl RoleConfig {
     }
 }
 
-/// The rules of a project, in the order of the file, its worker table and its role table.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+/// The `[plan]` table: how far into the week a run on a `claude-*` model may go before it is
+/// steered, to the local route when one is up and refused otherwise, unless `--force`.
+///
+/// ```toml
+/// [plan]
+/// threshold = 0.95    # the share of the week; 0.9 when left out
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct PlanConfig {
+    #[serde(default)]
+    pub threshold: Option<f64>,
+}
+
+impl PlanConfig {
+    /// The threshold, 0 to 1: the table's when it names a sane one, else the default.
+    #[must_use]
+    pub fn threshold(&self) -> f64 {
+        self.threshold.filter(|t| (0.0..=1.0).contains(t)).unwrap_or(ra_providers::limits::DEFAULT_THRESHOLD)
+    }
+}
+
+/// The rules of a project, in the order of the file, its worker table, its role table and its
+/// plan table.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Router {
     #[serde(default, rename = "route")]
     pub rules: Vec<Rule>,
@@ -213,6 +241,8 @@ pub struct Router {
     pub worker: WorkerConfig,
     #[serde(default)]
     pub role: RoleConfig,
+    #[serde(default)]
+    pub plan: PlanConfig,
 }
 
 /// Why a choice fell where it did.

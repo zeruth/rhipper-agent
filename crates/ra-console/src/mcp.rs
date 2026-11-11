@@ -147,6 +147,19 @@ fn tools() -> Vec<Value> {
         ),
         tool("ping", "One round trip to the badge model: the answer, the tokens and the cost.", json!({}), &[]),
         tool("usage", "The ledger by model: calls, tokens and cost, all time, and the session tally.", json!({}), &[]),
+        tool(
+            "context",
+            "The context a run of a card would send, without running: the brief, the file outlines and the handoffs so far. Without an id, the project context file beside the roadmap.",
+            json!({"id": id}),
+            &[],
+        ),
+        tool("gotchas", "The gotchas that fired, by how often, and the refused commands no gotcha names yet.", json!({}), &[]),
+        tool(
+            "handoffs",
+            "The handoffs of a card's earlier runs, oldest first: when, model, outcome, the check, the files changed, the report and the lint warnings.",
+            json!({"id": id}),
+            &["id"],
+        ),
     ]
 }
 
@@ -249,7 +262,7 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
             let picked = text("model").map(str::to_owned).or_else(|| node.assignee.map(|a| a.model));
             let mut runner = worker.clone();
             if let Some(model) = picked {
-                runner.model = model;
+                runner.model = agent::resolve(&model);
             }
             agent::run(store, id, &runner).await
         }
@@ -259,8 +272,8 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
         }
         "model" => match text("id") {
             Some(model) => {
-                worker.model = model.to_owned();
-                Ok(vec![format!("the badge model is {model} ({:?})", worker.route())])
+                worker.model = agent::resolve(model);
+                Ok(vec![format!("the badge model is {} ({:?})", worker.model, worker.route())])
             }
             None => Ok(vec![format!("the badge model is {} ({:?})", worker.model, worker.route())]),
         },
@@ -288,8 +301,63 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
             }
             Ok(out)
         }
+        "context" => {
+            let line = int("id").map_or_else(|| "/context".to_owned(), |id| format!("/context {id}"));
+            Ok(commands::run(&line, store, worker).await?.0)
+        }
+        "gotchas" => Ok(gotchas(&agent::workspace_of(store))),
+        "handoffs" => {
+            let id = need_id()?;
+            // the node is read for its existence: a missing card is an error, a card without
+            // runs is an empty list
+            store.read(id).await?;
+            Ok(handoffs(id, &ra_context::TaskContext::open(&agent::workspace_of(store), id).handoffs))
+        }
         other => anyhow::bail!("no tool {other}"),
     }
+}
+
+/// The gotchas of `root` by how often they fired, and the refused commands none names yet: the
+/// lines `rc gotchas` prints.
+fn gotchas(root: &std::path::Path) -> Vec<String> {
+    let catalogue = ra_gotchas::Catalogue::load(&root.join("var/gotchas.toml")).ok();
+    let journal_path = root.join("var/gotchas.log");
+    let journal = ra_gotchas::Journal::at(&journal_path);
+    let counts = journal.counts();
+    if counts.is_empty() {
+        let held = catalogue.as_ref().map_or(0, |c| c.entries.len());
+        return vec![format!("no gotcha has fired yet; the catalogue holds {held} entries in var/gotchas.toml")];
+    }
+    let mut out = vec![format!("{:<26} {:>5}  message", "gotcha", "hits")];
+    for (id, count) in &counts {
+        let message =
+            catalogue.as_ref().and_then(|c| c.get(id)).map_or("a refused command no gotcha names; see below", |g| g.message.as_str());
+        out.push(format!("{id:<26} {count:>5}  {message}"));
+    }
+    let unmatched = journal.unmatched();
+    if !unmatched.is_empty() {
+        out.push("refused commands no gotcha names, newest last:".to_owned());
+        out.extend(unmatched.iter().rev().take(20).rev().map(|command| format!("  {command}")));
+    }
+    out
+}
+
+/// The handoffs of card `id` as lines: a header with the count, then each run's block.
+fn handoffs(id: i64, handoffs: &[ra_context::Handoff]) -> Vec<String> {
+    let mut out = vec![format!("#{id} · {} handoff(s)", handoffs.len())];
+    for handoff in handoffs {
+        out.push(format!("## Handoff {} · {} · {}", handoff.when, handoff.model, handoff.outcome));
+        out.push(format!("check: {}", handoff.check.trim()));
+        if !handoff.changed.is_empty() {
+            out.push(format!("changed: {}", handoff.changed.join(" ")));
+        }
+        out.extend(handoff.report.lines().map(str::to_owned));
+        if !handoff.warnings.is_empty() {
+            out.push("### Warnings".to_owned());
+            out.extend(handoff.warnings.iter().cloned());
+        }
+    }
+    out
 }
 
 #[cfg(test)]

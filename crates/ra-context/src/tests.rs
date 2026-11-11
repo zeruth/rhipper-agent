@@ -228,6 +228,26 @@ fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_ca
 }
 
 #[test]
+fn a_notes_for_line_leaves_the_report_and_lands_as_a_handoff_on_the_other_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let report = "done\n- notes-for #9: the seam is in prepare\nNotes-for #9: workspace is overridden\nnotes-for #10: hi\nnotes-for nobody: stays\nnotes-for #11:\n";
+    let (rest, notes) = notes_for(report);
+    assert_eq!(rest, "done\nnotes-for nobody: stays\nnotes-for #11:\n");
+    assert_eq!(notes, vec![(9, "the seam is in prepare\nworkspace is overridden".to_owned()), (10, "hi".to_owned())]);
+    // a report without one is untouched
+    assert_eq!(notes_for("plain\n").0, "plain\n");
+    TaskContext::leave_note(root, 9, 7, "m", 5, &notes[0].1).unwrap();
+    let other = TaskContext::open(root, 9);
+    assert_eq!(other.handoffs.len(), 1);
+    let note = &other.handoffs[0];
+    assert_eq!(note.when, 5);
+    assert_eq!(note.outcome, "note from #7");
+    assert_eq!(note.report, "the seam is in prepare\nworkspace is overridden");
+    assert!(other.prompt().contains("## Handoff 5 · m · note from #7\n"), "{}", other.prompt());
+}
+
+#[test]
 fn the_changed_paths_are_the_status_lines_a_run_added() {
     let before = " M apps/a.rs\n?? var/x\n";
     let after = " M apps/a.rs\n?? var/x\n M crates/b.rs\nR  old.rs -> new.rs\n?? \"with space.rs\"\n";

@@ -101,6 +101,9 @@ struct App {
     all_time: Option<ra_usage::Totals>,
     /// The plan's windows as the harness last reported them, re-read every few seconds.
     limits: ra_providers::limits::Limits,
+    /// The share of the week past which a claude-* run is steered, from `rhipper.toml`; the
+    /// week's pill shows it.
+    threshold: f64,
     /// Whether the local server is up, probed once a minute in the background; the status line
     /// shows it as a dot.
     local: ra_providers::openrouter::LocalProbe,
@@ -143,6 +146,7 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
         activity_offset: std::fs::metadata(ACTIVITY_FILE).map_or(0, |m| m.len()),
         all_time: worker.all_time().await,
         limits: ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE)),
+        threshold: crate::agent::plan_threshold(Path::new(".")),
         local: ra_providers::openrouter::LocalProbe::default(),
         local_seen: None,
         worker,
@@ -1032,6 +1036,10 @@ fn status_line(app: &App) -> Line<'static> {
             spans.push(sep());
             spans.push(Span::styled(format!("{label} "), dim));
             spans.push(Span::styled(format!("{:.0}%", window.utilization * 100.0), Style::new().fg(color).bold()));
+            // the week carries the threshold the runs steer at
+            if name == ra_providers::limits::WEEK {
+                spans.push(Span::styled(format!("/{:.0}%", app.threshold * 100.0), dim));
+            }
             spans.push(Span::styled(format!(" · resets in {}", ra_providers::limits::until(window.resets_at)), dim));
         }
     }

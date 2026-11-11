@@ -65,6 +65,11 @@ pub const COMMANDS: &[Spec] = &[
         usage: "<id> [dry]",
         help: "executes one roadmap task on the badge model; dry prints what it would send and calls nothing",
     },
+    Spec {
+        name: "review",
+        usage: "<id>",
+        help: "a second model reads the card's acceptance, handoff and git diff and writes its verdict into the notes: accepted, or needs revision with the points",
+    },
     Spec { name: "reassess", usage: "<id>", help: "the model revises the objective and acceptance of one node" },
     Spec {
         name: "reassess-tree",
@@ -379,7 +384,7 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             // a node with a model of its own runs on it; the badge is the default
             let mut runner = worker.clone();
             if let Some(assignment) = store.read(id).await?.assignee {
-                runner.model = assignment.model;
+                runner.model = agent::resolve(&assignment.model);
             }
             let lines = if dry { agent::dry_run(store, id, &runner).await? } else { agent::run(store, id, &runner).await? };
             return Ok((lines, Outcome::Continue));
@@ -387,14 +392,17 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
         "assign" => {
             let (id_text, model) = args.split_once(char::is_whitespace).context("usage: assign <id> <model|none>")?;
             let id = id_text.parse::<i64>().context("the id is a node id")?;
-            let model = model.trim();
-            let assignment =
-                (model != "none").then(|| ra_roadmap::model::Assignment { model: model.to_owned(), role: "implementer".to_owned() });
+            let model = agent::resolve(model);
+            let assignment = (model != "none").then(|| ra_roadmap::model::Assignment { model, role: "implementer".to_owned() });
             store.assign(id, assignment.as_ref()).await?;
             out.push(match &assignment {
                 Some(a) => format!("#{id} runs on {} through {}", a.model, agent::Route::of(&a.model).name()),
                 None => format!("#{id} runs on the badge model"),
             });
+        }
+        "review" => {
+            let id = args.parse::<i64>().context("usage: review <id>")?;
+            return Ok((agent::review(store, id, worker).await?, Outcome::Continue));
         }
         "reassess" | "reassess-tree" => {
             let id = args.parse::<i64>().context(format!("usage: {name} <id>"))?;
@@ -477,9 +485,10 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             return Ok((out, Outcome::Filter(states)));
         }
         "model" => {
-            anyhow::ensure!(!args.is_empty(), "usage: model <id>, such as claude-opus-5-5, local/qwen3 or z-ai/glm-5.3-flash");
-            out.push(format!("the next worker session runs on {args} through {}", agent::Route::of(args).name()));
-            return Ok((out, Outcome::Model(args.to_owned())));
+            anyhow::ensure!(!args.is_empty(), "usage: model <id>, such as opus, claude-opus-5-5, local/qwen3 or z-ai/glm-5.3-flash");
+            let model = agent::resolve(args);
+            out.push(format!("the next worker session runs on {model} through {}", agent::Route::of(&model).name()));
+            return Ok((out, Outcome::Model(model)));
         }
         "budgets" => {
             return match args {

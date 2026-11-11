@@ -132,6 +132,10 @@ enum Command {
         #[arg(long)]
         dry: bool,
     },
+    /// Checks what a run needs, one line each: `claude` on the path and logged in, the hooks, the settings a
+    /// worker loads, git, the local server, the OpenRouter key, the roadmap parsing, the ledger opening; exit
+    /// code 1 when a required one fails.
+    Doctor,
     /// One round trip to a model: the answer and the usage.
     Ping {
         /// The model: a claude-* id runs on Claude Code, local/<name> on the local server at
@@ -186,6 +190,42 @@ enum Command {
         /// command line) and calls no model; the card keeps its state and its session.
         #[arg(long)]
         dry: bool,
+        /// Runs the card in var/worktrees/<id> on a branch card/<id> made from HEAD; the handoff
+        /// names the branch, and merging it is yours (`rc worktree list|drop`).
+        #[arg(long, conflicts_with_all = ["dry", "next", "all"])]
+        worktree: bool,
+        /// With --all: runs that many ready cards at once, each in its own worktree.
+        #[arg(long, requires = "all", value_name = "N")]
+        parallel: Option<usize>,
+        /// Spends the plan past its week threshold (90%, or `[plan] threshold` of rhipper.toml):
+        /// without it a run on a claude-* model falls to the local route when one is up and is
+        /// refused with the room left and the reset otherwise.
+        #[arg(long)]
+        force: bool,
+    },
+    /// The worktrees the runs made under var/worktrees, one per card on its branch card/<id>.
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+    /// Has a second model review the card: it reads the acceptance, the last handoff and the git diff
+    /// of the card's files, and writes its verdict into the notes: accepted, or needs revision with
+    /// the points first. The reviewer is the `reviewer` rule of rhipper.toml that fits the card, else
+    /// the default model.
+    Review {
+        /// The node id.
+        id: i64,
+    },
+    /// Asks the architect model to split a milestone or a section into cards with objective, acceptance,
+    /// complexity and files, shows them, and adds them on confirmation. The planner is the `planner` rule
+    /// of rhipper.toml that fits the node, else the default model; the prompt carries the project context
+    /// and the cards already under the node, so none repeats.
+    Plan {
+        /// The milestone or section id.
+        id: i64,
+        /// Adds the cards without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Prints the model a run of the card would take and why: the card's own, the `[[route]]` rule of
     /// rhipper.toml that fits its complexity and kind, or the default. No model call.
@@ -277,6 +317,18 @@ enum Command {
     },
 }
 
+/// What `rc worktree` does with the worktrees of the cards.
+#[derive(Subcommand)]
+enum WorktreeAction {
+    /// Lists them: the card, the branch and the path.
+    List,
+    /// Removes the worktree of a card, changes and all; its branch goes too when it is merged and stays otherwise.
+    Drop {
+        /// The node id.
+        id: i64,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let options = Options::parse();
@@ -350,6 +402,10 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             import(&file, under, dry).await
         }
+        Command::Doctor => {
+            plain_tracing()?;
+            doctor().await
+        }
         Command::Ping { model } => {
             plain_tracing()?;
             let worker = Worker::new(model).with_ledger(open_ledger().await?);
@@ -373,7 +429,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Run { id, next, all, stop_on_revision, model, budget, turns, no_debug, effort, dry } => {
+        Command::Run { id, next, all, stop_on_revision, model, budget, turns, no_debug, effort, dry, worktree, parallel, force } => {
             plain_tracing()?;
             if let Some(budget) = budget {
                 anyhow::ensure!(budget.is_finite() && budget > 0.0, "the budget is a positive number of dollars");
@@ -387,20 +443,52 @@ async fn main() -> anyhow::Result<()> {
                 Some(model) => Worker::new(model),
                 None => Worker::new(ra_console::ui::DEFAULT_MODEL).with_routing(true),
             };
-            let mut worker = worker.with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns).with_effort(effort);
+            let mut worker =
+                worker.with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns).with_effort(effort).with_force(force);
             if no_debug {
                 worker = worker.with_debug(false);
             }
             let lines = match id {
                 Some(id) if dry => ra_console::agent::dry_run(&store, id, &worker).await?,
+                Some(id) if worktree => ra_console::agent::run_in_worktree(&store, id, &worker).await?,
                 Some(id) => ra_console::agent::run(&store, id, &worker).await?,
-                None if all => ra_console::agent::run_all(&store, &worker, stop_on_revision).await?,
+                None if all => match parallel {
+                    Some(width) => ra_console::agent::run_parallel(&store, &worker, width, stop_on_revision).await?,
+                    None => ra_console::agent::run_all(&store, &worker, stop_on_revision).await?,
+                },
                 None => ra_console::agent::run_next(&store, &worker).await?,
             };
             for line in lines {
                 println!("{line}");
             }
             Ok(())
+        }
+        Command::Worktree { action } => {
+            let store = open_store().await?;
+            let root = ra_console::agent::workspace_of(&store);
+            let lines = match action {
+                WorktreeAction::List => ra_console::agent::worktree_list(&root)?,
+                WorktreeAction::Drop { id } => ra_console::agent::worktree_drop(&root, id).await?,
+            };
+            for line in lines {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Command::Review { id } => {
+            plain_tracing()?;
+            let store = open_store().await?;
+            let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
+            for line in ra_console::agent::review(&store, id, &worker).await? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Command::Plan { id, yes } => {
+            plain_tracing()?;
+            let store = open_store().await?;
+            let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
+            plan(&store, id, &worker, yes).await
         }
         Command::Route { id } => route(id).await,
         Command::Stop => {
@@ -623,6 +711,19 @@ fn gotchas() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Prints the doctor's checks as a table; a required one failing is the error, so the exit code
+/// says it.
+async fn doctor() -> anyhow::Result<()> {
+    use ra_console::agent::Check;
+    let checks = ra_console::agent::doctor(Path::new(".")).await;
+    for line in Check::table(&checks) {
+        println!("{line}");
+    }
+    let blocking = Check::blocking(&checks);
+    anyhow::ensure!(blocking.is_empty(), "a run needs: {}", blocking.join(", "));
+    Ok(())
+}
+
 /// Opens the usage ledger under `var/`.
 async fn open_ledger() -> anyhow::Result<UsageStore> {
     std::fs::create_dir_all("var")?;
@@ -635,6 +736,12 @@ async fn usage() -> anyhow::Result<()> {
     let limits = ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE));
     if limits.fresh() {
         println!("Claude plan ({}): {}", limits.status, limits.summary().join(" · "));
+        // the threshold the runs steer at, so the line says how much of the week is still a run's
+        let threshold = ra_console::agent::plan_threshold(Path::new("."));
+        match limits.week_past(threshold) {
+            Some(_) => println!("week past the {:.0}% threshold: claude-* runs go local or need --force", threshold * 100.0),
+            None => println!("claude-* runs steer at {:.0}% of the week", threshold * 100.0),
+        }
     } else {
         println!("Claude plan: no fresh report; a Claude Code run brings one");
     }
@@ -865,6 +972,29 @@ async fn import(file: &Path, under: i64, dry: bool) -> anyhow::Result<()> {
         }
     }
     println!("added {} under #{under} {}", outline.summary(), root.title);
+    Ok(())
+}
+
+/// Shows the planner's cards for `id` and adds them when `yes` or the person answers `y`.
+async fn plan(store: &Store, id: i64, worker: &Worker, yes: bool) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let plan = ra_console::agent::plan(store, id, worker).await?;
+    for line in plan.preview() {
+        println!("{line}");
+    }
+    if !yes {
+        print!("add them under #{id}? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("nothing added");
+            return Ok(());
+        }
+    }
+    for line in plan.add(store).await? {
+        println!("{line}");
+    }
     Ok(())
 }
 

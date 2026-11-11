@@ -1084,11 +1084,18 @@ impl App {
                 } else {
                     theme::online()
                 };
-                let (used, resets_at) = (week.utilization, week.resets_at);
-                cards::pill_bar(ui, &format!("week {:.0}%", shown * 100.0), shown, color, pulse).on_hover_ui(|ui| {
-                    ui.label(format!("the plan's week: {:.0}% used, resets in {}", used * 100.0, ra_providers::limits::until(resets_at)));
-                    cards::sparkline(ui, &tab.week.days, color);
-                });
+                let (used, resets_at, threshold) = (week.utilization, week.resets_at, tab.threshold);
+                cards::pill_bar(ui, &format!("week {:.0}%/{:.0}%", shown * 100.0, threshold * 100.0), shown, color, pulse).on_hover_ui(
+                    |ui| {
+                        ui.label(format!(
+                            "the plan's week: {:.0}% used, resets in {}",
+                            used * 100.0,
+                            ra_providers::limits::until(resets_at)
+                        ));
+                        ui.label(format!("claude-* runs steer at {:.0}%: local when up, else refused without --force", threshold * 100.0));
+                        cards::sparkline(ui, &tab.week.days, color);
+                    },
+                );
             }
             let secs = self.started.elapsed().as_secs();
             ui.label(RichText::new(format!("up {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)).color(theme::dim()).small());
@@ -1444,6 +1451,9 @@ struct Workspace {
     /// The plan's windows as the harness last reported them, and when they were last read.
     limits: ra_providers::limits::Limits,
     limits_read: Instant,
+    /// The share of the week past which a claude-* run is steered, from the project's
+    /// `rhipper.toml`; the week's pill shows it.
+    threshold: f64,
     /// Whether the local server is up, probed once a minute on the runtime with no model call;
     /// the status bar shows it as a dot. `None` until the first probe went out.
     local: ra_providers::openrouter::LocalProbe,
@@ -1589,6 +1599,7 @@ impl Workspace {
             code: None,
             limits: ra_providers::limits::Limits::load(&root.join(ra_providers::claude_code::LIMITS_FILE)),
             limits_read: Instant::now(),
+            threshold: ra_console::agent::plan_threshold(&root),
             local: ra_providers::openrouter::LocalProbe::default(),
             local_probed: None,
             week: ra_providers::limits::Week::load(&root.join(ra_providers::claude_code::LIMITS_LOG)),
@@ -1667,7 +1678,7 @@ impl Workspace {
         self.job = Some(what.clone());
         self.sink.push(Kind::Input, what);
         let mut worker = self.worker.clone();
-        worker.model.clone_from(&setup.model);
+        worker.model = ra_console::agent::resolve(&setup.model);
         let (sink, tx, root) = (self.sink.clone(), self.job_tx.clone(), self.root.clone());
         self.rt.spawn(async move {
             match ra_console::setup::init(&root, &worker, mode).await {
@@ -2451,21 +2462,28 @@ impl Workspace {
                 } else {
                     theme::online()
                 };
-                let (used, resets_at) = (week.utilization, week.resets_at);
-                cards::pill_bar(ui, &format!("week {:.0}%", shown * 100.0), shown, color, pulse).on_hover_ui(|ui| {
-                    ui.label(format!("the plan's week: {:.0}% used, resets in {}", used * 100.0, ra_providers::limits::until(resets_at)));
-                    cards::sparkline(ui, &self.week.days, color);
-                    let steepest = match self.week.steepest() {
-                        Some((day, rise)) => format!("steepest day {day}, +{:.0}%", rise * 100.0),
-                        None => "no day climbed this week".to_owned(),
-                    };
-                    ui.label(
-                        RichText::new(format!("{} to {} · {steepest}", self.week.day_name(0), self.week.day_name(6)))
-                            .color(theme::dim())
-                            .small(),
-                    );
-                    ui.label(RichText::new("from the harness's runs").color(theme::dim()).small());
-                });
+                let (used, resets_at, threshold) = (week.utilization, week.resets_at, self.threshold);
+                cards::pill_bar(ui, &format!("week {:.0}%/{:.0}%", shown * 100.0, threshold * 100.0), shown, color, pulse).on_hover_ui(
+                    |ui| {
+                        ui.label(format!(
+                            "the plan's week: {:.0}% used, resets in {}",
+                            used * 100.0,
+                            ra_providers::limits::until(resets_at)
+                        ));
+                        ui.label(format!("claude-* runs steer at {:.0}%: local when up, else refused without --force", threshold * 100.0));
+                        cards::sparkline(ui, &self.week.days, color);
+                        let steepest = match self.week.steepest() {
+                            Some((day, rise)) => format!("steepest day {day}, +{:.0}%", rise * 100.0),
+                            None => "no day climbed this week".to_owned(),
+                        };
+                        ui.label(
+                            RichText::new(format!("{} to {} · {steepest}", self.week.day_name(0), self.week.day_name(6)))
+                                .color(theme::dim())
+                                .small(),
+                        );
+                        ui.label(RichText::new("from the harness's runs").color(theme::dim()).small());
+                    },
+                );
             }
             let secs = self.started.elapsed().as_secs();
             ui.label(RichText::new(format!("up {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)).color(theme::dim()).small());

@@ -29,6 +29,19 @@ const GOTCHAS_LOG: &str = "var/gotchas.log";
 /// How many of the latest hits the machine notes of a run draw on.
 const RECENT_HITS: usize = 30;
 
+/// The short names of the Claude models and the ids they stand for on the Claude Code route: the
+/// ids move with the releases, the names stay, and a person types the name.
+pub const ALIASES: [(&str, &str); 4] =
+    [("fable", "claude-fable-5-1"), ("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5-5"), ("haiku", "claude-haiku-4-5-20251001")];
+
+/// The id `model` stands for: the alias table's when it is one of the short names, `model`
+/// itself otherwise. Every place a model is typed goes through here, so the badge, the ledger and
+/// the harness all see the id.
+pub fn resolve(model: &str) -> String {
+    let typed = model.trim();
+    ALIASES.iter().find(|(alias, _)| alias.eq_ignore_ascii_case(typed)).map_or_else(|| typed.to_owned(), |(_, id)| (*id).to_owned())
+}
+
 /// Where a model id routes: a bare Claude id runs on the local Claude Code; `local/<name>` goes to
 /// the local OpenAI-compatible server at `RHIPPER_LOCAL_URL`; any other id with a vendor prefix,
 /// such as `z-ai/glm-5.3-flash`, goes through OpenRouter.
@@ -90,6 +103,9 @@ pub struct Worker {
     /// Whether a run picks its model per card: the card's own, else the rule of `rhipper.toml`
     /// that fits, else [`Worker::model`] as the default. Off, every run is on the badge model.
     pub routed: bool,
+    /// Whether a run on a `claude-*` model goes ahead past the plan's threshold, from `--force`;
+    /// off, such a run falls to the local route when one is up and is refused otherwise.
+    pub force: bool,
     /// Debug mode, on unless `RHIPPER_DEBUG=off`: a run asks the worker to end its report with
     /// what would have made it faster, keeps the answer, and hands the latest to the next runs.
     pub debug: bool,
@@ -99,6 +115,11 @@ pub struct Worker {
     /// The cheap roles when a test set them; a run resolves its own from `rhipper.toml` and the
     /// local server otherwise.
     roles: Option<Roles>,
+    /// The directory the worker acts in and the checks run in when it is not the project's: a
+    /// worktree of the card. The roadmap, the context files and `var/` stay the project's.
+    workspace: Option<PathBuf>,
+    /// The branch of that worktree, which the check line and the handoff name.
+    branch: Option<String>,
 }
 
 /// The cheap roles of a run, each with the model that takes it and the provider behind it; a
@@ -122,10 +143,11 @@ const SUMMARY_INSTRUCTION: &str = "Condense this worker's report for the next ru
 const DIGEST_INSTRUCTION: &str = "In one line of at most 120 characters and no markdown, say what this run did for the people and the agents working on other projects on the same machine: the card, the outcome, and the crates or files it touched. The first line is how the run ended; the rest are the notes of the card.";
 
 impl Worker {
-    /// A worker on `model`, not yet connected and without a ledger.
+    /// A worker on `model` (an id or one of the [`ALIASES`]), not yet connected and without a
+    /// ledger.
     pub fn new(model: impl Into<String>) -> Self {
         Self {
-            model: model.into(),
+            model: resolve(&model.into()),
             provider: Arc::new(Mutex::new(None)),
             ledger: None,
             tally: Arc::new(Mutex::new(Totals::default())),
@@ -135,11 +157,23 @@ impl Worker {
             turns: None,
             effort: None,
             routed: false,
+            force: false,
             debug: !std::env::var("RHIPPER_DEBUG")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
             script: None,
             roles: None,
+            workspace: None,
+            branch: None,
         }
+    }
+
+    /// The same worker, acting in the worktree at `path` on `branch` instead of the project
+    /// directory.
+    #[must_use]
+    pub fn with_worktree(mut self, path: PathBuf, branch: impl Into<String>) -> Self {
+        self.workspace = Some(path);
+        self.branch = Some(branch.into());
+        self
     }
 
     /// The same worker, with every cheap role on `model` through `provider`; the tests hand in
@@ -274,6 +308,48 @@ impl Worker {
         self
     }
 
+    /// The same worker, spending the plan past its threshold or not.
+    #[must_use]
+    pub fn with_force(mut self, on: bool) -> Self {
+        self.force = on;
+        self
+    }
+
+    /// The worker a run in `root` goes to once the plan's week is read: this one, unless it is
+    /// on a `claude-*` model and the week is at or past the project's threshold; then, without
+    /// `--force`, the same worker on the local server's model when one is up, and an error
+    /// naming the room left and the reset when none is.
+    ///
+    /// # Errors
+    /// When the week is past the threshold, the run is not forced and no local route is up.
+    pub async fn steered_by_plan(&self, root: &Path) -> anyhow::Result<Self> {
+        if self.force || self.route() != Route::ClaudeCode {
+            return Ok(self.clone());
+        }
+        let threshold = plan_threshold(root);
+        let readings = plan_readings(root);
+        let Some((name, window)) = plan_week(&readings, threshold, unix_now()) else {
+            return Ok(self.clone());
+        };
+        let room = ra_providers::limits::room(&window);
+        let at = format!(
+            "the plan's week is at {:.0}% as {name} last saw it, past the {:.0}% threshold: {room}",
+            window.utilization * 100.0,
+            threshold * 100.0
+        );
+        // the tests never ping the local server
+        let local = if cfg!(test) { None } else { ra_providers::local::default_model().await };
+        match local {
+            Some(model) => {
+                tracing::info!(target: crate::trace::PROGRESS, "  steer: {at}; this run goes to {model}");
+                let mut worker = self.clone();
+                worker.model = model;
+                Ok(worker)
+            }
+            None => anyhow::bail!("{at}; no local route is up, run with --force to spend the week"),
+        }
+    }
+
     /// The worker a run of `node` in `root` goes to: this one unless it is routed; then the one
     /// on the model the card, the rules or the default name, with the rule's effort when
     /// `--effort` named none.
@@ -286,7 +362,7 @@ impl Worker {
         }
         let choice = crate::router::Router::load(root)?.choose(node, crate::router::IMPLEMENTER, &self.model);
         let mut worker = self.clone();
-        worker.model = choice.model;
+        worker.model = resolve(&choice.model);
         worker.effort = self.effort.or(choice.effort);
         Ok(worker)
     }
@@ -370,6 +446,7 @@ impl Worker {
             completion_tokens: usage.completion_tokens,
             cached_tokens: usage.cached_tokens,
             cost_usd: usage.cost_usd,
+            cost_computed: usage.cost_computed,
             turns,
         };
         self.tally.lock().add(&entry);
@@ -447,7 +524,10 @@ fn connect(route: Route) -> anyhow::Result<Arc<dyn ModelProvider>> {
             }
             Arc::new(harness)
         }
-        Route::OpenRouter => Arc::new(ra_providers::openrouter::OpenRouter::new(secret::api_key()?)?),
+        // the prices of the day in the project's var/, for the answers that come back uncosted
+        Route::OpenRouter => {
+            Arc::new(ra_providers::openrouter::OpenRouter::new(secret::api_key()?)?.with_prices_at(ra_providers::openrouter::PRICES_FILE))
+        }
         // the same wire format as OpenRouter, at the local URL and with no key
         Route::Local => Arc::new(ra_providers::openrouter::OpenRouter::local()?),
     };
@@ -485,6 +565,184 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
     ])
 }
 
+/// One line of `rc doctor`: what was looked at, whether it holds, whether a run needs it, and
+/// what was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub name: &'static str,
+    pub ok: bool,
+    pub required: bool,
+    pub detail: String,
+}
+
+impl Check {
+    fn new(name: &'static str, required: bool, outcome: Result<String, String>) -> Self {
+        match outcome {
+            Ok(detail) => Self { name, ok: true, required, detail },
+            Err(detail) => Self { name, ok: false, required, detail },
+        }
+    }
+
+    /// The checks as a table: a mark, the name and what was found. A failed optional check gets
+    /// a dash rather than a cross, since it blocks no run.
+    pub fn table(checks: &[Self]) -> Vec<String> {
+        let mut lines = vec![format!("   {:<15} found", "check")];
+        for check in checks {
+            let mark = match (check.ok, check.required) {
+                (true, _) => "✓",
+                (false, true) => "✗",
+                (false, false) => "–",
+            };
+            lines.push(format!("{mark}  {:<15} {}", check.name, check.detail));
+        }
+        lines
+    }
+
+    /// The names of the required checks that failed; a run needs every one of them.
+    pub fn blocking(checks: &[Self]) -> Vec<&'static str> {
+        checks.iter().filter(|c| c.required && !c.ok).map(|c| c.name).collect()
+    }
+}
+
+/// How long a probe of a program or a server may take before the doctor gives up on it.
+const DOCTOR_PROBE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a run in `root` needs, each looked at once: the harness and its login, the hooks and
+/// the settings a worker gets, git, the two other routes, the roadmap and the ledger. The
+/// routes a run can do without are optional; the rest is required.
+pub async fn doctor(root: &Path) -> Vec<Check> {
+    vec![
+        Check::new("claude", true, claude_check(root).await),
+        Check::new("hooks", false, hooks_check(root)),
+        Check::new("settings", false, settings_check(root)),
+        Check::new("git", true, git_check(root).await),
+        Check::new("local server", false, local_check().await),
+        Check::new("OpenRouter key", false, key_check()),
+        Check::new("roadmap", true, roadmap_check(root)),
+        Check::new("ledger", true, ledger_check(root).await),
+    ]
+}
+
+/// One run of `program` with `args` in `dir`, within the doctor's patience; the error names
+/// what went wrong with the program itself, not what it printed.
+async fn probe(program: &str, args: &[&str], dir: &Path) -> Result<std::process::Output, String> {
+    let mut command = tokio::process::Command::new(program);
+    // a nested session refuses to start; the doctor may itself run under Claude Code
+    command.args(args).current_dir(dir).env_remove("CLAUDECODE");
+    match tokio::time::timeout(DOCTOR_PROBE, command.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Err(format!("`{program}` is not on the path")),
+        Ok(Err(e)) => Err(format!("cannot start `{program}`: {e}")),
+        Err(_) => Err(format!("`{program} {}` gave no answer in {}s", args.join(" "), DOCTOR_PROBE.as_secs())),
+    }
+}
+
+/// The first line of what a program printed, stderr when stdout is empty.
+fn printed_line(output: &std::process::Output) -> String {
+    let text = if output.stdout.iter().any(|b| !b.is_ascii_whitespace()) { &output.stdout } else { &output.stderr };
+    String::from_utf8_lossy(text).lines().next().unwrap_or_default().trim().to_owned()
+}
+
+/// `claude` on the path and logged in: its version, and what `claude auth status` says.
+async fn claude_check(root: &Path) -> Result<String, String> {
+    let version = probe("claude", &["--version"], root).await?;
+    if !version.status.success() {
+        return Err(format!("`claude --version` failed: {}", printed_line(&version)));
+    }
+    let version = printed_line(&version);
+    let status = probe("claude", &["auth", "status"], root).await?;
+    // the status is JSON when the harness knows the subcommand, with `loggedIn` as its word;
+    // an older harness without it is believed on its exit code
+    let text = String::from_utf8_lossy(&status.stdout);
+    let json = serde_json::from_str::<serde_json::Value>(text.trim()).ok();
+    let logged_in = json.as_ref().and_then(|v| v.get("loggedIn")).and_then(serde_json::Value::as_bool);
+    let method = json.as_ref().and_then(|v| v.get("authMethod")).and_then(serde_json::Value::as_str).unwrap_or("the harness");
+    match logged_in {
+        Some(true) => Ok(format!("{version}, logged in through {method}")),
+        Some(false) => Err(format!("{version}, not logged in: run `claude` once and log in")),
+        None if status.status.success() => Ok(format!("{version}, logged in")),
+        None => Err(format!("{version}; `claude auth status` failed: {}", printed_line(&status))),
+    }
+}
+
+/// The hooks reachable: this binary, which the harness calls as `rc hook pre|post`, and the
+/// catalogue they answer from.
+fn hooks_check(root: &Path) -> Result<String, String> {
+    let rc = std::env::current_exe().map_err(|e| format!("no path to this binary, so the harness runs unguarded: {e}"))?;
+    if !rc.is_file() {
+        return Err(format!("{} is gone, so the harness runs unguarded", rc.display()));
+    }
+    let file = root.join(GOTCHAS_FILE);
+    let (catalogue, source) = if file.is_file() {
+        (
+            Catalogue::load(&file).map_err(|e| format!("{} does not load, so the harness runs unguarded: {e:#}", file.display()))?,
+            GOTCHAS_FILE,
+        )
+    } else {
+        (Catalogue::seed(), "the seed catalogue")
+    };
+    Ok(format!("`{}` hook pre|post, {} gotchas from {source}", rc.display(), catalogue.entries.len()))
+}
+
+/// The settings a worker loads, and which of the project's files are there to load.
+fn settings_check(root: &Path) -> Result<String, String> {
+    let presence = |file: &str| if root.join(".claude").join(file).is_file() { "present" } else { "absent" };
+    Ok(format!(
+        "a worker loads {}: .claude/settings.json {}, .claude/settings.local.json {}; the user's hooks stay out",
+        ra_providers::claude_code::WORKER_SETTING_SOURCES,
+        presence("settings.json"),
+        presence("settings.local.json")
+    ))
+}
+
+/// git on the path, and whether `root` is a repository: the review reads the diff and the
+/// worktrees branch from HEAD.
+async fn git_check(root: &Path) -> Result<String, String> {
+    let version = probe("git", &["--version"], root).await?;
+    if !version.status.success() {
+        return Err(format!("`git --version` failed: {}", printed_line(&version)));
+    }
+    let repository = probe("git", &["rev-parse", "--is-inside-work-tree"], root).await.is_ok_and(|o| o.status.success());
+    let place = if repository { "a repository here" } else { "no repository here: the review has no diff and a worktree no HEAD" };
+    Ok(format!("{}, {place}", printed_line(&version)))
+}
+
+/// The local server answering at its URL, and the model the roles default to on it.
+async fn local_check() -> Result<String, String> {
+    let url = ra_providers::openrouter::local_url();
+    match ra_providers::local::default_model_at(&url).await {
+        Some(model) => Ok(format!("{url} answers; the roles default to {model}")),
+        None => {
+            Err(format!("nothing answers at {url}; set {} to a server, or the roles call nothing", ra_providers::openrouter::LOCAL_URL_VAR))
+        }
+    }
+}
+
+/// The OpenRouter key, masked, and where it came from.
+fn key_check() -> Result<String, String> {
+    let source =
+        if std::env::var("OPENROUTER_API_KEY").is_ok_and(|k| !k.trim().is_empty()) { "OPENROUTER_API_KEY" } else { "the credential store" };
+    secret::masked().map(|mask| format!("{mask} from {source}")).map_err(|e| format!("{e:#}; the OpenRouter route is off"))
+}
+
+/// The roadmap file parsing, and how many nodes it holds.
+fn roadmap_check(root: &Path) -> Result<String, String> {
+    let path = root.join(crate::setup::ROADMAP_FILE);
+    let text = std::fs::read_to_string(&path).map_err(|_| format!("no {}; `rc init` makes one", path.display()))?;
+    let nodes = ra_roadmap::markdown::parse(&text).map_err(|e| format!("{} does not parse: {e:#}", path.display()))?;
+    Ok(format!("{} parses, {} nodes", path.display(), nodes.len()))
+}
+
+/// The ledger opening under `var/`, and how many calls it holds.
+async fn ledger_check(root: &Path) -> Result<String, String> {
+    let dir = root.join("var");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+    let path = dir.join("usage.db");
+    let ledger = UsageStore::open(&path).await.map_err(|e| format!("{} does not open: {e:#}", path.display()))?;
+    let totals = ledger.totals().await.map_err(|e| format!("{} does not read: {e:#}", path.display()))?;
+    Ok(format!("{} opens, {} calls", path.display(), totals.calls))
+}
+
 /// Runs one roadmap task: builds the context from the node, its ancestors and its dependencies,
 /// sends it to the model, and writes the answer and the state back. A failed call leaves the node
 /// failed, not in progress. The run announces its start and its outcome on the progress channel,
@@ -501,7 +759,9 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     anyhow::ensure!(node.kind != NodeKind::Project, "#{} is a project; run a task", id);
     // the model of this card, when the command left the choice to the card and the rules
     let root = workspace_of(store);
-    let worker = &worker.for_card(&root, &node)?;
+    // then the plan's week: a claude-* pick past the threshold falls to the local route or is
+    // refused here, before the start marker
+    let worker = &worker.for_card(&root, &node)?.steered_by_plan(&root).await?;
     let pick = if tight { format!(" · {TIGHT_PICK}") } else { String::new() };
     // the pid on the start marker, last: a window coming up tells a run that died from one
     // still going
@@ -562,6 +822,307 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     };
     write_digest(store, &root, None, Some(changed), drafted).await;
     outcome.map(|(lines, _, _)| lines)
+}
+
+/// What the reviewer is told: the verdict on the first line, the points after it.
+const REVIEW_INSTRUCTION: &str = "You review one card of a roadmap after a worker implemented it. You get the card's objective and acceptance, the worker's handoff, and the git diff of the card's files. Judge whether the diff meets the acceptance and whether the handoff tells the truth about it. Answer with one word on the first line: `accepted` or `needs_revision`. After `needs_revision`, list the points as `- ` lines, each naming the file and what is wrong or missing; after `accepted`, nothing or one line of why. No other text.";
+
+/// How much of the diff the reviewer reads: a card's files, not a reformat of the tree.
+const REVIEW_DIFF: usize = 60_000;
+
+/// The reviewer's verdict on a card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Accepted,
+    /// The points the reviewer listed, one per entry, without their bullets.
+    NeedsRevision(Vec<String>),
+}
+
+/// The verdict of a reviewer's answer: `accepted` on the first line is acceptance; anything
+/// else is a revision, with the lines after a `needs_revision` first line as its points, or
+/// every line when the first is not the word.
+#[must_use]
+pub fn verdict_of(answer: &str) -> Verdict {
+    let mut lines = answer.lines().map(str::trim).filter(|line| !line.is_empty());
+    let Some(first) = lines.next() else {
+        return Verdict::NeedsRevision(vec!["the reviewer answered nothing".to_owned()]);
+    };
+    let word = first.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase().replace(' ', "_");
+    if word.starts_with("accepted") {
+        return Verdict::Accepted;
+    }
+    let point = |line: &str| line.trim_start_matches(['-', '*', '•']).trim().to_owned();
+    let points: Vec<String> = if word.starts_with("needs_revision") {
+        lines.map(point).collect()
+    } else {
+        std::iter::once(first).chain(lines).map(point).collect()
+    };
+    Verdict::NeedsRevision(if points.is_empty() { vec!["the reviewer gave no points".to_owned()] } else { points })
+}
+
+/// Has a second model review a card: it reads the objective and the acceptance, the last
+/// handoff and the `git diff` of the card's files (and of the ones the handoff names), and
+/// gives a verdict. The card is in review while the reviewer reads; it ends accepted, or needs
+/// revision with the points first in its notes. The reviewer's model is the `reviewer` rule of
+/// `rhipper.toml` that fits the card, else the worker's own.
+///
+/// # Errors
+/// A bad id or a project, an unreadable `rhipper.toml`, no provider for the model, or a failed
+/// call; the card goes back to the state it had.
+pub async fn review(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
+    let node = store.read(id).await?;
+    anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; review a task");
+    let root = workspace_of(store);
+    // the reviewer is a role of its own: the card's assignee is its implementer, not its judge
+    let model = match crate::router::Router::load(&root)?.pick(&node, crate::router::REVIEWER) {
+        Some((_, rule)) => resolve(&rule.model),
+        None => worker.model.clone(),
+    };
+    let provider = worker.provider_for(&model)?;
+    let brief = review_brief(&root, &node).await;
+    let before = node.state;
+    store.set_state_by(id, TaskState::Review, Source::Run).await?;
+    tracing::info!(target: crate::trace::PROGRESS, "#{id} {} · review by {}", node.title, short(&model));
+    let answer = provider
+        .complete(CompletionRequest {
+            model: model.clone(),
+            messages: vec![Message::system(REVIEW_INSTRUCTION), Message::user(&brief)],
+            temperature: Some(0.0),
+            max_tokens: Some(1500),
+            tools: Vec::new(),
+            workspace: None,
+            budget_usd: None,
+            resume: None,
+            max_turns: Some(1),
+            effort: Some(Effort::default().to_string()),
+        })
+        .await;
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(error) => {
+            // a reviewer that did not answer is no verdict: the card goes back where it was
+            store.set_state_by(id, before, Source::Run).await?;
+            return Err(map_error(error));
+        }
+    };
+    worker.record_as(&model, Some(id), &answer.usage, answer.turns).await;
+    let verdict = verdict_of(&answer.text);
+    let (state, head, said) = match &verdict {
+        Verdict::Accepted => (TaskState::Accepted, format!("review by {model}: accepted"), "accepted".to_owned()),
+        Verdict::NeedsRevision(points) => {
+            let list: Vec<String> = points.iter().map(|point| format!("- {point}")).collect();
+            (
+                TaskState::NeedsRevision,
+                format!("review by {model}: needs revision\n{}", list.join("\n")),
+                format!("needs revision · {} point(s)", points.len()),
+            )
+        }
+    };
+    // the verdict leads the notes; the worker's report stays under it for the next run
+    let notes = match node.notes.as_deref().map(str::trim) {
+        Some(report) if !report.is_empty() => format!("{head}\n\n{report}"),
+        _ => head,
+    };
+    store.set_notes(id, &notes).await?;
+    store.set_state_by(id, state, Source::Run).await?;
+    let mut lines = vec![format!(
+        "{} #{} {} {said} by {} · in {} out {} · {}",
+        if verdict == Verdict::Accepted { "✓" } else { "✗" },
+        id,
+        node.title,
+        short(&model),
+        answer.usage.prompt_tokens,
+        answer.usage.completion_tokens,
+        cost_text(answer.usage.cost_usd)
+    )];
+    if let Verdict::NeedsRevision(points) = &verdict {
+        lines.extend(points.iter().map(|point| format!("  - {point}")));
+    }
+    Ok(lines)
+}
+
+/// What the reviewer reads: the card, the last handoff when there is one, and the diff of the
+/// card's files and the handoff's changed ones against `HEAD`, clipped.
+async fn review_brief(root: &Path, node: &Node) -> String {
+    let mut text = format!("# #{} {}\n", node.id, node.title);
+    if let Some(objective) = &node.objective {
+        let _ = writeln!(text, "\nObjective: {objective}");
+    }
+    let _ = writeln!(text, "\nAcceptance: {}", node.acceptance.as_deref().unwrap_or("none written; the workspace tests are the check"));
+    let mut files = node.files.clone();
+    match ra_context::TaskContext::open(root, node.id).handoffs.last() {
+        Some(last) => {
+            let _ = writeln!(text, "\n## Handoff of the last run\n{} on {} · {}\n{}", last.outcome, last.model, last.check, last.report);
+            for file in &last.changed {
+                if !files.contains(file) {
+                    files.push(file.clone());
+                }
+            }
+        }
+        None => text.push_str("\n## Handoff of the last run\nnone: no run of this card left one\n"),
+    }
+    // the notes hold the worker's report whole where the handoff holds its summary
+    if let Some(notes) = node.notes.as_deref().filter(|notes| !notes.trim().is_empty()) {
+        let notes: String = notes.chars().take(DIGEST_NOTES).collect();
+        let _ = writeln!(text, "\n## Notes of the card\n{notes}");
+    }
+    text.push_str("\n## git diff HEAD of the card's files\n");
+    if files.is_empty() {
+        text.push_str("the card names no files and no run changed any\n");
+        return text;
+    }
+    let mut command = tokio::process::Command::new("git");
+    command.args(["diff", "HEAD", "--"]).args(&files).current_dir(root);
+    let diff = match command.output().await {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(out) => format!("git diff failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        Err(e) => format!("git diff did not run: {e}"),
+    };
+    if diff.trim().is_empty() {
+        let _ = writeln!(text, "no change against HEAD in {}", files.join(", "));
+    } else if diff.chars().count() > REVIEW_DIFF {
+        let cut: String = diff.chars().take(REVIEW_DIFF).collect();
+        let _ = writeln!(text, "{cut}\n… clipped at {REVIEW_DIFF} characters");
+    } else {
+        text.push_str(&diff);
+    }
+    text
+}
+
+/// What the planner is told: the cards of one milestone or section, as a plain outline the store
+/// imports as it is.
+const PLAN_INSTRUCTION: &str = "You are the architect of a roadmap. You get the project context, one milestone or section with its objective and acceptance, and the cards already under it. Split the work it still owes into cards a worker can each finish in one sitting. Answer with a plain outline and nothing else: one `- Title {cN}` line per card, N the complexity 1..5, followed by indented `objective:`, `acceptance:` and `files:` lines; the acceptance names the command that checks the card in backticks; the files are the paths the change lands in, separated by spaces. No headings, no card that repeats one already listed, no prose.";
+
+/// The cards the planner proposed for a milestone or a section: shown first, added on the
+/// person's word.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    /// The milestone or the section the cards go under.
+    pub id: i64,
+    pub title: String,
+    /// The planner's model.
+    pub model: String,
+    pub outline: ra_roadmap::outline::Outline,
+    pub usage: Usage,
+}
+
+impl Plan {
+    /// The proposal as lines: the head with the usage, then the cards as an import would nest
+    /// them.
+    #[must_use]
+    pub fn preview(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "{} proposed under #{} {} by {} · in {} out {} · {}",
+            self.outline.summary(),
+            self.id,
+            self.title,
+            short(&self.model),
+            self.usage.prompt_tokens,
+            self.usage.completion_tokens,
+            cost_text(self.usage.cost_usd)
+        )];
+        lines.extend(self.outline.preview().into_iter().map(|line| format!("  {line}")));
+        lines
+    }
+
+    /// Adds the cards to the store, defined with their fields; one line per card added.
+    ///
+    /// # Errors
+    /// When the store cannot take them.
+    pub async fn add(&self, store: &Store) -> anyhow::Result<Vec<String>> {
+        let ids = store.import(self.id, &self.outline).await?;
+        let nodes = store.all().await?;
+        let mut lines: Vec<String> = ids
+            .iter()
+            .filter_map(|id| nodes.iter().find(|n| n.id == *id))
+            .map(|node| format!("#{} {} {} {{c{}}}", node.id, node.kind, node.title, node.complexity))
+            .collect();
+        lines.push(format!("added {} under #{} {}", self.outline.summary(), self.id, self.title));
+        Ok(lines)
+    }
+}
+
+/// Asks the planner to split a milestone or a section into cards and returns them, adding
+/// nothing: the caller shows the plan and adds it on confirmation. The planner's model is the
+/// `planner` rule of `rhipper.toml` that fits the node, else the worker's own.
+///
+/// # Errors
+/// A bad id or a node that is not a milestone or a section, an unreadable `rhipper.toml`, no
+/// provider for the model, a failed call, or an answer with no card in it.
+pub async fn plan(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Plan> {
+    let node = store.read(id).await?;
+    anyhow::ensure!(
+        matches!(node.kind, NodeKind::Milestone | NodeKind::Section),
+        "#{id} is a {}; plan a milestone or a section",
+        node.kind
+    );
+    let root = workspace_of(store);
+    let model = match crate::router::Router::load(&root)?.pick(&node, crate::router::PLANNER) {
+        Some((_, rule)) => resolve(&rule.model),
+        None => worker.model.clone(),
+    };
+    let provider = worker.provider_for(&model)?;
+    let brief = plan_brief(store, &node).await?;
+    tracing::info!(target: crate::trace::PROGRESS, "#{id} {} · plan by {}", node.title, short(&model));
+    let answer = provider
+        .complete(CompletionRequest {
+            model: model.clone(),
+            messages: vec![Message::system(PLAN_INSTRUCTION), Message::user(&brief)],
+            temperature: Some(0.2),
+            max_tokens: Some(4000),
+            tools: Vec::new(),
+            workspace: None,
+            budget_usd: None,
+            resume: None,
+            max_turns: Some(1),
+            effort: Some(Effort::default().to_string()),
+        })
+        .await
+        .map_err(map_error)?;
+    worker.record_as(&model, Some(id), &answer.usage, answer.turns).await;
+    let mut outline = ra_roadmap::outline::parse(&answer.text).context("the planner's answer is not an outline")?;
+    // a planner that answered in headings meant cards: under a milestone they nest as sections,
+    // under a section every item is a task
+    outline.title = None;
+    for item in &mut outline.items {
+        item.kind = match (node.kind, item.kind) {
+            (NodeKind::Milestone, NodeKind::Project | NodeKind::Milestone | NodeKind::Section) => NodeKind::Section,
+            (NodeKind::Milestone, kind) => kind,
+            (_, NodeKind::Subtask) => NodeKind::Subtask,
+            _ => NodeKind::Task,
+        };
+    }
+    Ok(Plan { id, title: node.title, model, outline, usage: answer.usage })
+}
+
+/// What the planner reads: the project context, the node with its objective and acceptance,
+/// and the cards already under it with their states, so none comes back twice.
+async fn plan_brief(store: &Store, node: &Node) -> anyhow::Result<String> {
+    let mut text = String::new();
+    let context = project_context(store);
+    if !context.trim().is_empty() {
+        let _ = writeln!(text, "# Project context\n{}", context.trim_end());
+    }
+    let _ = writeln!(text, "\n# {} #{} {}", node.kind, node.id, node.title);
+    if let Some(objective) = &node.objective {
+        let _ = writeln!(text, "\nObjective: {objective}");
+    }
+    if let Some(acceptance) = &node.acceptance {
+        let _ = writeln!(text, "\nAcceptance: {acceptance}");
+    }
+    let nodes = store.all().await?;
+    let existing: Vec<&Node> = tree::subtree(&nodes, node.id).into_iter().filter(|n| n.id != node.id).collect();
+    text.push_str("\n## Cards already under it\n");
+    if existing.is_empty() {
+        text.push_str("none yet\n");
+    }
+    for card in existing {
+        let _ = writeln!(text, "- #{} {} {} [{}]", card.id, card.kind, card.title, card.state);
+        if let Some(objective) = &card.objective {
+            let _ = writeln!(text, "  objective: {objective}");
+        }
+    }
+    Ok(text)
 }
 
 /// How much of the notes the digest role reads: enough for the report, not a long check output.
@@ -637,6 +1198,8 @@ pub struct PlanReading {
     pub name: String,
     /// The five-hour window as the project last saw it, and when.
     pub five_hour: Option<ra_providers::limits::Window>,
+    /// The week's window as the project last saw it.
+    pub seven_day: Option<ra_providers::limits::Window>,
     pub seen_at: u64,
     /// Whether a run or a walk of the project is going right now.
     pub live: bool,
@@ -673,9 +1236,33 @@ fn plan_readings(root: &Path) -> Vec<PlanReading> {
         }
         let limits = ra_providers::limits::Limits::load(&project.join(ra_providers::claude_code::LIMITS_FILE));
         let live = digests.iter().any(|d| d.name == name && d.live.is_some() && crate::hub::pid_alive(d.pid));
-        readings.push(PlanReading { name, five_hour: limits.windows.get("five_hour").copied(), seen_at: limits.seen_at, live });
+        readings.push(PlanReading {
+            name,
+            five_hour: limits.windows.get("five_hour").copied(),
+            seven_day: limits.windows.get(ra_providers::limits::WEEK).copied(),
+            seen_at: limits.seen_at,
+            live,
+        });
     }
     readings
+}
+
+/// The project's threshold on the plan's week, from the `[plan]` table of its `rhipper.toml`;
+/// [`ra_providers::limits::DEFAULT_THRESHOLD`] without one, or with one that does not read.
+#[must_use]
+pub fn plan_threshold(root: &Path) -> f64 {
+    crate::router::Router::load(root).map_or(ra_providers::limits::DEFAULT_THRESHOLD, |r| r.plan.threshold())
+}
+
+/// The account's week and the project that last saw it, when it is at or past `threshold`: the
+/// latest reading of a week that has not reset, whichever project took it. Room is `None`.
+fn plan_week(readings: &[PlanReading], threshold: f64, now: u64) -> Option<(&str, ra_providers::limits::Window)> {
+    readings
+        .iter()
+        .filter_map(|r| r.seven_day.filter(|w| w.resets_at > now).map(|w| (r.name.as_str(), r.seen_at, w)))
+        .max_by_key(|(_, seen_at, _)| *seen_at)
+        .filter(|(_, _, window)| window.utilization >= threshold)
+        .map(|(name, _, window)| (name, window))
 }
 
 /// Why a run in `this` project is held, or `None` when the plan has room. The harness reports
@@ -729,8 +1316,13 @@ pub fn plan_tight(root: &Path) -> bool {
 /// holds its project's reading already.
 #[must_use]
 pub fn limits_tight(limits: &ra_providers::limits::Limits) -> bool {
-    let reading =
-        PlanReading { name: String::new(), five_hour: limits.windows.get("five_hour").copied(), seen_at: limits.seen_at, live: false };
+    let reading = PlanReading {
+        name: String::new(),
+        five_hour: limits.windows.get("five_hour").copied(),
+        seven_day: limits.windows.get(ra_providers::limits::WEEK).copied(),
+        seen_at: limits.seen_at,
+        live: false,
+    };
     plan_tight_in(&[reading], unix_now())
 }
 
@@ -918,11 +1510,186 @@ pub fn walk_order(nodes: &[Node], tight: bool) -> Vec<i64> {
 /// among equals: what is left of the window finishes small cards whole rather than starting a
 /// large one it cannot end.
 fn batch_ready(nodes: &[Node], tight: bool) -> Option<&Node> {
+    ready_cards(nodes, tight).into_iter().next()
+}
+
+/// Every card a batch may run, in the order [`batch_ready`] would pick them: tree order, or by
+/// complexity with `tight`, the smallest first.
+fn ready_cards(nodes: &[Node], tight: bool) -> Vec<&Node> {
     let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && matches!(d.state, TaskState::Accepted | TaskState::Implemented));
-    let mut ready = nodes
+    let mut ready: Vec<&Node> = nodes
         .iter()
-        .filter(|n| n.state == TaskState::Defined && matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.depends_on.iter().all(met));
-    if tight { ready.min_by_key(|n| n.complexity) } else { ready.next() }
+        .filter(|n| n.state == TaskState::Defined && matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.depends_on.iter().all(met))
+        .collect();
+    if tight {
+        ready.sort_by_key(|n| n.complexity);
+    }
+    ready
+}
+
+/// Where the worktrees of the cards live, under the project's `var/`.
+const WORKTREES_DIR: &str = "var/worktrees";
+
+/// The branch a card's worktree is on.
+#[must_use]
+pub fn worktree_branch(id: i64) -> String {
+    format!("card/{id}")
+}
+
+/// The worktree of card `id` in the project at `root`: `var/worktrees/<id>` on the branch
+/// `card/<id>`, made from HEAD when it is not there yet; a second run of the card reuses the
+/// worktree and the branch as they stand. The path and the branch.
+///
+/// # Errors
+/// When the project is not a git repository, or git cannot add the worktree.
+pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, String)> {
+    let path = root.join(WORKTREES_DIR).join(id.to_string());
+    let branch = worktree_branch(id);
+    if path.join(".git").exists() {
+        return Ok((path, branch));
+    }
+    std::fs::create_dir_all(root.join(WORKTREES_DIR)).with_context(|| format!("cannot create {WORKTREES_DIR}"))?;
+    // the branch outlives a dropped worktree: a new worktree takes it up where it was
+    let exists = git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).await.is_ok();
+    let target = path.to_string_lossy().into_owned();
+    if exists {
+        git(root, &["worktree", "add", &target, &branch]).await?;
+    } else {
+        git(root, &["worktree", "add", "-b", &branch, &target, "HEAD"]).await?;
+    }
+    Ok((path, branch))
+}
+
+/// The worktrees of the cards, one line each: the id, the branch and the path; a line says so
+/// when there are none.
+///
+/// # Errors
+/// When `var/worktrees` cannot be listed.
+pub fn worktree_list(root: &Path) -> anyhow::Result<Vec<String>> {
+    let dir = root.join(WORKTREES_DIR);
+    if !dir.exists() {
+        return Ok(vec!["no worktree".to_owned()]);
+    }
+    let mut ids: Vec<i64> = std::fs::read_dir(&dir)
+        .with_context(|| format!("cannot list {}", dir.display()))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join(".git").exists())
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
+        .collect();
+    ids.sort_unstable();
+    if ids.is_empty() {
+        return Ok(vec!["no worktree".to_owned()]);
+    }
+    Ok(ids.into_iter().map(|id| format!("#{id} · {} · {}", worktree_branch(id), dir.join(id.to_string()).display())).collect())
+}
+
+/// Removes the worktree of card `id`, changes and all, and its branch when it is merged; an
+/// unmerged branch stays, and the line says so, as merging is the person's.
+///
+/// # Errors
+/// When there is no such worktree, or git cannot remove it.
+pub async fn worktree_drop(root: &Path, id: i64) -> anyhow::Result<Vec<String>> {
+    let path = root.join(WORKTREES_DIR).join(id.to_string());
+    anyhow::ensure!(path.join(".git").exists(), "#{id} has no worktree; `rc worktree list` names them");
+    git(root, &["worktree", "remove", "--force", &path.to_string_lossy()]).await?;
+    let branch = worktree_branch(id);
+    let mut lines = vec![format!("dropped the worktree of #{id} at {}", path.display())];
+    match git(root, &["branch", "-d", &branch]).await {
+        Ok(_) => lines.push(format!("deleted {branch}: it was merged")),
+        Err(_) => lines.push(format!("kept {branch}: it is not merged; `git merge {branch}` takes it, `git branch -D {branch}` drops it")),
+    }
+    Ok(lines)
+}
+
+/// One git command in `dir`, its stdout trimmed; the stderr is the error when it fails.
+async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = tokio::process::Command::new("git").args(args).current_dir(dir).output().await.context("cannot run git")?;
+    anyhow::ensure!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// [`run`], in the card's worktree: the worker acts and the checks run in `var/worktrees/<id>`
+/// on the branch `card/<id>`, which the check line and the handoff name; the roadmap and the
+/// context stay the project's.
+///
+/// # Errors
+/// When the worktree cannot be made, or as [`run`].
+pub async fn run_in_worktree(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
+    let (path, branch) = worktree_add(&workspace_of(store), id).await?;
+    run(store, id, &worker.clone().with_worktree(path, branch)).await
+}
+
+/// Runs the ready cards `width` at a time, each in its own worktree, in waves: the ready cards
+/// are read, up to `width` of them run together, and readiness is read again once the wave
+/// ends, until no card is ready, a run fails, or with `stop_on_revision` a card needs revision.
+/// A dependent of a card the batch implemented runs from HEAD like the rest: its dependency's
+/// changes are on a branch until the person merges them.
+///
+/// # Errors
+/// When the roadmap cannot be read between waves, or a worktree cannot be made.
+pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(width > 0, "the width of a parallel batch is at least one");
+    let root = workspace_of(store);
+    let Some(_lock) = take_walk_lock(&root) else {
+        anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
+    };
+    let mut lines = Vec::new();
+    let mut ran = 0;
+    loop {
+        let nodes = store.all().await?;
+        let ids: Vec<i64> = ready_cards(&nodes, plan_tight(&root)).iter().take(width).map(|n| n.id).collect();
+        if ids.is_empty() {
+            lines.push(format!("ran {ran} card(s) · no card is ready"));
+            return Ok(lines);
+        }
+        let mut runs: Vec<(i64, Worker)> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let (path, branch) = worktree_add(&root, *id).await?;
+            runs.push((*id, worker.clone().with_worktree(path, branch)));
+        }
+        let wave = join_all(runs.iter().map(|(id, worker)| run(store, *id, worker))).await;
+        let mut stopped = None;
+        for (id, outcome) in ids.iter().zip(wave) {
+            match outcome {
+                Ok(run_lines) => {
+                    lines.extend(run_lines);
+                    ran += 1;
+                    if stop_on_revision && stopped.is_none() && store.read(*id).await?.state == TaskState::NeedsRevision {
+                        stopped = Some(format!("stopped: #{id} needs revision"));
+                    }
+                }
+                Err(error) => {
+                    stopped.get_or_insert(format!("stopped: the run of #{id} failed: {error:#}"));
+                }
+            }
+        }
+        if let Some(why) = stopped {
+            lines.push(format!("ran {ran} card(s) · {why}"));
+            return Ok(lines);
+        }
+    }
+}
+
+/// Drives `futures` together on the one task and collects their outputs in their order. The
+/// runs of a wave overlap in their waits, the model and the checks, not in their bookkeeping:
+/// the store reads and writes `rhipper.md` without yielding, so two runs never interleave a
+/// read-modify-write of it, which a spawned task per run could not promise.
+async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
+    let mut pending: Vec<Option<std::pin::Pin<Box<F>>>> = futures.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let mut outputs: Vec<Option<F::Output>> = (0..pending.len()).map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        for (slot, out) in pending.iter_mut().zip(outputs.iter_mut()) {
+            if let Some(future) = slot
+                && let std::task::Poll::Ready(value) = future.as_mut().poll(cx)
+            {
+                *out = Some(value);
+                *slot = None;
+            }
+        }
+        if pending.iter().all(Option::is_none) { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
 }
 
 /// The work of [`run`], with the cost of the session and the count of the gotchas it hit beside
@@ -934,8 +1701,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
 
     let Prepared { workspace, root, mut task, project, budget, cap, effort } = prepare(store, &node, worker, true).await?;
     let workspace_dir = workspace.clone();
+    // where the changes land: the worktree when the run has one, else the project
+    let acting = workspace_dir.clone().unwrap_or_else(|| root.clone());
     // what is dirty before the run, so the handoff names only what the run changed
-    let dirty_before = git_status(&root).await;
+    let dirty_before = git_status(&acting).await;
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
     // the session of the last run of this node, so the harness keeps its context, unless it is
@@ -991,7 +1760,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         report: report.to_owned(),
         warnings: Vec::new(),
     };
-    let session = match session {
+    let mut session = match session {
         Ok(session) => session,
         Err(error) => {
             // a spent budget is worth a note: the next attempt sees what the last one cost
@@ -999,12 +1768,26 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 store.set_notes(id, &over.to_string()).await?;
             }
             store.set_state_by(id, TaskState::Failed, Source::Run).await?;
-            let changed = ra_context::changed_between(&dirty_before, &git_status(&root).await);
+            let changed = ra_context::changed_between(&dirty_before, &git_status(&acting).await);
             task.record(handoff("failed", "no check: the run failed", &format!("{error:#}"), changed));
             save_context(store, &root, &task).await;
             return Err(error);
         }
     };
+    // a word for another card: the `notes-for #<id>:` lines go to that card's context as a
+    // handoff from this one, and out of this card's own notes and handoff
+    let (text, notes_for) = ra_context::notes_for(&session.text);
+    session.text = text;
+    let mut noted = Vec::new();
+    for (to, text) in notes_for {
+        if to == id || store.read(to).await.is_err() {
+            noted.push(format!("  notes-for #{to} dropped: no such card"));
+        } else if let Err(e) = ra_context::TaskContext::leave_note(&root, to, id, &worker.model, unix_now(), &text) {
+            noted.push(format!("  notes-for #{to} not left: {e:#}"));
+        } else {
+            noted.push(format!("  notes-for #{to}: left on its context"));
+        }
+    }
     // the local checks before the card counts as done: no model call, the acceptance names
     // them (else the project, else the workspace tests), and they run in order up to the first
     // failure
@@ -1015,7 +1798,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // two builds do not fight over the directory
     let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root).await } else { None };
     let checks = run_checks(&toolbox, &commands).await;
-    let changed = ra_context::changed_between(&dirty_before, &git_status(&root).await);
+    let changed = ra_context::changed_between(&dirty_before, &git_status(&acting).await);
     // a failed check leads the notes and the handoff: the failed command with its tests and the
     // tail of its output first, then the commands that passed before it with their exit codes,
     // then the worker's answer, so the next run reads the failures before anything
@@ -1055,7 +1838,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let mut lint_lines = Vec::new();
     let mut lint_warnings = Vec::new();
     if passed && let Ok(toolbox) = &toolbox {
-        let lint = lint_changed(toolbox, &root, &changed, project_lint.as_deref()).await;
+        let lint = lint_changed(toolbox, &acting, &changed, project_lint.as_deref()).await;
         for skipped in &lint.skipped {
             lint_lines.push(format!("  lint skipped: {skipped}"));
         }
@@ -1092,6 +1875,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     if let Some(advice) = build_advice(&changed) {
         check_line = format!("{check_line} · {advice}");
     }
+    // the branch the changes sit on, when the run had a worktree: merging it is the person's
+    if let Some(branch) = &worker.branch {
+        check_line = format!("{check_line} · branch {branch}");
+    }
     // the summary role condenses the answer for the handoff, when it has a model; the notes of
     // the card keep the answer whole either way. The warnings ride in their own section of the
     // handoff, not at the head of its report: the notes lead with them, the next run gets them
@@ -1124,6 +1911,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         check_line,
     ];
     lines.extend(fresh);
+    lines.extend(noted);
     lines.extend(lint_lines);
     // in debug mode the worker's own look back: kept for the next runs, and named here
     if worker.debug {
@@ -1175,10 +1963,12 @@ struct Prepared {
 /// continues rather than exploring again. With `draft`, a missing project context file is
 /// written first, as a run does; a dry run reads what is there.
 async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> anyhow::Result<Prepared> {
-    // the worker acts in the directory of the roadmap file: the project it describes
-    let workspace =
+    // the worker acts in the directory of the roadmap file, the project it describes, unless a
+    // worktree of the card was made for it; the context and `var/` are the project's either way
+    let project =
         store.path().parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
-    let root = workspace.clone().unwrap_or_else(|| PathBuf::from("."));
+    let root = project.clone().unwrap_or_else(|| PathBuf::from("."));
+    let workspace = worker.workspace.clone().or(project);
     let mut task = ra_context::TaskContext::open(&root, node.id);
     let brief = context_of(store, node).await?;
     task.brief = brief.text;
