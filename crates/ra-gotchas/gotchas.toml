@@ -41,6 +41,13 @@ message = "the binary is held by a running console; run cargo with -p <crate> or
 remedy = { kind = "hint" }
 
 [[gotcha]]
+id = "powershell-wrapped"
+where = "command"
+pattern = '^\s*\$__claude_shell_log\b'
+message = "the PowerShell tool wraps every command in a prelude the allowlist cannot read, so nothing of it is ever allowed here; run cargo and git through Bash"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 id = "powershell-not-allowed"
 where = "result"
 pattern = 'Command name is a dynamic expression|PowerShell.*not allowed|permission.*PowerShell'

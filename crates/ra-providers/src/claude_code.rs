@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use ra_gotchas::{Catalogue, Conditions, Hit, Verdict, Where};
+use ra_gotchas::{Catalogue, Conditions, Hit, Journal, Verdict, Where};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -24,6 +24,9 @@ pub struct ClaudeCode {
     max_turns: u32,
     /// The shell commands a worker may run, as Claude Code permission rules such as `Bash(cargo *)`.
     allowed_shell: Vec<String>,
+    /// The effort the harness asks of the model: `medium` unless told otherwise, the efficient
+    /// setting for the routine card; a hard one can ask for more.
+    effort: String,
     /// The `rc` binary the harness's tool hooks call, when the gotchas guard a run.
     hooks: Option<PathBuf>,
     /// The gotchas the stream is read against, when there is a catalogue.
@@ -57,9 +60,16 @@ impl ClaudeCode {
             ]
             .map(str::to_owned)
             .to_vec(),
+            effort: "medium".to_owned(),
             hooks: None,
             catalogue: None,
         }
+    }
+
+    /// The effort level: `low`, `medium`, `high`, `xhigh` or `max`.
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        self.effort = effort.into();
+        self
     }
 
     /// Runs another binary, for a pinned install or a test double.
@@ -101,7 +111,7 @@ impl ClaudeCode {
             // run of the task to resume
             args.push("--no-session-persistence".to_owned());
         }
-        args.extend(["--model".to_owned(), request.model.clone()]);
+        args.extend(["--model".to_owned(), request.model.clone(), "--effort".to_owned(), self.effort.clone()]);
         if let Some(session) = request.resume.as_deref().filter(|s| !s.trim().is_empty()) {
             // the harness picks up where the last run of the task left off, its context intact
             args.extend(["--resume".to_owned(), session.trim().to_owned()]);
@@ -173,8 +183,23 @@ impl ClaudeCode {
                     tracing::info!(target: "ra::progress", "{step}");
                 }
                 if let Some(catalogue) = &self.catalogue {
+                    // where the hit showed, from the event that carried it
+                    let place = if line.contains(r#""type":"assistant""#) {
+                        Where::Command
+                    } else if line.contains(r#""type":"user""#) {
+                        Where::Result
+                    } else {
+                        Where::Answer
+                    };
                     for hit in gotchas_of_event(catalogue, &line, conditions) {
                         tracing::info!(target: "ra::progress", "⚠ {}: {}", hit.id, hit.excerpt);
+                        // the journal is written here, as the hits come, so a run that ends badly
+                        // still counts them
+                        if let Some(workspace) = &request.workspace {
+                            if let Err(e) = Journal::at(&workspace.join("var/gotchas.log")).record(None, place, &hit) {
+                                tracing::warn!("cannot write the gotchas journal: {e:#}");
+                            }
+                        }
                         gotchas.push(hit);
                     }
                 }

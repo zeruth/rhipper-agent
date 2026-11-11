@@ -72,9 +72,12 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
         /// The most dollars the run may spend; left out, the node's complexity sets it
-        /// (c1 0.25, c2 0.50, c3 1.00, c4 2.00, c5 5.00).
+        /// (c1 0.25, c2 0.50, c3 1.00, c4 2.00, c5 5.00) while budgets are on.
         #[arg(long)]
         budget: Option<f64>,
+        /// No cap at all: the run spends what it needs. RHIPPER_BUDGETS=off does the same everywhere.
+        #[arg(long)]
+        no_budget: bool,
     },
     /// Starts the console over the orchestrator.
     Console {
@@ -134,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             usage().await
         }
-        Command::Run { id, model, budget } => {
+        Command::Run { id, model, budget, no_budget } => {
             plain_tracing()?;
             if let Some(budget) = budget {
                 anyhow::ensure!(budget.is_finite() && budget > 0.0, "the budget is a positive number of dollars");
@@ -144,7 +147,10 @@ async fn main() -> anyhow::Result<()> {
                 Some(model) => model,
                 None => store.read(id).await?.assignee.map_or_else(|| ra_console::ui::DEFAULT_MODEL.to_owned(), |a| a.model),
             };
-            let worker = Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget);
+            let mut worker = Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget);
+            if no_budget {
+                worker = worker.with_budgets(false);
+            }
             for line in ra_console::agent::run(&store, id, &worker).await? {
                 println!("{line}");
             }

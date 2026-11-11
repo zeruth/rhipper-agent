@@ -13,7 +13,7 @@ use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 use ra_usage::{Entry, Totals, UsageStore};
 
-use ra_gotchas::{Catalogue, Journal, Where};
+use ra_gotchas::{Catalogue, Journal};
 
 use crate::secret;
 
@@ -54,6 +54,10 @@ pub struct Worker {
     tally: Arc<Mutex<Totals>>,
     /// The dollar budget of a run, from `--budget`; `None` takes it from the node's complexity.
     pub budget: Option<f64>,
+    /// Whether a run without an explicit budget takes one from the node's complexity. On unless
+    /// `RHIPPER_BUDGETS=off` is in the environment, `--no-budget` was passed, or `budgets off`
+    /// was typed: a subscription has no bill to guard.
+    pub budgets: bool,
 }
 
 impl Worker {
@@ -65,7 +69,15 @@ impl Worker {
             ledger: None,
             tally: Arc::new(Mutex::new(Totals::default())),
             budget: None,
+            budgets: !std::env::var("RHIPPER_BUDGETS")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
         }
+    }
+
+    /// The same worker, with every run capped at `budget` dollars instead of the complexity's.
+    pub fn with_budgets(mut self, on: bool) -> Self {
+        self.budgets = on;
+        self
     }
 
     /// The same worker, with every run capped at `budget` dollars instead of the complexity's.
@@ -223,10 +235,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     // the worker acts in the directory of the roadmap file: the project it describes
     let workspace =
         store.path().parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
-    let budget = worker.budget.unwrap_or_else(|| budget_for(node.complexity));
+    let workspace_dir = workspace.clone();
+    // an explicit budget, else the complexity's while budgets are on, else none at all
+    let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
-    let gotchas_log = workspace.as_deref().unwrap_or(Path::new(".")).join(GOTCHAS_LOG);
     let session = if provider.has_own_tools() {
         // a harness acts in the workspace by itself: one call carries the whole task, and the
         // harness holds it to the budget. The machine notes name what tripped the last runs.
@@ -244,7 +257,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
                 max_tokens: Some(4096),
                 tools: Vec::new(),
                 workspace,
-                budget_usd: Some(budget),
+                budget_usd: budget,
                 // the session of the last run of this node, so the harness keeps its context
                 resume: node.session.clone(),
             })
@@ -276,21 +289,36 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             return Err(error);
         }
     };
-    // every hit goes in the journal: the counts for rc gotchas, the notes for the next run
-    let journal = Journal::at(&gotchas_log);
-    for hit in &gotcha_hits {
-        let place = if hit.id == "untested-claim" { Where::Answer } else { Where::Result };
-        if let Err(e) = journal.record(Some(id), place, hit) {
-            tracing::warn!("cannot write the gotchas journal: {e:#}");
+    // a local check before the card counts as done: no model call, the acceptance names it
+    let command = check_command(node.acceptance.as_deref());
+    let check = match ra_tools::Toolbox::new(workspace_dir.as_deref().unwrap_or(Path::new("."))) {
+        Ok(toolbox) => toolbox.check(&command).await,
+        Err(e) => Err(e),
+    };
+    let (passed, check_line) = match check {
+        Ok((true, _)) => (true, format!("  check passed: {command}")),
+        Ok((false, output)) => {
+            store.set_notes(id, &format!("{}\ncheck failed: {command}\n{}", session.text, last_lines(&output, 40))).await?;
+            (false, format!("  check failed: {command} · the output is in the notes"))
         }
+        Err(e) => {
+            store.set_notes(id, &format!("{}\ncheck failed: {command}\n{e:#}", session.text)).await?;
+            (false, format!("  check failed: {command} · {e:#}"))
+        }
+    };
+    if passed {
+        store.set_notes(id, &session.text).await?;
+        store.set_state(id, TaskState::Implemented).await?;
+    } else {
+        store.set_state(id, TaskState::NeedsRevision).await?;
     }
-    store.set_notes(id, &session.text).await?;
-    store.set_state(id, TaskState::Implemented).await?;
     let mut lines = vec![
         format!(
-            "✓ #{} {} implemented on {} · {} turn(s), {} tool call(s) · in {} out {} · {}",
+            "{} #{} {} {} on {} · {} turn(s), {} tool call(s) · in {} out {} · {}",
+            if passed { "✓" } else { "✗" },
             id,
             node.title,
+            if passed { "implemented" } else { "needs revision" },
             short(&worker.model),
             session.turns,
             session.calls,
@@ -298,6 +326,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             session.usage.completion_tokens,
             cost_text(session.usage.cost_usd)
         ),
+        check_line,
         "  the full answer is in the notes of the card in rhipper.md".to_owned(),
     ];
     if !gotcha_hits.is_empty() {
@@ -306,6 +335,22 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         lines.push(format!("  ⚠ {} gotcha(s): {} · rc gotchas lists them", gotcha_hits.len(), ids.join(", ")));
     }
     Ok((lines, session.usage.cost_usd, gotcha_hits.len()))
+}
+
+/// The check of a node: the first backticked command in its acceptance that starts with cargo,
+/// else the tests of the whole workspace.
+pub fn check_command(acceptance: Option<&str>) -> String {
+    acceptance
+        .and_then(|text| {
+            text.split('`').skip(1).step_by(2).map(str::trim).find(|c| c == &"cargo" || c.starts_with("cargo ")).map(str::to_owned)
+        })
+        .unwrap_or_else(|| "cargo test --workspace -q".to_owned())
+}
+
+/// The last `n` lines of a text.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 /// The machine notes of a run: what the gotchas say about the last hits in the journal, for the
@@ -369,7 +414,7 @@ async fn tool_loop(
     id: i64,
     context: String,
     workspace: Option<&Path>,
-    budget: f64,
+    budget: Option<f64>,
 ) -> anyhow::Result<Session> {
     let workspace = workspace.context("the worker has no workspace to act in")?;
     let toolbox = ra_tools::Toolbox::new(workspace)?;
@@ -385,7 +430,7 @@ async fn tool_loop(
                 max_tokens: Some(4096),
                 tools: ra_tools::Toolbox::specs(),
                 workspace: Some(workspace.to_path_buf()),
-                budget_usd: Some(budget),
+                budget_usd: budget,
                 resume: None,
             })
             .await
@@ -397,7 +442,7 @@ async fn tool_loop(
             return Ok(Session { text: answer.text, usage, calls, turns: turn });
         }
         // the budget is checked before the tools run: the work it would pay for is not done
-        if let Some(spent) = usage.cost_usd.filter(|spent| *spent > budget) {
+        if let Some((budget, spent)) = budget.zip(usage.cost_usd).filter(|(budget, spent)| spent > budget) {
             return Err(OverBudget { budget, spent, turns: turn, calls }.into());
         }
         messages.push(Message::assistant_calls(answer.text, answer.tool_calls.clone()));

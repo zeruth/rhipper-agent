@@ -33,6 +33,8 @@ fn a_chat_request_runs_with_no_tools_and_one_turn() {
     // --bare would drop the OAuth login the subscription route runs on
     assert!(!args.contains(&"--bare".to_owned()), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--model", "claude-opus-5-5"]), "{args:?}");
+    assert!(args.windows(2).any(|w| w == ["--effort", "medium"]), "{args:?}");
+    assert!(ClaudeCode::new().with_effort("high").args(&request(None)).windows(2).any(|w| w == ["--effort", "high"]));
     assert!(args.windows(2).any(|w| w == ["--system-prompt", "You answer in one word."]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--tools", ""]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--max-turns", "1"]), "{args:?}");

@@ -191,6 +191,7 @@ async fn run_on_a_bare_model_loops_through_the_tools_and_lands_the_answer() {
         arguments: r#"{"path":"hello.txt","content":"hello from the worker\n"}"#.into(),
     };
     let read = ra_providers::ToolCall { id: "call_2".into(), name: "read_file".into(), arguments: r#"{"path":"hello.txt"}"#.into() };
+    cargo_project(dir.path(), true);
     let provider =
         Scripted::new(vec![says("", vec![write]), says("checking", vec![read]), says("wrote hello.txt and read it back", vec![])]);
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
@@ -213,6 +214,50 @@ async fn run_on_a_bare_model_loops_through_the_tools_and_lands_the_answer() {
     assert_eq!(last[last.len() - 1].role, "tool");
     assert!(last[last.len() - 1].content.starts_with("    1│hello from the worker"), "{}", last[last.len() - 1].content);
     assert_eq!(last[last.len() - 3].tool_call_id.as_deref(), Some("call_1"));
+}
+
+/// A one-crate Cargo project in `dir` whose single test passes or fails.
+fn cargo_project(dir: &std::path::Path, passing: bool) {
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n")
+        .unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), format!("#[test]\nfn probe() {{ assert!({passing}, \"the probe broke\"); }}\n")).unwrap();
+}
+
+#[test]
+fn the_check_is_the_first_backticked_cargo_command_else_the_workspace_tests() {
+    use crate::agent::check_command;
+    assert_eq!(check_command(Some("run `rc gotchas` then `cargo test -p ra-console` and `cargo clippy`")), "cargo test -p ra-console");
+    assert_eq!(check_command(Some("it is done, see `git log`")), "cargo test --workspace -q");
+    assert_eq!(check_command(None), "cargo test --workspace -q");
+}
+
+async fn checked_run(passing: bool) -> (Vec<String>, ra_roadmap::model::Node) {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), passing);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task Probe parent 1", &store, &worker()).await.unwrap();
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])]));
+    let (out, _) = run("run 2", &store, &worker).await.unwrap();
+    let node = store.read(2).await.unwrap();
+    (out, node)
+}
+
+#[tokio::test]
+async fn a_failing_check_leaves_the_node_needing_revision() {
+    let (out, node) = checked_run(false).await;
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
+    let notes = node.notes.unwrap_or_default();
+    assert!(notes.starts_with("done\ncheck failed: cargo test --workspace -q"), "{notes}");
+    assert!(out.iter().any(|l| l.contains("check failed: cargo test --workspace -q")), "{out:?}");
+}
+
+#[tokio::test]
+async fn a_passing_check_leaves_the_node_implemented() {
+    let (out, node) = checked_run(true).await;
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented);
+    assert_eq!(node.notes.as_deref(), Some("done"));
+    assert!(out.iter().any(|l| l.contains("check passed: cargo test --workspace -q")), "{out:?}");
 }
 
 /// The answer of a reassessment that keeps the text: the three lines the prompt asks for.

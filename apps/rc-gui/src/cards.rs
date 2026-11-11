@@ -103,10 +103,10 @@ pub(crate) fn priority(ui: &mut Ui, complexity: u8) -> egui::Response {
             }
         })
         .response;
-    response.on_hover_text(format!("complexity {complexity} of 5 · budget {}", budget_text(complexity)))
+    response.on_hover_text(format!("complexity {complexity} of 5"))
 }
 
-/// The dollar budget of a complexity, as the runner sets it.
+/// The dollar budget of a complexity, as the runner sets it while budgets are on.
 pub(crate) fn budget_text(complexity: u8) -> String {
     let budget = match complexity {
         0 | 1 => 0.25,
@@ -170,7 +170,6 @@ pub(crate) fn tooltip(ui: &mut Ui, node: &Node, lane: Color32) {
     let model = node.assignee.as_ref().map_or("badge model", |a| a.model.as_str());
     ui.horizontal_wrapped(|ui| {
         badge_marked(ui, "◉", model, theme::TRACE);
-        badge_marked(ui, "$", &budget_text(node.complexity), theme::WARN_TEXT);
         if !node.files.is_empty() {
             badge_marked(ui, "▤", &format!("{} files", node.files.len()), theme::DEBUG);
         }

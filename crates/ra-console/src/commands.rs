@@ -35,6 +35,7 @@ pub const COMMANDS: &[Spec] = &[
         help: "the model of the next worker session: a claude-* id runs on Claude Code, vendor/model on OpenRouter",
     },
     Spec { name: "assign", usage: "<id> <model|none>", help: "the model one node runs on, over the badge; none clears it" },
+    Spec { name: "budgets", usage: "[on|off]", help: "whether a run is capped by its card's complexity; off on a subscription" },
     Spec { name: "key", usage: "[<paste> | clear]", help: "stores, shows the state of, or clears the OpenRouter key" },
     Spec { name: "ping", usage: "", help: "one round trip to the badge model" },
     Spec { name: "run", usage: "<id>", help: "executes one roadmap task on the badge model" },
@@ -56,6 +57,8 @@ pub enum Outcome {
     Model(String),
     /// The console shows or hides the trace lines: `debug` toggled them.
     ToggleDebug,
+    /// The console turns the complexity budgets on or off: `budgets` set it.
+    Budgets(bool),
 }
 
 /// Command names that start with `prefix`.
@@ -239,6 +242,26 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             };
             out.push(format!("the next worker session runs on {args} through {route}"));
             return Ok((out, Outcome::Model(args.to_owned())));
+        }
+        "budgets" => {
+            return match args {
+                "" => {
+                    out.push(format!(
+                        "budgets are {}",
+                        if worker.budgets { "on: a run is capped by its card's complexity" } else { "off" }
+                    ));
+                    Ok((out, Outcome::Continue))
+                }
+                "on" | "off" => {
+                    let on = args == "on";
+                    out.push(format!(
+                        "budgets {}",
+                        if on { "on: a run is capped by its card's complexity" } else { "off: a run spends what it needs" }
+                    ));
+                    Ok((out, Outcome::Budgets(on)))
+                }
+                _ => anyhow::bail!("usage: budgets [on|off]"),
+            };
         }
         "quit" | "exit" | "shutdown" | "stop" => return Ok((out, Outcome::Quit)),
         other => anyhow::bail!("no command {other}; help lists them"),

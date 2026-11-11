@@ -260,6 +260,14 @@ impl Toolbox {
         })
     }
 
+    /// Runs an allowlisted command in the workspace under the ten-minute limit, for a check:
+    /// whether it exited with code 0, and its whole output ending with the exit line.
+    pub async fn check(&self, command: &str) -> anyhow::Result<(bool, String)> {
+        let text = self.run(command).await?;
+        let passed = text.lines().last() == Some("exit code 0");
+        Ok((passed, text))
+    }
+
     async fn run(&self, command: &str) -> anyhow::Result<String> {
         let mut parts = command.split_whitespace();
         let program = parts.next().context("the command is empty")?;

@@ -30,7 +30,7 @@ const PROMPT: &str = "❯ ";
 const WHEEL_ROWS: usize = 3;
 /// The model the console starts with; `model` swaps it. A bare Claude id runs on the local
 /// Claude Code; a vendor-prefixed id goes through OpenRouter.
-pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
+pub const DEFAULT_MODEL: &str = "claude-fable-5-1";
 
 /// Whether stdout is a terminal; the console needs one.
 pub fn is_terminal() -> bool {
@@ -557,6 +557,10 @@ async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, j
                 Outcome::Quit => true,
                 Outcome::Model(model) => {
                     app.worker.model = model;
+                    false
+                }
+                Outcome::Budgets(on) => {
+                    app.worker.budgets = on;
                     false
                 }
                 Outcome::ToggleDebug => {

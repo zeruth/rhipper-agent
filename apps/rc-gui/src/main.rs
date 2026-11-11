@@ -238,6 +238,7 @@ impl App {
                     Outcome::Clear => self.sink.clear(),
                     Outcome::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     Outcome::Model(model) => self.worker.model = model,
+                    Outcome::Budgets(on) => self.worker.budgets = on,
                     Outcome::ToggleDebug => {
                         self.show_debug = !self.show_debug;
                         self.sink.push(Kind::Output, format!("trace lines {}", if self.show_debug { "on" } else { "off" }));
@@ -523,8 +524,13 @@ impl App {
                     cards::badge(ui, &node.state.to_string(), theme::state_color(node.state));
                     cards::badge(ui, &node.kind.to_string(), theme::DIM);
                     cards::priority(ui, node.complexity);
-                    cards::badge_marked(ui, "$", &cards::budget_text(node.complexity), theme::WARN_TEXT)
-                        .on_hover_text("the budget of a run, from the complexity");
+                    if self.worker.budgets {
+                        cards::badge_marked(ui, "$", &cards::budget_text(node.complexity), theme::WARN_TEXT)
+                            .on_hover_text("the budget of a run, from the complexity; `budgets off` lifts it");
+                    } else {
+                        cards::badge_marked(ui, "$", "no budget", theme::DIM)
+                            .on_hover_text("budgets are off; `budgets on` caps a run by its card's complexity");
+                    }
                     let model =
                         node.assignee.as_ref().map_or_else(|| format!("{} (badge)", short(&self.worker.model)), |a| a.model.clone());
                     cards::badge_marked(ui, "◉", &model, theme::TRACE).on_hover_text("the model a run of this card uses");
