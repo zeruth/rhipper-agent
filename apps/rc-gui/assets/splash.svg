@@ -1,0 +1,184 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400">
+  <!-- The Rhipper splash, from the workbench's rhipper_splash.svg, with the reaper redrawn: the
+       staff stands at the reaper's right side instead of crossing the face, the blade sweeps over
+       the hood, and the cloak hangs from the shoulders. The wordmark is drawn by the window. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#140306"/>
+      <stop offset="0.55" stop-color="#2a0710"/>
+      <stop offset="1" stop-color="#4a0d14"/>
+    </linearGradient>
+    <radialGradient id="moonGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ff3d2e" stop-opacity="0.55"/>
+      <stop offset="0.45" stop-color="#c4161c" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#7a0b12" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="moon" cx="0.42" cy="0.38" r="0.62">
+      <stop offset="0" stop-color="#ff8a65"/>
+      <stop offset="0.45" stop-color="#e5392b"/>
+      <stop offset="0.85" stop-color="#a3141c"/>
+      <stop offset="1" stop-color="#7c0d14"/>
+    </radialGradient>
+    <linearGradient id="blade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffab91"/>
+      <stop offset="0.35" stop-color="#e53935"/>
+      <stop offset="1" stop-color="#7f0f16"/>
+    </linearGradient>
+    <linearGradient id="cloak" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0b0204"/>
+      <stop offset="0.7" stop-color="#170408"/>
+      <stop offset="1" stop-color="#3a0910"/>
+    </linearGradient>
+    <linearGradient id="fog" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff4d3d" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#ff4d3d" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#ff4d3d" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="vignette" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0.55" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#050102" stop-opacity="0.85"/>
+    </linearGradient>
+  </defs>
+
+  <!-- sky -->
+  <rect width="640" height="400" fill="url(#sky)"/>
+
+  <!-- stars, red-tinted -->
+  <g fill="#ff8a80">
+    <circle cx="42" cy="38" r="1.1" opacity="0.7"/>
+    <circle cx="118" cy="22" r="0.8" opacity="0.5"/>
+    <circle cx="176" cy="64" r="1" opacity="0.6"/>
+    <circle cx="262" cy="30" r="0.9" opacity="0.55"/>
+    <circle cx="331" cy="58" r="1.2" opacity="0.65"/>
+    <circle cx="372" cy="18" r="0.8" opacity="0.5"/>
+    <circle cx="590" cy="40" r="1" opacity="0.6"/>
+    <circle cx="612" cy="104" r="0.8" opacity="0.45"/>
+    <circle cx="78" cy="96" r="0.8" opacity="0.4"/>
+    <circle cx="226" cy="104" r="0.7" opacity="0.4"/>
+  </g>
+
+  <!-- blood moon -->
+  <circle cx="470" cy="126" r="150" fill="url(#moonGlow)"/>
+  <circle cx="470" cy="126" r="74" fill="url(#moon)"/>
+  <g fill="#7c0d14">
+    <circle cx="446" cy="104" r="11" opacity="0.35"/>
+    <circle cx="492" cy="150" r="15" opacity="0.3"/>
+    <circle cx="500" cy="98" r="6" opacity="0.3"/>
+    <circle cx="440" cy="152" r="7" opacity="0.28"/>
+    <circle cx="470" cy="126" r="5" opacity="0.22"/>
+  </g>
+  <path d="M470 52 a74 74 0 0 1 0 148 a62 74 0 0 0 0 -148 z" fill="#5c0910" opacity="0.35"/>
+
+  <!-- bats across the moon -->
+  <g fill="#160408">
+    <path d="M418 92 q6 -6 12 0 q4 -4 6 0 q2 -4 6 0 q6 -6 12 0 q-8 0 -12 6 q-3 -3 -6 0 q-4 -6 -12 -6 z"/>
+    <path d="M520 70 q4 -4 8 0 q3 -3 4 0 q1 -3 4 0 q4 -4 8 0 q-5 0 -8 4 q-2 -2 -4 0 q-3 -4 -8 -4 z"/>
+    <path d="M498 186 q5 -5 10 0 q3 -3 5 0 q2 -3 5 0 q5 -5 10 0 q-6 0 -10 5 q-2 -2 -5 0 q-3 -5 -10 -5 z"/>
+  </g>
+
+  <!-- far hills -->
+  <path d="M0 262 C70 236 120 250 180 238 C250 224 300 252 370 240 C440 228 500 246 560 232 C600 224 625 230 640 228 L640 400 L0 400 Z" fill="#2c0810"/>
+  <path d="M0 262 C70 236 120 250 180 238 C250 224 300 252 370 240 C440 228 500 246 560 232 C600 224 625 230 640 228" fill="none" stroke="#a3141c" stroke-width="1.2" opacity="0.3"/>
+  <!-- near hills -->
+  <path d="M0 292 C60 276 120 288 190 280 C270 270 330 292 410 284 C490 276 560 290 640 278 L640 400 L0 400 Z" fill="#1d050a"/>
+  <path d="M0 292 C60 276 120 288 190 280 C270 270 330 292 410 284 C490 276 560 290 640 278" fill="none" stroke="#c62828" stroke-width="1" opacity="0.22"/>
+
+  <!-- dead tree, left -->
+  <g fill="#120306">
+    <path d="M58 300 C62 250 56 210 66 168 C70 150 64 132 72 118 L76 120 C70 136 78 152 74 170 C66 214 74 252 72 300 Z"/>
+    <path d="M68 196 C52 184 40 168 30 150 L34 148 C46 164 58 178 72 186 Z"/>
+    <path d="M72 168 C88 154 104 150 120 132 L123 135 C108 154 92 162 76 176 Z"/>
+    <path d="M70 140 C60 126 52 112 50 96 L54 96 C58 110 66 122 74 132 Z"/>
+    <path d="M100 150 C108 144 116 138 118 124 L122 126 C120 140 112 148 104 154 Z"/>
+    <path d="M40 160 C34 150 26 146 18 146 L18 142 C28 142 38 148 44 156 Z"/>
+  </g>
+
+  <!-- graveyard: tombstones and crosses, rim lit from the moon (right) -->
+  <g>
+    <path d="M330 290 v-26 a12 12 0 0 1 24 0 v26 z" fill="#1a0509"/>
+    <path d="M354 264 v26 h-3 v-26 a9 9 0 0 0 -2 -6 a12 12 0 0 1 5 6 z" fill="#8e1a20" opacity="0.6"/>
+    <path d="M392 292 v-34 h-6 v-7 h6 v-8 h7 v8 h6 v7 h-6 v34 z" fill="#1a0509"/>
+    <rect x="399" y="243" width="2" height="49" fill="#8e1a20" opacity="0.55"/>
+    <path d="M430 291 v-22 a10 10 0 0 1 20 0 v22 z" fill="#1a0509"/>
+    <path d="M450 269 v22 h-2 v-22 a8 8 0 0 0 -2 -5 a10 10 0 0 1 4 5 z" fill="#8e1a20" opacity="0.55"/>
+    <path d="M556 289 v-30 a13 13 0 0 1 26 0 v30 z" fill="#1a0509"/>
+    <path d="M582 259 v30 h-3 v-30 a10 10 0 0 0 -2 -7 a13 13 0 0 1 5 7 z" fill="#8e1a20" opacity="0.6"/>
+    <path d="M470 330 v-44 a20 20 0 0 1 40 0 v44 z" fill="#12030a"/>
+    <path d="M510 286 v44 h-4 v-44 a16 16 0 0 0 -4 -11 a20 20 0 0 1 8 11 z" fill="#b3202a" opacity="0.65"/>
+    <rect x="480" y="294" width="20" height="2" fill="#3a0910"/>
+    <rect x="483" y="300" width="14" height="2" fill="#3a0910"/>
+    <path d="M532 334 v-46 h-9 v-10 h9 v-12 h10 v12 h9 v10 h-9 v46 z" fill="#12030a"/>
+    <rect x="542" y="266" width="3" height="68" fill="#b3202a" opacity="0.6"/>
+    <path d="M300 326 v-30 a15 15 0 0 1 30 0 v30 z" fill="#12030a"/>
+    <path d="M330 296 v30 h-3 v-30 a12 12 0 0 0 -3 -8 a15 15 0 0 1 6 8 z" fill="#b3202a" opacity="0.55"/>
+  </g>
+
+  <!-- fog band behind the reaper -->
+  <rect x="0" y="282" width="640" height="54" fill="url(#fog)"/>
+
+  <!-- ground -->
+  <path d="M0 330 C90 318 180 326 270 320 C360 314 450 328 540 322 C580 319 615 322 640 320 L640 400 L0 400 Z" fill="#0d0205"/>
+
+  <!-- the reaper, mid-swing: the staff gripped in both fists across the front of the body,
+       passing left of the hood; the blade arcs over the head and comes forward at the viewer -->
+  <g>
+    <!-- long shadow on the ground, away from the moon -->
+    <path d="M190 336 L300 332 L150 362 Z" fill="#050102" opacity="0.7"/>
+
+    <!-- cloak, from the shoulders down -->
+    <path d="M246 174 C272 172 288 188 292 206 C298 246 306 292 318 334 L176 334 C190 298 198 254 202 218 C206 194 220 176 246 174 Z" fill="url(#cloak)"/>
+    <!-- moon-side rim light on the cloak -->
+    <path d="M268 180 C284 192 290 210 292 224 C298 260 306 298 318 334 L312 334 C300 294 292 250 288 222 C284 204 278 190 268 180 Z" fill="#b3202a" opacity="0.55"/>
+    <!-- folds -->
+    <path d="M232 214 C226 254 216 296 206 334 L216 334 C224 298 230 258 236 218 Z" fill="#050102" opacity="0.6"/>
+    <path d="M258 222 C262 262 268 300 276 334 L268 334 C260 300 254 262 254 224 Z" fill="#050102" opacity="0.45"/>
+    <!-- tattered hem -->
+    <path d="M176 334 L188 346 L200 334 L214 350 L228 334 L244 348 L258 334 L272 352 L286 334 L302 346 L318 344 L318 334 Z" fill="#0b0204"/>
+
+    <!-- hood, level: the apex over the center of the face, both corners at one height -->
+    <path d="M208 172 C204 132 222 102 246 102 C270 102 288 132 284 172 C282 186 266 196 246 198 C226 196 210 186 208 172 Z" fill="#0b0204"/>
+    <path d="M266 108 C282 120 290 142 284 164 C282 176 276 186 268 192 C276 176 280 160 278 144 C276 128 272 116 266 108 Z" fill="#c62828" opacity="0.5"/>
+    <!-- face in shadow -->
+    <path d="M224 160 C226 136 236 126 246 126 C256 126 266 136 268 160 C262 174 230 174 224 160 Z" fill="#030001"/>
+    <!-- eyes -->
+    <circle cx="238" cy="148" r="3.2" fill="#ff5252"/>
+    <circle cx="254" cy="148" r="3.2" fill="#ff5252"/>
+    <circle cx="238" cy="148" r="7" fill="#ff1744" opacity="0.25"/>
+    <circle cx="254" cy="148" r="7" fill="#ff1744" opacity="0.25"/>
+
+    <!-- the staff, across the front: from the blade at the upper left to the lower right -->
+    <path d="M168.4 118.5 L173.6 115.5 L303.6 339.5 L298.4 342.5 Z" fill="#2b070c"/>
+    <path d="M173.6 115.5 L303.6 339.5 L302.4 340.2 L172.4 116.2 Z" fill="#c62828" opacity="0.75"/>
+
+    <!-- the fists around the staff: a knuckled oval each along the staff, the finger lines
+         across it, at right angles to the handle -->
+    <g transform="rotate(60 226 215)">
+      <ellipse cx="226" cy="215" rx="10" ry="7.5" fill="#e6d3cf"/>
+      <rect x="221.5" y="208" width="1.4" height="14" rx="0.7" fill="#8d6e6a" opacity="0.7"/>
+      <rect x="226" y="208" width="1.4" height="14" rx="0.7" fill="#8d6e6a" opacity="0.7"/>
+      <rect x="230.5" y="208.5" width="1.4" height="13" rx="0.7" fill="#8d6e6a" opacity="0.7"/>
+      <rect x="216" y="211" width="7" height="3" rx="1.5" fill="#e6d3cf"/>
+    </g>
+    <g transform="rotate(60 249 252)">
+      <ellipse cx="249" cy="252" rx="10" ry="7.5" fill="#d9c3bf"/>
+      <rect x="244.5" y="245" width="1.4" height="14" rx="0.7" fill="#8d6e6a" opacity="0.7"/>
+      <rect x="249" y="245" width="1.4" height="14" rx="0.7" fill="#8d6e6a" opacity="0.7"/>
+      <rect x="253.5" y="245.5" width="1.4" height="13" rx="0.7" fill="#8d6e6a" opacity="0.7"/>
+      <rect x="239" y="248" width="7" height="3" rx="1.5" fill="#d9c3bf"/>
+    </g>
+
+    <!-- the blade, rooted at the top of the staff, arcing over the hood toward the viewer:
+         lit top facet, dark under facet, a bright edge -->
+    <path d="M171 114 C200 66 262 48 318 62 C266 64 210 84 178 122 Z" fill="url(#blade)"/>
+    <path d="M178 122 C210 84 266 64 318 62 C268 80 216 100 180 126 Z" fill="#5a0a10"/>
+    <path d="M171 114 C200 66 262 48 318 62 C264 50 202 64 172 116 Z" fill="#ffd0c2" opacity="0.8"/>
+    <!-- collar of the blade, around the top of the staff -->
+    <path d="M163 112 L179 106 L184 118 L168 124 Z" fill="#3a0910"/>
+  </g>
+
+  <!-- fog in front -->
+  <rect x="0" y="318" width="640" height="40" fill="url(#fog)" opacity="0.8"/>
+
+  <!-- vignette -->
+  <rect width="640" height="400" fill="url(#vignette)"/>
+</svg>

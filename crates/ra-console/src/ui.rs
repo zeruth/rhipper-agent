@@ -318,11 +318,12 @@ enum Action {
 }
 
 /// The file the processes without a console write their progress lines to.
-const ACTIVITY_FILE: &str = "var/activity.log";
+pub const ACTIVITY_FILE: &str = "var/activity.log";
 
 /// Pushes the lines the activity file gained since `offset` into the log, as progress; a file
-/// that shrank was rotated and reads from its start. Returns whether any line came in.
-fn tail_activity(offset: &mut u64, sink: &Sink) -> bool {
+/// that shrank was rotated and reads from its start. Returns whether any line came in. The GUI
+/// tails the same file.
+pub fn tail_activity(offset: &mut u64, sink: &Sink) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(len) = std::fs::metadata(ACTIVITY_FILE).map(|m| m.len()) else { return false };
     if len < *offset {

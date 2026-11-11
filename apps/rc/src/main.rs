@@ -174,7 +174,8 @@ fn hook(event: &str) -> anyhow::Result<()> {
     use std::io::Read;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
-    let Ok(call) = serde_json::from_str::<serde_json::Value>(&input) else { return Ok(()) };
+    // a byte-order mark at the start of a piped file is not part of the event
+    let Ok(call) = serde_json::from_str::<serde_json::Value>(input.trim_start_matches('\u{feff}')) else { return Ok(()) };
     let cwd =
         call.get("cwd").and_then(serde_json::Value::as_str).map_or_else(|| std::env::current_dir().unwrap_or_default(), PathBuf::from);
     let Ok(catalogue) = ra_gotchas::Catalogue::load(&cwd.join("var/gotchas.toml")) else { return Ok(()) };
