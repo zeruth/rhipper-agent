@@ -35,13 +35,38 @@ fn a_rust_outline_names_the_items_with_their_lines() {
 
 #[test]
 fn other_files_outline_their_headings_tables_or_definitions_and_a_long_one_is_counted() {
-    assert_eq!(outline(Path::new("README.md"), "# Title\n\ntext\n\n## Part\n"), "README.md (5 lines)\n      1  # Title\n      5  ## Part\n");
-    assert_eq!(outline(Path::new("Cargo.toml"), "[package]\nname = \"x\"\n\n[dependencies]\n"), "Cargo.toml (4 lines)\n      1  [package]\n      4  [dependencies]\n");
+    assert_eq!(
+        outline(Path::new("README.md"), "# Title\n\ntext\n\n## Part\n"),
+        "README.md (5 lines)\n      1  # Title\n      5  ## Part\n"
+    );
+    assert_eq!(
+        outline(Path::new("Cargo.toml"), "[package]\nname = \"x\"\n\n[dependencies]\n"),
+        "Cargo.toml (4 lines)\n      1  [package]\n      4  [dependencies]\n"
+    );
     assert_eq!(outline(Path::new("run.ps1"), "function Go {\n  x\n}\n"), "run.ps1 (3 lines)\n      1  function Go\n");
     let many: String = (0..70).map(|i| format!("fn f{i}() {{}}\n")).collect();
     let text = outline(Path::new("a.rs"), &many);
     assert_eq!(text.lines().count(), 1 + 60 + 1, "{text}");
     assert!(text.ends_with("… and 10 more\n"), "{text}");
+}
+
+#[test]
+fn an_outline_marks_the_items_that_hold_a_changed_line_and_no_others() {
+    // `open` owns lines 11-14, `write` 15-17, `helper` 18-24, `ROOM` 25 to the end
+    let text = outline_marked(Path::new("store.rs"), SOURCE, &[(12, 12), (25, 27)]);
+    let marked: Vec<&str> = text.lines().filter(|l| l.starts_with('*')).map(str::trim).collect();
+    assert_eq!(marked, ["*    11  pub async fn open(path: &Path) -> anyhow::Result<Self>", "*    25  const ROOM: usize = 3"], "{text}");
+    assert!(text.contains("\n     15  fn write(&self)\n"), "{text}");
+    assert_eq!(outline_marked(Path::new("store.rs"), SOURCE, &[]), outline(Path::new("store.rs"), SOURCE));
+}
+
+#[test]
+fn a_diff_gives_the_changed_lines_of_each_file() {
+    let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -3 +3 @@ fn x()\n-old\n+new\n@@ -10,2 +10,4 @@\n+a\n+b\n@@ -20,1 +21,0 @@\n-gone\ndiff --git a/b.md b/b.md\n--- a/b.md\n+++ b/b.md\n@@ -0,0 +1,2 @@\n+# T\n+text\n";
+    let changed = changed_lines(diff);
+    assert_eq!(changed["src/a.rs"], [(3, 3), (10, 13), (21, 21)]);
+    assert_eq!(changed["b.md"], [(1, 2)]);
+    assert_eq!(changed.len(), 2);
 }
 
 #[test]
@@ -87,7 +112,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
     let mut task = TaskContext::open(root, 7);
     assert!(task.handoffs.is_empty());
     task.brief = "Task #7: a thing\nObjective: do it\n".to_owned();
-    task.outlines = outline_files(root, &["src/lib.rs".to_owned(), "src/missing.rs".to_owned()]);
+    task.outlines = outline_files(root, &["src/lib.rs".to_owned(), "src/missing.rs".to_owned()], &ChangedLines::new());
     assert!(task.outlines.contains("src/lib.rs (1 lines)\n      1  pub fn one()\n"), "{}", task.outlines);
     assert!(task.outlines.contains("src/missing.rs (not in the workspace yet)"), "{}", task.outlines);
     // the first prompt carries no handoff
@@ -119,13 +144,27 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
     assert!(prompt.find("report 2").unwrap() < prompt.find("report 4").unwrap());
     // the file keeps ten at most
     for i in 5..15 {
-        task.record(Handoff { when: 1000 + i, model: "m".into(), outcome: "failed".into(), check: "c".into(), changed: vec![], report: "r".into() });
+        task.record(Handoff {
+            when: 1000 + i,
+            model: "m".into(),
+            outcome: "failed".into(),
+            check: "c".into(),
+            changed: vec![],
+            report: "r".into(),
+        });
     }
     assert_eq!(task.handoffs.len(), 10);
     assert_eq!(task.handoffs[0].when, 1005);
     // a long report is clipped in the file, and the clip is not read back as report text
     let mut long = TaskContext::open(root, 8);
-    long.record(Handoff { when: 1, model: "m".into(), outcome: "implemented".into(), check: "c".into(), changed: vec![], report: (0..50).map(|i| format!("line {i}\n")).collect() });
+    long.record(Handoff {
+        when: 1,
+        model: "m".into(),
+        outcome: "implemented".into(),
+        check: "c".into(),
+        changed: vec![],
+        report: (0..50).map(|i| format!("line {i}\n")).collect(),
+    });
     long.save(root).unwrap();
     let back = TaskContext::open(root, 8);
     assert_eq!(back.handoffs[0].report.lines().count(), 40);

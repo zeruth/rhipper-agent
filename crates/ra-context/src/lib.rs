@@ -10,6 +10,7 @@
 //! run of the card starts where the last one stopped. A task's file lives until the card is
 //! done; [`TaskContext::prune`] removes the rest.
 
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -82,7 +83,9 @@ impl Project {
         }
         if manifest.is_some() {
             text.push_str("## Build and checks\n\n");
-            text.push_str("- `cargo test --workspace -q` is the check of a card unless its acceptance names another cargo command in backticks.\n");
+            text.push_str(
+                "- `cargo test --workspace -q` is the check of a card unless its acceptance names another cargo command in backticks.\n",
+            );
             if manifest.as_ref().and_then(|m| m.get("workspace")?.get("lints")?.get("clippy")).is_some() {
                 text.push_str("- `cargo clippy --workspace` warns with the pedantic set; a change adds no warnings of its own.\n");
             }
@@ -184,11 +187,20 @@ fn doc_line(path: &Path) -> Option<String> {
 /// their line numbers, so a reader opens the region it needs and not the file. Rust files give
 /// their functions, types, traits, impls and modules at the top level and one level in; Markdown
 /// its headings; TOML its tables; anything else the definitions at the start of a line.
+#[must_use]
 pub fn outline(path: &Path, text: &str) -> String {
+    outline_marked(path, text, &[])
+}
+
+/// The outline with the items that hold a changed line marked `*`: `changed` lists inclusive
+/// 1-based line ranges, as [`changed_lines`] reads them from a diff, and an item reaches from
+/// its line to the line before the next one. A worker returning to a card in revision finds its
+/// own change first.
+#[must_use]
+pub fn outline_marked(path: &Path, text: &str, changed: &[(usize, usize)]) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let mut items: Vec<String> = Vec::new();
-    let mut hidden = 0usize;
+    let mut items: Vec<(usize, String)> = Vec::new();
     // the tests module of a Rust file is not where a change lands; its functions stay out
     let mut in_tests = false;
     for (number, line) in lines.iter().enumerate() {
@@ -209,12 +221,9 @@ pub fn outline(path: &Path, text: &str) -> String {
             _ => generic_item(line),
         };
         let Some(item) = item else { continue };
-        if items.len() == OUTLINE_ROOM {
-            hidden += 1;
-            continue;
-        }
-        items.push(format!("  {:>5}  {}", number + 1, clip(&item, 110)));
+        items.push((number + 1, item));
     }
+    let hidden = items.len().saturating_sub(OUTLINE_ROOM);
     let mut out = format!("{} ({} lines)", path.display().to_string().replace('\\', "/"), lines.len());
     if extension == "rs"
         && let Some(doc) = lines.iter().find_map(|l| l.strip_prefix("//!").map(str::trim)).filter(|d| !d.is_empty())
@@ -222,15 +231,36 @@ pub fn outline(path: &Path, text: &str) -> String {
         out.push_str(&format!(" — {}", clip(doc, 140)));
     }
     out.push('\n');
-    for item in &items {
-        out.push_str(item);
-        out.push('\n');
+    for (index, (start, item)) in items.iter().take(OUTLINE_ROOM).enumerate() {
+        // an item owns its lines up to the next item, the last one up to the end of the file
+        let end = items.get(index + 1).map_or(lines.len().max(*start), |(next, _)| next - 1);
+        let mark = if changed.iter().any(|&(from, to)| from <= end && to >= *start) { '*' } else { ' ' };
+        let _ = writeln!(out, "{mark} {start:>5}  {}", clip(item, 110));
     }
     if hidden > 0 {
         out.push_str(&format!("         … and {hidden} more\n"));
     }
     out
 }
+
+/// The words a Rust item opens with, after any `pub`.
+const KEYWORDS: [&str; 15] = [
+    "fn",
+    "async fn",
+    "const fn",
+    "unsafe fn",
+    "struct",
+    "enum",
+    "union",
+    "trait",
+    "impl",
+    "mod",
+    "const",
+    "static",
+    "type",
+    "macro_rules!",
+    "unsafe impl",
+];
 
 /// A Rust item at the top level or one level in: the declaration without its body.
 fn rust_item(line: &str) -> Option<String> {
@@ -246,8 +276,6 @@ fn rust_item(line: &str) -> Option<String> {
         }
         .trim_start();
     }
-    const KEYWORDS: [&str; 15] =
-        ["fn", "async fn", "const fn", "unsafe fn", "struct", "enum", "union", "trait", "impl", "mod", "const", "static", "type", "macro_rules!", "unsafe impl"];
     let is_item = KEYWORDS.iter().any(|k| {
         rest.strip_prefix(k).is_some_and(|after| after.starts_with([' ', '<', '!']) || (k.ends_with('!') && after.starts_with(' ')))
     });
@@ -266,17 +294,47 @@ fn generic_item(line: &str) -> Option<String> {
     STARTS.iter().any(|s| line.starts_with(s)).then(|| line.trim().trim_end_matches(['{', ':', ' ']).to_owned())
 }
 
-/// The outlines of the files a card names, under one heading; a file that is not there is
-/// named as missing, so the card's list shows its mistake.
-pub fn outline_files(workspace: &Path, files: &[String]) -> String {
+/// The outlines of the files a card names, under one heading, with the lines `changed` names
+/// per file marked; a file that is not there is named as missing, so the card's list shows
+/// its mistake.
+pub fn outline_files(workspace: &Path, files: &[String], changed: &ChangedLines) -> String {
     let mut out = String::new();
     for file in files {
         match std::fs::read_to_string(workspace.join(file)) {
-            Ok(text) => out.push_str(&outline(Path::new(file), &text)),
-            Err(_) => out.push_str(&format!("{file} (not in the workspace yet)\n")),
+            Ok(text) => out.push_str(&outline_marked(Path::new(file), &text, changed.get(file).map_or(&[], Vec::as_slice))),
+            Err(_) => {
+                let _ = writeln!(out, "{file} (not in the workspace yet)");
+            }
         }
     }
     out
+}
+
+/// The changed line ranges of each path, 1-based and inclusive, keyed by the path as the diff
+/// names it.
+pub type ChangedLines = std::collections::HashMap<String, Vec<(usize, usize)>>;
+
+/// The lines a `git diff -U0` touched, from its `+++` and `@@` headers: the new side of each
+/// hunk; a pure deletion marks the line it happened after, so the item around it shows.
+#[must_use]
+pub fn changed_lines(diff: &str) -> ChangedLines {
+    let mut changed = ChangedLines::new();
+    let mut file: Option<String> = None;
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            let path = path.strip_prefix("b/").unwrap_or(path).trim_matches('"');
+            file = (path != "/dev/null").then(|| path.to_owned());
+        } else if let Some(hunk) = line.strip_prefix("@@ ")
+            && let Some(file) = &file
+            && let Some(added) = hunk.split(' ').find_map(|part| part.strip_prefix('+'))
+        {
+            let (start, count) = added.split_once(',').unwrap_or((added, "1"));
+            let (Ok(start), Ok(count)) = (start.parse::<usize>(), count.parse::<usize>()) else { continue };
+            let start = start.max(1);
+            changed.entry(file.clone()).or_default().push((start, start + count.saturating_sub(1)));
+        }
+    }
+    changed
 }
 
 /// What one run of a task left behind, for the next run to start from.
@@ -421,9 +479,15 @@ fn parse_handoffs(text: &str) -> Vec<Handoff> {
             // edit may
             continue;
         }
-        if current.check.is_empty() && current.report.is_empty() && let Some(check) = line.strip_prefix("check: ") {
-            current.check = check.to_owned();
-        } else if current.changed.is_empty() && current.report.is_empty() && let Some(changed) = line.strip_prefix("changed: ") {
+        if current.check.is_empty()
+            && current.report.is_empty()
+            && let Some(check) = line.strip_prefix("check: ")
+        {
+            check.clone_into(&mut current.check);
+        } else if current.changed.is_empty()
+            && current.report.is_empty()
+            && let Some(changed) = line.strip_prefix("changed: ")
+        {
             current.changed = changed.split_whitespace().map(str::to_owned).collect();
         } else if line.starts_with("… ") && line.ends_with("in the notes of the card") {
             // the count of the clipped lines is not part of the report

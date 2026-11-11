@@ -105,7 +105,8 @@ impl Worker {
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes")),
             turns: None,
             effort: None,
-            debug: !std::env::var("RHIPPER_DEBUG").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
+            debug: !std::env::var("RHIPPER_DEBUG")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
             script: None,
         }
     }
@@ -558,7 +559,7 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     let root = workspace.clone().unwrap_or_else(|| PathBuf::from("."));
     let mut task = ra_context::TaskContext::open(&root, node.id);
     task.brief = context_of(store, node).await?;
-    task.outlines = ra_context::outline_files(&root, &node.files);
+    task.outlines = ra_context::outline_files(&root, &node.files, &last_change(&root, node, &task).await);
     let project =
         if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
     // an explicit budget, else the complexity's while budgets are on, else none at all; a turn
@@ -765,8 +766,24 @@ pub async fn context_preview(store: &Store, id: i64) -> anyhow::Result<String> {
     let root = workspace_of(store);
     let mut task = ra_context::TaskContext::open(&root, id);
     task.brief = context_of(store, &node).await?;
-    task.outlines = ra_context::outline_files(&root, &node.files);
+    task.outlines = ra_context::outline_files(&root, &node.files, &last_change(&root, &node, &task).await);
     Ok(task.prompt())
+}
+
+/// The lines the last run of a card in revision changed, from `git diff -U0` over the files
+/// its handoff names, so the outline marks them; nothing for any other card, whose worker
+/// starts fresh.
+async fn last_change(root: &Path, node: &Node, task: &ra_context::TaskContext) -> ra_context::ChangedLines {
+    let files = match task.handoffs.last() {
+        Some(last) if node.state == TaskState::NeedsRevision && !last.changed.is_empty() => &last.changed,
+        _ => return ra_context::ChangedLines::new(),
+    };
+    let mut command = tokio::process::Command::new("git");
+    command.args(["diff", "-U0", "HEAD", "--"]).args(files).current_dir(root);
+    match command.output().await {
+        Ok(out) if out.status.success() => ra_context::changed_lines(&String::from_utf8_lossy(&out.stdout)),
+        _ => ra_context::ChangedLines::new(),
+    }
 }
 
 /// The project context a run sends ahead of the task, as the file beside the roadmap holds
