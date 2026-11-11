@@ -12,6 +12,7 @@ fn node(id: i64, parent: Option<i64>) -> Node {
         objective: None,
         acceptance: None,
         files: Vec::new(),
+        session: None,
         depends_on: Vec::new(),
         state: TaskState::Defined,
         assignee: None,

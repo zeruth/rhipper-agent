@@ -16,7 +16,7 @@ execution state and acceptance.
 | `ra-tools` | The tools a bare model gets to act in a workspace: files, search, and an allowlist of commands |
 | `ra-usage` | The usage ledger: tokens and cost per completion, model and task |
 | `ra-console` | The Blood Moon terminal UI, the commands, and the worker that runs a task |
-| `rc` (app) | The CLI: `show`, `add`, `depend`, `set`, `ping`, `usage`, `console` |
+| `rc` (app) | The CLI: `show`, `add`, `depend`, `set`, `run`, `ping`, `usage`, `console`, `stop`, `mcp` |
 
 ## Run
 
@@ -38,21 +38,43 @@ editor whenever the file's mtime moves. The ledger is `var/usage.db`; `rc usage`
 
 ## Workers
 
-The badge model decides the route. A bare Claude id such as `claude-opus-5-5` runs on the local
-Claude Code (`claude -p`), on the machine's own login, so a subscription pays for the work; the
-harness brings its own tools and acts in the directory of the roadmap file. A vendor-prefixed id
-such as `z-ai/glm-5.3-flash` goes through OpenRouter with the key from `OPENROUTER_API_KEY` or the
+The model decides the route. A bare Claude id such as `claude-opus-5-5` runs on the local Claude
+Code (`claude -p`), on the machine's own login, so a subscription pays for the work; the harness
+brings its own tools and acts in the directory of the roadmap file. A vendor-prefixed id such as
+`z-ai/glm-5.3-flash` goes through OpenRouter with the key from `OPENROUTER_API_KEY` or the
 console's `key` command; a bare model gets the `ra-tools` toolbox and runs through the tool loop.
+
+A node can name its own model (`assign <id> <model>`), the files its change lands in (`files <id>
+<path>...`, which the worker reads first), and a budget comes from its complexity (c1 $0.25 up to
+c5 $5.00) or `rc run --budget`. A run past its budget fails the node and leaves a note with the
+spend. `reassess` skips a node marked `final <id>` or one whose inputs have not changed since its
+last assessment, with no model call.
 
 In the console: `run <id>` executes a task, `reassess <id>` and `reassess-tree <id>` have the model
 revise the objective and acceptance of what is still open, `model <id>` swaps the badge, and
-`ping` proves the route. The `▶` and `↻` buttons on a selected card do the same.
+`ping` proves the route. The `▶` and `↻` buttons on a selected card do the same. Every run draws
+its own bubble in the log, with the harness's steps as they happen and the cost when it ends;
+runs started from `rc run` or over MCP show there too, through `var/activity.log`.
+
+## MCP
+
+`rc mcp` serves the same tools over stdio for a client such as Claude Code: `show`, `add`,
+`details`, `set`, `depend`, `run`, `reassess`, `model`, `ping` and `usage`. `.mcp.json` registers it
+for this repository.
+
+## Launching
+
+`rhipper-agent.ps1` reopens itself in a Windows Terminal tab (the console paints in 24-bit color),
+asks a running console to quit through `var/console.quit`, builds, and starts `rc console
+--replace`. The build names itself `0.1.<n>` from `var/build-number`.
 
 ## Status
 
 Phase 1 (Foundation) of the plan in Rhipper-IDE's `docs/rhipper/`: the roadmap, two providers, a
-worker with tools, and the ledger. Not yet: independent testing and review workers, acceptance
-gates, worker-to-worker messages, parallel workers over git worktrees.
+worker with tools, budgets, the ledger, and the console. The agent implements its own roadmap
+cards; the reviews so far are in the git log. Not yet: a local acceptance check before a card
+counts as done, session resume, a local model route, review workers, worker-to-worker messages,
+parallel workers over git worktrees.
 
 ## License
 

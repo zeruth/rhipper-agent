@@ -156,6 +156,7 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
             tools: Vec::new(),
             workspace: None,
             budget_usd: None,
+            resume: None,
         })
         .await
         .map_err(map_error)?;
@@ -212,12 +213,18 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
                 tools: Vec::new(),
                 workspace,
                 budget_usd: Some(budget),
+                // the session of the last run of this node, so the harness keeps its context
+                resume: node.session.clone(),
             })
             .await
             .map_err(map_error);
         match answer {
             Ok(answer) => {
                 worker.record(Some(id), &answer.usage).await;
+                if let Some(session) = answer.session_id.as_deref() {
+                    // kept on the node: the next run of it resumes this session
+                    store.set_session(id, Some(session)).await?;
+                }
                 Ok(Session { text: answer.text, usage: answer.usage, calls: 0, turns: 1 })
             }
             Err(error) => Err(error),
@@ -326,6 +333,7 @@ async fn tool_loop(
                 tools: ra_tools::Toolbox::specs(),
                 workspace: Some(workspace.to_path_buf()),
                 budget_usd: Some(budget),
+                resume: None,
             })
             .await
             .map_err(map_error)?;
@@ -466,6 +474,7 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
             tools: Vec::new(),
             workspace: None,
             budget_usd: None,
+            resume: None,
         })
         .await
         .map_err(map_error)?;

@@ -80,6 +80,9 @@ pub struct CompletionRequest {
     /// The most dollars the run may spend; `None` sets no cap. A harness such as Claude Code
     /// enforces it itself; for a bare model the caller's tool loop does.
     pub budget_usd: Option<f64>,
+    /// The harness session to resume, so a later run of the same task keeps its context; a
+    /// provider without sessions ignores it.
+    pub resume: Option<String>,
 }
 
 /// One answer, with the usage the provider reported.
@@ -89,6 +92,9 @@ pub struct Completion {
     pub usage: Usage,
     /// The tool calls the answer asks for; empty means a plain answer.
     pub tool_calls: Vec<ToolCall>,
+    /// The harness session the answer came from, for a later run to resume; `None` from a
+    /// provider without sessions.
+    pub session_id: Option<String>,
 }
 
 /// The token counts of one execution, as the provider reported them.

@@ -159,6 +159,10 @@ pub struct Node {
     /// exploring the repository.
     #[serde(default)]
     pub files: Vec<String>,
+    /// The harness session of the last worker run, so the next run resumes it and keeps its
+    /// context instead of reading the repository again.
+    #[serde(default)]
+    pub session: Option<String>,
     /// The nodes that must be accepted first.
     pub depends_on: Vec<i64>,
     pub state: TaskState,

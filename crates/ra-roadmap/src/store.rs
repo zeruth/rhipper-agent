@@ -31,6 +31,7 @@ impl Store {
                 objective: None,
                 acceptance: None,
                 files: Vec::new(),
+                session: None,
                 depends_on: Vec::new(),
                 state: TaskState::Defined,
                 assignee: None,
@@ -98,6 +99,7 @@ impl Store {
             objective: objective.map(str::to_owned),
             acceptance: acceptance.map(str::to_owned),
             files: Vec::new(),
+            session: None,
             depends_on: Vec::new(),
             state: TaskState::Defined,
             assignee: None,
@@ -148,6 +150,16 @@ impl Store {
         anyhow::ensure!(files.iter().all(|f| !f.is_empty() && !f.contains(char::is_whitespace)), "a path holds no whitespace");
         let mut nodes = self.all().await?;
         node_mut(&mut nodes, id)?.files = files.to_vec();
+        self.write(nodes).await
+    }
+
+    /// Keeps the harness session of a node's last worker run, so the next run resumes it; `None`
+    /// forgets it. A session id is one word.
+    pub async fn set_session(&self, id: i64, session: Option<&str>) -> anyhow::Result<()> {
+        let session = session.map(str::trim).filter(|s| !s.is_empty());
+        anyhow::ensure!(session.is_none_or(|s| !s.contains(char::is_whitespace)), "a session id holds no whitespace");
+        let mut nodes = self.all().await?;
+        node_mut(&mut nodes, id)?.session = session.map(str::to_owned);
         self.write(nodes).await
     }
 

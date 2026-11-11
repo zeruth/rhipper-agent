@@ -12,6 +12,7 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
         tools: Vec::new(),
         workspace,
         budget_usd: None,
+        resume: None,
     }
 }
 
@@ -42,12 +43,22 @@ fn a_chat_request_runs_with_no_tools_and_one_turn() {
 fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
     let args = ClaudeCode::new().with_max_turns(7).args(&request(Some(PathBuf::from("."))));
     assert!(!args.contains(&"--bare".to_owned()), "{args:?}");
-    assert!(args.contains(&"--no-session-persistence".to_owned()), "{args:?}");
+    // a worker keeps its session, for the next run of the task to resume
+    assert!(!args.contains(&"--no-session-persistence".to_owned()), "{args:?}");
+    assert!(!args.contains(&"--resume".to_owned()), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--max-turns", "7"]), "{args:?}");
     let at = args.iter().position(|a| a == "--allowedTools").unwrap();
     assert_eq!(args[at + 1], "Bash(cargo *)");
     assert!(!args.contains(&"--tools".to_owned()), "{args:?}");
+}
+
+#[test]
+fn a_known_session_is_resumed() {
+    let mut worker = request(Some(PathBuf::from(".")));
+    worker.resume = Some("3f2a9c1e".to_owned());
+    let args = ClaudeCode::new().args(&worker);
+    assert!(args.windows(2).any(|w| w == ["--resume", "3f2a9c1e"]), "{args:?}");
 }
 
 #[test]
@@ -64,6 +75,7 @@ fn a_result_yields_the_text_the_usage_and_the_cost() {
         "permission_denials":[],"session_id":"x"}"#;
     let answer = parse_result(json).unwrap();
     assert_eq!(answer.text, "pong");
+    assert_eq!(answer.session_id.as_deref(), Some("x"));
     assert_eq!(answer.usage.prompt_tokens, 10 + 20479 + 5);
     assert_eq!(answer.usage.completion_tokens, 52);
     assert_eq!(answer.usage.cached_tokens, 5);

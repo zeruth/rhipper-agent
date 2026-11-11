@@ -113,6 +113,9 @@ fn detail_lines(node: &Node, level: usize) -> Vec<String> {
     if !node.files.is_empty() {
         lines.push(format!("{indent}files: {}", node.files.join(" ")));
     }
+    if let Some(session) = node.session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        lines.push(format!("{indent}session: {session}"));
+    }
     if !node.depends_on.is_empty() {
         let ids: Vec<String> = node.depends_on.iter().map(|id| id.to_string()).collect();
         lines.push(format!("{indent}waits-on: {}", ids.join(" ")));
@@ -153,6 +156,7 @@ pub fn parse(text: &str) -> anyhow::Result<Vec<Node>> {
             "notes" => node.notes = Some(value),
             "assessed" => node.assessed = Some(value),
             "files" => node.files = value.split_whitespace().map(str::to_owned).collect(),
+            "session" => node.session = Some(value),
             "waits-on" => {
                 node.depends_on = value
                     .split_whitespace()
@@ -215,6 +219,7 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         objective: None,
         acceptance: None,
         files: Vec::new(),
+        session: None,
         depends_on: Vec::new(),
         state,
         assignee,

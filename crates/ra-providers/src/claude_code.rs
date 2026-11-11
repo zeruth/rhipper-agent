@@ -60,8 +60,17 @@ impl ClaudeCode {
         // not --bare: it skips the hooks and plugins, but it also skips the OAuth login the
         // subscription route runs on (card #11 found out)
         // stream-json: the events arrive as the harness works, so the console can show the work
-        let mut args = ["-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"].map(str::to_owned).to_vec();
+        let mut args = ["-p", "--output-format", "stream-json", "--verbose"].map(str::to_owned).to_vec();
+        if request.workspace.is_none() {
+            // a chat completion leaves no session behind; a worker keeps its own, for the next
+            // run of the task to resume
+            args.push("--no-session-persistence".to_owned());
+        }
         args.extend(["--model".to_owned(), request.model.clone()]);
+        if let Some(session) = request.resume.as_deref().filter(|s| !s.trim().is_empty()) {
+            // the harness picks up where the last run of the task left off, its context intact
+            args.extend(["--resume".to_owned(), session.trim().to_owned()]);
+        }
         let system = system_prompt(&request.messages);
         if !system.is_empty() {
             args.extend(["--system-prompt".to_owned(), system]);
@@ -248,6 +257,8 @@ struct WireResult {
     num_turns: u64,
     #[serde(default)]
     permission_denials: Vec<serde_json::Value>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -288,7 +299,8 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
         cached_tokens: u.cache_read_input_tokens,
         cost_usd: parsed.total_cost_usd,
     });
-    Ok(Completion { text, usage, tool_calls: Vec::new() })
+    let session_id = parsed.session_id.filter(|s| !s.trim().is_empty());
+    Ok(Completion { text, usage, tool_calls: Vec::new(), session_id })
 }
 
 /// The first 200 characters of a text, for an error message.

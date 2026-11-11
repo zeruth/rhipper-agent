@@ -12,6 +12,7 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
         objective: None,
         acceptance: None,
         files: Vec::new(),
+        session: None,
         depends_on: Vec::new(),
         state: TaskState::Defined,
         assignee: None,
@@ -86,6 +87,17 @@ fn round_trips_the_files_line() {
     assert!(text.contains("    files: crates/ra-roadmap/src/model.rs crates/ra-console/src/agent.rs"), "{text}");
     let parsed = parse(&text).unwrap();
     assert_eq!(parsed[0].files, task.files);
+    assert_eq!(render(&parsed), text);
+}
+
+#[test]
+fn round_trips_the_session_line() {
+    let mut task = node(7, None, NodeKind::Task, "Session task");
+    task.session = Some("3f2a9c1e-0b7d-4e55-9a10-6c2d8e4f1b23".into());
+    let text = render(std::slice::from_ref(&task));
+    assert!(text.contains("    session: 3f2a9c1e-0b7d-4e55-9a10-6c2d8e4f1b23"), "{text}");
+    let parsed = parse(&text).unwrap();
+    assert_eq!(parsed[0].session, task.session);
     assert_eq!(render(&parsed), text);
 }
 

@@ -141,5 +141,6 @@ fn request() -> CompletionRequest {
         tools: Vec::new(),
         workspace: None,
         budget_usd: None,
+        resume: None,
     }
 }

@@ -177,7 +177,7 @@ impl ra_providers::ModelProvider for Scripted {
 
 fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Completion {
     let usage = ra_providers::Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 0, cost_usd: Some(0.01) };
-    ra_providers::Completion { text: text.to_owned(), usage, tool_calls: calls }
+    ra_providers::Completion { text: text.to_owned(), usage, tool_calls: calls, session_id: None }
 }
 
 #[tokio::test]
@@ -312,6 +312,36 @@ async fn run_on_a_bare_model_fails_the_node_when_the_provider_does() {
 fn the_complexity_sets_the_budget() {
     use crate::agent::budget_for;
     assert_eq!([1, 2, 3, 4, 5].map(budget_for), [0.25, 0.50, 1.00, 2.00, 5.00]);
+}
+
+/// The script behind a harness: it brings its own tools, as Claude Code does.
+struct Harness(std::sync::Arc<Scripted>);
+
+impl ra_providers::ModelProvider for Harness {
+    fn complete(&self, request: ra_providers::CompletionRequest) -> ra_providers::CompletionFuture<'_> {
+        self.0.complete(request)
+    }
+
+    fn has_own_tools(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn a_second_run_of_a_node_resumes_its_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task T parent 1", &store, &worker()).await.unwrap();
+    let mut first = says("done", vec![]);
+    first.session_id = Some("sess-1".into());
+    let script = Scripted::new(vec![first, says("done again", vec![])]);
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
+    run("run 2", &store, &runner).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().session.as_deref(), Some("sess-1"));
+    run("run 2", &store, &runner).await.unwrap();
+    let seen = script.seen.lock();
+    assert_eq!(seen[0].resume, None, "a first run has nothing to resume");
+    assert_eq!(seen[1].resume.as_deref(), Some("sess-1"), "the second run resumes the first");
 }
 
 #[tokio::test]
