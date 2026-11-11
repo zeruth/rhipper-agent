@@ -1,0 +1,20 @@
+[package]
+name = "ra-gotchas"
+description = "The catalogue of recurring machine problems a worker run hits, and the local fixes for them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+regex.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

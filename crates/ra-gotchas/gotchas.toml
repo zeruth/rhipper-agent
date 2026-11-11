@@ -1,0 +1,69 @@
+# The gotchas: recurring, machine-dependent problems a worker run hits, and the local fix for
+# each. Nothing here costs a model call. `rc gotchas` shows which ones fire; add an entry when
+# the same denied command or error line keeps coming back.
+#
+# where:   command  — a shell command the worker is about to run
+#          result   — the text a tool returned
+#          answer   — the worker's final report
+# remedy:  hint     — the message goes to the worker: as the reason of a denied command, as
+#                     context after a result, and in the machine notes of later runs
+#          rewrite  — the command runs changed: `insert` goes after the first `after` words (one
+#                     unless said), unless the command already matches `unless`;
+#                     `when = "console-running"` limits it to the time a console holds the binary
+#          allow    — the command runs as it is; the hit is only counted
+
+[[gotcha]]
+id = "shell-outside-allowlist"
+where = "command"
+pattern = '^\s*(ls|dir|wc|cat|head|tail|find|tree|cd|pwd|Get-ChildItem|Get-Content|Select-String|Set-Location)\b'
+message = "the shell here runs cargo and git status/diff/log only; read files with Read, search with Grep and Glob, and start from the files on the card"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+id = "shell-chain"
+where = "command"
+pattern = '(&&|\|\||;)\s*(cargo|git)\b'
+message = "a chained command is refused as a whole; run cargo and git as single commands"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+id = "binary-locked"
+where = "command"
+pattern = '^\s*cargo\s+(build|test|clippy|check|run)\b'
+message = "a console holds target/debug/rc.exe while it runs, so a workspace build cannot relink it; build and test the crates (-p) or exclude the binary"
+remedy = { kind = "rewrite", insert = "--workspace --exclude rc", after = 2, unless = '(-p |--package |--exclude rc|--bin )', when = "console-running" }
+
+[[gotcha]]
+id = "binary-locked-result"
+where = "result"
+pattern = 'failed to remove file .*rc\.exe|Access is denied\. \(os error 5\)'
+message = "the binary is held by a running console; run cargo with -p <crate> or --workspace --exclude rc"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+id = "powershell-not-allowed"
+where = "result"
+pattern = 'Command name is a dynamic expression|PowerShell.*not allowed|permission.*PowerShell'
+message = "the PowerShell tool is outside the allowlist on this machine; run cargo and git through Bash"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+id = "mojibake"
+where = "result"
+pattern = 'â€[œ"˜™¦]|Ã©|Ã¼|Â·'
+message = "the output is UTF-8 read as another code page; PowerShell 5.1 does this. Files are UTF-8 without BOM; read them with Read, not Get-Content"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+id = "not-logged-in"
+where = "result"
+pattern = 'Not logged in'
+message = "the harness lost its login: never pass --bare on the subscription route, and run `claude /login` once"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+id = "untested-claim"
+where = "answer"
+pattern = "(?i)couldn't run (any )?tests|could not run (the )?tests|unable to run (the )?tests|did not run the tests|tests? (were|was) not run"
+message = "the worker reported the card done without running its tests; the acceptance check decides, not the report"
+remedy = { kind = "hint" }

@@ -177,7 +177,7 @@ impl ra_providers::ModelProvider for Scripted {
 
 fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Completion {
     let usage = ra_providers::Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 0, cost_usd: Some(0.01) };
-    ra_providers::Completion { text: text.to_owned(), usage, tool_calls: calls, session_id: None }
+    ra_providers::Completion { text: text.to_owned(), usage, tool_calls: calls, session_id: None, gotchas: Vec::new() }
 }
 
 #[tokio::test]

@@ -224,7 +224,7 @@ impl OpenRouter {
                         cost_usd: u.cost,
                     })
                     .unwrap_or_default();
-                Ok(Completion { text, usage, tool_calls, session_id: None })
+                Ok(Completion { text, usage, tool_calls, session_id: None, gotchas: Vec::new() })
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ProviderError::Auth(error_text(&body, status))),
             StatusCode::NOT_FOUND => Err(ProviderError::UnknownModel(error_text(&body, status))),

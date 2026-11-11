@@ -95,6 +95,9 @@ pub struct Completion {
     /// The harness session the answer came from, for a later run to resume; `None` from a
     /// provider without sessions.
     pub session_id: Option<String>,
+    /// The gotchas the run hit, as the provider saw them go by: the commands the machine refused,
+    /// the errors it knows, the claims the answer made. Empty from a provider that does not look.
+    pub gotchas: Vec<ra_gotchas::Hit>,
 }
 
 /// The token counts of one execution, as the provider reported them.

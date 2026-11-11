@@ -93,6 +93,13 @@ enum Command {
         #[arg(long, default_value = "rhipper.md")]
         roadmap: PathBuf,
     },
+    /// A Claude Code tool hook: reads the event on stdin and answers from the gotchas, with no model call.
+    Hook {
+        /// `pre` refuses or rewrites a command about to run; `post` adds the hint a result calls for.
+        event: String,
+    },
+    /// The gotchas that fired, by id, and the refused commands no gotcha names yet.
+    Gotchas,
 }
 
 #[tokio::main]
@@ -154,7 +161,96 @@ async fn main() -> anyhow::Result<()> {
             ra_console::mcp::serve(store, worker).await
         }
         Command::Console { roadmap, replace } => console(roadmap, replace).await,
+        // a hook answers fast and stays silent on anything it cannot judge; no trace file either
+        Command::Hook { event } => hook(&event),
+        Command::Gotchas => gotchas(),
     }
+}
+
+/// Answers one Claude Code tool hook from the gotchas. `pre` prints a deny with the reason, or
+/// an allow with the rewritten command; `post` prints the hints the result calls for. Anything
+/// the hook cannot judge, a missing catalogue included, gets no answer at all: the run goes on.
+fn hook(event: &str) -> anyhow::Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let Ok(call) = serde_json::from_str::<serde_json::Value>(&input) else { return Ok(()) };
+    let cwd =
+        call.get("cwd").and_then(serde_json::Value::as_str).map_or_else(|| std::env::current_dir().unwrap_or_default(), PathBuf::from);
+    let Ok(catalogue) = ra_gotchas::Catalogue::load(&cwd.join("var/gotchas.toml")) else { return Ok(()) };
+    let conditions = ra_gotchas::Conditions { console_running: cwd.join("var/console.pid").exists() };
+    let answer = match event {
+        "pre" => {
+            let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str).unwrap_or("");
+            match catalogue.command(command, conditions) {
+                ra_gotchas::Verdict::Pass => None,
+                ra_gotchas::Verdict::Deny { reason, .. } => Some(serde_json::json!({
+                    "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
+                })),
+                ra_gotchas::Verdict::Rewrite { command, reason, .. } => Some(serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": reason,
+                        "updatedInput": {"command": command}
+                    }
+                })),
+            }
+        }
+        "post" => {
+            let response = call.get("tool_response").cloned().unwrap_or_default();
+            let text = match &response {
+                serde_json::Value::String(s) => s.clone(),
+                other => ["stdout", "stderr"]
+                    .iter()
+                    .filter_map(|k| other.get(k).and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            let hits = catalogue.scan(ra_gotchas::Where::Result, &text);
+            (!hits.is_empty()).then(|| {
+                let context = hits.iter().map(|h| h.message.as_str()).collect::<Vec<_>>().join("; ");
+                serde_json::json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}})
+            })
+        }
+        _ => None,
+    };
+    if let Some(answer) = answer {
+        println!("{answer}");
+    }
+    Ok(())
+}
+
+/// Prints the gotchas by how often they fired, and the refused commands no gotcha names yet.
+fn gotchas() -> anyhow::Result<()> {
+    let catalogue = ra_gotchas::Catalogue::load(Path::new("var/gotchas.toml"))?;
+    let journal = ra_gotchas::Journal::at(Path::new("var/gotchas.log"));
+    let counts = journal.counts();
+    if counts.is_empty() {
+        println!("no gotcha has fired yet; the catalogue holds {} entries in var/gotchas.toml", catalogue.entries.len());
+        return Ok(());
+    }
+    println!("{:<26} {:>5}  message", "gotcha", "hits");
+    for (id, count) in &counts {
+        let message = catalogue.get(id).map_or("a refused command no gotcha names; see below", |g| g.message.as_str());
+        println!("{id:<26} {count:>5}  {message}");
+    }
+    let unmatched: Vec<String> = std::fs::read_to_string("var/gotchas.log")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut cols = l.split('\t');
+            let (_, _, id, _, excerpt) = (cols.next()?, cols.next()?, cols.next()?, cols.next()?, cols.next()?);
+            (id == "unmatched-denied").then(|| excerpt.to_owned())
+        })
+        .collect();
+    if !unmatched.is_empty() {
+        println!("\nrefused commands no gotcha names, newest last:");
+        for command in unmatched.iter().rev().take(20).rev() {
+            println!("  {command}");
+        }
+    }
+    Ok(())
 }
 
 /// Opens the usage ledger under `var/`.

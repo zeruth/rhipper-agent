@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use ra_gotchas::{Catalogue, Conditions, Hit, Verdict, Where};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -23,6 +24,10 @@ pub struct ClaudeCode {
     max_turns: u32,
     /// The shell commands a worker may run, as Claude Code permission rules such as `Bash(cargo *)`.
     allowed_shell: Vec<String>,
+    /// The `rc` binary the harness's tool hooks call, when the gotchas guard a run.
+    hooks: Option<PathBuf>,
+    /// The gotchas the stream is read against, when there is a catalogue.
+    catalogue: Option<Catalogue>,
 }
 
 impl Default for ClaudeCode {
@@ -38,7 +43,22 @@ impl ClaudeCode {
         Self {
             binary: PathBuf::from("claude"),
             max_turns: 60,
-            allowed_shell: ["Bash(cargo *)", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)"].map(str::to_owned).to_vec(),
+            // the same commands through either shell: the harness picks PowerShell on Windows
+            // at times, and a rule for one shell does not cover the other
+            allowed_shell: [
+                "Bash(cargo *)",
+                "Bash(git status*)",
+                "Bash(git diff*)",
+                "Bash(git log*)",
+                "PowerShell(cargo *)",
+                "PowerShell(git status*)",
+                "PowerShell(git diff*)",
+                "PowerShell(git log*)",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            hooks: None,
+            catalogue: None,
         }
     }
 
@@ -48,10 +68,25 @@ impl ClaudeCode {
         self
     }
 
+    /// Routes the harness's tool hooks to `rc hook pre|post` at `rc`, so the gotchas act before
+    /// a command runs and right after a result, and reads the stream against `catalogue` to
+    /// count what the run hit.
+    pub fn with_gotchas(mut self, rc: impl Into<PathBuf>, catalogue: Catalogue) -> Self {
+        self.hooks = Some(rc.into());
+        self.catalogue = Some(catalogue);
+        self
+    }
+
     /// The most turns a worker run may take.
     pub fn with_max_turns(mut self, turns: u32) -> Self {
         self.max_turns = turns;
         self
+    }
+
+    /// The permission rules a worker gets.
+    #[cfg(test)]
+    fn new_allowed(&self) -> &[String] {
+        &self.allowed_shell
     }
 
     /// The command-line arguments of one request. The prompt goes on stdin, so its length is no
@@ -82,6 +117,9 @@ impl ClaudeCode {
             if !self.allowed_shell.is_empty() {
                 args.push("--allowedTools".to_owned());
                 args.extend(self.allowed_shell.iter().cloned());
+            }
+            if let Some(rc) = &self.hooks {
+                args.extend(["--settings".to_owned(), hook_settings(rc)]);
             }
         } else {
             // a chat completion: no tools, one turn
@@ -125,11 +163,20 @@ impl ClaudeCode {
         // happens, and the last `result` event is the answer
         let mut result: Option<String> = None;
         let mut last_line = String::new();
+        let mut gotchas: Vec<Hit> = Vec::new();
+        // a console holds the binary while var/console.pid is in the workspace
+        let conditions = Conditions { console_running: request.workspace.as_deref().is_some_and(|w| w.join("var/console.pid").exists()) };
         if let Some(pipe) = child.stdout.take() {
             let mut lines = tokio::io::BufReader::new(pipe).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 for step in progress_of(&line, request.workspace.as_deref()) {
                     tracing::info!(target: "ra::progress", "{step}");
+                }
+                if let Some(catalogue) = &self.catalogue {
+                    for hit in gotchas_of_event(catalogue, &line, conditions) {
+                        tracing::info!(target: "ra::progress", "⚠ {}: {}", hit.id, hit.excerpt);
+                        gotchas.push(hit);
+                    }
                 }
                 if line.contains(r#""type":"result""#) {
                     result = Some(line.clone());
@@ -146,7 +193,10 @@ impl ClaudeCode {
         };
         match result {
             // a result names the reason itself, exit code or not
-            Some(result) => parse_result(&result),
+            Some(result) => parse_result(&result).map(|mut completion| {
+                completion.gotchas = gotchas;
+                completion
+            }),
             None => {
                 let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).next_back().unwrap_or(last_line.trim());
                 let reason = if reason.is_empty() { "no output" } else { reason };
@@ -300,7 +350,80 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
         cost_usd: parsed.total_cost_usd,
     });
     let session_id = parsed.session_id.filter(|s| !s.trim().is_empty());
-    Ok(Completion { text, usage, tool_calls: Vec::new(), session_id })
+    Ok(Completion { text, usage, tool_calls: Vec::new(), session_id, gotchas: Vec::new() })
+}
+
+/// The gotchas one stream event shows: a command about to run that the catalogue would refuse
+/// or rewrite, a tool result with a known error in it, the final answer with a claim in it, and
+/// a command the harness refused that no gotcha names (`unmatched-denied`, for the catalogue
+/// to grow).
+fn gotchas_of_event(catalogue: &Catalogue, line: &str, conditions: Conditions) -> Vec<Hit> {
+    use serde_json::Value;
+    let Ok(event) = serde_json::from_str::<Value>(line) else { return Vec::new() };
+    let text_of = |value: &Value| -> String {
+        match value {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
+            _ => String::new(),
+        }
+    };
+    let mut hits = Vec::new();
+    match event.get("type").and_then(Value::as_str) {
+        Some("assistant") => {
+            for block in event.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
+                if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    continue;
+                }
+                if !matches!(block.get("name").and_then(Value::as_str), Some("Bash" | "PowerShell")) {
+                    continue;
+                }
+                let Some(command) = block.pointer("/input/command").and_then(Value::as_str) else { continue };
+                match catalogue.command(command, conditions) {
+                    Verdict::Pass => {}
+                    Verdict::Deny { id, reason } | Verdict::Rewrite { id, reason, .. } => {
+                        hits.push(Hit { id, message: reason, excerpt: snippet(command.lines().next().unwrap_or("")) });
+                    }
+                }
+            }
+        }
+        Some("user") => {
+            for block in event.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
+                if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    hits.extend(catalogue.scan(Where::Result, &text_of(block.get("content").unwrap_or(&Value::Null))));
+                }
+            }
+        }
+        Some("result") => {
+            hits.extend(catalogue.scan(Where::Answer, event.get("result").and_then(Value::as_str).unwrap_or("")));
+            for denial in event.get("permission_denials").and_then(Value::as_array).into_iter().flatten() {
+                let command = denial.pointer("/tool_input/command").and_then(Value::as_str).unwrap_or("");
+                if !command.is_empty() && catalogue.command(command, conditions) == Verdict::Pass {
+                    hits.push(Hit {
+                        id: "unmatched-denied".to_owned(),
+                        message: "the harness refused a command no gotcha names; see rc gotchas".to_owned(),
+                        excerpt: snippet(command.lines().next().unwrap_or("")),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    hits
+}
+
+/// The `--settings` JSON that routes the harness's tool hooks to `rc hook pre` and `rc hook
+/// post`, so a command the catalogue knows is refused or rewritten before it runs and a result
+/// it knows gets its hint right after, with no model call.
+fn hook_settings(rc: &Path) -> String {
+    // the JSON encoder escapes the backslashes of a Windows path itself
+    let command = |event: &str| format!("\"{}\" hook {event}", rc.display());
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{"matcher": "Bash|PowerShell", "hooks": [{"type": "command", "command": command("pre"), "timeout": 10}]}],
+            "PostToolUse": [{"matcher": "Bash|PowerShell", "hooks": [{"type": "command", "command": command("post"), "timeout": 10}]}]
+        }
+    })
+    .to_string()
 }
 
 /// The first 200 characters of a text, for an error message.

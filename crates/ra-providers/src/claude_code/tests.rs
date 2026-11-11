@@ -123,6 +123,36 @@ fn the_stream_shows_tool_calls_and_text_but_not_thinking() {
 }
 
 #[test]
+fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
+    let catalogue = Catalogue::seed();
+    let provider = ClaudeCode::new().with_gotchas(r"C:\tools\rc.exe", catalogue.clone());
+    let args = provider.args(&request(Some(PathBuf::from("."))));
+    let at = args.iter().position(|a| a == "--settings").expect("--settings");
+    let settings: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+    assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Bash|PowerShell");
+    assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "\"C:\\tools\\rc.exe\" hook pre");
+    assert_eq!(settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "\"C:\\tools\\rc.exe\" hook post");
+    // a chat completion carries no hooks
+    assert!(!ClaudeCode::new().with_gotchas("rc", Catalogue::seed()).args(&request(None)).contains(&"--settings".to_owned()));
+    assert!(ClaudeCode::new().new_allowed().iter().any(|r| r == "PowerShell(cargo *)"));
+
+    let quiet = Conditions::default();
+    let denied = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la crates"}}]}}"#;
+    let hits = gotchas_of_event(&catalogue, denied, quiet);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "shell-outside-allowlist");
+    assert_eq!(hits[0].excerpt, "ls -la crates");
+    let fine =
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap"}}]}}"#;
+    assert!(gotchas_of_event(&catalogue, fine, quiet).is_empty());
+    let locked = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"error: failed to remove file `rc.exe`\nAccess is denied. (os error 5)"}]}}"#;
+    assert_eq!(gotchas_of_event(&catalogue, locked, quiet)[0].id, "binary-locked-result");
+    let claim = r#"{"type":"result","result":"Done, but I couldn't run any tests.","permission_denials":[{"tool_name":"Bash","tool_input":{"command":"python x.py"}}]}"#;
+    let ids: Vec<String> = gotchas_of_event(&catalogue, claim, quiet).into_iter().map(|h| h.id).collect();
+    assert_eq!(ids, ["untested-claim", "unmatched-denied"]);
+}
+
+#[test]
 fn garbage_names_its_start() {
     let error = parse_result("Not a JSON line").unwrap_err();
     assert!(format!("{error}").contains("Not a JSON"), "{error}");

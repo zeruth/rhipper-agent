@@ -13,7 +13,16 @@ use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 use ra_usage::{Entry, Totals, UsageStore};
 
+use ra_gotchas::{Catalogue, Journal, Where};
+
 use crate::secret;
+
+/// The catalogue of the gotchas, beside the roadmap file.
+const GOTCHAS_FILE: &str = "var/gotchas.toml";
+/// The journal of the gotchas that fired.
+const GOTCHAS_LOG: &str = "var/gotchas.log";
+/// How many of the latest hits the machine notes of a run draw on.
+const RECENT_HITS: usize = 30;
 
 /// Where a model id routes: a bare Claude id runs on the local Claude Code; an id with a vendor
 /// prefix, such as `z-ai/glm-5.3-flash`, goes through OpenRouter.
@@ -131,7 +140,17 @@ impl Worker {
             }
         }
         let provider: Arc<dyn ModelProvider> = match route {
-            Route::ClaudeCode => Arc::new(ra_providers::claude_code::ClaudeCode::new()),
+            Route::ClaudeCode => {
+                // the gotchas guard every harness run: the hooks call this very binary, and the
+                // catalogue lives beside the roadmap; without either, the harness runs unguarded
+                let mut harness = ra_providers::claude_code::ClaudeCode::new();
+                match (std::env::current_exe(), Catalogue::load(Path::new(GOTCHAS_FILE))) {
+                    (Ok(rc), Ok(catalogue)) => harness = harness.with_gotchas(rc, catalogue),
+                    (_, Err(e)) => tracing::warn!("the gotchas are off: {e:#}"),
+                    (Err(e), _) => tracing::warn!("the gotchas are off: no path to this binary: {e}"),
+                }
+                Arc::new(harness)
+            }
             Route::OpenRouter => Arc::new(ra_providers::openrouter::OpenRouter::new(secret::api_key()?)?),
         };
         *slot = Some((route, provider.clone()));
@@ -184,14 +203,18 @@ pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<
     tracing::info!(target: crate::trace::PROGRESS, "{}#{} {} · {}", crate::logs::RUN_START, id, node.title, short(&worker.model));
     let outcome = run_task(store, node, worker).await;
     match &outcome {
-        Ok((_, cost)) => tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, cost_text(*cost)),
+        Ok((_, cost, 0)) => tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, cost_text(*cost)),
+        Ok((_, cost, gotchas)) => {
+            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {} · {gotchas} gotchas", crate::logs::RUN_END, cost_text(*cost));
+        }
         Err(e) => tracing::info!(target: crate::trace::PROGRESS, "{}✗ {}", crate::logs::RUN_END, first_line(&format!("{e:#}"))),
     }
-    outcome.map(|(lines, _)| lines)
+    outcome.map(|(lines, _, _)| lines)
 }
 
-/// The work of [`run`], with the cost of the session beside the log lines.
-async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<(Vec<String>, Option<f64>)> {
+/// The work of [`run`], with the cost of the session and the count of the gotchas it hit beside
+/// the log lines.
+async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<(Vec<String>, Option<f64>, usize)> {
     let id = node.id;
     let provider = worker.provider()?;
     store.set_state(id, TaskState::InProgress).await?;
@@ -201,13 +224,22 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     let workspace =
         store.path().parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
     let budget = worker.budget.unwrap_or_else(|| budget_for(node.complexity));
+    // the gotchas the run hits, for the journal and the summary
+    let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
+    let gotchas_log = workspace.as_deref().unwrap_or(Path::new(".")).join(GOTCHAS_LOG);
     let session = if provider.has_own_tools() {
         // a harness acts in the workspace by itself: one call carries the whole task, and the
-        // harness holds it to the budget
+        // harness holds it to the budget. The machine notes name what tripped the last runs.
+        let mut messages = vec![Message::system(SYSTEM)];
+        let notes = machine_notes(workspace.as_deref().unwrap_or(Path::new(".")));
+        if !notes.is_empty() {
+            messages.push(Message::system(notes));
+        }
+        messages.push(Message::user(context));
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
-                messages: vec![Message::system(SYSTEM), Message::user(context)],
+                messages,
                 temperature: Some(0.4),
                 max_tokens: Some(4096),
                 tools: Vec::new(),
@@ -221,6 +253,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         match answer {
             Ok(answer) => {
                 worker.record(Some(id), &answer.usage).await;
+                gotcha_hits.clone_from(&answer.gotchas);
                 if let Some(session) = answer.session_id.as_deref() {
                     // kept on the node: the next run of it resumes this session
                     store.set_session(id, Some(session)).await?;
@@ -243,9 +276,17 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             return Err(error);
         }
     };
+    // every hit goes in the journal: the counts for rc gotchas, the notes for the next run
+    let journal = Journal::at(&gotchas_log);
+    for hit in &gotcha_hits {
+        let place = if hit.id == "untested-claim" { Where::Answer } else { Where::Result };
+        if let Err(e) = journal.record(Some(id), place, hit) {
+            tracing::warn!("cannot write the gotchas journal: {e:#}");
+        }
+    }
     store.set_notes(id, &session.text).await?;
     store.set_state(id, TaskState::Implemented).await?;
-    let lines = vec![
+    let mut lines = vec![
         format!(
             "✓ #{} {} implemented on {} · {} turn(s), {} tool call(s) · in {} out {} · {}",
             id,
@@ -259,7 +300,19 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         ),
         "  the full answer is in the notes of the card in rhipper.md".to_owned(),
     ];
-    Ok((lines, session.usage.cost_usd))
+    if !gotcha_hits.is_empty() {
+        let mut ids: Vec<&str> = gotcha_hits.iter().map(|h| h.id.as_str()).collect();
+        ids.dedup();
+        lines.push(format!("  ⚠ {} gotcha(s): {} · rc gotchas lists them", gotcha_hits.len(), ids.join(", ")));
+    }
+    Ok((lines, session.usage.cost_usd, gotcha_hits.len()))
+}
+
+/// The machine notes of a run: what the gotchas say about the last hits in the journal, for the
+/// system prompt, so the worker does not find out the hard way again. Empty when nothing fired.
+fn machine_notes(workspace: &Path) -> String {
+    let Ok(catalogue) = Catalogue::load(&workspace.join(GOTCHAS_FILE)) else { return String::new() };
+    catalogue.notes(&Journal::at(&workspace.join(GOTCHAS_LOG)).recent(RECENT_HITS))
 }
 
 /// What one worker session came to: the final answer, the usage summed over its turns, and how
