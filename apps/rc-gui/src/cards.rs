@@ -3,7 +3,7 @@
 //! carries its depth's color wherever it shows, the way the console's tree does.
 
 use egui::epaint::RectShape;
-use egui::{Color32, CornerRadius, Frame, InnerResponse, Margin, Painter, Rect, RichText, Stroke, Ui};
+use egui::{Align, Color32, CornerRadius, Frame, InnerResponse, Layout, Margin, Painter, Rect, RichText, Stroke, Ui};
 use ra_roadmap::history::{self, Change};
 use ra_roadmap::model::{Node, NodeKind, TaskState};
 
@@ -75,7 +75,9 @@ pub(crate) fn bubble<R>(ui: &mut Ui, color: Color32, lit: bool, contents: impl F
         .outer_margin(Margin::symmetric(0, 3));
     let painter = ui.painter().clone();
     let slot = painter.add(egui::Shape::Noop);
-    let response = frame.show(ui, contents);
+    // the contents read top to bottom whatever row the bubble sits in: a frame takes its
+    // parent's layout, and in a row of bubbles that laid a header beside its own body
+    let response = frame.show(ui, |ui| ui.with_layout(Layout::top_down(Align::Min), contents).inner);
     let rect = response.response.rect;
     let spread = if lit { 8.0 } else { 4.0 };
     let shape = RectShape::filled(rect.expand(spread * 0.5), CornerRadius::same(11), alpha(color, if lit { 80 } else { 30 }))
@@ -234,6 +236,74 @@ pub(crate) fn sparkline(ui: &mut Ui, days: &[Option<f64>; 7], color: Color32) {
         painter.circle_filled(at, 2.0, color);
         previous = Some(at);
     }
+}
+
+/// How many samples a machine gauge keeps and its graph spans: two minutes, one a second.
+pub(crate) const GAUGE_SPAN: usize = 120;
+
+/// A machine gauge of the dashboard: a bubble `width` wide with `name` and the `value` as a
+/// badge across its top, and under them `samples` (0 to 1, the newest last) as a filled area
+/// under a line in `color`, the oldest end fading into the bubble's fill; a thin rule marks the
+/// top of the range.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn gauge(ui: &mut Ui, name: &str, value: &str, samples: &[f32], color: Color32, width: f32) {
+    use egui::epaint::{Mesh, Vertex, WHITE_UV};
+    let fill = theme::mix(theme::bg(), color, 0.07);
+    bubble(ui, color, false, |ui| {
+        // the bubble's inner width: the card less its own margins
+        let inner = (width - 16.0).max(60.0);
+        ui.set_width(inner);
+        ui.set_max_width(inner);
+        ui.horizontal(|ui| {
+            ui.set_width(inner);
+            ui.label(RichText::new(name).small().strong().color(theme::dim()));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                badge(ui, value, color);
+            });
+        });
+        ui.add_space(4.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(inner, 44.0), egui::Sense::hover());
+        let painter = ui.painter();
+        let plot = rect.shrink2(egui::vec2(0.0, 2.0));
+        painter.hline(plot.x_range(), plot.top(), Stroke::new(1.0, alpha(color, 60)));
+        let points = gauge_points(samples, plot);
+        if points.len() < 2 {
+            return;
+        }
+        // the area under the line: a strip of quads down to the floor of the plot
+        let shade = alpha(color, 70);
+        let mut mesh = Mesh::default();
+        for pair in points.windows(2) {
+            let i = mesh.vertices.len() as u32;
+            mesh.vertices.push(Vertex { pos: pair[0], uv: WHITE_UV, color: shade });
+            mesh.vertices.push(Vertex { pos: pair[1], uv: WHITE_UV, color: shade });
+            mesh.vertices.push(Vertex { pos: egui::pos2(pair[1].x, plot.bottom()), uv: WHITE_UV, color: shade });
+            mesh.vertices.push(Vertex { pos: egui::pos2(pair[0].x, plot.bottom()), uv: WHITE_UV, color: shade });
+            mesh.add_triangle(i, i + 1, i + 2);
+            mesh.add_triangle(i, i + 2, i + 3);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        painter.add(egui::Shape::line(points, Stroke::new(1.5, alpha(color, 220))));
+        // the past dissolves into the bubble: the oldest third fades from the fill at the left
+        let past = Rect::from_min_max(plot.left_top(), egui::pos2(plot.left() + plot.width() * 0.35, plot.bottom()));
+        painter.add(fade_shape(past, fill, 235, false));
+    });
+}
+
+/// The samples of a gauge as points across `plot`: one slot a second over the span, the newest
+/// at the right edge, a full reading at the top. Fewer samples than the span leave the left
+/// of the plot empty, so a graph grows in from the right.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn gauge_points(samples: &[f32], plot: Rect) -> Vec<egui::Pos2> {
+    // the samples span the whole plot from the first minute on: a young trace stretches,
+    // a full one scrolls, and the line never sits in one corner of the card
+    let n = samples.len();
+    let step = plot.width() / (n.clamp(2, GAUGE_SPAN) - 1) as f32;
+    samples
+        .iter()
+        .enumerate()
+        .map(|(i, v)| egui::pos2(plot.right() - (n - 1 - i) as f32 * step, plot.bottom() - plot.height() * v.clamp(0.0, 1.0)))
+        .collect()
 }
 
 /// A filter chip: a badge that is lit while `on` and dim while off, and reports a click.

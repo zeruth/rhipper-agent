@@ -16,7 +16,7 @@ mod markdown;
 mod tests;
 mod theme;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -76,6 +76,9 @@ struct WindowLayout {
     theme: String,
     /// The zoom over the monitor's own scale, `ZOOM_MIN..=ZOOM_MAX`; zero reads as one.
     zoom: f32,
+    /// Whether the report groups its bubbles under a divider per project, or interleaves them
+    /// by time.
+    report_by_project: bool,
 }
 
 /// The zoom Ctrl+= and Ctrl+- move between, a step at a time; Ctrl+0 puts it back to one.
@@ -347,6 +350,308 @@ struct App {
     title: String,
     /// Whether the dashboard is in front: every project at once, instead of the active tab.
     dashboard: bool,
+    /// When the window started, for the dashboard's uptime.
+    started: Instant,
+    /// Whether the report is in front: the cards that landed across every project.
+    report: bool,
+    /// The report's bubbles in the order they draw, rebuilt when a roadmap or a ledger moves.
+    landed: Vec<Landed>,
+    /// What the report was built from: each tab's roadmap and ledger stamps, so a frame rebuilds
+    /// it only when one of them moved.
+    landed_from: Vec<(Option<SystemTime>, Option<Instant>)>,
+    /// Why the window goes when it does, for the projects' pair feeds: `close` unless
+    /// `rc restart` asked.
+    down: &'static str,
+    /// The machine's cpu, memory and disk, for the dashboard's gauges.
+    gauges: Gauges,
+    /// The tokens the runs took, from every open project's ledger, for the row under them.
+    tokens: TokenGauges,
+}
+
+/// One reading of the machine: the cpu's share in use (0 to 1) and the bytes of memory and of
+/// the projects' disk.
+#[derive(Clone, Copy, Default)]
+struct Reading {
+    cpu: f32,
+    memory_used: u64,
+    memory_total: u64,
+    disk_free: u64,
+    disk_total: u64,
+}
+
+/// The last two minutes of one gauge's readings, 0 to 1, the newest last; a reading past the
+/// span pushes the oldest out.
+#[derive(Default)]
+struct Ring(VecDeque<f32>);
+
+impl Ring {
+    fn push(&mut self, value: f32) {
+        if self.0.len() == cards::GAUGE_SPAN {
+            self.0.pop_front();
+        }
+        self.0.push_back(value);
+    }
+
+    fn samples(&self) -> Vec<f32> {
+        self.0.iter().copied().collect()
+    }
+}
+
+/// The machine's gauges: the readings a background thread takes once a second, kept two
+/// minutes deep for the dashboard's graphs. The frame only takes what the thread left.
+struct Gauges {
+    readings: mpsc::UnboundedReceiver<Reading>,
+    latest: Reading,
+    cpu: Ring,
+    memory: Ring,
+    disk: Ring,
+}
+
+impl Gauges {
+    /// Starts the sampling thread; it refreshes the cpu, the memory and the one disk `root`
+    /// lives on, once a second, and stops when the window drops the receiver.
+    fn start(root: &Path) -> Self {
+        use sysinfo::{DiskRefreshKind, Disks, MemoryRefreshKind, System};
+        let (tx, readings) = mpsc::unbounded_channel();
+        let root = root.to_path_buf();
+        let spawned = std::thread::Builder::new().name("gauges".into()).spawn(move || {
+            let mut system = match System::new() {
+                Ok(system) => system,
+                Err(e) => {
+                    tracing::warn!("the machine does not read: {e}");
+                    return;
+                }
+            };
+            // the disk the projects live on: the deepest mount point the root is under; the
+            // first disk when none holds it; none at all leaves the gauge at zero
+            let mut disks = Disks::new_with_refreshed_list().ok();
+            let disk = disks.as_ref().and_then(|disks| {
+                disks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| root.starts_with(d.mount_point()))
+                    .max_by_key(|(_, d)| d.mount_point().as_os_str().len())
+                    .map(|(i, _)| i)
+                    .or_else(|| (!disks.is_empty()).then_some(0))
+            });
+            let memory = MemoryRefreshKind::nothing().with_ram();
+            let storage = DiskRefreshKind::nothing().with_storage();
+            // the cpu's share is the change since the last refresh, so the first one only primes
+            system.refresh_cpu_usage();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                system.refresh_cpu_usage();
+                system.refresh_memory_specifics(memory);
+                let (disk_free, disk_total) = disks.as_mut().zip(disk).map_or((0, 0), |(disks, i)| {
+                    let d = &mut disks[i];
+                    d.refresh_specifics(storage);
+                    (d.available_space(), d.total_space())
+                });
+                let reading = Reading {
+                    cpu: system.global_cpu_usage() / 100.0,
+                    memory_used: system.used_memory(),
+                    memory_total: system.total_memory(),
+                    disk_free,
+                    disk_total,
+                };
+                if tx.send(reading).is_err() {
+                    break;
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("the gauges thread does not start: {e:#}");
+        }
+        Self { readings, latest: Reading::default(), cpu: Ring::default(), memory: Ring::default(), disk: Ring::default() }
+    }
+
+    /// Takes the readings the thread left since the last frame: one a second, none most frames.
+    fn tick(&mut self) {
+        while let Ok(reading) = self.readings.try_recv() {
+            self.latest = reading;
+            self.cpu.push(reading.cpu);
+            self.memory.push(ratio(reading.memory_used, reading.memory_total));
+            self.disk.push(ratio(reading.disk_total.saturating_sub(reading.disk_free), reading.disk_total));
+        }
+    }
+
+    /// The row of the three gauges across `page`: equal widths down to a minimum.
+    fn row(&self, ui: &mut egui::Ui, page: f32) {
+        let r = self.latest;
+        let width = ((page - 20.0) / 3.0).max(180.0);
+        let cpu = format!("{:.0} %", r.cpu * 100.0);
+        let memory = format!("{} / {} GB", gib(r.memory_used), gib(r.memory_total));
+        let disk = format!("{} of {} GB free", gib(r.disk_free), gib(r.disk_total));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            cards::gauge(ui, "CPU", &cpu, &self.cpu.samples(), theme::lane(1), width);
+            cards::gauge(ui, "MEMORY", &memory, &self.memory.samples(), theme::lane(2), width);
+            cards::gauge(ui, "DISK", &disk, &self.disk.samples(), theme::lane(3), width);
+        });
+    }
+}
+
+/// How many runs the token graphs span: the last 60 across the open projects.
+const RUNS_SHOWN: usize = 60;
+
+/// One token gauge as the row draws it: the badge's text and the graph's samples, 0 to 1,
+/// the oldest first.
+#[derive(Default, Debug, PartialEq)]
+struct TokenGauge {
+    value: String,
+    samples: Vec<f32>,
+}
+
+/// The token gauges of the dashboard, from the ledgers of the open projects: the tokens a
+/// card run takes this session, the session's total, and every run the ledgers hold. The
+/// ledgers are read on the tick when a run ended somewhere, never per frame; the row draws
+/// what the read left.
+#[derive(Default)]
+struct TokenGauges {
+    /// What the ledgers were last read for: the tabs open and the runs their logs saw end;
+    /// `None` before the first read.
+    read_for: Option<(usize, u64)>,
+    task: TokenGauge,
+    session: TokenGauge,
+    all: TokenGauge,
+}
+
+impl TokenGauges {
+    /// Reads the ledgers again when a run ended, or a tab came or went, since the last read.
+    fn tick(&mut self, tabs: &[Workspace]) {
+        let key = (tabs.len(), tabs.iter().map(|t| t.announced).sum::<u64>());
+        if self.read_for == Some(key) {
+            return;
+        }
+        let (mut session, mut all) = (Vec::new(), Vec::new());
+        let (mut session_totals, mut all_totals) = (Totals::default(), Totals::default());
+        let shown = u32::try_from(RUNS_SHOWN).unwrap_or(u32::MAX);
+        for tab in tabs {
+            let Some(usage) = &tab.usage else { continue };
+            let read = tab.rt.block_on(async {
+                anyhow::Ok((
+                    usage.recent(tab.session_from, shown).await?,
+                    usage.totals_after(tab.session_from).await?,
+                    usage.recent(0, shown).await?,
+                    usage.totals().await?,
+                ))
+            });
+            match read {
+                Ok((runs, totals, every, every_totals)) => {
+                    session.extend(runs);
+                    session_totals.merge(&totals);
+                    all.extend(every);
+                    all_totals.merge(&every_totals);
+                }
+                Err(e) => tracing::warn!("the ledger of {} does not read: {e:#}", tab.root.display()),
+            }
+        }
+        *self = token_gauges(session, &session_totals, all, &all_totals);
+        self.read_for = Some(key);
+    }
+
+    /// The row of the three token gauges across `page`, the same widths as the machine's.
+    fn row(&self, ui: &mut egui::Ui, page: f32) {
+        let width = ((page - 20.0) / 3.0).max(180.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            cards::gauge(ui, "TOKENS / TASK", &self.task.value, &self.task.samples, theme::lane(4), width);
+            cards::gauge(ui, "SESSION", &self.session.value, &self.session.samples, theme::lane(5), width);
+            cards::gauge(ui, "ALL TIME", &self.all.value, &self.all.samples, theme::lane(6), width);
+        });
+    }
+}
+
+/// The token gauges from what the ledgers answered: `session` the rows since the window
+/// started and `all` the newest rows of each project, both merged by time and cut to the last
+/// [`RUNS_SHOWN`]; the totals cover every row of their span, not only the ones shown.
+fn token_gauges(
+    mut session: Vec<ra_usage::Spend>,
+    session_totals: &Totals,
+    mut all: Vec<ra_usage::Spend>,
+    all_totals: &Totals,
+) -> TokenGauges {
+    for runs in [&mut session, &mut all] {
+        runs.sort_by(|a, b| a.at.cmp(&b.at));
+        let extra = runs.len().saturating_sub(RUNS_SHOWN);
+        runs.drain(..extra);
+    }
+    let average = |totals: &Totals| if totals.calls == 0 { 0 } else { totals.tokens() / totals.calls };
+    let per_run = |runs: &[ra_usage::Spend]| {
+        let top = runs.iter().map(|s| s.tokens).max().unwrap_or(0);
+        runs.iter().map(|s| ratio(s.tokens, top)).collect::<Vec<_>>()
+    };
+    let task = TokenGauge {
+        value: match session_totals.calls {
+            0 => "no runs yet".to_owned(),
+            1 => format!("{} · 1 run", tokens_text(average(session_totals))),
+            n => format!("{} avg · {n} runs", tokens_text(average(session_totals))),
+        },
+        samples: per_run(&session),
+    };
+    // the running total climbs to the session's total at the right; the runs before the ones
+    // shown are the floor it starts from
+    let total = session_totals.tokens();
+    let mut running = total - session.iter().map(|s| s.tokens).sum::<u64>().min(total);
+    let climb = session
+        .iter()
+        .map(|s| {
+            running += s.tokens;
+            ratio(running, total)
+        })
+        .collect();
+    let session = TokenGauge { value: format!("{} · {}", tokens_text(total), cents(session_totals.cost_usd)), samples: climb };
+    let all =
+        TokenGauge { value: format!("{} avg · {}", tokens_text(average(all_totals)), cents(all_totals.cost_usd)), samples: per_run(&all) };
+    TokenGauges { read_for: None, task, session, all }
+}
+
+/// A token count as the gauges read it: `842`, `1.2k`, `128k`, `1.2M`.
+#[allow(clippy::cast_precision_loss)]
+fn tokens_text(count: u64) -> String {
+    let (value, unit) = match count {
+        0..=999 => return count.to_string(),
+        1_000..=999_999 => (count as f64 / 1_000.0, "k"),
+        _ => (count as f64 / 1_000_000.0, "M"),
+    };
+    // one decimal while it fits in three characters, none past ten, so 9 960 reads 10k
+    if value < 9.95 { format!("{value:.1}{unit}") } else { format!("{value:.0}{unit}") }
+}
+
+/// A cost as the gauges read it, cents without the dollar sign: `.34`, `12.40`; `—` when no
+/// run reported one.
+fn cents(cost: Option<f64>) -> String {
+    match cost {
+        None => "—".to_owned(),
+        Some(c) => {
+            let text = format!("{c:.2}");
+            match text.strip_prefix('0') {
+                Some(rest) => rest.to_owned(),
+                None => text,
+            }
+        }
+    }
+}
+
+/// `part` of `whole` as 0 to 1; nothing of nothing is 0.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn ratio(part: u64, whole: u64) -> f32 {
+    if whole == 0 { 0.0 } else { (part as f64 / whole as f64) as f32 }
+}
+
+/// Bytes as gibibytes with one decimal, the unit Task Manager calls GB.
+#[allow(clippy::cast_precision_loss)]
+fn gib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // the tabs still open hear the window go; a tab closed earlier heard it then
+        for tab in &self.tabs {
+            ra_console::pair::window_down(&tab.root, self.down);
+        }
+    }
 }
 
 impl App {
@@ -378,10 +683,28 @@ impl App {
         if let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(ra_console::hub::dir().join("gui.log")) {
             ra_console::trace::init(log, None, None);
         }
-        let mut app =
-            Self { lock, tabs: Vec::new(), active: 0, mailbox_read: Instant::now(), adding: None, title: String::new(), dashboard: false };
+        let mut app = Self {
+            lock,
+            tabs: Vec::new(),
+            active: 0,
+            mailbox_read: Instant::now(),
+            adding: None,
+            title: String::new(),
+            dashboard: false,
+            started: Instant::now(),
+            report: false,
+            landed: Vec::new(),
+            landed_from: Vec::new(),
+            down: "close",
+            gauges: Gauges::start(&projects[0]),
+            tokens: TokenGauges::default(),
+        };
         for project in projects {
             app.open(&cc.egui_ctx, project);
+        }
+        // every project's feed hears the window is up, once the tab count is known
+        for tab in &app.tabs {
+            ra_console::pair::window_up(&tab.root, ra_console::VERSION, app.tabs.len());
         }
         // the project asked for is in front; without one, many projects open on all of them
         match front.and_then(|f| app.tabs.iter().position(|t| t.root == f)) {
@@ -391,16 +714,18 @@ impl App {
         app
     }
 
-    /// Opens a project as a tab, or brings its tab to the front when it is open already.
-    fn open(&mut self, ctx: &egui::Context, project: &Path) {
+    /// Opens a project as a tab, or brings its tab to the front when it is open already. Says
+    /// whether the tab is new.
+    fn open(&mut self, ctx: &egui::Context, project: &Path) -> bool {
         let project = plain_path(project);
         if let Some(at) = self.tabs.iter().position(|t| t.root == project) {
             self.active = at;
-            return;
+            return false;
         }
         self.tabs.push(Workspace::new(ctx, project));
         self.active = self.tabs.len() - 1;
         ra_console::hub::remember(&self.tabs.iter().map(|t| t.root.clone()).collect::<Vec<_>>());
+        true
     }
 
     /// Closes a tab: its workspace releases its project as it drops. A tab the person closes
@@ -408,6 +733,7 @@ impl App {
     /// quit, or because the window restarts, comes back.
     fn close(&mut self, at: usize, forget: bool) {
         if at < self.tabs.len() {
+            ra_console::pair::window_down(&self.tabs[at].root, if forget { "tab closed" } else { "quit" });
             self.tabs.remove(at);
             self.active = self.active.min(self.tabs.len().saturating_sub(1));
             if forget {
@@ -425,48 +751,31 @@ impl App {
         let mut open: Option<PathBuf> = None;
         let mut active_rect: Option<(Rect, Color32)> = None;
         let mut home = false;
+        let mut report = false;
         let strip = ui.horizontal(|ui| {
             // the strip is buttons, not text: the pointer is a hand over it, never a caret
             ui.style_mut().interaction.selectable_labels = false;
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.add_space(4.0);
-            // the dashboard's own tab first: every project at a glance
-            {
-                let on = self.dashboard;
-                let lane = theme::accent();
-                let fill = if on { theme::panel() } else { theme::mix(theme::bg(), theme::panel(), 0.5) };
-                let frame = Frame::new()
-                    .fill(fill)
-                    .stroke(Stroke::new(1.0, if on { cards::alpha(lane, 200) } else { cards::alpha(theme::rule(), 180) }))
-                    .corner_radius(CornerRadius { nw: 9, ne: 9, sw: 0, se: 0 })
-                    .inner_margin(Margin { left: 12, right: 12, top: 6, bottom: 6 });
-                let shown = frame.show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(RichText::new("⊞").size(15.0).color(if on { lane } else { theme::dim() }));
-                        let text = RichText::new("dashboard").color(if on { theme::text() } else { theme::dim() });
-                        ui.label(if on { text.strong() } else { text });
-                    });
-                });
-                let rect = shown.response.rect;
-                if on {
-                    ui.painter().rect_filled(
-                        Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), 2.0)),
-                        CornerRadius::same(1),
-                        cards::alpha(lane, 220),
-                    );
-                    active_rect = Some((rect, fill));
-                }
-                let response = ui
-                    .interact(rect, ui.make_persistent_id("tab-home"), egui::Sense::click())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if response.on_hover_text("every project: the card each is on and its latest run").clicked() {
-                    home = true;
-                }
-                ui.add_space(6.0);
+            // the window's own tabs first: the dashboard, every project at a glance, and the
+            // report, what landed across them
+            let dashboard_tab = house_tab(ui, "⊞", "dashboard", self.dashboard, "every project: the card each is on and its latest run");
+            if dashboard_tab.clicked {
+                home = true;
             }
+            if let Some(rect) = dashboard_tab.active {
+                active_rect = Some(rect);
+            }
+            let report_tab = house_tab(ui, "≣", "report", self.report, "every project: the cards that landed, newest first");
+            if report_tab.clicked {
+                report = true;
+            }
+            if let Some(rect) = report_tab.active {
+                active_rect = Some(rect);
+            }
+            ui.add_space(6.0);
             for (i, tab) in self.tabs.iter().enumerate() {
-                let active = i == self.active && !self.dashboard;
+                let active = i == self.active && !self.dashboard && !self.report;
                 let live = tab.sink.live_run().is_some() || tab.job.is_some();
                 let lane = theme::lane(1 + i % 9);
                 let name = tab
@@ -576,10 +885,16 @@ impl App {
         let ctx = ui.ctx().clone();
         if home {
             self.dashboard = true;
+            self.report = false;
+        }
+        if report {
+            self.report = true;
+            self.dashboard = false;
         }
         if let Some(i) = switch {
             self.active = i;
             self.dashboard = false;
+            self.report = false;
         }
         if let Some(i) = close {
             self.close(i, true);
@@ -600,22 +915,29 @@ impl eframe::App for App {
         if self.mailbox_read.elapsed() >= Duration::from_millis(500) {
             self.mailbox_read = Instant::now();
             for project in ra_console::hub::take_requests() {
-                self.open(&ctx, &project);
+                if self.open(&ctx, &project) {
+                    ra_console::pair::window_up(&plain_path(&project), ra_console::VERSION, self.tabs.len());
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             if ra_console::hub::quit_requested() {
+                self.down = "restart";
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
             }
         }
+        // the machine's readings land whichever view is up, so the dashboard opens with history
+        self.gauges.tick();
         // the projects not in front keep up with their runs and their files; on the dashboard
-        // every one is in front
-        let dashboard = self.dashboard;
+        // and the report every one is in front
+        let dashboard = self.dashboard || self.report;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             if i != self.active || dashboard {
                 tab.tick(&ctx);
             }
         }
+        // the ledgers, only when a run ended in some project since the last read
+        self.tokens.tick(&self.tabs);
         // a workspace asked to quit closes its tab; the last one closes the window
         if let Some(at) = self.tabs.iter().position(|t| t.closing) {
             self.close(at, false);
@@ -662,6 +984,8 @@ impl eframe::App for App {
         self.active = active;
         let title = if self.dashboard {
             format!("Dashboard — Rhipper Agent {}", ra_console::VERSION)
+        } else if self.report {
+            format!("Report — Rhipper Agent {}", ra_console::VERSION)
         } else {
             window_title(self.tabs[active].project_title.as_deref(), &self.tabs[active].root)
         };
@@ -671,6 +995,8 @@ impl eframe::App for App {
         }
         if self.dashboard {
             self.dashboard_view(root);
+        } else if self.report {
+            self.report_view(root);
         } else {
             self.tabs[active].draw(root);
         }
@@ -678,12 +1004,111 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// The dashboard's status bar: the thin bar a workspace wears, over every project at once.
+    /// The model, debug and the local dot are the active project's (the same for all in
+    /// practice; debug toggles every tab); the session's tokens and the ledger are summed over
+    /// the open projects; the week pill is the plan's, read from the active project; the uptime
+    /// is the window's.
+    fn dashboard_status(&mut self, ui: &mut egui::Ui) {
+        let active = self.active.min(self.tabs.len().saturating_sub(1));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(" ✦ Rhipper").color(theme::accent()).strong().size(15.0));
+            ui.label(RichText::new("Agent").strong().size(15.0));
+            ui.label(RichText::new(ra_console::VERSION).color(theme::dim()).small());
+            ui.add_space(10.0);
+            let Some(tab) = self.tabs.get(active) else { return };
+            cards::badge_marked(ui, "◉", &tab.worker.model, theme::accent())
+                .on_hover_text("the model of the next run in the active project");
+            let debug = tab.worker.debug;
+            let (mark, color, hint) = if debug {
+                ("⚙", theme::debug(), "debug mode in every project: a run ends with what would have made it faster · click to turn off")
+            } else {
+                ("○", theme::dim(), "debug mode off in every project · click to turn on")
+            };
+            let toggle = cards::badge_marked(ui, mark, "debug", color).interact(egui::Sense::click()).on_hover_text(hint).clicked();
+            let url = ra_providers::openrouter::local_url();
+            let (mark, color, hint) = match tab.local.up() {
+                Some(true) => ("●", theme::online(), format!("the local server at {url} answers; probed once a minute")),
+                Some(false) => ("●", theme::error_text(), format!("no local server at {url}; set RHIPPER_LOCAL_URL to move it")),
+                None => ("○", theme::dim(), format!("probing the local server at {url}")),
+            };
+            cards::badge_marked(ui, mark, "local", color).on_hover_text(hint);
+            let live = self.tabs.iter().filter(|t| t.sink.live_run().is_some()).count();
+            let projects = self.tabs.len();
+            cards::badge_marked(ui, "◇", &format!("{projects} projects · {live} running"), theme::trace());
+            // the counts over every open project
+            ui.add_space(18.0);
+            let (mut prompt, mut completion, mut cost) = (0u64, 0u64, 0f64);
+            let (mut all_cost, mut all_calls, mut any_ledger) = (0f64, 0u64, false);
+            for t in &self.tabs {
+                let session = t.worker.tally();
+                prompt += session.prompt_tokens;
+                completion += session.completion_tokens;
+                cost += session.cost_usd.unwrap_or(0.0);
+                if let Some(all) = &t.ledger.all_time {
+                    all_cost += all.cost_usd.unwrap_or(0.0);
+                    all_calls += all.calls;
+                    any_ledger = true;
+                }
+            }
+            cards::badge_marked(
+                ui,
+                "⇅",
+                &format!("in {} · out {} · {}", compact(prompt), compact(completion), dollars(Some(cost))),
+                theme::warn_text(),
+            )
+            .on_hover_text("this session's tokens and cost, every project");
+            if any_ledger {
+                cards::badge_marked(ui, "◉", &format!("ledger {} · {all_calls} calls", dollars(Some(all_cost))), theme::online())
+                    .on_hover_text("all time, every project's var/usage.db");
+            } else {
+                cards::badge_marked(ui, "◌", "no ledger", theme::dim());
+            }
+            // the plan's week, from the active project's limits file
+            let tab = &self.tabs[active];
+            if tab.limits.fresh()
+                && let Some(week) = tab.limits.windows.get("seven_day")
+            {
+                let target = tab.week_target;
+                let shown = ui.ctx().animate_value_with_time(egui::Id::unique("dashboard-week-pill"), target, 0.9);
+                let fade = tab.week_moved.map_or(0.0, |t| (1.0 - t.elapsed().as_secs_f32() / 1.6).clamp(0.0, 1.0));
+                if fade > 0.0 {
+                    ui.ctx().request_repaint();
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let pulse = (40.0 + 190.0 * fade) as u8;
+                let color = if target >= 0.8 {
+                    theme::error_text()
+                } else if target >= 0.5 {
+                    theme::warn_text()
+                } else {
+                    theme::online()
+                };
+                let (used, resets_at) = (week.utilization, week.resets_at);
+                cards::pill_bar(ui, &format!("week {:.0}%", shown * 100.0), shown, color, pulse).on_hover_ui(|ui| {
+                    ui.label(format!("the plan's week: {:.0}% used, resets in {}", used * 100.0, ra_providers::limits::until(resets_at)));
+                    cards::sparkline(ui, &tab.week.days, color);
+                });
+            }
+            let secs = self.started.elapsed().as_secs();
+            ui.label(RichText::new(format!("up {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)).color(theme::dim()).small());
+            if toggle {
+                for t in &mut self.tabs {
+                    t.worker.debug = !debug;
+                }
+            }
+        });
+    }
+
     /// The dashboard: one card per project, top to bottom, as many as the window has room for
     /// and a scroll for the rest. Each card is the project's name and state, the card a run is
     /// on (else the next ready ones) in the roadmap's own rows, and its latest run.
     fn dashboard_view(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
         let mut open: Option<usize> = None;
+        egui::Panel::top("dashboard-status")
+            .frame(Frame::new().fill(theme::panel()).inner_margin(Margin::symmetric(8, 6)))
+            .show(root, |ui| self.dashboard_status(ui));
         egui::CentralPanel::default().frame(Frame::new().fill(theme::bg()).inner_margin(Margin::symmetric(18, 12))).show(root, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("DASHBOARD").small().strong().color(theme::dim()));
@@ -696,11 +1121,19 @@ impl App {
                 ui.label(RichText::new(text).small().color(theme::dim()));
             });
             ui.add_space(6.0);
+            // the page's width is the window's, not what the panel reports: the panel's ui
+            // answers with far more than the window shows, and everything laid out to it
+            // ran off the right edge. The margins and the scroll bar come off the content rect.
+            let page = (ctx.content_rect().width() - 36.0 - 14.0).min(ui.available_width()).max(400.0);
+            self.gauges.row(ui, page);
+            ui.add_space(10.0);
+            self.tokens.row(ui, page);
+            ui.add_space(6.0);
             egui::ScrollArea::vertical().id_salt("dashboard").auto_shrink([false, false]).show(ui, |ui| {
                 // the page's width, handed down: a card holds itself to it, so nothing in it
                 // takes the room a scroll area's content would otherwise be allowed
-                let page = ui.available_width();
                 ui.set_width(page);
+                ui.set_max_width(page);
                 for i in 0..self.tabs.len() {
                     let lane = theme::lane(1 + i % 9);
                     if self.tabs[i].dashboard_card(ui, lane, page) {
@@ -717,6 +1150,233 @@ impl App {
         let live = self.tabs.iter().any(|t| t.sink.live_run().is_some() || t.job.is_some());
         ctx.request_repaint_after(Duration::from_millis(if live { 40 } else { 250 }));
     }
+
+    /// The report: the cards that landed in every open project, as bubbles in two columns,
+    /// newest first; grouped under a divider per project when the toggle says so. A click on
+    /// a bubble opens the project's tab with the card selected.
+    fn report_view(&mut self, root: &mut egui::Ui) {
+        let ctx = root.ctx().clone();
+        self.rebuild_landed();
+        let mut by_project = self.tabs.first().is_some_and(|t| t.report_by_project);
+        let mut open: Option<(usize, i64)> = None;
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        egui::CentralPanel::default().frame(Frame::new().fill(theme::bg()).inner_margin(Margin::symmetric(18, 12))).show(root, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("REPORT").small().strong().color(theme::dim()));
+                let text = format!("{} landed across {} open", self.landed.len(), self.tabs.len());
+                ui.label(RichText::new(text).small().color(theme::dim()));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if cards::tab(ui, "by time", theme::accent(), !by_project) {
+                        by_project = false;
+                    }
+                    if cards::tab(ui, "by project", theme::accent(), by_project) {
+                        by_project = true;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().id_salt("report").auto_shrink([false, false]).show(ui, |ui| {
+                // the page's width, handed down: the columns are sized from it, so no bubble
+                // takes the room a scroll area's content would otherwise be allowed
+                let page = ui.available_width();
+                ui.set_width(page);
+                let column = ((page - 10.0) / 2.0).max(200.0);
+                if self.landed.is_empty() {
+                    ui.label(RichText::new("nothing has landed yet: a card implemented or accepted shows here").color(theme::dim()));
+                }
+                let mut rows: Vec<&[Landed]> = Vec::new();
+                if by_project {
+                    for group in self.landed.chunk_by(|a, b| a.tab == b.tab) {
+                        rows.push(group);
+                    }
+                } else {
+                    rows.push(&self.landed);
+                }
+                for (g, group) in rows.into_iter().enumerate() {
+                    if by_project {
+                        let lane = theme::lane(1 + group[0].tab % 9);
+                        if g > 0 {
+                            ui.add_space(4.0);
+                        }
+                        ui.horizontal(|ui| {
+                            cards::badge(ui, &group[0].project, lane);
+                            ui.label(RichText::new(format!("{} landed", group.len())).small().color(theme::dim()));
+                        });
+                        cards::divider(ui, lane);
+                    }
+                    for pair in group.chunks(2) {
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            for item in pair {
+                                ui.allocate_ui_with_layout(egui::vec2(column, 0.0), Layout::top_down(Align::Min), |ui| {
+                                    ui.set_width(column);
+                                    if landed_bubble(ui, item, now) {
+                                        open = Some((item.tab, item.id));
+                                    }
+                                });
+                            }
+                        });
+                    }
+                }
+            });
+        });
+        if self.tabs.first().is_some_and(|t| t.report_by_project != by_project) {
+            // every project's layout keeps the choice, so whichever opens first reads it back
+            for tab in &mut self.tabs {
+                tab.report_by_project = by_project;
+                tab.save_layout();
+            }
+            self.landed_from.clear();
+        }
+        if let Some((tab, id)) = open
+            && tab < self.tabs.len()
+        {
+            self.active = tab;
+            self.report = false;
+            self.tabs[tab].select(Some(id));
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
+    /// Rebuilds the report's list when a tab's roadmap or ledger moved since the last build,
+    /// or a tab came or went; a frame that finds them where they were draws the list it has.
+    fn rebuild_landed(&mut self) {
+        let from: Vec<_> = self.tabs.iter().map(|t| (t.roadmap_seen, t.ledger.read_at)).collect();
+        if from == self.landed_from {
+            return;
+        }
+        self.landed_from = from;
+        let mut landed = Vec::new();
+        for (tab, workspace) in self.tabs.iter().enumerate() {
+            let project = workspace
+                .project_title
+                .clone()
+                .unwrap_or_else(|| workspace.root.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
+            let cards = workspace
+                .roadmap
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.kind == NodeKind::Task && matches!(n.state, TaskState::Implemented | TaskState::Accepted));
+            for (seq, node) in cards {
+                landed.push(Landed {
+                    tab,
+                    project: project.clone(),
+                    id: node.id,
+                    title: node.title.clone(),
+                    state: node.state,
+                    model: node.assignee.as_ref().map(|a| short(&a.model).to_owned()).unwrap_or_default(),
+                    cost: workspace.costs.get(&node.id).filter(|t| t.calls > 0).and_then(|t| t.cost_usd),
+                    at: workspace.last_changes.get(&node.id).map(|c| c.at),
+                    seq,
+                });
+            }
+        }
+        let by_project = self.tabs.first().is_some_and(|t| t.report_by_project);
+        order_landed(&mut landed, by_project);
+        self.landed = landed;
+    }
+}
+
+/// One bubble of the report: a card that landed, with what the bubble shows of it.
+#[derive(Clone, Debug, PartialEq)]
+struct Landed {
+    /// The index of the project's tab.
+    tab: usize,
+    project: String,
+    id: i64,
+    title: String,
+    state: TaskState,
+    /// The model's short name; empty when the card names none.
+    model: String,
+    /// The card's cost from the ledger, when it had a call.
+    cost: Option<f64>,
+    /// When its state last changed, from the history; `None` when the project has none.
+    at: Option<u64>,
+    /// The card's place in the store, the order a project without history falls back to.
+    seq: usize,
+}
+
+/// Orders the report's bubbles: newest first by the time of the last state change, the cards
+/// without one after them in their store's order; `by_project` keeps that order within each
+/// project and lays the projects out in the tabs' order.
+fn order_landed(landed: &mut [Landed], by_project: bool) {
+    landed.sort_by_key(|l| (l.at.is_none(), std::cmp::Reverse(l.at), l.tab, l.seq));
+    if by_project {
+        landed.sort_by_key(|l| l.tab);
+    }
+}
+
+/// The bubble of one landed card: the project as a small badge, the id and the title, the
+/// state, the model, the cost and how long ago it landed. Returns true when clicked.
+fn landed_bubble(ui: &mut egui::Ui, item: &Landed, now: u64) -> bool {
+    let lane = theme::lane(1 + item.tab % 9);
+    let shown = cards::bubble(ui, lane, false, |ui| {
+        let inner = ui.available_width();
+        ui.set_width(inner);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            cards::badge(ui, &item.project, lane);
+            ui.label(RichText::new(format!("#{}", item.id)).small().strong().color(cards::alpha(theme::text(), 180)));
+            let title = egui::Label::new(RichText::new(&item.title).color(theme::text())).truncate();
+            ui.add(title).on_hover_text(format!("#{} {}", item.id, item.title));
+        });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            cards::badge(ui, &item.state.to_string(), theme::state_color(item.state));
+            if !item.model.is_empty() {
+                cards::badge(ui, &item.model, theme::accent());
+            }
+            if let Some(cost) = item.cost {
+                ui.label(RichText::new(dollars(Some(cost))).small().color(theme::dim()));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let when = item.at.map_or_else(|| "—".to_owned(), |at| format!("{} ago", ra_roadmap::history::age(now.saturating_sub(at))));
+                ui.label(RichText::new(when).small().color(theme::dim()));
+            });
+        });
+    });
+    ui.interact(shown.response.rect, ui.make_persistent_id(("landed", item.tab, item.id)), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+}
+
+/// What one of the window's own tabs in the strip answered: whether it was clicked, and its
+/// rect and fill when it is the one in front, for the floor to open under.
+struct HouseTab {
+    clicked: bool,
+    active: Option<(Rect, Color32)>,
+}
+
+/// One of the window's own tabs in the strip, the dashboard's or the report's: a mark and a
+/// name in the accent, drawn the way a project's tab is.
+fn house_tab(ui: &mut egui::Ui, mark: &str, name: &str, on: bool, hover: &str) -> HouseTab {
+    let lane = theme::accent();
+    let fill = if on { theme::panel() } else { theme::mix(theme::bg(), theme::panel(), 0.5) };
+    let frame = Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, if on { cards::alpha(lane, 200) } else { cards::alpha(theme::rule(), 180) }))
+        .corner_radius(CornerRadius { nw: 9, ne: 9, sw: 0, se: 0 })
+        .inner_margin(Margin { left: 12, right: 12, top: 6, bottom: 6 });
+    let shown = frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(RichText::new(mark).size(15.0).color(if on { lane } else { theme::dim() }));
+            let text = RichText::new(name).color(if on { theme::text() } else { theme::dim() });
+            ui.label(if on { text.strong() } else { text });
+        });
+    });
+    let rect = shown.response.rect;
+    if on {
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), 2.0)),
+            CornerRadius::same(1),
+            cards::alpha(lane, 220),
+        );
+    }
+    let response =
+        ui.interact(rect, ui.make_persistent_id(("tab-house", name)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    HouseTab { clicked: response.on_hover_text(hover).clicked(), active: on.then_some((rect, fill)) }
 }
 
 /// One project in the window: its store, its log, its panels. The window holds one per tab.
@@ -770,6 +1430,11 @@ struct Workspace {
     job_done: mpsc::UnboundedReceiver<()>,
     /// The numbers of the ledger tab and the status bar's ledger badge.
     ledger: Ledger,
+    /// The project's ledger, the same the worker writes, for the dashboard's token gauges;
+    /// `None` when it did not open.
+    usage: Option<UsageStore>,
+    /// The ledger's newest row when the workspace opened: the rows after it are this session's.
+    session_from: i64,
     context: ContextView,
     diff: DiffView,
     tab: Tab,
@@ -811,6 +1476,8 @@ struct Workspace {
     zoom: f32,
     /// The layout as last written, so a frame that changed nothing writes nothing.
     layout_saved: WindowLayout,
+    /// The report's toggle, as the layout file had it; the window keeps every tab's the same.
+    report_by_project: bool,
     /// The command palette while Ctrl+K holds it open.
     palette: Option<input::Palette>,
     /// The project's directory: every file of the workspace is under it.
@@ -862,10 +1529,15 @@ impl Workspace {
             temp_store()
         };
         let mut worker = Worker::new(ra_console::ui::DEFAULT_MODEL);
+        let mut usage = None;
         match rt.block_on(UsageStore::open(&root.join("var/usage.db"))) {
-            Ok(ledger) => worker = worker.with_ledger(ledger),
+            Ok(ledger) => {
+                worker = worker.with_ledger(ledger.clone());
+                usage = Some(ledger);
+            }
             Err(e) => tracing::warn!("no ledger: {e:#}"),
         }
+        let session_from = usage.as_ref().map_or(0, |u| rt.block_on(u.last_id()).unwrap_or(0));
         sink.push(
             Kind::Banner,
             format!(
@@ -903,11 +1575,14 @@ impl Workspace {
             input: String::new(),
             history: Vec::new(),
             browsing: None,
-            activity_offset: std::fs::metadata(root.join(ra_console::ui::ACTIVITY_FILE)).map_or(0, |m| m.len()),
+            // a run going when the tab opens is re-attached from its start, so it shows live
+            activity_offset: ra_console::ui::attach_offset(&root.join(ra_console::ui::ACTIVITY_FILE)),
             job: None,
             job_tx,
             job_done,
             ledger: Ledger::default(),
+            usage,
+            session_from,
             context: ContextView::default(),
             diff: DiffView::default(),
             tab: layout.tab.unwrap_or(Tab::Card),
@@ -929,6 +1604,7 @@ impl Workspace {
             announced: 0,
             console_height: layout.console,
             zoom: if layout.zoom > 0.0 { layout.zoom.clamp(ZOOM_MIN, ZOOM_MAX) } else { 1.0 },
+            report_by_project: layout.report_by_project,
             layout_saved: layout.clone(),
             palette: None,
             root,
@@ -959,6 +1635,7 @@ impl Workspace {
             selected: self.selected,
             theme: theme::current().name.to_owned(),
             zoom: self.zoom,
+            report_by_project: self.report_by_project,
         }
     }
 
@@ -1915,7 +2592,7 @@ impl Workspace {
                 RoadmapView::Walk => {
                     // the projected order: the cards as a walk would take them, numbered,
                     // the filters and the search applying as in the tree
-                    let order = ra_console::agent::walk_order(&nodes);
+                    let order = ra_console::agent::walk_order(&nodes, ra_console::agent::limits_tight(&self.limits));
                     if order.is_empty() {
                         ui.label(RichText::new("no card is ready to walk").color(theme::dim()).italics());
                     }
@@ -3054,7 +3731,7 @@ impl Workspace {
     /// latest run's card, live or finished. Returns true when the header asks for the tab.
     fn dashboard_card(&mut self, ui: &mut egui::Ui, lane: Color32, page: f32) -> bool {
         let nodes = self.roadmap.clone();
-        let order = ra_console::agent::walk_order(&nodes);
+        let order = ra_console::agent::walk_order(&nodes, ra_console::agent::limits_tight(&self.limits));
         let live = self.sink.live_run();
         // the card the live run is on: its id leads the run's title
         let running: Option<i64> = live.and_then(|id| {
@@ -3070,7 +3747,7 @@ impl Workspace {
         let job = self.job.clone();
         // the rows read as in the column: the running card first, then the next ready ones
         let mut rows: Vec<i64> = running.into_iter().collect();
-        rows.extend(order.iter().copied().filter(|id| Some(*id) != running).take(if running.is_some() { 2 } else { 3 }));
+        rows.extend(order.iter().copied().filter(|id| Some(*id) != running).take(if running.is_some() { 5 } else { 6 }));
         let walk = Walk {
             searching: false,
             matched: HashSet::new(),
@@ -3130,7 +3807,7 @@ impl Workspace {
             let right = (total - left - 12.0).max(200.0);
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                ui.allocate_ui_with_layout(egui::vec2(left, 0.0), Layout::top_down(Align::Min), |ui| {
+                let queue = ui.allocate_ui_with_layout(egui::vec2(left, 0.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(left);
                     if rows.is_empty() {
                         ui.label(RichText::new("no card is ready").color(theme::dim()).italics());
@@ -3155,10 +3832,12 @@ impl Workspace {
                         });
                     }
                 });
+                // the run card is held to the queue's height: it never outgrows the rows beside it
+                let room = queue.response.rect.height();
                 ui.allocate_ui_with_layout(egui::vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(right);
                     ui.set_max_width(right);
-                    if !console::draw_latest_run(ui, &self.sink) {
+                    if !console::draw_latest_run(ui, &self.sink, room) {
                         ui.label(RichText::new("no run in this session yet").color(theme::dim()).italics());
                     }
                 });

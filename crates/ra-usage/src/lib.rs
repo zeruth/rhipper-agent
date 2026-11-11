@@ -54,7 +54,24 @@ pub struct Call {
     pub cost_usd: Option<f64>,
 }
 
+/// One row as the dashboard's token gauges read it: when it was written, the tokens in and
+/// out together, and the cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spend {
+    /// When the row was written, as `SQLite` writes it: `YYYY-MM-DD HH:MM:SS`, UTC.
+    pub at: String,
+    /// The prompt and the completion tokens together; the cache is not counted.
+    pub tokens: u64,
+    pub cost_usd: Option<f64>,
+}
+
 impl Totals {
+    /// The prompt and the completion tokens together, as the gauges count a run.
+    #[must_use]
+    pub fn tokens(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+    }
+
     /// Adds one entry.
     pub fn add(&mut self, entry: &Entry) {
         self.calls += 1;
@@ -154,6 +171,47 @@ impl UsageStore {
     pub async fn totals(&self) -> anyhow::Result<Totals> {
         let row = sqlx::query(concat!("select ", sums!(), " from usage")).fetch_one(&self.pool).await?;
         Ok(totals_of(&row))
+    }
+
+    /// The id of the newest row, 0 when there is none: a reader's mark of where its session
+    /// starts, so `totals_after` and `recent` read only the rows since.
+    ///
+    /// # Errors
+    /// When the query fails.
+    pub async fn last_id(&self) -> anyhow::Result<i64> {
+        let row = sqlx::query("select coalesce(max(id), 0) as id from usage").fetch_one(&self.pool).await?;
+        Ok(row.get("id"))
+    }
+
+    /// The totals over the rows written after the row `after`; 0 sums every row.
+    ///
+    /// # Errors
+    /// When the query fails.
+    pub async fn totals_after(&self, after: i64) -> anyhow::Result<Totals> {
+        let row = sqlx::query(concat!("select ", sums!(), " from usage where id > ?")).bind(after).fetch_one(&self.pool).await?;
+        Ok(totals_of(&row))
+    }
+
+    /// The newest `limit` rows written after the row `after`, the oldest first, with the tokens
+    /// and the cost of each; 0 reads from the start.
+    ///
+    /// # Errors
+    /// When the query fails.
+    pub async fn recent(&self, after: i64, limit: u32) -> anyhow::Result<Vec<Spend>> {
+        let rows = sqlx::query("select at, prompt_tokens, completion_tokens, cost_usd from usage where id > ? order by id desc limit ?")
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut spends: Vec<Spend> = rows
+            .iter()
+            .map(|row| {
+                let count = |name: &str| u64::try_from(row.get::<i64, _>(name)).unwrap_or(0);
+                Spend { at: row.get("at"), tokens: count("prompt_tokens") + count("completion_tokens"), cost_usd: row.get("cost_usd") }
+            })
+            .collect();
+        spends.reverse();
+        Ok(spends)
     }
 
     /// The totals of every model that has rows, by model id, the costliest first.

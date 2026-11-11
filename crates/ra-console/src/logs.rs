@@ -118,9 +118,16 @@ impl Sink {
     /// opens untitled.
     pub fn progress(&self, text: &str) {
         if let Some(title) = text.strip_prefix(RUN_START) {
-            self.open_run(title);
+            // the pid on the marker is for the window's orphan scan, not for the bubble
+            self.open_run(title.rsplit_once(" · pid ").map_or(title, |(title, _)| title));
         } else if let Some(outcome) = text.strip_prefix(RUN_END) {
-            if let Some(id) = self.live_run() {
+            // an orphan's end names its card: it closes that run and no other, so a window
+            // reporting an older run never closes the card still going
+            let id = match orphaned_card(outcome) {
+                Some(card) => self.live_run_of(card),
+                None => self.live_run(),
+            };
+            if let Some(id) = id {
                 self.close_run(id, outcome);
             }
         } else {
@@ -169,6 +176,20 @@ impl Sink {
     /// The newest run that is still going.
     pub fn live_run(&self) -> Option<u64> {
         self.inner.runs.lock().0.iter().filter(|(_, r)| r.live()).map(|(id, _)| *id).max()
+    }
+
+    /// The newest run of `card` that is still going; none when the card has no open run here.
+    fn live_run_of(&self, card: i64) -> Option<u64> {
+        let ids: Vec<u64> = self
+            .inner
+            .lines
+            .lock()
+            .iter()
+            .filter(|l| l.kind == Kind::Run && card_of(&l.text) == Some(card))
+            .filter_map(|l| l.run)
+            .collect();
+        let runs = self.inner.runs.lock();
+        ids.into_iter().filter(|id| runs.0.get(id).is_some_and(Run::live)).max()
     }
 
     /// A copy of one run, for the draw.
@@ -260,6 +281,19 @@ impl Sink {
     }
 }
 
+/// The card a run's title names: `#12 The title · model` is card 12; none for an untitled run.
+#[must_use]
+pub fn card_of(title: &str) -> Option<i64> {
+    title.strip_prefix('#')?.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// The card an orphan's end names, `✗ orphaned #12: process 4242 is gone`: the one end that
+/// closes its own run rather than the newest.
+#[must_use]
+pub fn orphaned_card(outcome: &str) -> Option<i64> {
+    card_of(outcome.strip_prefix("✗ orphaned ")?)
+}
+
 impl Default for Sink {
     fn default() -> Self {
         Self::new()
@@ -299,6 +333,31 @@ mod tests {
             assert_eq!(kinds, [Kind::Run, Kind::Output, Kind::Output, Kind::Run]);
             assert_eq!(lines[3].text, "#16 Next · opus-5-5");
         });
+    }
+
+    #[test]
+    fn an_orphans_end_closes_its_own_card_and_leaves_the_one_still_going() {
+        let sink = Sink::new();
+        sink.progress(&format!("{RUN_START}#3 Older · opus · pid 222"));
+        let older = sink.live_run().unwrap();
+        sink.progress(&format!("{RUN_START}#4 Going · opus · pid 333"));
+        let going = sink.live_run().unwrap();
+        sink.progress("edit b.rs");
+        // the pid stays off the bubble's title
+        sink.with_lines(|lines| assert_eq!(lines[1].text, "#4 Going · opus"));
+        sink.progress(&format!("{RUN_END}✗ orphaned #3: process 222 is gone"));
+        assert!(!sink.run(older).unwrap().live());
+        assert!(sink.run(going).unwrap().live());
+        // an orphan's end for a card this log never opened closes nothing
+        sink.progress(&format!("{RUN_END}✗ orphaned #9: process 1 is gone"));
+        assert_eq!(sink.live_run(), Some(going));
+        // a plain end still closes the newest
+        sink.progress(&format!("{RUN_END}✓ $0.02"));
+        assert_eq!(sink.live_run(), None);
+        assert_eq!(card_of("#12 The title · model"), Some(12));
+        assert_eq!(card_of("worker"), None);
+        assert_eq!(orphaned_card("✗ orphaned #12: process 4242 is gone"), Some(12));
+        assert_eq!(orphaned_card("✗ failed: #12"), None);
     }
 
     #[test]

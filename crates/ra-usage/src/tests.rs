@@ -59,6 +59,25 @@ async fn the_totals_sum_the_rows_and_keep_an_unknown_cost_unknown() {
     assert_eq!(sum, totals);
 }
 
+#[tokio::test]
+async fn the_rows_after_a_mark_read_oldest_first_and_sum_apart() {
+    let store = UsageStore::in_memory().await.unwrap();
+    assert_eq!(store.last_id().await.unwrap(), 0);
+    store.record(&entry("m", Some(1), Some(0.1))).await.unwrap();
+    store.record(&Entry { prompt_tokens: 1_000, ..entry("m", Some(2), Some(0.2)) }).await.unwrap();
+    let mark = store.last_id().await.unwrap();
+    assert_eq!(mark, 2);
+    store.record(&Entry { completion_tokens: 50, ..entry("m", Some(3), None) }).await.unwrap();
+    store.record(&Entry { prompt_tokens: 300, ..entry("m", Some(3), Some(0.3)) }).await.unwrap();
+    // since the mark: the two later rows, oldest first; the cap keeps the newest
+    let since = store.recent(mark, 10).await.unwrap();
+    assert_eq!(since.iter().map(|s| (s.tokens, s.cost_usd)).collect::<Vec<_>>(), [(150, None), (310, Some(0.3))]);
+    assert_eq!(store.recent(0, 3).await.unwrap().iter().map(|s| s.tokens).collect::<Vec<_>>(), [1_010, 150, 310]);
+    let after = store.totals_after(mark).await.unwrap();
+    assert_eq!((after.calls, after.tokens(), after.cost_usd), (2, 460, Some(0.3)));
+    assert_eq!(store.totals_after(0).await.unwrap(), store.totals().await.unwrap());
+}
+
 #[test]
 fn a_running_tally_matches_the_store() {
     let mut tally = Totals::default();

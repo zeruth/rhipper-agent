@@ -27,6 +27,7 @@ ra-providers.workspace = true
 ra-roadmap.workspace = true
 ra-usage.workspace = true
 serde.workspace = true
+sysinfo.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true

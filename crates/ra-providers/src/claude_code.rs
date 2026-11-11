@@ -53,6 +53,9 @@ pub struct ClaudeCode {
     catalogue: Option<Catalogue>,
     /// The environment the harness runs with, on top of this process's own.
     env: Vec<(String, String)>,
+    /// The programs of the project's own `[worker] allow` rules, which the allowlist gotcha
+    /// does not count against a run.
+    own_prefixes: Vec<String>,
 }
 
 impl Default for ClaudeCode {
@@ -113,6 +116,7 @@ impl ClaudeCode {
             hooks: None,
             catalogue: None,
             env: Vec::new(),
+            own_prefixes: Vec::new(),
         }
     }
 
@@ -120,11 +124,25 @@ impl ClaudeCode {
     #[must_use]
     pub fn with_allowed(mut self, rules: impl IntoIterator<Item = String>) -> Self {
         for rule in rules {
+            if let Some(prefix) = rule_prefix(&rule)
+                && !self.own_prefixes.contains(&prefix)
+            {
+                self.own_prefixes.push(prefix);
+            }
             if !self.allowed_shell.contains(&rule) {
                 self.allowed_shell.push(rule);
             }
         }
         self
+    }
+
+    /// Whether a command starts with one of the project's own allowed programs: such a command
+    /// is outside the shell allowlist by design, and the allowlist gotcha does not count it.
+    fn own_command(&self, command: &str) -> bool {
+        let command = command.trim_start();
+        self.own_prefixes
+            .iter()
+            .any(|p| command.starts_with(p.as_str()) && command[p.len()..].chars().next().is_none_or(char::is_whitespace))
     }
 
     /// Environment the harness runs with, a project's `[worker.env]`.
@@ -278,6 +296,11 @@ impl ClaudeCode {
                         Where::Answer
                     };
                     for hit in gotchas_of_event(catalogue, &line, conditions, &mut tools) {
+                        // the project's own commands are past the allowlist by design: the
+                        // hook lets them run, and the count leaves them alone too
+                        if hit.id == "shell-outside-allowlist" && self.own_command(&hit.excerpt) {
+                            continue;
+                        }
                         tracing::info!(target: "ra::progress", "⚠ {}: {}", hit.id, hit.excerpt);
                         // the journal is written here, as the hits come, so a run that ends badly
                         // still counts them
@@ -549,6 +572,17 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
     });
     let session_id = parsed.session_id.filter(|s| !s.trim().is_empty());
     Ok(Completion { text, usage, turns: parsed.num_turns, turn_usage: Vec::new(), tool_calls: Vec::new(), session_id, gotchas: Vec::new() })
+}
+
+/// The program a permission rule names: `python` of `Bash(python *)`, `gw.ps1` of
+/// `PowerShell(.\gw.ps1 *)` is `.\gw.ps1`; none for a rule with nothing inside.
+fn rule_prefix(rule: &str) -> Option<String> {
+    let inner = match rule.find('(') {
+        Some(at) => rule[at + 1..].trim_end_matches(')'),
+        None => rule,
+    };
+    let prefix = inner.trim().trim_end_matches('*').trim_end();
+    (!prefix.is_empty()).then(|| prefix.to_owned())
 }
 
 /// The gotchas one stream event shows: a command about to run that the catalogue would refuse

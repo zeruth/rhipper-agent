@@ -31,6 +31,8 @@ pub fn default_dir() -> PathBuf {
 /// When the directory cannot be made, the source is the destination, or a binary cannot be
 /// copied; a binary set aside for a copy that failed is put back.
 pub fn install(dir: Option<&Path>) -> anyhow::Result<Vec<String>> {
+    // one install or restart at a time across the projects: two would set the same binary aside twice
+    let _install = crate::hub::guard(crate::hub::INSTALL_LOCK);
     let dir = dir.map_or_else(default_dir, Path::to_path_buf);
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot make {}", dir.display()))?;
     let suffix = std::env::consts::EXE_SUFFIX;

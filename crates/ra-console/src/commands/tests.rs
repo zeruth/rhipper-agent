@@ -447,11 +447,55 @@ fn cargo_project(dir: &std::path::Path, passing: bool) {
 }
 
 #[test]
-fn the_check_is_the_first_backticked_cargo_command_else_the_workspace_tests() {
-    use crate::agent::check_command;
-    assert_eq!(check_command(Some("run `rc gotchas` then `cargo test -p ra-console` and `cargo clippy`")), "cargo test -p ra-console");
-    assert_eq!(check_command(Some("it is done, see `git log`")), "cargo test --workspace -q");
-    assert_eq!(check_command(None), "cargo test --workspace -q");
+fn the_checks_are_the_backticked_commands_in_order_else_the_workspace_tests() {
+    use crate::agent::check_commands;
+    assert_eq!(check_commands(Some("`cargo test -p ra-console -q` passes")), ["cargo test -p ra-console -q"]);
+    assert_eq!(
+        check_commands(Some("run `rc gotchas` then `cargo test -p ra-console` and `cargo clippy`")),
+        ["cargo test -p ra-console", "cargo clippy"]
+    );
+    assert_eq!(
+        check_commands(Some("`python tools-src/x.py --only T` passes, then `.\\gw.ps1 :m:task` passes; see `src/lib.rs` and `Node`")),
+        ["python tools-src/x.py --only T", ".\\gw.ps1 :m:task"]
+    );
+    assert_eq!(check_commands(Some("it is done, see `git log`")), ["cargo test --workspace -q"]);
+    assert_eq!(check_commands(None), ["cargo test --workspace -q"]);
+}
+
+#[tokio::test]
+async fn a_run_with_several_checks_stops_at_the_first_failure_and_notes_each() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    run(
+        "/edit 2 acceptance `python tools-src/x.py --only T` passes, `.\\gw.ps1 :m:task` passes and `cargo test -q` passes",
+        &store,
+        &worker(),
+    )
+    .await
+    .unwrap();
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        log.lock().push(command.to_owned());
+        Ok(if command.starts_with(".\\gw.ps1") { (1, "BUILD FAILED\n".to_owned()) } else { (0, "ok\n".to_owned()) })
+    });
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])])).with_script(script);
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    // the third command never runs
+    assert_eq!(*seen.lock(), ["python tools-src/x.py --only T", ".\\gw.ps1 :m:task"]);
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
+    let notes = node.notes.unwrap_or_default();
+    assert_eq!(
+        notes,
+        "check failed: .\\gw.ps1 :m:task\nBUILD FAILED\nexit code 1\n\ncheck passed: python tools-src/x.py --only T · exit code 0\nok\nexit code 0\n\ndone"
+    );
+    assert!(
+        out.iter().any(|l| l.contains("check failed: .\\gw.ps1 :m:task · after 1 of 3 passed · the output is in the notes")),
+        "{out:?}"
+    );
 }
 
 async fn checked_run(passing: bool) -> (Vec<String>, ra_roadmap::model::Node) {
@@ -494,6 +538,54 @@ async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_depend
     assert_eq!(store.read(2).await.unwrap().notes.as_deref(), Some("did A"));
     assert_eq!(store.read(4).await.unwrap().notes.as_deref(), Some("did C"));
     assert_eq!(script.seen.lock().len(), 3);
+}
+
+/// Leaves the plan's five-hour window at `utilization` in the project's `var/limits.json`, seen
+/// just now, so it is the latest reading on the machine.
+fn plan_at(root: &std::path::Path, utilization: f64) {
+    let now = crate::agent::unix_now();
+    let mut limits = ra_providers::limits::Limits { status: "allowed".to_owned(), seen_at: now, ..Default::default() };
+    limits.windows.insert("five_hour".to_owned(), ra_providers::limits::Window { utilization, resets_at: now + 3600 });
+    limits.save(&root.join(ra_providers::claude_code::LIMITS_FILE)).unwrap();
+}
+
+#[tokio::test]
+async fn run_all_in_a_tight_window_takes_the_smallest_ready_card_first_and_the_start_line_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = three_cards(dir.path(), true).await;
+    // #2 A is a c4 ahead of #3 B, a c1; #4 C, a c3, waits on #3
+    store.set_complexity(2, 4).await.unwrap();
+    store.set_complexity(3, 1).await.unwrap();
+    let nodes = store.all().await.unwrap();
+    assert_eq!(crate::agent::walk_order(&nodes, false), vec![2, 3, 4]);
+    assert_eq!(crate::agent::walk_order(&nodes, true), vec![3, 4, 2]);
+    // a tenth of the window left: the walk takes the c1 before the c4 that stands earlier
+    plan_at(dir.path(), 0.9);
+    let script = Scripted::new(vec![says("did B", vec![]), says("did C", vec![]), says("did A", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    let ran: Vec<&String> = out.iter().filter(|l| l.starts_with('✓')).collect();
+    assert_eq!(ran.len(), 3, "{out:?}");
+    assert!(ran[0].starts_with("✓ #3 B implemented"), "{out:?}");
+    assert!(ran[1].starts_with("✓ #4 C implemented"), "{out:?}");
+    assert!(ran[2].starts_with("✓ #2 A implemented"), "{out:?}");
+    let pair = crate::pair::recent(dir.path(), 20);
+    assert!(pair.iter().any(|l| l.starts_with("start #3 B · glm-5.3-flash · tight: smallest first · check:")), "{pair:?}");
+    // half the window left: the roadmap's order holds and the start line says nothing of it
+    let dir = tempfile::tempdir().unwrap();
+    let store = three_cards(dir.path(), true).await;
+    store.set_complexity(2, 4).await.unwrap();
+    store.set_complexity(3, 1).await.unwrap();
+    plan_at(dir.path(), 0.5);
+    let script = Scripted::new(vec![says("did A", vec![]), says("did B", vec![]), says("did C", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    let ran: Vec<&String> = out.iter().filter(|l| l.starts_with('✓')).collect();
+    assert!(ran[0].starts_with("✓ #2 A implemented"), "{out:?}");
+    assert!(ran[1].starts_with("✓ #3 B implemented"), "{out:?}");
+    let pair = crate::pair::recent(dir.path(), 20);
+    assert!(pair.iter().any(|l| l.starts_with("start #2 A · glm-5.3-flash · check:")), "{pair:?}");
+    assert!(!pair.iter().any(|l| l.contains("tight")), "{pair:?}");
 }
 
 #[tokio::test]
@@ -556,6 +648,80 @@ async fn in_debug_mode_the_run_keeps_the_worker_s_look_back_for_the_next_one() {
     let (out, _) = run("/run 3", &store, &quiet).await.unwrap();
     assert!(!out.iter().any(|l| l.contains('↯')), "{out:?}");
     assert_eq!(crate::retro::recent(dir.path(), 10).len(), 2);
+}
+
+/// The report of the role tests: an answer, and a look back whose bullet lost its tag.
+const ROLE_REPORT: &str = "wrote the greeting into hello.txt and verified it by cargo test\n\n## Faster next time\n- Select-String after a native pipe is refused here; grep in Bash works\n";
+
+#[tokio::test]
+async fn the_summary_role_runs_on_the_local_provider_and_not_on_the_cards_model() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let card = Scripted::new(vec![says(ROLE_REPORT, vec![])]);
+    // the roles in the order a run asks them: the summary, the classification, the digest
+    let local = Scripted::new(vec![
+        says("wrote hello.txt; verified by cargo test", vec![]),
+        says("machine", vec![]),
+        says("#2 Probe implemented: hello.txt written\nnothing else", vec![]),
+    ]);
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    let runner = Worker::new("z-ai/glm-5.3-flash")
+        .with_provider(card.clone())
+        .with_role_provider("local/qwen3-8b", local.clone())
+        .with_ledger(ledger);
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    // the card's model answered once; every cheap role went to the local provider
+    assert_eq!(card.seen.lock().len(), 1);
+    {
+        let seen = local.seen.lock();
+        assert_eq!(seen.len(), 3, "{out:?}");
+        assert!(seen.iter().all(|r| r.model == "local/qwen3-8b" && r.tools.is_empty() && r.workspace.is_none()));
+        assert!(seen[0].messages[1].content.starts_with("wrote the greeting"), "{}", seen[0].messages[1].content);
+        assert_eq!(seen[1].messages[1].content, "Select-String after a native pipe is refused here; grep in Bash works");
+        assert!(seen[2].messages[1].content.starts_with("✓ #2 Probe implemented"), "{}", seen[2].messages[1].content);
+    }
+    // the handoff carries the summary, the notes of the card the whole answer
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    assert_eq!(task.handoffs.last().unwrap().report, "wrote hello.txt; verified by cargo test");
+    assert_eq!(store.read(2).await.unwrap().notes.as_deref(), Some(ROLE_REPORT));
+    // the untagged bullet was classified as the machine's
+    assert!(out.iter().any(|l| l.contains("↯ [machine] Select-String")), "{out:?}");
+    assert!(crate::retro::recent(dir.path(), 1)[0].machine);
+    // the digest line is the drafted one, its first line only
+    assert_eq!(crate::hub::own_digest(dir.path()).unwrap().last.as_deref(), Some("#2 Probe implemented: hello.txt written"));
+    // the ledger shows the roles' calls under the local model, apart from the card's
+    let rows = runner.by_model().await.unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let local_row = rows.iter().find(|(model, _)| model == "local/qwen3-8b").unwrap();
+    assert_eq!(local_row.1.calls, 3);
+    assert_eq!(rows.iter().find(|(model, _)| model == "z-ai/glm-5.3-flash").unwrap().1.calls, 1);
+    assert_eq!(runner.tally().calls, 4);
+}
+
+#[tokio::test]
+async fn without_a_local_server_the_roles_make_no_call_and_the_rule_based_path_stands() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let card = Scripted::new(vec![says(ROLE_REPORT, vec![])]);
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    // no role provider and no server: a run resolves no role at all
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger);
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert_eq!(card.seen.lock().len(), 1);
+    assert_eq!(runner.tally().calls, 1);
+    assert_eq!(runner.by_model().await.unwrap().len(), 1);
+    // the handoff carries the answer itself, the bullet stays as the worker tagged it, and
+    // the digest line is the feed's end line
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    let report = &task.handoffs.last().unwrap().report;
+    assert!(report.starts_with("wrote the greeting into hello.txt") && report.ends_with("grep in Bash works"), "{report}");
+    assert!(out.iter().any(|l| l.contains("↯ Select-String")), "{out:?}");
+    assert!(!crate::retro::recent(dir.path(), 1)[0].machine);
+    assert!(crate::hub::own_digest(dir.path()).unwrap().last.unwrap().starts_with("✓ #2 Probe implemented"));
 }
 
 #[tokio::test]
@@ -652,6 +818,55 @@ async fn a_warning_elsewhere_leaves_the_card_implemented() {
     assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented);
     assert_eq!(node.notes.as_deref(), Some("added extra"));
     assert!(out.iter().any(|l| l.contains("lint clean: cargo clippy -p probe")), "{out:?}");
+}
+
+/// A run of card #2 in `dir`, whose worker writes `src/extra.rs`; the commands the checks ran
+/// and the lines of the run.
+async fn run_writing_extra(dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    let write = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"src/extra.rs","content":"pub fn extra() {}\n"}"#.into(),
+    };
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        log.lock().push(command.to_owned());
+        Ok((0, "ok\n".to_owned()))
+    });
+    let provider = Scripted::new(vec![says("", vec![write]), says("added extra", vec![])]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider).with_script(script);
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    let seen = seen.lock().clone();
+    (seen, out)
+}
+
+#[tokio::test]
+async fn the_projects_check_stands_in_for_the_workspace_tests_and_an_empty_lint_skips_it() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // before the table: the workspace tests, and clippy over what changed
+    let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("check: cargo test --workspace -q · lint: clippy over the changed crates")), "{out:?}");
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\ncheck = \".\\\\gw.ps1 :m:task\"\nlint = \"\"\n").unwrap();
+    let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("check: .\\gw.ps1 :m:task · lint: none")), "{out:?}");
+    // a card without a backticked command runs the project's check and nothing lints the change
+    let (seen, out) = run_writing_extra(dir.path()).await;
+    assert_eq!(seen, [".\\gw.ps1 :m:task"]);
+    assert!(out.iter().any(|l| l.contains("check passed: .\\gw.ps1 :m:task")), "{out:?}");
+    assert!(!out.iter().any(|l| l.contains("lint")), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Implemented);
+    let pair = crate::pair::recent(dir.path(), 10);
+    assert!(pair.iter().any(|l| l.starts_with("start #2 Probe") && l.contains("check: .\\gw.ps1 :m:task · lint: none · pid ")), "{pair:?}");
+    // a card with its own backticked check still wins
+    run("/edit 2 acceptance `cargo test -q` passes", &store, &worker()).await.unwrap();
+    let (seen, out) = run_writing_extra(dir.path()).await;
+    assert_eq!(seen, ["cargo test -q"]);
+    assert!(out.iter().any(|l| l.contains("check passed: cargo test -q")), "{out:?}");
 }
 
 /// The answer of a reassessment that keeps the text: the three lines the prompt asks for.

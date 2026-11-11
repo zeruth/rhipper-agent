@@ -53,7 +53,10 @@ for an interactive session can leave a headless worker without a shell. A vendor
 such as `z-ai/glm-5.3-flash` goes through OpenRouter with the key from `OPENROUTER_API_KEY` or
 the console's `key` command. A `local/<name>` id goes to a local OpenAI-compatible server such
 as llama.cpp at `RHIPPER_LOCAL_URL` (default `http://127.0.0.1:8080/v1`), with no key. A bare
-model on either route gets the `ra-tools` toolbox and runs through the tool loop.
+model on either route gets the `ra-tools` toolbox and runs through the tool loop. The cheap roles
+a run ends with (the report condensed for the handoff, the run's digest line, whether an untagged
+look-back is `[machine]`) go to the model the `[role]` table of `rhipper.toml` names, else to the
+local server when it answers a ping, else to no model at all; `rc usage` shows them by model.
 
 A run ends with a local check, no model call: the first backticked `cargo …` command in the
 card's acceptance, else `cargo test --workspace -q`. Passed, the card is `implemented`; failed,

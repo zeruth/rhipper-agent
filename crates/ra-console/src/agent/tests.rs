@@ -69,6 +69,15 @@ fn a_routed_worker_takes_the_model_of_the_card_or_the_rules_and_a_pinned_one_kee
     assert_eq!(pinned.model, "claude-opus-5-5");
 }
 
+#[test]
+fn the_digest_block_names_the_other_projects_one_line_each_and_is_nothing_without_them() {
+    assert_eq!(digest_block(&[]), "");
+    let block = digest_block(&["beta (C:/code/beta) · 2 ready".to_owned(), "gamma (C:/code/gamma) · live: walk · pid 7".to_owned()]);
+    assert!(block.starts_with("What the other projects on this machine are doing"), "{block}");
+    assert_eq!(block.matches("\n- ").count(), 2);
+    assert_eq!(clock(19_676 * 86_400 + 10 * 3600 + 4 * 60 + 59), "10:04Z");
+}
+
 /// A task with a session made an `age` of seconds before `now`, for the card as it stands.
 fn with_session(age: u64, now: u64) -> Node {
     let mut node = ra_roadmap::markdown::parse("- 2 ‹task› T\n    objective: a goal\n    files: a.rs\n").unwrap().remove(0);
@@ -115,4 +124,54 @@ fn the_build_advice_tells_the_window_from_rc_from_neither() {
     // neither says nothing
     assert_eq!(build_advice(&files(&[".claude/skills/rhipper-pair/SKILL.md", "rhipper.md"])), None);
     assert_eq!(build_advice(&[]), None);
+}
+
+#[test]
+fn the_plan_guard_holds_a_run_when_two_roots_together_reach_the_cap_and_names_the_other() {
+    let now = unix_now();
+    let reading = |name: &str, utilization: f64, seen_at: u64, live: bool| PlanReading {
+        name: name.to_owned(),
+        five_hour: Some(ra_providers::limits::Window { utilization, resets_at: now + 3600 }),
+        seen_at,
+        live,
+    };
+    // alpha alone, at 80% with a run's share to spare: no hold
+    let alpha = reading("alpha", 0.8, now - 600, false);
+    assert_eq!(plan_hold(&[alpha.clone()], "alpha", now), None);
+    // a run live in beta counts for a share the readings do not show yet: together they reach the cap
+    let beta_live = PlanReading { name: "beta".to_owned(), five_hour: None, seen_at: 0, live: true };
+    let hold = plan_hold(&[alpha.clone(), beta_live.clone()], "alpha", now).expect("held");
+    assert!(hold.starts_with("hold: the plan's five-hour window is at 80% as alpha last saw it, with a run live in beta"), "{hold}");
+    // a project's own live run is not another project's
+    assert_eq!(plan_hold(&[alpha.clone(), beta_live], "beta", now), None);
+    // the latest reading is the account's level, whichever project took it
+    let beta = reading("beta", 0.95, now - 60, false);
+    let hold = plan_hold(&[alpha.clone(), beta], "alpha", now).expect("held");
+    assert!(hold.contains("at 95% as beta last saw it"), "{hold}");
+    // a window that reset does not count, and no reading at all is no hold
+    let mut gone = reading("beta", 0.95, now - 60, false);
+    gone.five_hour = Some(ra_providers::limits::Window { utilization: 0.95, resets_at: now - 1 });
+    assert_eq!(plan_hold(&[alpha, gone], "alpha", now), None);
+    assert_eq!(plan_hold(&[], "alpha", now), None);
+}
+
+#[test]
+fn the_window_is_tight_under_a_quarter_left_by_the_latest_reading_of_any_project() {
+    let now = unix_now();
+    let reading = |name: &str, utilization: f64, seen_at: u64, resets_at: u64| PlanReading {
+        name: name.to_owned(),
+        five_hour: Some(ra_providers::limits::Window { utilization, resets_at }),
+        seen_at,
+        live: false,
+    };
+    // a tenth left is tight; half left is not; a quarter exactly is not under it
+    assert!(plan_tight_in(&[reading("alpha", 0.9, now - 60, now + 3600)], now));
+    assert!(!plan_tight_in(&[reading("alpha", 0.5, now - 60, now + 3600)], now));
+    assert!(!plan_tight_in(&[reading("alpha", 0.75, now - 60, now + 3600)], now));
+    // the latest reading decides, whichever project took it
+    assert!(plan_tight_in(&[reading("alpha", 0.5, now - 600, now + 3600), reading("beta", 0.9, now - 60, now + 3600)], now));
+    assert!(!plan_tight_in(&[reading("alpha", 0.9, now - 600, now + 3600), reading("beta", 0.5, now - 60, now + 3600)], now));
+    // a window that reset, or no reading, is room
+    assert!(!plan_tight_in(&[reading("alpha", 0.9, now - 60, now - 1)], now));
+    assert!(!plan_tight_in(&[], now));
 }

@@ -12,11 +12,12 @@ A roadmap-driven, provider-independent AI development orchestrator in Rust. It b
 - `crates/ra-context` — the project context (this file) and the per-task context files under `var/context/`
 - `crates/ra-console` — the agent loop (`agent.rs`), the commands, the MCP server, the ratatui console
 - `apps/rc` — the CLI: `rc show|add|set|run|context|gotchas|usage|console|mcp|hook`
+- the hub directory (`%LOCALAPPDATA%\rhipper\agent`, `hub::dir()`) is shared by every project on the machine: the window's lock and mailbox, and `notes.log`, where a `[machine]` look-back or `rc note "[machine] …"` lands for every project's runs to read (`retro.rs`)
 - `apps/rc-gui` — the egui workspace window (Blood Moon theme): roadmap column, card view, console band
 
 ## Build and checks
 
-- `cargo test --workspace -q` is the check of a card unless its acceptance names another cargo command in backticks; run it before reporting.
+- Every backticked command in a card's acceptance is its check (`cargo test -p x`, `python tools/x.py`, `.\gw.ps1 :task`); several run in the order written and stop at the first failure; `cargo test --workspace -q` when none is named. Run them before reporting.
 - `cargo clippy --workspace` warns with the pedantic set; a change adds no warnings of its own. Casts and long functions already warn in `rc-gui`; do not add to them.
 - Rust edition 2024, let chains allowed. `rustfmt.toml` sets the width; run `cargo fmt -p <crate>` on what you touched.
 - A running console or window holds `rc.exe` / `rc-gui.exe`: build and test with `-p <crate>` or `--workspace --exclude rc --exclude rc-gui` when a workspace build fails to relink.

@@ -84,7 +84,7 @@ impl Project {
         if manifest.is_some() {
             text.push_str("## Build and checks\n\n");
             text.push_str(
-                "- `cargo test --workspace -q` is the check of a card unless its acceptance names another cargo command in backticks.\n",
+                "- Every backticked command in a card's acceptance is its check (`cargo test -p x`, `python tools/x.py`, `.\\gw.ps1 :task`); several run in the order written and stop at the first failure; `cargo test --workspace -q` when none is named. Run them before reporting.\n",
             );
             if manifest.as_ref().and_then(|m| m.get("workspace")?.get("lints")?.get("clippy")).is_some() {
                 text.push_str("- `cargo clippy --workspace` warns with the pedantic set; a change adds no warnings of its own.\n");

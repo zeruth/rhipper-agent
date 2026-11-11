@@ -49,12 +49,20 @@ push into a session, so the session subscribes. **First thing in a Rhipper proje
 Monitor on it** and re-arm it on every expiry while runs are going:
 
 ```
-Monitor(command: "tail -n 0 -F var/pair.log", description: "the agent's pair feed (<project>)", timeout_ms: 1800000)
+Monitor(command: "rc pair --follow --since <last seen>", description: "the agent's pair feed (<project>)", timeout_ms: 1800000)
 ```
 
+Each line comes stamped, `<unix time>\t<text>`; keep the last stamp you saw and pass it as
+`--since` when you re-arm, so what landed while the Monitor was down is replayed first (the
+first arm takes the current time). `rc pair --since <ts>` alone prints that catch-up and exits.
+`rc pair --follow` follows the file by name and survives its rotation; on a build before
+0.1.475, `tail -n 0 -F var/pair.log` does the same without the catch-up.
+
 Every line arrives as a notification: a card started, a card ended (then review it), the walk
-ended (then do the pass), a note the person left. `rc pair` prints the last twenty. Do not tail
-`var/activity.log` for this; that is the step-by-step stream the window draws.
+ended (then do the pass), a note the person left, `window up/down` and `run orphaned #id` when
+the window restarts. `rc pair` prints the last twenty. Do not tail `var/activity.log` for
+this; that is the step-by-step stream the window draws. Managing several projects: one
+Monitor per project, each in its own directory.
 
 ## The cycle (what this session does for every card)
 
@@ -84,7 +92,10 @@ ended (then do the pass), a note the person left. `rc pair` prints the last twen
    is what forgets it). **When**: `rc install` any time a card lands (the next run is on it);
    `rc restart` only on a **milestone commit** — a phase's cards done and committed together —
    or when the person asks. Not per card: the window is every session's and a restart
-   interrupts whoever is looking at it.
+   interrupts whoever is looking at it. The run's check line says which the card is:
+   `window: restart on the milestone commit` (it touched `apps/rc-gui` or `crates/ra-console`),
+   `rc: install any time, no restart` (it touched `apps/rc` or another crate), or nothing (no
+   Rust code). Follow that line.
 6. **Commit** with a message that says the card, the model, the cost line, what the worker did
    and what you fixed (the git log is the review record), with `git commit -F <scratchpad file>`.
 7. **Accept**: `rc set <id> accepted`. Accept a milestone when its cards are.
@@ -186,6 +197,21 @@ CARGO_BUILD_JOBS = "6"               # the harness runs with these on top of the
 
 The extra commands are exempt from the `shell-outside-allowlist` gotcha (the other gotchas still
 apply). The next `rc run` reads it; no restart.
+
+**The check and the lint of a run** (since 0.1.491): every backticked command in a card's
+acceptance is a check, run in the project directory in the order written, stopping at the
+first failure; a card with none uses the project's default; a project with none uses
+`cargo test --workspace -q`. The lint is clippy over the changed crates unless the project
+names its own command or turns it off:
+
+```toml
+[worker]
+check = ".\\gw.ps1 :android-awt:compileDebugJavaWithJavac"   # the default check of a card that names none
+lint = ""                                                      # no lint here; a command runs it instead of clippy
+```
+
+`rc run <id> --dry` prints the resolved `check: … · lint: …`; the same line follows the
+`◆start` marker in `var/activity.log` and ends the `start #id` event of `var/pair.log`.
 
 ## Reading the roadmap fast
 

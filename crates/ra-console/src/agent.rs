@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use parking_lot::Mutex;
+use ra_providers::local::Role;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError, TurnUsage, Usage};
 use ra_roadmap::history::Source;
 use ra_roadmap::model::{Effort, Estimate, Node, NodeKind, TaskState};
@@ -95,7 +96,30 @@ pub struct Worker {
     /// What answers the commands of a run instead of the shell; the tests script the check and
     /// the lint with it.
     script: Option<ra_tools::Script>,
+    /// The cheap roles when a test set them; a run resolves its own from `rhipper.toml` and the
+    /// local server otherwise.
+    roles: Option<Roles>,
 }
+
+/// The cheap roles of a run, each with the model that takes it and the provider behind it; a
+/// role with none runs its rule-based path and calls nothing.
+#[derive(Clone, Default)]
+pub struct Roles {
+    routes: Vec<(Role, String, Arc<dyn ModelProvider>)>,
+}
+
+impl Roles {
+    /// The model and the provider of `role`, when it has one.
+    fn of(&self, role: Role) -> Option<(&str, &Arc<dyn ModelProvider>)> {
+        self.routes.iter().find(|(r, _, _)| *r == role).map(|(_, model, provider)| (model.as_str(), provider))
+    }
+}
+
+/// What the summary role is told: the report condensed for the next run of the same card.
+const SUMMARY_INSTRUCTION: &str = "Condense this worker's report for the next run of the same card, in at most eight plain lines and no heading: what changed (which files), what was verified, what is left or failed. Keep the exact names, paths and commands; drop everything else.";
+
+/// What the digest role is told: the run's line for the other projects on the machine.
+const DIGEST_INSTRUCTION: &str = "In one line of at most 120 characters and no markdown, say what this run did for the people and the agents working on other projects on the same machine: the card, the outcome, and the crates or files it touched. The first line is how the run ended; the rest are the notes of the card.";
 
 impl Worker {
     /// A worker on `model`, not yet connected and without a ledger.
@@ -114,6 +138,77 @@ impl Worker {
             debug: !std::env::var("RHIPPER_DEBUG")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
             script: None,
+            roles: None,
+        }
+    }
+
+    /// The same worker, with every cheap role on `model` through `provider`; the tests hand in
+    /// a scripted local one.
+    #[must_use]
+    pub fn with_role_provider(mut self, model: impl Into<String>, provider: Arc<dyn ModelProvider>) -> Self {
+        let model = model.into();
+        let shared = std::iter::repeat_n(provider, Role::ALL.len());
+        self.roles =
+            Some(Roles { routes: Role::ALL.into_iter().zip(shared).map(|(role, provider)| (role, model.clone(), provider)).collect() });
+        self
+    }
+
+    /// The cheap roles of a run in `root`: the ones a test set, else each as the `[role]` table
+    /// of `rhipper.toml` names it, with a key left out going to the local server when it answers
+    /// a ping (once per run, whatever the number of roles) and to no model at all when it does
+    /// not. A role whose model has no provider is off, with a warning.
+    async fn roles(&self, root: &Path) -> Roles {
+        if let Some(preset) = &self.roles {
+            return preset.clone();
+        }
+        let config = match crate::router::Router::load(root) {
+            Ok(router) => router.role,
+            Err(e) => {
+                tracing::warn!("the role table is off: {e:#}");
+                crate::router::RoleConfig::default()
+            }
+        };
+        // the local default, pinged the first time a role needs it; the tests never ping
+        let mut local: Option<Option<String>> = None;
+        let mut roles = Roles::default();
+        for role in Role::ALL {
+            let model = match config.model(role) {
+                Some("") => continue,
+                Some(named) => named.to_owned(),
+                None => {
+                    if local.is_none() {
+                        local = Some(if cfg!(test) { None } else { ra_providers::local::default_model().await });
+                    }
+                    match local.as_ref().and_then(Option::as_deref) {
+                        Some(model) => model.to_owned(),
+                        None => continue,
+                    }
+                }
+            };
+            match self.provider_for(&model) {
+                Ok(provider) => roles.routes.push((role, model, provider)),
+                Err(e) => tracing::warn!("the {} role is off: {e:#}", role.name()),
+            }
+        }
+        roles
+    }
+
+    /// One call of `role` on its model, booked under that model against `node`; `None` when the
+    /// role has no model, the text is empty or the call failed, and the rule-based path stands.
+    async fn ask_role(&self, roles: &Roles, role: Role, node: Option<i64>, instruction: &str, text: &str) -> Option<String> {
+        let (model, provider) = roles.of(role)?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        match ra_providers::local::ask(provider.as_ref(), model, role, instruction, text).await {
+            Ok((answer, usage)) => {
+                self.record_as(model, node, &usage, 1).await;
+                (!answer.is_empty()).then_some(answer)
+            }
+            Err(e) => {
+                tracing::warn!("the {} role failed on {model}: {e}", role.name());
+                None
+            }
         }
     }
 
@@ -262,8 +357,14 @@ impl Worker {
     /// Books one completion of `turns` turns against the tally and the ledger. A ledger that
     /// cannot be written is a warning, not a failed run: the answer already came back.
     pub(crate) async fn record(&self, node: Option<i64>, usage: &Usage, turns: u64) {
+        self.record_as(&self.model, node, usage, turns).await;
+    }
+
+    /// [`record`](Self::record) under `model` rather than the badge's: a cheap role's call lands
+    /// under the model that took it, so the saving shows in `rc usage`.
+    async fn record_as(&self, model: &str, node: Option<i64>, usage: &Usage, turns: u64) {
         let entry = Entry {
-            model: self.model.clone(),
+            model: model.to_owned(),
             node,
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
@@ -295,48 +396,62 @@ impl Worker {
                 return Ok(provider.clone());
             }
         }
-        let provider: Arc<dyn ModelProvider> = match route {
-            Route::ClaudeCode => {
-                // the gotchas guard every harness run: the hooks call this very binary, and the
-                // catalogue lives beside the roadmap; without either, the harness runs unguarded
-                let mut harness = ra_providers::claude_code::ClaudeCode::new();
-                // the project's own commands and environment, from the `[worker]` table of
-                // its rhipper.toml, when it has one
-                match crate::router::Router::load(Path::new(".")) {
-                    Ok(router) => {
-                        let worker = router.worker;
-                        if !worker.allow.is_empty() {
-                            harness = harness.with_allowed(worker.rules());
-                        }
-                        if !worker.env.is_empty() {
-                            harness = harness.with_env(worker.env);
-                        }
-                    }
-                    Err(e) => tracing::warn!("the worker table is off: {e:#}"),
-                }
-                // the project's catalogue when it has one; the seed otherwise, written by the
-                // hook in the run's own directory, not here (a test runs where no var/ belongs)
-                let catalogue =
-                    if Path::new(GOTCHAS_FILE).exists() { Catalogue::load(Path::new(GOTCHAS_FILE)) } else { Ok(Catalogue::seed()) };
-                match (std::env::current_exe(), catalogue) {
-                    (Ok(rc), Ok(catalogue)) => harness = harness.with_gotchas(rc, catalogue),
-                    (_, Err(e)) => tracing::warn!("the gotchas are off: {e:#}"),
-                    (Err(e), _) => tracing::warn!("the gotchas are off: no path to this binary: {e}"),
-                }
-                Arc::new(harness)
-            }
-            Route::OpenRouter => Arc::new(ra_providers::openrouter::OpenRouter::new(secret::api_key()?)?),
-            // the same wire format as OpenRouter, at the local URL and with no key
-            Route::Local => Arc::new(ra_providers::openrouter::OpenRouter::local()?),
-        };
+        let provider = connect(route)?;
         *slot = Some((route, provider.clone()));
         Ok(provider)
+    }
+
+    /// The provider of `model`, which a cheap role runs on: the badge's own when the routes
+    /// agree, else a fresh connection on the model's route.
+    fn provider_for(&self, model: &str) -> anyhow::Result<Arc<dyn ModelProvider>> {
+        let route = Route::of(model);
+        if route == self.route() { self.provider() } else { connect(route) }
     }
 
     /// Drops the connected provider, so the next call connects with the current key.
     pub fn forget(&self) {
         *self.provider.lock() = None;
     }
+}
+
+/// A fresh connection on `route`, with what each needs: the aggregator the key from the
+/// credential store or the environment, and a missing one is the error; Claude Code only its own
+/// login; the local server no key, only to be running.
+fn connect(route: Route) -> anyhow::Result<Arc<dyn ModelProvider>> {
+    let provider: Arc<dyn ModelProvider> = match route {
+        Route::ClaudeCode => {
+            // the gotchas guard every harness run: the hooks call this very binary, and the
+            // catalogue lives beside the roadmap; without either, the harness runs unguarded
+            let mut harness = ra_providers::claude_code::ClaudeCode::new();
+            // the project's own commands and environment, from the `[worker]` table of
+            // its rhipper.toml, when it has one
+            match crate::router::Router::load(Path::new(".")) {
+                Ok(router) => {
+                    let worker = router.worker;
+                    if !worker.allow.is_empty() {
+                        harness = harness.with_allowed(worker.rules());
+                    }
+                    if !worker.env.is_empty() {
+                        harness = harness.with_env(worker.env);
+                    }
+                }
+                Err(e) => tracing::warn!("the worker table is off: {e:#}"),
+            }
+            // the project's catalogue when it has one; the seed otherwise, written by the
+            // hook in the run's own directory, not here (a test runs where no var/ belongs)
+            let catalogue = if Path::new(GOTCHAS_FILE).exists() { Catalogue::load(Path::new(GOTCHAS_FILE)) } else { Ok(Catalogue::seed()) };
+            match (std::env::current_exe(), catalogue) {
+                (Ok(rc), Ok(catalogue)) => harness = harness.with_gotchas(rc, catalogue),
+                (_, Err(e)) => tracing::warn!("the gotchas are off: {e:#}"),
+                (Err(e), _) => tracing::warn!("the gotchas are off: no path to this binary: {e}"),
+            }
+            Arc::new(harness)
+        }
+        Route::OpenRouter => Arc::new(ra_providers::openrouter::OpenRouter::new(secret::api_key()?)?),
+        // the same wire format as OpenRouter, at the local URL and with no key
+        Route::Local => Arc::new(ra_providers::openrouter::OpenRouter::local()?),
+    };
+    Ok(provider)
 }
 
 /// Sends one message and returns the answer and the usage as log lines.
@@ -375,17 +490,48 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
 /// failed, not in progress. The run announces its start and its outcome on the progress channel,
 /// so the console draws its steps in a bubble of their own.
 pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
+    run_picked(store, id, worker, false).await
+}
+
+/// [`run`], with whether a tight window picked the card, which the start line and the pair
+/// feed then say.
+async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> anyhow::Result<Vec<String>> {
     // the node first, so a bad id or a project is named before the key matters
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != NodeKind::Project, "#{} is a project; run a task", id);
     // the model of this card, when the command left the choice to the card and the rules
     let root = workspace_of(store);
     let worker = &worker.for_card(&root, &node)?;
-    tracing::info!(target: crate::trace::PROGRESS, "{}#{} {} · {}", crate::logs::RUN_START, id, node.title, short(&worker.model));
+    let pick = if tight { format!(" · {TIGHT_PICK}") } else { String::new() };
+    // the pid on the start marker, last: a window coming up tells a run that died from one
+    // still going
+    tracing::info!(
+        target: crate::trace::PROGRESS,
+        "{}#{} {} · {}{pick} · pid {}",
+        crate::logs::RUN_START,
+        id,
+        node.title,
+        short(&worker.model),
+        std::process::id()
+    );
+    // the check and the lint the run ends on, resolved up front: the activity log and the paired
+    // session see what the card will be judged by before the worker starts
+    let checks = checks_of(&root, &node).describe();
+    tracing::info!(target: crate::trace::PROGRESS, "{checks}");
     // the paired session hears of the start and the end through the feed it watches
     let title = node.title.clone();
-    crate::pair::event(&root, &format!("start #{id} {title} · {}", short(&worker.model)));
-    let outcome = run_task(store, node, worker).await;
+    // the pid last on the feed's start too: `rc status` tells a live run from an orphan by it
+    crate::pair::event(&root, &format!("start #{id} {title} · {}{pick} · {checks} · pid {}", short(&worker.model), std::process::id()));
+    // the plan's room across every project on the machine, before any token goes
+    if worker.route() == Route::ClaudeCode {
+        wait_for_plan(&root).await;
+    }
+    // the other projects see the run while it goes, and what it came to once it ended
+    let started = unix_now();
+    write_digest(store, &root, Some(format!("#{id} {title} · pid {} · started {}", std::process::id(), clock(started))), None, None).await;
+    // the cheap roles of this run, resolved once: the local server is pinged here, not per role
+    let roles = worker.roles(&root).await;
+    let outcome = run_task(store, node, worker, &roles).await;
     match &outcome {
         Ok((lines, cost, 0)) => {
             tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, cost_text(*cost));
@@ -400,7 +546,192 @@ pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<
             crate::pair::event(&root, &format!("end ✗ #{id} {title} failed: {}", first_line(&format!("{e:#}"))));
         }
     }
+    let changed = ra_context::TaskContext::open(&root, id).handoffs.last().map(|h| h.changed.clone()).unwrap_or_default();
+    // the digest role drafts the run's line for the other projects from the end line and the
+    // notes of the card, when it has a model; the feed's end line stands otherwise
+    let drafted = match crate::pair::last_end(&root) {
+        Some(end) => {
+            let notes = store.read(id).await.ok().and_then(|n| n.notes).unwrap_or_default();
+            let notes: String = notes.chars().take(DIGEST_NOTES).collect();
+            worker
+                .ask_role(&roles, Role::Digest, Some(id), DIGEST_INSTRUCTION, &format!("{end}\n\n{notes}"))
+                .await
+                .map(|line| first_line(&line))
+        }
+        None => None,
+    };
+    write_digest(store, &root, None, Some(changed), drafted).await;
     outcome.map(|(lines, _, _)| lines)
+}
+
+/// How much of the notes the digest role reads: enough for the report, not a long check output.
+const DIGEST_NOTES: usize = 6000;
+
+/// Writes the project's digest under the hub for the other projects' runs: the live run or walk
+/// when one is named, the last end as `drafted` says it or as the paired feed does, the ready
+/// count of the roadmap, and the files the last run changed, or the ones of the digest before
+/// when this write has none.
+async fn write_digest(store: &Store, root: &Path, live: Option<String>, changed: Option<Vec<String>>, drafted: Option<String>) {
+    let ready = match store.all().await {
+        Ok(nodes) => tree::effective_states(&nodes).values().filter(|s| **s == TaskState::Ready).count(),
+        Err(_) => 0,
+    };
+    let before = crate::hub::own_digest(root);
+    let path = std::fs::canonicalize(root)
+        .map_or_else(|_| root.display().to_string(), |p| p.display().to_string().trim_start_matches(r"\\?\").to_owned());
+    crate::hub::write_digest(&crate::hub::Digest {
+        name: crate::hub::project_name(root),
+        path,
+        pid: std::process::id(),
+        when: unix_now(),
+        live,
+        last: drafted.or_else(|| crate::pair::last_end(root)),
+        ready,
+        changed: changed.or_else(|| before.map(|d| d.changed)).unwrap_or_default(),
+    });
+}
+
+/// A unix time as the clock of the day, `hh:mmZ`: UTC, which every project's run reads alike.
+fn clock(when: u64) -> String {
+    let day = when % 86_400;
+    format!("{:02}:{:02}Z", day / 3600, day / 60 % 60)
+}
+
+/// Takes the hub's lock on the cargo target of `root` for the check, waiting on a check of
+/// another project that builds in the same target; the wait is said once, on the progress
+/// channel and the paired feed. `None` when the lock cannot be opened: the check goes unguarded.
+async fn guard_target(root: &Path) -> Option<crate::hub::Guard> {
+    let target = crate::hub::cargo_target(root);
+    let name = crate::hub::target_lock_name(&target);
+    let mut said = false;
+    loop {
+        match crate::hub::try_guard(&name) {
+            Ok(Some(guard)) => return Some(guard),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("the check runs without the lock on {}: {e:#}", target.display());
+                return None;
+            }
+        }
+        if !said {
+            said = true;
+            let text = format!("wait: the check waits on the cargo target {}, which another project's check builds in", target.display());
+            tracing::info!(target: crate::trace::PROGRESS, "  {text}");
+            crate::pair::event(root, &text);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// The share of the plan's five-hour window one run of a card is taken to use: the margin a run
+/// keeps from the cap, and what a run live in another project counts for before the limits
+/// show it.
+const RUN_SHARE: f64 = 0.1;
+
+/// How often a held run reads the limits again.
+const PLAN_POLL: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// What one project's `var/limits.json` and digest say, for the hold before a run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanReading {
+    pub name: String,
+    /// The five-hour window as the project last saw it, and when.
+    pub five_hour: Option<ra_providers::limits::Window>,
+    pub seen_at: u64,
+    /// Whether a run or a walk of the project is going right now.
+    pub live: bool,
+}
+
+/// Holds the run while the plan's five-hour window, across every project on the machine, is
+/// within one run of its cap: says so once, on the progress channel and the paired feed, and
+/// reads the limits again every minute until there is room.
+async fn wait_for_plan(root: &Path) {
+    let this = crate::hub::project_name(root);
+    let mut said = false;
+    while let Some(text) = plan_hold(&plan_readings(root), &this, unix_now()) {
+        if !said {
+            said = true;
+            tracing::info!(target: crate::trace::PROGRESS, "  {text}");
+            crate::pair::event(root, &text);
+        }
+        tokio::time::sleep(PLAN_POLL).await;
+    }
+}
+
+/// The plan readings of every project the machine remembers: the window's tabs, the projects
+/// with a digest, and `root`, each once.
+fn plan_readings(root: &Path) -> Vec<PlanReading> {
+    let digests = crate::hub::digests();
+    let mut projects: Vec<PathBuf> = crate::hub::recent();
+    projects.extend(digests.iter().map(|d| PathBuf::from(&d.path)));
+    projects.push(root.to_path_buf());
+    let mut readings: Vec<PlanReading> = Vec::new();
+    for project in projects {
+        let name = crate::hub::project_name(&project);
+        if readings.iter().any(|r| r.name == name) {
+            continue;
+        }
+        let limits = ra_providers::limits::Limits::load(&project.join(ra_providers::claude_code::LIMITS_FILE));
+        let live = digests.iter().any(|d| d.name == name && d.live.is_some() && crate::hub::pid_alive(d.pid));
+        readings.push(PlanReading { name, five_hour: limits.windows.get("five_hour").copied(), seen_at: limits.seen_at, live });
+    }
+    readings
+}
+
+/// Why a run in `this` project is held, or `None` when the plan has room. The harness reports
+/// the account's window whichever project asked, so the window's level is the latest reading
+/// any project has of a window that has not reset; a run live in another project has used what
+/// no reading shows yet, one [`RUN_SHARE`] each. The run is held while the level, those runs
+/// and its own share together reach the cap, and the line names the projects behind it.
+fn plan_hold(readings: &[PlanReading], this: &str, now: u64) -> Option<String> {
+    let (name, window) = plan_window(readings, now)?;
+    let live: Vec<&str> = readings.iter().filter(|r| r.live && r.name != this).map(|r| r.name.as_str()).collect();
+    #[allow(clippy::cast_precision_loss)]
+    let level = window.utilization + RUN_SHARE * live.len() as f64;
+    if level + RUN_SHARE < 1.0 {
+        return None;
+    }
+    let with = if live.is_empty() { String::new() } else { format!(", with a run live in {}", live.join(", ")) };
+    Some(format!(
+        "hold: the plan's five-hour window is at {:.0}% as {name} last saw it{with}; this run waits for room, the window resets in {}",
+        window.utilization * 100.0,
+        ra_providers::limits::until(window.resets_at)
+    ))
+}
+
+/// The account's five-hour window and the project that last saw it: the latest reading of a
+/// window that has not reset, whichever project took it.
+fn plan_window(readings: &[PlanReading], now: u64) -> Option<(&str, ra_providers::limits::Window)> {
+    readings
+        .iter()
+        .filter_map(|r| r.five_hour.filter(|w| w.resets_at > now).map(|w| (r.name.as_str(), r.seen_at, w)))
+        .max_by_key(|(_, seen_at, _)| *seen_at)
+        .map(|(name, _, window)| (name, window))
+}
+
+/// What the start line and the pair feed say of a tight pick.
+const TIGHT_PICK: &str = "tight: smallest first";
+
+/// Whether the window is tight by `readings`: less than [`ra_providers::TIGHT_SHARE`] of the
+/// five-hour window is left. No reading is not tight.
+fn plan_tight_in(readings: &[PlanReading], now: u64) -> bool {
+    plan_window(readings, now).is_some_and(|(_, window)| 1.0 - window.utilization < ra_providers::TIGHT_SHARE)
+}
+
+/// Whether the plan's five-hour window is tight, read across every project the machine
+/// remembers, as [`wait_for_plan`] reads it.
+#[must_use]
+pub fn plan_tight(root: &Path) -> bool {
+    plan_tight_in(&plan_readings(root), unix_now())
+}
+
+/// Whether `limits`, one project's reading, say the window is tight: for the window, which
+/// holds its project's reading already.
+#[must_use]
+pub fn limits_tight(limits: &ra_providers::limits::Limits) -> bool {
+    let reading =
+        PlanReading { name: String::new(), five_hour: limits.windows.get("five_hour").copied(), seen_at: limits.seen_at, live: false };
+    plan_tight_in(&[reading], unix_now())
 }
 
 /// Runs the first ready card, the one `rc next` names; a line says so when none is.
@@ -430,35 +761,41 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     let Some(_lock) = take_walk_lock(&workspace_of(store)) else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
     };
+    // the other projects see the walk from its start
+    let root = workspace_of(store);
+    write_digest(store, &root, Some(format!("walk · pid {} · started {}", std::process::id(), clock(unix_now()))), None, None).await;
     loop {
         let nodes = store.all().await?;
-        let root = workspace_of(store);
-        // the walk's end, whichever way, goes to the paired session's feed
-        let done = |lines: &mut Vec<String>, text: String| {
+        // the walk's end, whichever way, goes to the paired session's feed and the digest
+        let done = async |lines: &mut Vec<String>, text: String| {
             crate::pair::event(&root, &format!("walk {text}"));
+            write_digest(store, &root, None, None, None).await;
             lines.push(text);
         };
-        let Some(id) = batch_ready(&nodes).map(|n| n.id) else {
-            done(&mut lines, format!("ran {ran} card(s) · no card is ready"));
+        // the plan's room decides the pick before each card: a window that got tight during
+        // the walk takes the small cards from here on
+        let tight = plan_tight(&root);
+        let Some(id) = batch_ready(&nodes, tight).map(|n| n.id) else {
+            done(&mut lines, format!("ran {ran} card(s) · no card is ready")).await;
             return Ok(lines);
         };
-        match run(store, id, worker).await {
+        match run_picked(store, id, worker, tight).await {
             Ok(run_lines) => lines.extend(run_lines),
             Err(error) => {
-                done(&mut lines, format!("ran {ran} card(s) · stopped: the run of #{id} failed: {error:#}"));
+                done(&mut lines, format!("ran {ran} card(s) · stopped: the run of #{id} failed: {error:#}")).await;
                 return Ok(lines);
             }
         }
         ran += 1;
         if stop_on_revision && store.read(id).await?.state == TaskState::NeedsRevision {
-            done(&mut lines, format!("ran {ran} card(s) · stopped: #{id} needs revision"));
+            done(&mut lines, format!("ran {ran} card(s) · stopped: #{id} needs revision")).await;
             return Ok(lines);
         }
         // `stop` from the console or the window: the walk ends after the run it was in
         let stop = root.join(WALK_STOP);
         if stop.exists() {
             let _ = std::fs::remove_file(&stop);
-            done(&mut lines, format!("ran {ran} card(s) · stopped after #{id}, as asked"));
+            done(&mut lines, format!("ran {ran} card(s) · stopped after #{id}, as asked")).await;
             return Ok(lines);
         }
     }
@@ -557,12 +894,13 @@ pub fn stop_walk(root: &Path) -> String {
 
 /// The order a walk would take the cards in, as `rc run --all` picks them one after another,
 /// each pick counted as implemented for the next: the projected order of the work, for the
-/// window's walk view. Nothing is written.
+/// window's walk view. With `tight` the picks are the smallest ready card first, as a walk picks
+/// when the plan's window is tight ([`plan_tight`]). Nothing is written.
 #[must_use]
-pub fn walk_order(nodes: &[Node]) -> Vec<i64> {
+pub fn walk_order(nodes: &[Node], tight: bool) -> Vec<i64> {
     let mut nodes = nodes.to_vec();
     let mut order = Vec::new();
-    while let Some(id) = batch_ready(&nodes).map(|n| n.id) {
+    while let Some(id) = batch_ready(&nodes, tight).map(|n| n.id) {
         order.push(id);
         if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
             node.state = TaskState::Implemented;
@@ -576,16 +914,20 @@ pub fn walk_order(nodes: &[Node]) -> Vec<i64> {
 /// the batch implements are not accepted until the person reviews, and their dependents are what
 /// the batch is meant to run ahead of that review. A card whose waits-on failed, left the roadmap
 /// or are still open is not picked, so every pick moves a card out of defined and the loop ends.
-fn batch_ready(nodes: &[Node]) -> Option<&Node> {
+/// With `tight` the pick is the ready card of the lowest complexity, the first in tree order
+/// among equals: what is left of the window finishes small cards whole rather than starting a
+/// large one it cannot end.
+fn batch_ready(nodes: &[Node], tight: bool) -> Option<&Node> {
     let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && matches!(d.state, TaskState::Accepted | TaskState::Implemented));
-    nodes
+    let mut ready = nodes
         .iter()
-        .find(|n| n.state == TaskState::Defined && matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.depends_on.iter().all(met))
+        .filter(|n| n.state == TaskState::Defined && matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.depends_on.iter().all(met));
+    if tight { ready.min_by_key(|n| n.complexity) } else { ready.next() }
 }
 
 /// The work of [`run`], with the cost of the session and the count of the gotchas it hit beside
 /// the log lines.
-async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<(Vec<String>, Option<f64>, usize)> {
+async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> anyhow::Result<(Vec<String>, Option<f64>, usize)> {
     let id = node.id;
     let provider = worker.provider()?;
     store.set_state_by(id, TaskState::InProgress, Source::Run).await?;
@@ -663,31 +1005,48 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             return Err(error);
         }
     };
-    // a local check before the card counts as done: no model call, the acceptance names it
-    let command = check_command(node.acceptance.as_deref());
+    // the local checks before the card counts as done: no model call, the acceptance names
+    // them (else the project, else the workspace tests), and they run in order up to the first
+    // failure
+    let Checks { commands, lint: project_lint } = checks_of(&root, &node);
+    let command = commands.join(" · ");
     let toolbox = worker.toolbox(workspace_dir.as_deref().unwrap_or(Path::new(".")));
-    let check = match &toolbox {
-        Ok(toolbox) => toolbox.check(&command).await,
-        Err(e) => Err(anyhow::anyhow!("{e:#}")),
-    };
+    // a cargo check builds in a target another project may share: the hub's lock on it, so
+    // two builds do not fight over the directory
+    let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root).await } else { None };
+    let checks = run_checks(&toolbox, &commands).await;
     let changed = ra_context::changed_between(&dirty_before, &git_status(&root).await);
-    // a failed check leads the notes and the handoff: the failed tests first, then the tail of
-    // the output, then the worker's answer, so the next run reads the failures before anything
+    // a failed check leads the notes and the handoff: the failed command with its tests and the
+    // tail of its output first, then the commands that passed before it with their exit codes,
+    // then the worker's answer, so the next run reads the failures before anything
     let mut report = session.text.clone();
-    let (mut passed, mut check_line) = match check {
-        Ok((true, _)) => (true, format!("  check passed: {command}")),
-        Ok((false, output)) => {
-            let failure = check_failure(&output);
-            report = format!("check failed: {command}\n{}\n\n{}", failure.text, session.text);
-            let count = match failure.failed {
+    // what leads the answer in the notes and the handoff alike: the failed check, when one did
+    let mut lead = String::new();
+    let (mut passed, mut check_line) = match checks.iter().find(|run| !run.passed) {
+        None => (true, format!("  check passed: {command}")),
+        Some(failed) => {
+            let before: Vec<String> = checks
+                .iter()
+                .filter(|run| run.passed)
+                .map(|run| format!("check passed: {} · {}\n{}", run.command, run.exit, run.text))
+                .collect();
+            let before = if before.is_empty() { String::new() } else { format!("{}\n\n", before.join("\n\n")) };
+            lead = format!("check failed: {}\n{}\n\n{before}", failed.command, failed.text);
+            report = format!("{lead}{}", session.text);
+            let count = match failed.failed_tests {
                 0 => String::new(),
                 n => format!(" · {n} test(s) failed"),
             };
-            (false, format!("  check failed: {command}{count} · the output is in the notes"))
-        }
-        Err(e) => {
-            report = format!("check failed: {command}\n{e:#}\n\n{}", session.text);
-            (false, format!("  check failed: {command} · {e:#}"))
+            let after = match checks.len() {
+                1 => String::new(),
+                n => format!(" · after {} of {} passed", n - 1, commands.len()),
+            };
+            let where_ = if failed.exit.starts_with("exit code") || failed.exit.starts_with("stopped") {
+                " · the output is in the notes".to_owned()
+            } else {
+                format!(" · {}", failed.exit)
+            };
+            (false, format!("  check failed: {}{count}{after}{where_}", failed.command))
         }
     };
     // the lint of what the run changed, once the check passed: the orchestrator finds the
@@ -696,21 +1055,21 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     let mut lint_lines = Vec::new();
     let mut lint_warnings = Vec::new();
     if passed && let Ok(toolbox) = &toolbox {
-        let lint = lint_changed(toolbox, &root, &changed).await;
+        let lint = lint_changed(toolbox, &root, &changed, project_lint.as_deref()).await;
         for skipped in &lint.skipped {
             lint_lines.push(format!("  lint skipped: {skipped}"));
         }
         if lint.warnings.is_empty() {
-            if !lint.crates.is_empty() {
-                lint_lines.push(format!("  lint clean: cargo clippy -p {}", lint.crates.join(" -p ")));
+            if !lint.command.is_empty() {
+                lint_lines.push(format!("  lint clean: {}", lint.command));
             }
         } else {
             passed = false;
             report = format!("{}\n\n{}", lint.warnings.join("\n\n"), session.text);
             check_line = format!(
-                "  check passed: {command} · lint: {} warning(s) in the changed files from cargo clippy -p {} · the lines are in the notes",
+                "  check passed: {command} · lint: {} warning(s) in the changed files from {} · the lines are in the notes",
                 lint.warnings.len(),
-                lint.crates.join(" -p ")
+                lint.command
             );
             lint_warnings = lint.warnings;
         }
@@ -733,14 +1092,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     if let Some(advice) = build_advice(&changed) {
         check_line = format!("{check_line} · {advice}");
     }
-    // the warnings ride in their own section of the handoff, not at the head of its report: the
-    // notes lead with them, the next run gets them in its machine notes
-    let mut last = handoff(
-        if passed { "implemented" } else { "needs revision" },
-        check_line.trim(),
-        if lint_warnings.is_empty() { &report } else { &session.text },
-        changed,
-    );
+    // the summary role condenses the answer for the handoff, when it has a model; the notes of
+    // the card keep the answer whole either way. The warnings ride in their own section of the
+    // handoff, not at the head of its report: the notes lead with them, the next run gets them
+    // in its machine notes
+    let summary = worker.ask_role(roles, Role::Summary, Some(id), SUMMARY_INSTRUCTION, &session.text).await;
+    let answer = summary.as_deref().unwrap_or(&session.text);
+    let handed = if lint_warnings.is_empty() { format!("{lead}{answer}") } else { answer.to_owned() };
+    let mut last = handoff(if passed { "implemented" } else { "needs revision" }, check_line.trim(), &handed, changed);
     last.warnings = lint_warnings;
     task.record(last);
     save_context(store, &root, &task).await;
@@ -768,7 +1127,16 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     lines.extend(lint_lines);
     // in debug mode the worker's own look back: kept for the next runs, and named here
     if worker.debug {
-        let notes = crate::retro::parse(&session.text);
+        let mut notes = crate::retro::parse(&session.text);
+        // a bullet without its tag is put to the classify role, when it has a model: the
+        // worker forgets the tag more often than it misplaces it
+        for note in notes.iter_mut().filter(|note| !note.machine) {
+            if let Some(answer) = worker.ask_role(roles, Role::Classify, Some(id), crate::retro::CLASSIFY, &note.text).await
+                && let Some(machine) = crate::retro::classified(&answer)
+            {
+                note.machine = machine;
+            }
+        }
         if let Err(e) = crate::retro::record(&root, Some(id), &notes) {
             tracing::warn!("the look back of #{id} was not kept: {e:#}");
         }
@@ -834,7 +1202,11 @@ fn harness_messages(task: &ra_context::TaskContext, project: &str, root: &Path, 
     if !project.is_empty() {
         messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
     }
-    let notes = [machine_notes(root), warnings_note(task)].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+    let notes = [machine_notes(root), warnings_note(task), digest_block(&crate::hub::digest_lines(root))]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     if !notes.is_empty() {
         messages.push(Message::system(notes));
     }
@@ -843,6 +1215,16 @@ fn harness_messages(task: &ra_context::TaskContext, project: &str, root: &Path, 
     }
     messages.push(Message::user(task.prompt()));
     messages
+}
+
+/// The other projects' digests as a block of the system prompt, one line each, so the worker
+/// knows what they are touching (a shared crate, the install dir); empty when there is none.
+fn digest_block(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = lines.iter().map(|l| format!("- {l}")).collect();
+    format!("What the other projects on this machine are doing, one line each:\n{}", lines.join("\n"))
 }
 
 /// The task of a bare model, which reads the project context at the head of it and, in debug
@@ -896,7 +1278,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             worker.route().name()
         ),
         format!(
-            "  budget {} · turn cap {} · resume {} · check: {}",
+            "  budget {} · turn cap {} · resume {} · {}",
             budget.map_or_else(|| "none".to_owned(), |b| format!("${b:.2}")),
             cap.map_or_else(|| "none".to_owned(), |c| c.to_string()),
             match resume_of(&node, unix_now()) {
@@ -904,7 +1286,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
                 Ok(None) => "none".to_owned(),
                 Err(reason) => format!("none, {reason}"),
             },
-            check_command(node.acceptance.as_deref())
+            checks_of(&root, &node).describe()
         ),
     ];
     let command = provider.command_line(&request);
@@ -955,30 +1337,42 @@ fn arguments<'a>(command: &'a [String], flag: &str) -> Vec<&'a str> {
 /// What the lint of a run's changed files came to.
 #[derive(Default)]
 struct Lint {
-    /// The crates linted, one `cargo clippy -p` each, in order.
-    crates: Vec<String>,
+    /// The command that linted: `cargo clippy -p` over the changed crates, or the project's own;
+    /// empty when nothing was linted.
+    command: String,
     /// The diagnostics pointing at a changed file, whole.
     warnings: Vec<String>,
     /// The lints that could not run, each with its reason.
     skipped: Vec<String>,
 }
 
-/// Lints each crate that owns one of `changed` and keeps the diagnostics that point into the
-/// lines the change touched (`git diff -U0` of those files; a file git does not know is new,
-/// and all of it counts), not the warnings its files had before. Clippy exits 0 on a warning,
-/// so the output decides, not the exit code.
-async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[String]) -> Lint {
-    let mut lint = Lint::default();
-    for file in changed {
-        if let Some(krate) = ra_tools::crate_of(root, file)
-            && !lint.crates.contains(&krate)
-        {
-            lint.crates.push(krate);
+/// Lints what `changed` touched and keeps the diagnostics that point into the lines the change
+/// touched (`git diff -U0` of those files; a file git does not know is new, and all of it
+/// counts), not the warnings its files had before. Without a `project` lint, clippy runs over
+/// each crate that owns a changed file; an empty one is no lint at all; any other is the
+/// project's command, run as a check is, outside the shell allowlist. Clippy exits 0 on a
+/// warning, so the output decides, not the exit code.
+async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[String], project: Option<&str>) -> Lint {
+    let command = match project {
+        Some("") => return Lint::default(),
+        Some(command) if !changed.is_empty() => command.to_owned(),
+        Some(_) => return Lint::default(),
+        None => {
+            let mut crates: Vec<String> = Vec::new();
+            for file in changed {
+                if let Some(krate) = ra_tools::crate_of(root, file)
+                    && !crates.contains(&krate)
+                {
+                    crates.push(krate);
+                }
+            }
+            if crates.is_empty() {
+                return Lint::default();
+            }
+            format!("cargo clippy -p {}", crates.join(" -p "))
         }
-    }
-    if lint.crates.is_empty() {
-        return lint;
-    }
+    };
+    let mut lint = Lint { command, ..Lint::default() };
     let diff = match toolbox.check(&format!("git diff -U0 HEAD -- {}", changed.join(" "))).await {
         Ok((_, output)) => output,
         Err(e) => {
@@ -995,8 +1389,8 @@ async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[Strin
     }
     // one clippy over every crate: a crate's warnings come out again under each crate that
     // depends on it, so a run per crate counted the same warning three times (#92 read 68)
-    let command = format!("cargo clippy -p {}", lint.crates.join(" -p "));
-    match toolbox.check(&command).await {
+    let outcome = if project.is_some() { toolbox.check_acceptance(&lint.command).await } else { toolbox.check(&lint.command).await };
+    match outcome {
         Ok((_, output)) => {
             for warning in ra_tools::warnings_within(&output, &ranges) {
                 if !lint.warnings.contains(&warning) {
@@ -1004,7 +1398,7 @@ async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[Strin
                 }
             }
         }
-        Err(e) => lint.skipped.push(format!("{command} · {e:#}")),
+        Err(e) => lint.skipped.push(format!("{} · {e:#}", lint.command)),
     }
     lint
 }
@@ -1074,14 +1468,141 @@ pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// The check of a node: the first backticked command in its acceptance that starts with cargo,
-/// else the tests of the whole workspace.
-pub fn check_command(acceptance: Option<&str>) -> String {
-    acceptance
-        .and_then(|text| {
-            text.split('`').skip(1).step_by(2).map(str::trim).find(|c| c == &"cargo" || c.starts_with("cargo ")).map(str::to_owned)
-        })
-        .unwrap_or_else(|| "cargo test --workspace -q".to_owned())
+/// The check of a node when its acceptance names none.
+const DEFAULT_CHECK: &str = "cargo test --workspace -q";
+
+/// The checks of a node: every backticked span of its acceptance that reads as a command line,
+/// in the order written, else the tests of the whole workspace. A span is a command when its
+/// first token is a build or script runner (cargo, python, npm, gradle and the like) or a
+/// relative script path (`./gw.sh`, `.\gw.ps1`, `tools/run.py`); a bare path, an identifier or a
+/// `git log` style reference is not.
+#[must_use]
+pub fn check_commands(acceptance: Option<&str>) -> Vec<String> {
+    check_commands_or(acceptance, DEFAULT_CHECK)
+}
+
+/// [`check_commands`] with `default` in place of the workspace tests.
+fn check_commands_or(acceptance: Option<&str>, default: &str) -> Vec<String> {
+    let commands: Vec<String> = acceptance
+        .map(|text| text.split('`').skip(1).step_by(2).map(str::trim).filter(|span| is_command(span)).map(str::to_owned).collect())
+        .unwrap_or_default();
+    if commands.is_empty() { vec![default.to_owned()] } else { commands }
+}
+
+/// What a card is judged by in its project: the checks and the lint.
+struct Checks {
+    /// The card's own backticked commands, else the project's `check`, else the workspace tests.
+    commands: Vec<String>,
+    /// The project's `lint` as the `[worker]` table has it; `None` leaves clippy in place.
+    lint: Option<String>,
+}
+
+impl Checks {
+    /// One line naming both, for the dry run header, the activity log and the pair log.
+    fn describe(&self) -> String {
+        let lint = match self.lint.as_deref() {
+            None => "clippy over the changed crates",
+            Some("") => "none",
+            Some(command) => command,
+        };
+        format!("check: {} · lint: {lint}", self.commands.join(" · then "))
+    }
+}
+
+/// The checks of `node` under the `[worker]` table of the project at `root`; a table that will
+/// not parse is the default one, as the run already said so when it picked the model.
+fn checks_of(root: &Path, node: &Node) -> Checks {
+    let worker = crate::router::Router::load(root).map(|router| router.worker).unwrap_or_default();
+    Checks {
+        commands: check_commands_or(node.acceptance.as_deref(), worker.check().unwrap_or(DEFAULT_CHECK)),
+        lint: worker.lint().map(str::to_owned),
+    }
+}
+
+/// The programs an acceptance runs a check through. `git` is not one: a backticked `git log`
+/// is a reference, and the tools run the read-only git commands by themselves.
+const CHECK_PROGRAMS: [&str; 34] = [
+    "cargo", "rustc", "python", "python3", "py", "pytest", "uv", "pip", "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "tsc", "go",
+    "make", "cmake", "ctest", "ninja", "just", "gradle", "gradlew", "mvn", "dotnet", "java", "zig", "swift", "ruby", "bundle", "php",
+    "composer", "bash",
+];
+
+/// The extensions of a script named by a relative path.
+const SCRIPT_EXTENSIONS: [&str; 5] = ["ps1", "sh", "py", "bat", "cmd"];
+
+/// Whether a backticked span is a command line: one line whose first token is a check program
+/// or a relative script path.
+fn is_command(span: &str) -> bool {
+    if span.lines().count() != 1 {
+        return false;
+    }
+    let Some(first) = span.split_whitespace().next() else { return false };
+    if CHECK_PROGRAMS.contains(&first) {
+        return true;
+    }
+    let is_script = Path::new(first).extension().and_then(|e| e.to_str()).is_some_and(|e| SCRIPT_EXTENSIONS.contains(&e));
+    let is_relative = !first.starts_with('/') && !first.starts_with('\\') && !first.contains(':');
+    is_script && is_relative
+}
+
+/// What one command of a check came to, for the notes and the activity log.
+struct CheckRun {
+    command: String,
+    passed: bool,
+    /// The last line of the output: `exit code N`, or why the command did not run.
+    exit: String,
+    /// The output as the notes keep it: the failures and the tail of a failed command, the
+    /// short tail of a passed one.
+    text: String,
+    failed_tests: usize,
+}
+
+/// How many lines of a passed command's output the notes keep.
+const PASSED_TAIL_LINES: usize = 5;
+
+/// Runs the checks of a card in the project directory, in the order written, and stops at the
+/// first failure; each command's verdict goes to the activity log as it comes.
+async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[String]) -> Vec<CheckRun> {
+    let mut runs = Vec::new();
+    for command in commands {
+        let outcome = match toolbox {
+            Ok(toolbox) => toolbox.check_acceptance(command).await,
+            Err(e) => Err(anyhow::anyhow!("{e:#}")),
+        };
+        let run = match outcome {
+            Ok((true, output)) => CheckRun {
+                command: command.clone(),
+                passed: true,
+                exit: output.lines().last().unwrap_or_default().to_owned(),
+                text: last_lines(&output, PASSED_TAIL_LINES),
+                failed_tests: 0,
+            },
+            Ok((false, output)) => {
+                let failure = check_failure(&output);
+                CheckRun {
+                    command: command.clone(),
+                    passed: false,
+                    exit: output.lines().last().unwrap_or_default().to_owned(),
+                    text: failure.text,
+                    failed_tests: failure.failed,
+                }
+            }
+            Err(e) => CheckRun { command: command.clone(), passed: false, exit: format!("{e:#}"), text: format!("{e:#}"), failed_tests: 0 },
+        };
+        tracing::info!(
+            target: crate::trace::PROGRESS,
+            "check {}: {} · {}",
+            if run.passed { "passed" } else { "failed" },
+            run.command,
+            run.exit
+        );
+        let stop = !run.passed;
+        runs.push(run);
+        if stop {
+            break;
+        }
+    }
+    runs
 }
 
 /// The last `n` lines of a text.

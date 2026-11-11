@@ -54,20 +54,23 @@ pub(crate) fn draw(ui: &mut Ui, sink: &Sink, show_debug: bool) {
     }
 }
 
-/// The rows a run card gets on the dashboard: enough to follow the work, never the page.
-const DASHBOARD_ROWS: f32 = 7.0;
+/// The rows a run card gets on the dashboard when the queue beside it is shorter: enough to
+/// follow the work, never the page.
+const DASHBOARD_ROWS: f32 = 3.0;
 
-/// The latest run's card alone, the live one before a finished one, for the dashboard;
-/// `false` when the session has run nothing yet.
-pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink) -> bool {
+/// The latest run's card alone, the live one before a finished one, for the dashboard, in
+/// `room` points of height at most (the queue beside it sets it); `false` when the session
+/// has run nothing yet.
+pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32) -> bool {
     let runs: Vec<(usize, u64, String)> = sink.with_lines(|lines| {
         lines.iter().enumerate().filter(|(_, l)| l.kind == Kind::Run).filter_map(|(i, l)| l.run.map(|id| (i, id, l.text.clone()))).collect()
     });
     let pick = runs.iter().rev().find(|(_, id, _)| sink.run(*id).is_some_and(|r| r.live())).or_else(|| runs.last());
     let Some((index, id, title)) = pick else { return false };
     let Some(run) = sink.run(*id) else { return false };
-    // a fixed room: in a scroll area the clip is the page, and a live card would take it all
-    run_card(ui, sink, *id, title, &run, *index, Some(96.0 + 24.0 * DASHBOARD_ROWS));
+    // a fixed room: in a scroll area the clip is the page, and a live card would take it all;
+    // the queue beside the card is the most it gets, the default rows the least
+    run_card(ui, sink, *id, title, &run, *index, Some(room.max(96.0 + 24.0 * DASHBOARD_ROWS)));
     true
 }
 
@@ -185,9 +188,11 @@ fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: us
             }
             ui.add_space(4.0);
             // a live card fills the console it is in, or the room the caller gives it; a
-            // finished one shrinks to its cap
+            // finished one shrinks to its cap. Room given is a bound: the card never grows
+            // past it, whatever its own height setting
+            let bounded = room.is_some();
             let room = room.unwrap_or_else(|| ui.clip_rect().height());
-            run_steps(ui, run, room);
+            run_steps(ui, run, room, bounded);
         })
         .response;
     if !run.folded() {
@@ -258,7 +263,7 @@ fn run_title(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, lane: Co
 /// The body of a run card: the latest steps at the run's height. A live run keeps its height,
 /// with the rows it has not filled yet left open; a finished one shrinks to its steps. The
 /// steps that fell off the top fold into one line that shows them on hover.
-fn run_steps(ui: &mut Ui, run: &Run, room: f32) {
+fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     let font = FontId::monospace(12.5);
     // a step that repeats the one before folds into it with a count at the end; the rows are
     // counted after the folding, so the card shows as many entries as it has rows for
@@ -274,7 +279,15 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32) {
     // cap or fewer
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let fit = ((room - 96.0) / 24.0).floor().max(0.0) as usize;
-    let body = if run.live() { height.max(fit) } else { height.min(folded.len().max(1)) };
+    let body = if bounded {
+        // the dashboard: the rows the room holds, and no more than the steps there are
+        let rows = fit.max(1);
+        if run.live() { rows } else { rows.min(folded.len().max(1)) }
+    } else if run.live() {
+        height.max(fit)
+    } else {
+        height.min(folded.len().max(1))
+    };
     let hidden = folded.len().saturating_sub(body);
     // the entries that fell off the top fold into one line, which takes a row of its own
     let skip = if hidden > 0 { hidden + 1 } else { 0 };

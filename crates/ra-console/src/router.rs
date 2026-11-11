@@ -93,6 +93,8 @@ impl fmt::Display for Rule {
 /// ```toml
 /// [worker]
 /// allow = ["rhtest", "Bash(ninja *)"]   # commands the worker may run here, on top of the defaults
+/// check = ".\\gw.ps1 :core:test"         # the check of a card whose acceptance names none
+/// lint = ""                             # the lint after a passed check; empty is none, absent is clippy
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -105,9 +107,28 @@ pub struct WorkerConfig {
     /// The environment the worker's harness runs with, on top of the agent's own.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// The check of a card whose acceptance names no command; the workspace tests without it.
+    #[serde(default)]
+    pub check: Option<String>,
+    /// The lint of what a run changed, once its check passed: absent, clippy over the changed
+    /// crates, as a Rust project wants; empty, no lint for this project; else this command.
+    #[serde(default)]
+    pub lint: Option<String>,
 }
 
 impl WorkerConfig {
+    /// The project's default check, when the table names a non-empty one.
+    #[must_use]
+    pub fn check(&self) -> Option<&str> {
+        self.check.as_deref().map(str::trim).filter(|c| !c.is_empty())
+    }
+
+    /// The project's lint: `None` leaves the lint to the agent, `Some("")` turns it off.
+    #[must_use]
+    pub fn lint(&self) -> Option<&str> {
+        self.lint.as_deref().map(str::trim)
+    }
+
     /// The permission rules of `allow`: a bare prefix becomes a rule for each shell.
     #[must_use]
     pub fn rules(&self) -> Vec<String> {
@@ -148,13 +169,50 @@ fn prefix_of(entry: &str) -> Option<String> {
     (!prefix.is_empty()).then(|| prefix.to_owned())
 }
 
-/// The rules of a project, in the order of the file, and its worker table.
+/// The `[role]` table: the model of each cheap role a run ends with. A key left out takes the
+/// local server when it answers a ping and no model call when it does not; an empty string turns
+/// the role off, whatever the server does.
+///
+/// ```toml
+/// [role]
+/// summary = "local/qwen3-8b"     # the report condensed for the handoff
+/// digest = "local/qwen3-8b"      # the run's line in the project's digest
+/// classify = ""                  # whether an untagged look-back is [machine]: off
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RoleConfig {
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub digest: Option<String>,
+    #[serde(default)]
+    pub classify: Option<String>,
+}
+
+impl RoleConfig {
+    /// The table's word on `role`: `None` left out, `Some("")` off, else the model.
+    #[must_use]
+    pub fn model(&self, role: ra_providers::local::Role) -> Option<&str> {
+        use ra_providers::local::Role;
+        match role {
+            Role::Summary => &self.summary,
+            Role::Digest => &self.digest,
+            Role::Classify => &self.classify,
+        }
+        .as_deref()
+        .map(str::trim)
+    }
+}
+
+/// The rules of a project, in the order of the file, its worker table and its role table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Router {
     #[serde(default, rename = "route")]
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub worker: WorkerConfig,
+    #[serde(default)]
+    pub role: RoleConfig,
 }
 
 /// Why a choice fell where it did.

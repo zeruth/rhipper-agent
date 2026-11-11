@@ -125,6 +125,433 @@ pub fn quit_requested() -> bool {
     quit.exists() && std::fs::remove_file(quit).is_ok()
 }
 
+/// A project's digest, under `digest/<project>.txt`: what it is doing, for the runs of the other
+/// projects to read as one line rather than its roadmap or its files. A run's end and a walk's
+/// start and end write it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Digest {
+    /// The project's directory name, which names the file too.
+    pub name: String,
+    pub path: String,
+    /// The process that wrote it, and when: a dead pid on a digest older than a day is stale.
+    pub pid: u32,
+    pub when: u64,
+    /// The live run or walk, when one is going: `#12 title · pid 4242 · started 10:04`.
+    pub live: Option<String>,
+    /// The last card that ended and how, as the paired feed's `end` line says it.
+    pub last: Option<String>,
+    pub ready: usize,
+    /// The files the last run changed.
+    pub changed: Vec<String>,
+}
+
+/// The longest a digest line gets in a system prompt: about fifty tokens a project.
+pub const DIGEST_WIDTH: usize = 160;
+
+/// A digest older than this whose writer is gone is dropped unread.
+const DIGEST_STALE: u64 = 24 * 60 * 60;
+
+/// The digests' directory under the hub.
+fn digest_dir() -> PathBuf {
+    dir().join("digest")
+}
+
+/// Writes `digest` for its project. A digest that cannot be written is nobody's failure: the
+/// run goes on, the other projects read the last one.
+pub fn write_digest(digest: &Digest) {
+    if let Err(e) = write_digest_in(&digest_dir(), digest) {
+        tracing::warn!("the project's digest was not written: {e:#}");
+    }
+}
+
+/// [`write_digest`] into the directory named, for the tests.
+///
+/// # Errors
+/// When the directory or the file cannot be written.
+pub fn write_digest_in(dir: &Path, digest: &Digest) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    use std::fmt::Write;
+    let one_line = |s: &str| s.replace(['\t', '\n'], " ");
+    let mut text =
+        format!("name: {}\npath: {}\npid: {}\nwhen: {}\n", one_line(&digest.name), one_line(&digest.path), digest.pid, digest.when);
+    if let Some(live) = &digest.live {
+        let _ = writeln!(text, "live: {}", one_line(live));
+    }
+    if let Some(last) = &digest.last {
+        let _ = writeln!(text, "last: {}", one_line(last));
+    }
+    let _ = writeln!(text, "ready: {}", digest.ready);
+    if !digest.changed.is_empty() {
+        let _ = writeln!(text, "changed: {}", digest.changed.join(" "));
+    }
+    std::fs::write(dir.join(format!("{}.txt", digest.name)), text).context("cannot write the project's digest")
+}
+
+/// Reads the digest `root` last wrote, so a walk's start keeps the last run's end and files.
+#[must_use]
+pub fn own_digest(root: &Path) -> Option<Digest> {
+    own_digest_in(&digest_dir(), root)
+}
+
+/// [`own_digest`] from the directory named, for the tests.
+#[must_use]
+pub fn own_digest_in(dir: &Path, root: &Path) -> Option<Digest> {
+    parse_digest(&std::fs::read_to_string(dir.join(format!("{}.txt", project_name(root)))).ok()?)
+}
+
+fn parse_digest(text: &str) -> Option<Digest> {
+    let mut digest = Digest::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(": ").or_else(|| line.strip_suffix(':').map(|k| (k, ""))) else { continue };
+        let value = value.trim();
+        match key {
+            "name" => value.clone_into(&mut digest.name),
+            "path" => value.clone_into(&mut digest.path),
+            "pid" => digest.pid = value.parse().ok()?,
+            "when" => digest.when = value.parse().ok()?,
+            "live" => digest.live = Some(value.to_owned()),
+            "last" => digest.last = Some(value.to_owned()),
+            "ready" => digest.ready = value.parse().ok()?,
+            "changed" => digest.changed = value.split_whitespace().map(str::to_owned).collect(),
+            _ => {}
+        }
+    }
+    (!digest.name.is_empty()).then_some(digest)
+}
+
+/// The other projects' digests as one line each, clipped at [`DIGEST_WIDTH`], for the system
+/// prompt of a run in `root`: the project's own is left out, and a stale one, whose writer is
+/// gone and which is older than a day, is dropped. Never their files or notes.
+#[must_use]
+pub fn digest_lines(root: &Path) -> Vec<String> {
+    digest_lines_with(&digest_dir(), root, pid_alive, unix_now())
+}
+
+/// [`digest_lines`] with the directory, the liveness check and the time named, for the tests.
+#[must_use]
+pub fn digest_lines_with(dir: &Path, root: &Path, alive: impl Fn(u32) -> bool, now: u64) -> Vec<String> {
+    let this = project_name(root);
+    digests_in(dir, alive, now).iter().filter(|digest| digest.name != this).map(digest_line).collect()
+}
+
+/// Every project's digest under the hub, this project's among them, by name; a stale one is
+/// dropped as in [`digest_lines`].
+#[must_use]
+pub fn digests() -> Vec<Digest> {
+    digests_in(&digest_dir(), pid_alive, unix_now())
+}
+
+/// [`digests`] from the directory named, with the liveness check and the time, for the tests.
+#[must_use]
+pub fn digests_in(dir: &Path, alive: impl Fn(u32) -> bool, now: u64) -> Vec<Digest> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "txt")).collect();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|file| parse_digest(&std::fs::read_to_string(file).ok()?))
+        .filter(|digest| {
+            let stale = now.saturating_sub(digest.when) > DIGEST_STALE && !alive(digest.pid);
+            if stale {
+                let _ = std::fs::remove_file(dir.join(format!("{}.txt", digest.name)));
+            }
+            !stale
+        })
+        .collect()
+}
+
+/// One digest as a line: the name and path, then the live run, the last end, the ready count and
+/// the changed files, whatever is there, clipped at the width.
+fn digest_line(digest: &Digest) -> String {
+    let mut parts = vec![format!("{} ({})", digest.name, digest.path)];
+    if let Some(live) = &digest.live {
+        parts.push(format!("live: {live}"));
+    }
+    if let Some(last) = &digest.last {
+        parts.push(format!("last: {last}"));
+    }
+    parts.push(format!("{} ready", digest.ready));
+    if !digest.changed.is_empty() {
+        parts.push(format!("changed: {}", digest.changed.join(" ")));
+    }
+    let line = parts.join(" · ");
+    if line.chars().count() <= DIGEST_WIDTH {
+        return line;
+    }
+    let mut clipped: String = line.chars().take(DIGEST_WIDTH - 1).collect();
+    clipped.push('…');
+    clipped
+}
+
+/// How a project is named in the hub: its directory's name.
+pub(crate) fn project_name(root: &Path) -> String {
+    std::fs::canonicalize(root)
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| String::from("-"))
+}
+
+/// One project's state in a read, as `rc status` prints it and the window's all-projects band
+/// shows it: the run the paired feed has open, judged by its pid, the last end, the ready count
+/// of the roadmap and today's calls from the ledger. Nothing of it is written anywhere.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Status {
+    pub name: String,
+    pub path: String,
+    pub run: Run,
+    /// The last card that ended and how, as the feed's `end` line says it.
+    pub last: Option<String>,
+    /// None without a roadmap to read.
+    pub ready: Option<usize>,
+    pub calls_today: u64,
+    pub spend_today: Option<f64>,
+}
+
+/// What the paired feed has open in a project.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Run {
+    #[default]
+    Idle,
+    /// A start with no end whose process lives, or carries no pid to judge: the start's text.
+    Live(String),
+    /// A start with no end whose process is gone: the window or the shell took the run with it.
+    Orphaned(String),
+}
+
+/// The most ledger rows a status reads back for today's calls: more than a day writes.
+const TODAY_ROWS: u32 = 5000;
+
+/// The status of the project at `root`, its ledger read when it has one.
+pub async fn status(root: &Path) -> Status {
+    // a project without a ledger gets none opened for it: the open would create the file
+    let ledger = root.join("var/usage.db");
+    let spends = if ledger.is_file() {
+        match ra_usage::UsageStore::open(&ledger).await {
+            Ok(ledger) => ledger.recent(0, TODAY_ROWS).await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    status_with(root, pid_alive, &spends, &day_of(unix_now()))
+}
+
+/// The status of every project the hub remembers, this one first: the window's open tabs and
+/// the digests' projects, each once, a directory that is gone left out.
+pub async fn statuses(root: &Path) -> Vec<Status> {
+    let mut roots: Vec<PathBuf> = vec![root.to_path_buf()];
+    roots.extend(recent());
+    roots.extend(digests().into_iter().map(|d| PathBuf::from(d.path)));
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut rows = Vec::new();
+    for root in roots {
+        let Ok(canonical) = std::fs::canonicalize(&root) else { continue };
+        if seen.contains(&canonical) {
+            continue;
+        }
+        seen.push(canonical);
+        rows.push(status(&root).await);
+    }
+    rows
+}
+
+/// [`status`] with the liveness check, the ledger's rows and the day named, for the tests.
+#[must_use]
+pub fn status_with(root: &Path, alive: impl Fn(u32) -> bool, spends: &[ra_usage::Spend], today: &str) -> Status {
+    let run = match crate::pair::live_start(root) {
+        Some((text, Some(pid))) if !alive(pid) => Run::Orphaned(text),
+        Some((text, _)) => Run::Live(text),
+        None => Run::Idle,
+    };
+    let ready = std::fs::read_to_string(root.join("rhipper.md")).ok().and_then(|text| {
+        let nodes = ra_roadmap::markdown::parse(&text).ok()?;
+        Some(ra_roadmap::tree::effective_states(&nodes).values().filter(|s| **s == ra_roadmap::model::TaskState::Ready).count())
+    });
+    let (calls_today, spend_today) = spend_on(spends, today);
+    let path = std::fs::canonicalize(root)
+        .map_or_else(|_| root.display().to_string(), |p| p.display().to_string().trim_start_matches(r"\\?\").to_owned());
+    Status { name: project_name(root), path, run, last: crate::pair::last_end(root), ready, calls_today, spend_today }
+}
+
+/// The calls and the dollars of the ledger rows written on `today` (`YYYY-MM-DD`, UTC, as the
+/// ledger stamps them); the cost is `None` when no call of the day reported one.
+#[must_use]
+pub fn spend_on(spends: &[ra_usage::Spend], today: &str) -> (u64, Option<f64>) {
+    spends
+        .iter()
+        .filter(|s| s.at.starts_with(today))
+        .fold((0, None), |(calls, cost), s| (calls + 1, s.cost_usd.map_or(cost, |c| Some(cost.unwrap_or(0.0) + c))))
+}
+
+/// The width of the run column of a status line.
+const RUN_WIDTH: usize = 44;
+
+impl Status {
+    /// The line of the status: the project, the run (or `idle`, or `orphaned: …`), the ready
+    /// count, today's calls and dollars, and the last end.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let run = match &self.run {
+            Run::Idle => String::from("idle"),
+            Run::Live(text) => clip(text, RUN_WIDTH),
+            Run::Orphaned(text) => clip(&format!("orphaned: {text}"), RUN_WIDTH),
+        };
+        let ready = self.ready.map_or(String::from("—"), |n| n.to_string());
+        let today = match (self.calls_today, self.spend_today) {
+            (0, _) => String::from("—"),
+            (calls, Some(cost)) => format!("{calls} calls ${cost:.2}"),
+            (calls, None) => format!("{calls} calls"),
+        };
+        // the end line's head says the card and how it ended; its tail is the cost, which `today` has
+        let last = self.last.as_deref().map_or("—", |last| last.split_once(" · ").map_or(last, |(head, _)| head));
+        format!("{:<20} {run:<RUN_WIDTH$} {ready:>5} {today:>16}  {last}", clip(&self.name, 20))
+    }
+
+    /// The header the lines go under.
+    #[must_use]
+    pub fn header() -> String {
+        format!("{:<20} {:<RUN_WIDTH$} {:>5} {:>16}  {}", "project", "run", "ready", "today", "last")
+    }
+}
+
+/// `text` within `width` characters, the last one `…` when it was longer.
+fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(width - 1).collect();
+    clipped.push('…');
+    clipped
+}
+
+/// A unix time as its UTC day, `YYYY-MM-DD`, the way the ledger stamps a row.
+#[must_use]
+pub fn day_of(when: u64) -> String {
+    // days to a civil date (Hinnant), the era of 400 years first
+    let z = i64::try_from(when / 86_400).unwrap_or(0) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// A lock under `locks/<name>.lock` in the hub, shared by every project on the machine: the
+/// cargo target two projects build in, around a check; the install directory, around
+/// `rc install` and `rc restart`. Dropping it, or the holder's death, releases it.
+pub struct Guard(#[allow(dead_code)] std::fs::File);
+
+/// The locks' directory under the hub.
+fn locks_dir() -> PathBuf {
+    dir().join("locks")
+}
+
+/// Takes the hub's lock `name` once: `Ok(None)` while another holder, in this process or
+/// another, has it.
+///
+/// # Errors
+/// When the lock file cannot be made or opened.
+pub fn try_guard(name: &str) -> anyhow::Result<Option<Guard>> {
+    try_guard_in(&locks_dir(), name)
+}
+
+/// [`try_guard`] in the directory named, for the tests.
+///
+/// # Errors
+/// When the lock file cannot be made or opened.
+pub fn try_guard_in(dir: &Path, name: &str) -> anyhow::Result<Option<Guard>> {
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot make {}", dir.display()))?;
+    let path = dir.join(format!("{name}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    // an OS lock on the open file, not the open itself: it goes with the holder, dead or done
+    match file.try_lock() {
+        Ok(()) => Ok(Some(Guard(file))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::new(e).context(format!("cannot lock {}", path.display()))),
+    }
+}
+
+/// Takes the hub's lock `name`, waiting on whoever holds it, `poll` between tries; `waited(n)`
+/// hears of the `n`th try that found it held, and a `false` from it gives up with `Ok(None)`.
+///
+/// # Errors
+/// When the lock file cannot be made or opened.
+pub fn guard_in(dir: &Path, name: &str, poll: std::time::Duration, mut waited: impl FnMut(u32) -> bool) -> anyhow::Result<Option<Guard>> {
+    let mut tries = 0;
+    loop {
+        if let Some(guard) = try_guard_in(dir, name)? {
+            return Ok(Some(guard));
+        }
+        tries += 1;
+        if !waited(tries) {
+            return Ok(None);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Takes the hub's lock `name`, waiting on whoever holds it. `None` only when the lock cannot be
+/// opened at all, which is said once and is nobody's failure: the caller goes on unguarded.
+#[must_use]
+pub fn guard(name: &str) -> Option<Guard> {
+    match guard_in(&locks_dir(), name, std::time::Duration::from_millis(200), |_| true) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!("the hub's lock {name} was not taken: {e:#}");
+            None
+        }
+    }
+}
+
+/// The lock `rc install` and `rc restart` take: two of them at once would set the same binary
+/// aside twice.
+pub const INSTALL_LOCK: &str = "install";
+
+/// The cargo target a check in `root` builds in: `CARGO_TARGET_DIR` when set (a relative one
+/// under `root`), else `target` under the outermost workspace above `root`, or `root` itself.
+#[must_use]
+pub fn cargo_target(root: &Path) -> PathBuf {
+    cargo_target_with(root, std::env::var_os("CARGO_TARGET_DIR").as_deref())
+}
+
+/// [`cargo_target`] with `CARGO_TARGET_DIR` as named, for the tests.
+#[must_use]
+pub fn cargo_target_with(root: &Path, target_dir: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(dir) = target_dir {
+        let dir = PathBuf::from(dir);
+        return if dir.is_absolute() { dir } else { root.join(dir) };
+    }
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let is_workspace =
+        |dir: &Path| std::fs::read_to_string(dir.join("Cargo.toml")).is_ok_and(|t| t.lines().any(|l| l.trim() == "[workspace]"));
+    root.ancestors().filter(|dir| is_workspace(dir)).last().unwrap_or(&root).join("target")
+}
+
+/// The name of the hub's lock on a cargo target: `target-<hash of the path>`, the same from
+/// every project that builds there.
+#[must_use]
+pub fn target_lock_name(target: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let mut text = target.display().to_string().trim_start_matches(r"\\?\").replace('\\', "/");
+    if cfg!(windows) {
+        text = text.to_lowercase();
+    }
+    let mut hasher = std::hash::DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("target-{:016x}", hasher.finish())
+}
+
 /// Starts the installed window on `project`, detached, or hands the project to the running
 /// one. Says which.
 ///
@@ -147,6 +574,8 @@ pub fn open(project: &Path) -> anyhow::Result<String> {
 /// # Errors
 /// When the window will not quit or the installed one cannot start.
 pub fn restart() -> anyhow::Result<String> {
+    // one install or restart at a time across the projects: the binary set aside once
+    let _install = guard(INSTALL_LOCK);
     let was_running = window_running();
     if was_running {
         request_quit()?;
@@ -207,6 +636,39 @@ pub fn detach(command: &mut std::process::Command) {
     }
 }
 
+/// Whether a process with this pid is running: on Windows asked of the process itself, elsewhere
+/// of `/proc`. A pid that cannot be asked counts as alive, so nothing is called gone on a doubt.
+#[must_use]
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn GetExitCodeProcess(handle: *mut std::ffi::c_void, code: *mut u32) -> i32;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        // SAFETY: a handle opened here is queried and closed here; a null one is not used
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                // no such process, or one this process may not look at: the latter is alive
+                return std::io::Error::last_os_error().raw_os_error() != Some(87);
+            }
+            let mut code = 0u32;
+            let asked = GetExitCodeProcess(handle, &raw mut code) != 0;
+            CloseHandle(handle);
+            !asked || code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+}
+
 /// Clears the inherit flag on this process's standard handles, so a detached child does not
 /// take the shell's pipes along.
 #[cfg(windows)]
@@ -231,3 +693,10 @@ fn keep_std_handles_private() {
 fn unix_nanos() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
 }
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests;

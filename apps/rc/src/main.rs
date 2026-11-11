@@ -141,6 +141,12 @@ enum Command {
     },
     /// The usage ledger: the calls, the tokens and the cost of every model, all time.
     Usage,
+    /// This project's state in one line: the live run (orphaned when its process is gone), the ready count, today's calls and the last end.
+    Status {
+        /// One line per project the hub remembers (the window's tabs, the digests), this one first.
+        #[arg(long)]
+        all: bool,
+    },
     /// Executes one task: the worker acts in the project directory and the answer lands in the node's notes.
     Run {
         /// The node id; left out with --next or --all.
@@ -212,7 +218,14 @@ enum Command {
     /// The gotchas that fired, by id, and the refused commands no gotcha names yet.
     Gotchas,
     /// The link to a paired session: the latest events of var/pair.log (a run's start and end, a walk's end, a note), which a pairing session watches.
-    Pair,
+    Pair {
+        /// Prints the events after this unix time instead of the last twenty, stamped, so a watch that expired catches up.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Keeps printing each new event as it lands, flushed, following the file by name across a rotation, until killed.
+        #[arg(long)]
+        follow: bool,
+    },
     /// Opens a project in the window: as a tab of the one running, or in a new window from the install directory.
     Open {
         /// The project directory; this one when left out.
@@ -349,6 +362,17 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             usage().await
         }
+        // a read of files only, no trace: it runs from any directory, a project or not
+        Command::Status { all } => {
+            use ra_console::hub::Status;
+            let rows =
+                if all { ra_console::hub::statuses(Path::new(".")).await } else { vec![ra_console::hub::status(Path::new(".")).await] };
+            println!("{}", Status::header());
+            for row in &rows {
+                println!("{}", row.line());
+            }
+            Ok(())
+        }
         Command::Run { id, next, all, stop_on_revision, model, budget, turns, no_debug, effort, dry } => {
             plain_tracing()?;
             if let Some(budget) = budget {
@@ -420,7 +444,18 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Pair => {
+        Command::Pair { since, follow } => {
+            if follow {
+                let mut out = std::io::stdout().lock();
+                ra_console::pair::follow(Path::new("."), since.unwrap_or(0), &mut out)?;
+                return Ok(());
+            }
+            if let Some(since) = since {
+                for event in ra_console::pair::since(Path::new("."), since) {
+                    println!("{event}");
+                }
+                return Ok(());
+            }
             let events = ra_console::pair::recent(Path::new("."), 20);
             if events.is_empty() {
                 println!("no events yet in {}; a run writes its start and its end there", ra_console::pair::PAIR_FILE);
@@ -428,7 +463,7 @@ async fn main() -> anyhow::Result<()> {
             for event in events {
                 println!("{event}");
             }
-            println!("\na pairing session watches {} (tail -F) and is told of each line", ra_console::pair::PAIR_FILE);
+            println!("\na pairing session follows it with `rc pair --follow --since <last seen>` and is told of each line");
             Ok(())
         }
         Command::Note { text } => {

@@ -411,6 +411,44 @@ pub fn tail_activity_at(path: &std::path::Path, offset: &mut u64, sink: &Sink) -
     true
 }
 
+/// Where a tab opened on a project starts tailing its activity file: at the newest `◆start`
+/// with no end whose process is alive, so a run `rc run` has going shows as its titled card,
+/// live from its first step, rather than as untitled steps; at the file's end when nothing
+/// runs, the earlier runs being history.
+#[must_use]
+pub fn attach_offset(path: &std::path::Path) -> u64 {
+    attach_offset_with(path, crate::hub::pid_alive)
+}
+
+/// [`attach_offset`] with the liveness check given, for the tests.
+#[must_use]
+pub fn attach_offset_with(path: &std::path::Path, alive: impl Fn(u32) -> bool) -> u64 {
+    let Ok(bytes) = std::fs::read(path) else { return 0 };
+    // the open starts, with where each begins; an end closes the newest, or the card it names
+    let mut open: Vec<(usize, Option<i64>, Option<u32>)> = Vec::new();
+    let mut at = 0;
+    for raw in bytes.split_inclusive(|b| *b == b'\n') {
+        let line = String::from_utf8_lossy(raw);
+        let line = line.trim_end_matches(['\r', '\n']);
+        if let Some(title) = line.strip_prefix(crate::logs::RUN_START) {
+            let pid = title.rsplit_once(" · pid ").and_then(|(_, pid)| pid.trim().parse().ok());
+            open.push((at, crate::logs::card_of(title), pid));
+        } else if let Some(outcome) = line.strip_prefix(crate::logs::RUN_END) {
+            let named = crate::logs::orphaned_card(outcome);
+            match named.and_then(|card| open.iter().rposition(|(_, of, _)| *of == Some(card))) {
+                Some(i) => {
+                    open.remove(i);
+                }
+                None => {
+                    open.pop();
+                }
+            }
+        }
+        at += raw.len();
+    }
+    open.into_iter().rev().find(|(_, _, pid)| pid.is_some_and(&alive)).map_or(bytes.len(), |(at, ..)| at) as u64
+}
+
 /// Whether screen row `y` lies inside `area`.
 fn contains_row(area: Rect, y: u16) -> bool {
     (area.y..area.y + area.height).contains(&y)

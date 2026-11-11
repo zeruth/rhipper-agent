@@ -119,3 +119,43 @@ fn a_search_keeps_the_hits_with_their_ancestors_and_enter_picks_the_first() {
     assert_eq!(first_match(&nodes, "search"), Some(7));
     assert_eq!(first_match(&nodes, ""), None);
 }
+
+#[test]
+fn a_tab_opened_during_a_run_attaches_at_its_start_and_shows_it_live() {
+    use crate::logs::{RUN_END, RUN_START};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("activity.log");
+    // nothing runs: the tab starts at the end, the finished runs are history
+    let done = format!("{RUN_START}#2 Finished · opus · pid 111\nread a.rs\n{RUN_END}✓ $0.01\n");
+    std::fs::write(&path, &done).unwrap();
+    assert_eq!(attach_offset_with(&path, |_| true), done.len() as u64);
+    assert_eq!(attach_offset_with(&dir.path().join("none"), |_| true), 0);
+    // `rc run 4` is going: the tab attaches at its start, after an orphan and an older build's
+    // start it cannot judge, and the run shows as its titled card, live from its first step
+    let orphan = format!("{RUN_START}#3 Killed with the window · opus · pid 222\nedit b.rs\n");
+    let live = format!("{RUN_START}#4 Going · opus · pid 333\n{RUN_START}#5 No pid · opus\n{RUN_END}✓\n");
+    std::fs::write(&path, format!("{done}{orphan}{live}Grep fn insert\n")).unwrap();
+    let mut offset = attach_offset_with(&path, |pid| pid == 333);
+    assert_eq!(offset, (done.len() + orphan.len()) as u64);
+    let sink = Sink::new();
+    assert!(tail_activity_at(&path, &mut offset, &sink));
+    let id = sink.live_run().unwrap();
+    assert_eq!(sink.run(id).unwrap().steps, ["Grep fn insert"]);
+    // the live card is titled, without the pid; the orphan before it is not shown, the finished
+    // run after it is history, closed
+    sink.with_lines(|lines| {
+        let run = lines.iter().find(|l| l.run == Some(id)).unwrap();
+        assert_eq!(run.text, "#4 Going · opus");
+        assert!(lines.iter().all(|l| !l.text.starts_with("#3")));
+    });
+    assert_eq!(sink.live_run(), Some(id));
+    // the window reporting the orphan it never showed closes nothing here
+    assert!(std::fs::OpenOptions::new().append(true).open(&path).is_ok_and(|mut f| {
+        use std::io::Write;
+        writeln!(f, "{RUN_END}✗ orphaned #3: process 222 is gone").is_ok()
+    }));
+    assert!(tail_activity_at(&path, &mut offset, &sink));
+    assert_eq!(sink.live_run(), Some(id));
+    // a dead pid is an orphan, not a run to attach to
+    assert_eq!(attach_offset_with(&path, |_| false), std::fs::metadata(&path).unwrap().len());
+}

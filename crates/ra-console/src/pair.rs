@@ -2,16 +2,18 @@
 //! and reviews this agent. The agent cannot push into such a session, but the session can
 //! watch a file; so the agent keeps `var/pair.log`, one line per event — a run's start, its
 //! end with the outcome, a walk's end, a note — and the pairing skill arms a watch on it first
-//! thing. `rc pair` prints the latest.
+//! thing. `rc pair` prints the latest; `rc pair --since <ts>` the ones after a time, and
+//! `--follow` keeps printing them, so a watch that expired catches up with what it missed.
 
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The feed, under the workspace: `time<TAB>text`.
 pub const PAIR_FILE: &str = "var/pair.log";
 
 /// Appends one event. A feed that cannot be written is nobody's failure: the run goes on.
 pub fn event(root: &Path, text: &str) {
-    use std::io::Write;
     let path = root.join(PAIR_FILE);
     let _ = std::fs::create_dir_all(root.join("var"));
     let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -27,18 +29,162 @@ pub fn recent(root: &Path, limit: usize) -> Vec<String> {
     lines[lines.len().saturating_sub(limit)..].to_vec()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The latest `end` event without its word: the last card that ended and how, for the
+/// project's digest; none while no run has ended.
+#[must_use]
+pub fn last_end(root: &Path) -> Option<String> {
+    recent(root, 50).into_iter().rev().find_map(|line| line.strip_prefix("end ").map(str::trim).map(str::to_owned))
+}
 
-    #[test]
-    fn the_feed_keeps_its_events_in_order_and_one_line_each() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(recent(dir.path(), 5).is_empty());
-        event(dir.path(), "start #7 A card · claude-fable-5-1");
-        event(dir.path(), "end #7 ✓ implemented\nwith a second line");
-        event(dir.path(), "note the tooltip is slow");
-        assert_eq!(recent(dir.path(), 2), ["end #7 ✓ implemented with a second line", "note the tooltip is slow"]);
-        assert_eq!(recent(dir.path(), 10).len(), 3);
+/// The run the feed has open: the latest `start` event with no `end` (or `run orphaned`) after
+/// it, without its word, and the pid its marker carries last; none while nothing runs. A start
+/// without a pid is from before the marker carried one, and its liveness cannot be judged.
+#[must_use]
+pub fn live_start(root: &Path) -> Option<(String, Option<u32>)> {
+    let open = recent(root, 50).into_iter().rev().find_map(|line| {
+        if line.starts_with("end ") || line.starts_with("run orphaned") {
+            return Some(None);
+        }
+        line.strip_prefix("start ").map(|text| Some(text.trim().to_owned()))
+    })??;
+    let pid = open.rsplit_once(" · pid ").and_then(|(_, pid)| pid.trim().parse().ok());
+    Some((open, pid))
+}
+
+/// The lines written after `since` (a unix time, exclusive), oldest first, as `time<TAB>text`
+/// so the reader knows where it got to.
+#[must_use]
+pub fn since(root: &Path, since: u64) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(root.join(PAIR_FILE)) else { return Vec::new() };
+    text.lines().filter(|l| after(l, since)).map(str::to_owned).collect()
+}
+
+/// Whether a feed line is stamped later than `since`; an unstamped line counts as new.
+fn after(line: &str, since: u64) -> bool {
+    line.split_once('\t').and_then(|(t, _)| t.parse::<u64>().ok()).is_none_or(|t| t > since)
+}
+
+/// A reader that follows the feed by name: each poll yields the whole lines written since the
+/// last one, and a file that shrank or went away (a rotation by rename) is read again from its
+/// start, so the new file's lines are not missed.
+pub struct Follower {
+    path: PathBuf,
+    since: u64,
+    offset: u64,
+    partial: Vec<u8>,
+}
+
+impl Follower {
+    /// Starts after `since`: the first poll replays what the file holds after that time.
+    #[must_use]
+    pub fn new(root: &Path, since: u64) -> Self {
+        Self { path: root.join(PAIR_FILE), since, offset: 0, partial: Vec::new() }
+    }
+
+    /// The whole lines appended since the last poll, stamped, later than `since`.
+    #[must_use]
+    pub fn poll(&mut self) -> Vec<String> {
+        let Ok(mut file) = std::fs::File::open(&self.path) else { return Vec::new() };
+        let len = file.metadata().map_or(0, |m| m.len());
+        if len < self.offset {
+            // the file was replaced: a rename rotation, read the new one whole
+            self.offset = 0;
+            self.partial.clear();
+        }
+        if std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut bytes = Vec::new();
+        let Ok(read) = file.read_to_end(&mut bytes) else { return Vec::new() };
+        self.offset += read as u64;
+        self.partial.extend_from_slice(&bytes);
+        let mut lines = Vec::new();
+        while let Some(end) = self.partial.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.partial[..end]).trim_end_matches('\r').to_owned();
+            self.partial.drain(..=end);
+            if after(&line, self.since) {
+                lines.push(line);
+            }
+        }
+        lines
     }
 }
+
+/// Prints the lines after `since`, then every new one as it lands, flushed, until the process
+/// is killed. Polls four times a second: a line shows within that of its write.
+///
+/// # Errors
+/// When `out` cannot be written: a closed pipe, which is how the follow ends.
+pub fn follow(root: &Path, since: u64, out: &mut impl Write) -> std::io::Result<()> {
+    let mut follower = Follower::new(root, since);
+    loop {
+        for line in follower.poll() {
+            writeln!(out, "{line}")?;
+        }
+        out.flush()?;
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The window has come up on this project: `window up <build> pid <pid> tabs <n>`, then one
+/// `run orphaned #id` per run in the activity log that started, never ended, and whose process
+/// is gone — a run the window took down with it. The run's end is written to the activity log
+/// too, so it is reported once and its bubble closes; a run whose process lives is left alone,
+/// the window owns no run's lifetime.
+pub fn window_up(root: &Path, build: &str, tabs: usize) {
+    window_up_with(root, build, tabs, crate::hub::pid_alive);
+}
+
+/// [`window_up`] with the liveness check given, for the tests.
+pub fn window_up_with(root: &Path, build: &str, tabs: usize, alive: impl Fn(u32) -> bool) {
+    event(root, &format!("window up {build} pid {} tabs {tabs}", std::process::id()));
+    let activity_path = root.join(crate::ui::ACTIVITY_FILE);
+    let activity = std::fs::read_to_string(&activity_path).unwrap_or_default();
+    let orphaned = orphans(&activity, alive);
+    if orphaned.is_empty() {
+        return;
+    }
+    let mut log = std::fs::OpenOptions::new().append(true).open(&activity_path).ok();
+    for (id, pid) in orphaned {
+        event(root, &format!("run orphaned #{id}"));
+        if let Some(log) = log.as_mut() {
+            let _ = writeln!(log, "{}✗ orphaned #{id}: process {pid} is gone", crate::logs::RUN_END);
+        }
+    }
+}
+
+/// The window has gone from this project: `window down <reason>`, the reason `restart` under
+/// `rc restart`, `close` when the person closed it.
+pub fn window_down(root: &Path, reason: &str) {
+    event(root, &format!("window down {reason}"));
+}
+
+/// The runs in the activity text that started with a pid, were not ended, and whose process is
+/// gone by `alive`: `(card, pid)` in the order they started. An end marker closes the newest
+/// open run, as the log pane does, unless it is an orphan's end, which names its card; a start
+/// without a pid cannot be judged and is not.
+fn orphans(activity: &str, alive: impl Fn(u32) -> bool) -> Vec<(i64, u32)> {
+    let mut open: Vec<(i64, Option<u32>)> = Vec::new();
+    for line in activity.lines() {
+        if let Some(title) = line.strip_prefix(crate::logs::RUN_START) {
+            let pid = title.rsplit_once(" · pid ").and_then(|(_, pid)| pid.trim().parse().ok());
+            if let Some(id) = crate::logs::card_of(title) {
+                open.push((id, pid));
+            }
+        } else if let Some(outcome) = line.strip_prefix(crate::logs::RUN_END) {
+            let named = crate::logs::orphaned_card(outcome);
+            match named.and_then(|id| open.iter().rposition(|(open_id, _)| *open_id == id)) {
+                Some(at) => {
+                    open.remove(at);
+                }
+                None => {
+                    open.pop();
+                }
+            }
+        }
+    }
+    open.into_iter().filter_map(|(id, pid)| pid.map(|pid| (id, pid))).filter(|(_, pid)| !alive(*pid)).collect()
+}
+
+#[cfg(test)]
+mod tests;

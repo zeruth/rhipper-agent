@@ -8,6 +8,7 @@
 
 pub mod claude_code;
 pub mod limits;
+pub mod local;
 pub mod openrouter;
 
 use std::future::Future;
@@ -105,6 +106,11 @@ pub fn turns_for(complexity: u8) -> u32 {
         _ => 90,
     }
 }
+
+/// The share of the plan's five-hour window left under which the window is tight: a walk then
+/// takes the smallest ready card first, so what is left of the window finishes cards whole
+/// rather than starting a large one it cannot end.
+pub const TIGHT_SHARE: f64 = 0.25;
 
 /// One answer, with the usage the provider reported.
 #[derive(Debug, Clone)]

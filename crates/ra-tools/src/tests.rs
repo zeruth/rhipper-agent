@@ -139,6 +139,8 @@ async fn a_scripted_toolbox_answers_a_command_from_the_script() {
     assert_eq!(tools.check("cargo test").await.unwrap(), (true, "ran cargo test\nexit code 0".to_owned()));
     assert!(!tools.check("cargo clippy").await.unwrap().0, "exit code 101 is a failed check");
     assert!(tools.check("rm -rf /").await.is_err(), "the allowlist comes before the script");
+    // an acceptance's own check is the person's command: it runs past the allowlist
+    assert_eq!(tools.check_acceptance("python tools/x.py").await.unwrap(), (false, "ran python tools/x.py\nexit code 101".to_owned()));
 }
 
 #[test]

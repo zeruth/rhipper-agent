@@ -1,0 +1,12 @@
+# The project's agent settings, beside rhipper.md: `[[route]]` rules, the `[worker]` table and
+# the `[role]` table. A key left out keeps the default.
+
+[role]
+# The model of each cheap role a run ends with. A key left out goes to the local server at
+# RHIPPER_LOCAL_URL (default http://127.0.0.1:8080/v1) when it answers a ping, under
+# `local/<the first model it lists>`, and to no model call at all when it does not; an empty
+# string turns the role off whatever the server does. The calls land in `rc usage` under the
+# role's model.
+# summary = "local/qwen3-8b"     # the worker's report condensed for the handoff of the card
+# digest = "local/qwen3-8b"      # the run's one-line digest for the other projects on the machine
+# classify = "local/qwen3-8b"    # whether a look-back bullet without its tag is [machine]
