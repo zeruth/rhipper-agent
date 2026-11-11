@@ -317,6 +317,14 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
         height.min(folded.len().max(1))
     };
     let hidden = folded.len().saturating_sub(body);
+    // a bounded card spreads what is left under a whole number of rows between them, so the
+    // rows end on the card's bottom edge instead of a part of a row short of it; the spacing
+    // is this card's alone
+    if bounded {
+        let rows = (body + usize::from(hidden > 0)) as f32;
+        let extra = ((room - rows * row) / rows).clamp(0.0, row);
+        ui.spacing_mut().item_spacing.y += extra;
+    }
     // the entries that fell off the top fold into one line, which takes a row of its own
     let skip = if hidden > 0 { hidden + 1 } else { 0 };
     if hidden > 0 {
