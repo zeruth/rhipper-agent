@@ -319,6 +319,50 @@ async fn checked_run(passing: bool) -> (Vec<String>, ra_roadmap::model::Node) {
     (out, node)
 }
 
+/// Three tasks under the root, #4 waiting on #3, in a project whose check passes or fails.
+async fn three_cards(dir: &std::path::Path, passing: bool) -> Store {
+    cargo_project(dir, passing);
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    for title in ["A", "B", "C"] {
+        run(&format!("add task {title} parent 1"), &store, &worker()).await.unwrap();
+    }
+    store.depend_on(4, 3).await.unwrap();
+    store
+}
+
+#[tokio::test]
+async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = three_cards(dir.path(), true).await;
+    let script = Scripted::new(vec![says("did A", vec![]), says("did B", vec![]), says("did C", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    // #4 is not ready while #3 is open; it runs once #3 is implemented, after #2 and #3
+    let ran: Vec<&String> = out.iter().filter(|l| l.starts_with('✓')).collect();
+    assert_eq!(ran.len(), 3, "{out:?}");
+    assert!(ran[0].starts_with("✓ #2 A implemented"), "{out:?}");
+    assert!(ran[1].starts_with("✓ #3 B implemented"), "{out:?}");
+    assert!(ran[2].starts_with("✓ #4 C implemented"), "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 3 card(s) · no card is ready");
+    // each card got its own answer in its notes, so each run was a run of its own
+    assert_eq!(store.read(2).await.unwrap().notes.as_deref(), Some("did A"));
+    assert_eq!(store.read(4).await.unwrap().notes.as_deref(), Some("did C"));
+    assert_eq!(script.seen.lock().len(), 3);
+}
+
+#[tokio::test]
+async fn run_all_stops_at_a_card_that_needs_revision_when_told_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = three_cards(dir.path(), false).await;
+    let script = Scripted::new(vec![says("did A", vec![]), says("did B", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let out = crate::agent::run_all(&store, &runner, true).await.unwrap();
+    assert_eq!(out.last().unwrap(), "ran 1 card(s) · stopped: #2 needs revision");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+    assert_eq!(store.read(3).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
+    assert_eq!(script.seen.lock().len(), 1);
+}
+
 #[tokio::test]
 async fn a_dry_run_prints_the_prompt_and_leaves_the_card_as_it_was() {
     let dir = tempfile::tempdir().unwrap();

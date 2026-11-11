@@ -346,6 +346,62 @@ pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<
     outcome.map(|(lines, _, _)| lines)
 }
 
+/// Runs the first ready card, the one `rc next` names; a line says so when none is.
+///
+/// # Errors
+/// When the roadmap cannot be read, or the run fails.
+pub async fn run_next(store: &Store, worker: &Worker) -> anyhow::Result<Vec<String>> {
+    let nodes = store.all().await?;
+    match tree::next_ready(&nodes) {
+        Some(node) => run(store, node.id, worker).await,
+        None => Ok(vec!["no card is ready".to_owned()]),
+    }
+}
+
+/// Runs the ready cards one after another, reading readiness again after each, until none is
+/// ready or a run fails; with `stop_on_revision` a card that needs revision stops the batch too.
+/// Each run is its own bubble and its own handoff, through [`run`]. A failed run ends the batch
+/// with its reason on the last line rather than as an error, so the runs before it keep their
+/// lines.
+///
+/// # Errors
+/// When the roadmap cannot be read between runs.
+pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let mut ran = 0;
+    loop {
+        let nodes = store.all().await?;
+        let Some(id) = batch_ready(&nodes).map(|n| n.id) else {
+            lines.push(format!("ran {ran} card(s) · no card is ready"));
+            return Ok(lines);
+        };
+        match run(store, id, worker).await {
+            Ok(run_lines) => lines.extend(run_lines),
+            Err(error) => {
+                lines.push(format!("ran {ran} card(s) · stopped: the run of #{id} failed: {error:#}"));
+                return Ok(lines);
+            }
+        }
+        ran += 1;
+        if stop_on_revision && store.read(id).await?.state == TaskState::NeedsRevision {
+            lines.push(format!("ran {ran} card(s) · stopped: #{id} needs revision"));
+            return Ok(lines);
+        }
+    }
+}
+
+/// The first card a batch runs, in tree order: a defined task whose waits-on are each accepted or
+/// implemented. Implemented counts beside accepted here, unlike in [`tree::next_ready`]: the cards
+/// the batch implements are not accepted until the person reviews, and their dependents are what
+/// the batch is meant to run ahead of that review. A card whose waits-on failed, left the roadmap
+/// or are still open is not picked, so every pick moves a card out of defined and the loop ends.
+fn batch_ready(nodes: &[Node]) -> Option<&Node> {
+    let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && matches!(d.state, TaskState::Accepted | TaskState::Implemented));
+    nodes
+        .iter()
+        .find(|n| n.state == TaskState::Defined && matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.depends_on.iter().all(met))
+}
+
 /// The work of [`run`], with the cost of the session and the count of the gotchas it hit beside
 /// the log lines.
 async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<(Vec<String>, Option<f64>, usize)> {

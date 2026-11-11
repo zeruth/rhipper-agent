@@ -76,8 +76,20 @@ enum Command {
     Usage,
     /// Executes one task: the worker acts in the project directory and the answer lands in the node's notes.
     Run {
-        /// The node id.
-        id: i64,
+        /// The node id; left out with --next or --all.
+        #[arg(required_unless_present_any = ["next", "all"])]
+        id: Option<i64>,
+        /// Runs the first ready card, the one `rc next` names.
+        #[arg(long, conflicts_with_all = ["id", "all"])]
+        next: bool,
+        /// Runs the ready cards one after another, reading readiness again after each, until none
+        /// is ready or a run fails; a card implemented by the batch counts as met for the cards
+        /// that wait on it.
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+        /// With --all: a card that needs revision stops the batch too.
+        #[arg(long, requires = "all")]
+        stop_on_revision: bool,
         /// The model for this run; left out, the node's own model, else the default.
         #[arg(long)]
         model: Option<String>,
@@ -195,26 +207,31 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             usage().await
         }
-        Command::Run { id, model, budget, turns, no_debug, effort, dry } => {
+        Command::Run { id, next, all, stop_on_revision, model, budget, turns, no_debug, effort, dry } => {
             plain_tracing()?;
             if let Some(budget) = budget {
                 anyhow::ensure!(budget.is_finite() && budget > 0.0, "the budget is a positive number of dollars");
             }
             anyhow::ensure!(turns != Some(0), "the turn cap is at least one");
+            anyhow::ensure!(!(dry && (next || all)), "--dry takes a node id: a dry run sends nothing and picks nothing");
             let store = open_store().await?;
-            let picked = match model {
-                Some(model) => model,
-                None => store.read(id).await?.assignee.map_or_else(|| ra_console::ui::DEFAULT_MODEL.to_owned(), |a| a.model),
+            // a card named by id runs on its own model unless one is given; --next and --all run
+            // on the given model, else the default
+            let picked = match (model, id) {
+                (Some(model), _) => model,
+                (None, Some(id)) => store.read(id).await?.assignee.map_or_else(|| ra_console::ui::DEFAULT_MODEL.to_owned(), |a| a.model),
+                (None, None) => ra_console::ui::DEFAULT_MODEL.to_owned(),
             };
             let mut worker =
                 Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns).with_effort(effort);
             if no_debug {
                 worker = worker.with_debug(false);
             }
-            let lines = if dry {
-                ra_console::agent::dry_run(&store, id, &worker).await?
-            } else {
-                ra_console::agent::run(&store, id, &worker).await?
+            let lines = match id {
+                Some(id) if dry => ra_console::agent::dry_run(&store, id, &worker).await?,
+                Some(id) => ra_console::agent::run(&store, id, &worker).await?,
+                None if all => ra_console::agent::run_all(&store, &worker, stop_on_revision).await?,
+                None => ra_console::agent::run_next(&store, &worker).await?,
             };
             for line in lines {
                 println!("{line}");

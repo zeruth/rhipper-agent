@@ -140,9 +140,7 @@ fn rows_of(
     // the children, embedded: each child's box is two columns narrower, this card's outline runs
     // down both sides of it, and a blank line of the card separates the parent from its children
     // and each child from the next
-    if !folded_here
-        && let Some(kids) = shape.children.get(&id)
-    {
+    if !folded_here && let Some(kids) = shape.children.get(&id) {
         for kid in kids {
             rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(Vec::new(), width, outline_style) });
             for row in rows_of(kid, shape, folded, selected, chain, hover_button, depth + 1, width.saturating_sub(2)) {
