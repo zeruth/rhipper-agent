@@ -66,6 +66,33 @@ async fn sets_states() {
 }
 
 #[tokio::test]
+async fn assign_sets_and_clears_the_model_of_a_node() {
+    let store = store().await;
+    run("add task T parent 1", &store, &worker()).await.unwrap();
+    let (out, _) = run("assign 2 claude-haiku-4-5", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["#2 runs on claude-haiku-4-5 through ClaudeCode"]);
+    assert_eq!(store.read(2).await.unwrap().assignee.unwrap().model, "claude-haiku-4-5");
+    let (out, _) = run("assign 2 none", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["#2 runs on the badge model"]);
+    assert!(store.read(2).await.unwrap().assignee.is_none());
+}
+
+#[tokio::test]
+async fn run_honors_the_model_of_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task T parent 1", &store, &worker()).await.unwrap();
+    run("assign 2 z-ai/glm-5.3-flash", &store, &worker()).await.unwrap();
+    let provider = Scripted::new(vec![says("done", Vec::new())]);
+    // the badge is another OpenRouter model, so the scripted provider serves both; the node's
+    // own model is what the request names
+    let worker = Worker::new("deepseek/deepseek-v4-flash").with_provider(provider.clone());
+    let (out, _) = run("run 2", &store, &worker).await.unwrap();
+    assert!(out[0].contains("on glm-5.3-flash"), "{out:?}");
+    assert_eq!(provider.seen.lock()[0].model, "z-ai/glm-5.3-flash");
+}
+
+#[tokio::test]
 async fn completes_names() {
     assert_eq!(complete("se"), ["set", "seed"]);
     assert_eq!(complete("q"), ["quit"]);

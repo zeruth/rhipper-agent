@@ -29,6 +29,7 @@ pub const COMMANDS: &[Spec] = &[
         usage: "<id>",
         help: "the model of the next worker session: a claude-* id runs on Claude Code, vendor/model on OpenRouter",
     },
+    Spec { name: "assign", usage: "<id> <model|none>", help: "the model one node runs on, over the badge; none clears it" },
     Spec { name: "key", usage: "[<paste> | clear]", help: "stores, shows the state of, or clears the OpenRouter key" },
     Spec { name: "ping", usage: "", help: "one round trip to the badge model" },
     Spec { name: "run", usage: "<id>", help: "executes one roadmap task on the badge model" },
@@ -164,7 +165,24 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
         }
         "run" => {
             let id = args.parse::<i64>().context("usage: run <id>")?;
-            return Ok((agent::run(store, id, worker).await?, Outcome::Continue));
+            // a node with a model of its own runs on it; the badge is the default
+            let mut runner = worker.clone();
+            if let Some(assignment) = store.read(id).await?.assignee {
+                runner.model = assignment.model;
+            }
+            return Ok((agent::run(store, id, &runner).await?, Outcome::Continue));
+        }
+        "assign" => {
+            let (id_text, model) = args.split_once(char::is_whitespace).context("usage: assign <id> <model|none>")?;
+            let id = id_text.parse::<i64>().context("the id is a node id")?;
+            let model = model.trim();
+            let assignment =
+                (model != "none").then(|| ra_roadmap::model::Assignment { model: model.to_owned(), role: "implementer".to_owned() });
+            store.assign(id, assignment.as_ref()).await?;
+            out.push(match &assignment {
+                Some(a) => format!("#{id} runs on {} through {:?}", a.model, agent::Route::of(&a.model)),
+                None => format!("#{id} runs on the badge model"),
+            });
         }
         "reassess" | "reassess-tree" => {
             let id = args.parse::<i64>().context(format!("usage: {name} <id>"))?;

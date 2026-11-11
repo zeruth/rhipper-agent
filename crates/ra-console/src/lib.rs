@@ -5,9 +5,14 @@
 
 pub mod agent;
 pub mod commands;
+pub mod instance;
 pub mod logs;
+pub mod mcp;
 pub mod roadmap_pane;
 pub mod secret;
 pub mod theme;
 pub mod trace;
 pub mod ui;
+
+/// The build version, `0.1.<commits>+<hash>`, with `.dirty` when the tree had uncommitted changes.
+pub const VERSION: &str = env!("RA_VERSION");

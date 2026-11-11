@@ -22,4 +22,5 @@ ra-providers.workspace = true
 ra-roadmap.workspace = true
 ra-usage.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true

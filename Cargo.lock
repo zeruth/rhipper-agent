@@ -1673,6 +1673,7 @@ dependencies = [
  "ra-tools",
  "ra-usage",
  "ratatui",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -1879,6 +1880,7 @@ dependencies = [
  "ra-roadmap",
  "ra-usage",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

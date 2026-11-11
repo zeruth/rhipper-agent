@@ -126,7 +126,7 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
         log_card: 12,
         job: None,
     };
-    sink.push(Kind::Banner, format!("Rhipper Agent v{} — Tyler Bochard. Type help for commands.", env!("CARGO_PKG_VERSION")));
+    sink.push(Kind::Banner, format!("Rhipper Agent {} — Tyler Bochard. Type help for commands.", crate::VERSION));
     // the slow calls report their completion here, so the status above the prompt can stop
     let (job_tx, mut job_done) = mpsc::unbounded_channel::<()>();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -209,6 +209,10 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                 dirty = true;
             }
             _ = tick.tick() => {
+                // another console, or the launch script, asked this one to leave
+                if crate::instance::quit_requested() {
+                    break Ok(());
+                }
                 app.ticks = app.ticks.wrapping_add(1);
                 // the marquee walks a step every fourth tick, a pace the eye follows
                 if app.ticks % 4 == 0 && app.worker.model.chars().count() + 3 > 14 {
@@ -720,7 +724,7 @@ fn status_line(app: &App) -> Line<'static> {
         Span::styled(" ✦ ", Style::new().fg(theme::ACCENT).bold()),
         Span::styled("Rhipper", Style::new().fg(theme::ACCENT).bold()),
         Span::styled(" Agent", Style::new().fg(theme::TEXT).bold()),
-        Span::styled(format!(" {}", env!("CARGO_PKG_VERSION")), dim),
+        Span::styled(format!(" {}", crate::VERSION), dim),
         sep(),
         Span::styled(format!("up {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60), dim),
     ])

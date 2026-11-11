@@ -11,7 +11,7 @@ use ra_roadmap::tree;
 use ra_usage::UsageStore;
 
 #[derive(Parser)]
-#[command(name = "rc", version, about = "Rhipper Agent: the roadmap-driven multi-model development orchestrator")]
+#[command(name = "rc", version = ra_console::VERSION, about = "Rhipper Agent: the roadmap-driven multi-model development orchestrator")]
 struct Options {
     #[command(subcommand)]
     command: Command,
@@ -64,8 +64,27 @@ enum Command {
     },
     /// The usage ledger: the calls, the tokens and the cost of every model, all time.
     Usage,
+    /// Executes one task: the worker acts in the project directory and the answer lands in the node's notes.
+    Run {
+        /// The node id.
+        id: i64,
+        /// The model for this run; left out, the node's own model, else the default.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Starts the console over the orchestrator.
     Console {
+        /// The roadmap file.
+        #[arg(long, default_value = "rhipper.md")]
+        roadmap: PathBuf,
+        /// Tells a running console to quit first, and kills it when it does not.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Tells a running console to quit, without starting one.
+    Stop,
+    /// Serves the roadmap and the workers over MCP on stdin and stdout, for a client such as Claude Code.
+    Mcp {
         /// The roadmap file.
         #[arg(long, default_value = "rhipper.md")]
         roadmap: PathBuf,
@@ -104,7 +123,30 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             usage().await
         }
-        Command::Console { roadmap } => console(roadmap).await,
+        Command::Run { id, model } => {
+            plain_tracing()?;
+            let store = open_store().await?;
+            let picked = match model {
+                Some(model) => model,
+                None => store.read(id).await?.assignee.map_or_else(|| ra_console::ui::DEFAULT_MODEL.to_owned(), |a| a.model),
+            };
+            let worker = Worker::new(picked).with_ledger(open_ledger().await?);
+            for line in ra_console::agent::run(&store, id, &worker).await? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Command::Stop => {
+            println!("{}", ra_console::instance::stop_running().unwrap_or_else(|| "no console is running".to_owned()));
+            Ok(())
+        }
+        Command::Mcp { roadmap } => {
+            plain_tracing()?;
+            let store = Store::open(&roadmap, "Rhipper Agent").await?;
+            let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
+            ra_console::mcp::serve(store, worker).await
+        }
+        Command::Console { roadmap, replace } => console(roadmap, replace).await,
     }
 }
 
@@ -231,15 +273,22 @@ async fn set(id: i64, state: TaskState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn console(roadmap: PathBuf) -> anyhow::Result<()> {
+async fn console(roadmap: PathBuf, replace: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all("var")?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open("var/console.log")?;
     let store = Store::open(&roadmap, "Rhipper Agent").await?;
     if !ra_console::ui::is_terminal() {
         anyhow::bail!("the console needs a terminal");
     }
+    let replaced = if replace { ra_console::instance::stop_running() } else { None };
+    ra_console::instance::claim()?;
     let sink = ra_console::logs::Sink::new();
     ra_console::trace::init(log, Some(sink.clone()));
+    if let Some(what) = replaced {
+        tracing::info!("{what}");
+    }
     let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
-    ra_console::ui::run(store, worker, sink).await
+    let result = ra_console::ui::run(store, worker, sink).await;
+    ra_console::instance::release();
+    result
 }
