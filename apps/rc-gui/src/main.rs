@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
-use egui::{Align, Color32, CornerRadius, FontId, Frame, Key, Layout, Margin, RichText, Stroke, TextStyle};
+use egui::{Align, Color32, CornerRadius, FontId, Frame, Key, Layout, Margin, Modifiers, RichText, Stroke, TextStyle};
 use ra_console::agent::Worker;
 use ra_console::commands::{self, Outcome};
 use ra_console::logs::{Kind, Sink};
@@ -97,6 +97,12 @@ struct App {
     /// The states whose tasks the roadmap column leaves out; the chips above it toggle them.
     hidden_states: HashSet<TaskState>,
     folded: HashSet<i64>,
+    /// What the search box above the tree holds; a row stays while its title or id contains it.
+    search: String,
+    /// The rows the roadmap column drew last frame, top to bottom: what the arrow keys walk.
+    visible_rows: Vec<i64>,
+    /// A row the keyboard just picked, to scroll into view as it draws.
+    scroll_to: Option<i64>,
     input: String,
     history: Vec<String>,
     browsing: Option<usize>,
@@ -180,6 +186,9 @@ impl App {
             followed: None,
             hidden_states: HashSet::new(),
             folded: HashSet::new(),
+            search: String::new(),
+            visible_rows: Vec::new(),
+            scroll_to: None,
             input: String::new(),
             history: Vec::new(),
             browsing: None,
@@ -273,6 +282,86 @@ impl App {
         self.selected = id;
         let node = id.and_then(|id| self.roadmap.iter().find(|n| n.id == id));
         self.assign_model = node.and_then(|n| n.assignee.as_ref()).map(|a| a.model.clone()).unwrap_or_default();
+    }
+
+    /// The keys of the roadmap column: Up and Down move the selection along the rows shown,
+    /// Left and Right fold and unfold, Enter runs the selected card. `sideways` is off while a
+    /// text field holds the caret, so Left and Right stay with it.
+    fn roadmap_keys(&mut self, ctx: &egui::Context, sideways: bool) {
+        let (up, down, left, right, enter) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                sideways && i.consume_key(Modifiers::NONE, Key::ArrowLeft),
+                sideways && i.consume_key(Modifiers::NONE, Key::ArrowRight),
+                i.consume_key(Modifiers::NONE, Key::Enter),
+            )
+        });
+        if up {
+            self.step_selection(-1);
+        }
+        if down {
+            self.step_selection(1);
+        }
+        if left {
+            self.fold_selected();
+        }
+        if right {
+            self.unfold_selected();
+        }
+        if enter
+            && let Some(node) = self.selected.and_then(|id| self.roadmap.iter().find(|n| n.id == id))
+            && node.kind != NodeKind::Project
+        {
+            let line = format!("run {}", node.id);
+            self.submit(ctx, line);
+        }
+    }
+
+    /// Moves the selection `step` rows along the rows shown; from no selection, to the first
+    /// or the last.
+    fn step_selection(&mut self, step: isize) {
+        if self.visible_rows.is_empty() {
+            return;
+        }
+        let last = self.visible_rows.len() - 1;
+        let at = self.selected.and_then(|id| self.visible_rows.iter().position(|r| *r == id));
+        let next = match at {
+            None if step > 0 => 0,
+            None => last,
+            Some(i) => i.saturating_add_signed(step).min(last),
+        };
+        let id = self.visible_rows[next];
+        self.select(Some(id));
+        self.scroll_to = Some(id);
+    }
+
+    /// Left: folds the selected row while it has children to hide; otherwise climbs to its parent.
+    fn fold_selected(&mut self) {
+        let Some(id) = self.selected else { return };
+        let searching = !self.search.trim().is_empty();
+        let has_children = self.roadmap.iter().any(|n| n.parent == Some(id));
+        if has_children && !searching && !self.folded.contains(&id) {
+            self.folded.insert(id);
+            return;
+        }
+        if let Some(parent) = self.roadmap.iter().find(|n| n.id == id).and_then(|n| n.parent) {
+            self.select(Some(parent));
+            self.scroll_to = Some(parent);
+        }
+    }
+
+    /// Right: unfolds the selected row; already open, steps into its first child shown.
+    fn unfold_selected(&mut self) {
+        let Some(id) = self.selected else { return };
+        if self.folded.remove(&id) {
+            return;
+        }
+        let child = self.roadmap.iter().find(|n| n.parent == Some(id) && self.visible_rows.contains(&n.id)).map(|n| n.id);
+        if let Some(child) = child {
+            self.select(Some(child));
+            self.scroll_to = Some(child);
+        }
     }
 
     /// Runs one command line, the way the console does: a slow call goes to the runtime and
@@ -462,7 +551,12 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("ROADMAP").small().strong().color(theme::DIM));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(format!("{} cards", self.roadmap.len())).small().color(theme::DIM));
+                let count = if self.search.trim().is_empty() {
+                    format!("{} cards", self.roadmap.len())
+                } else {
+                    format!("{} of {} cards", self.visible_rows.len(), self.roadmap.len())
+                };
+                ui.label(RichText::new(count).small().color(theme::DIM));
             });
         });
         // the filters: one chip per state the roadmap holds; a dim chip hides its tasks
@@ -482,27 +576,61 @@ impl App {
                 }
             });
         }
+        // the search box: a row stays while its title or id contains the text; its ancestors
+        // stay with it, and the folds stand aside until the box is empty again
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("⌕").color(theme::DIM).size(16.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if !self.search.is_empty()
+                    && ui.small_button(RichText::new("×").color(theme::DIM)).on_hover_text("clear the search (Escape)").clicked()
+                {
+                    self.search.clear();
+                }
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text(RichText::new("search by title or id").color(theme::DIM).italics())
+                        .desired_width(ui.available_width())
+                        .frame(Frame::new()),
+                );
+                let focused = response.has_focus() || response.lost_focus();
+                if focused {
+                    // Escape empties the box; Up, Down and Enter walk and run the rows under it
+                    if ui.input(|i| i.key_pressed(Key::Escape)) {
+                        self.search.clear();
+                    }
+                    self.roadmap_keys(ui.ctx(), false);
+                }
+            });
+        });
         ui.add_space(4.0);
+        let needle = self.search.trim().to_lowercase();
+        let searching = !needle.is_empty();
         let depths = tree::depths(&self.roadmap);
         let nodes = self.roadmap.clone();
+        let matched: HashSet<i64> = if searching { search_matches(&nodes, &needle) } else { HashSet::new() };
         let mut hidden_under: Vec<i64> = Vec::new();
+        let mut shown_rows: Vec<i64> = Vec::new();
         let mut clicked: Option<i64> = None;
         let mut toggled: Option<i64> = None;
         let mut command: Option<String> = None;
         egui::ScrollArea::vertical().id_salt("roadmap").auto_shrink([false, false]).show(ui, |ui| {
             for node in &nodes {
+                if searching && !matched.contains(&node.id) {
+                    continue;
+                }
                 // a node under a folded ancestor stays out
                 if node.parent.is_some_and(|p| hidden_under.contains(&p)) {
                     hidden_under.push(node.id);
                     continue;
                 }
-                if self.folded.contains(&node.id) {
+                if !searching && self.folded.contains(&node.id) {
                     hidden_under.push(node.id);
                 }
                 // a task in a hidden state stays out; the structure above it stays
                 if matches!(node.kind, NodeKind::Task | NodeKind::Subtask) && self.hidden_states.contains(&node.state) {
                     continue;
                 }
+                shown_rows.push(node.id);
                 let depth = depths.get(&node.id).copied().unwrap_or(0);
                 let lane = theme::lane(depth);
                 let has_children = nodes.iter().any(|n| n.parent == Some(node.id));
@@ -528,7 +656,7 @@ impl App {
                             ui.add_space(depth as f32 * 16.0);
                             let arrow = if !has_children {
                                 "  "
-                            } else if self.folded.contains(&node.id) {
+                            } else if !searching && self.folded.contains(&node.id) {
                                 "▸"
                             } else {
                                 "▾"
@@ -577,6 +705,9 @@ impl App {
                     .interact(egui::Sense::click());
                 ui.ctx().memory_mut(|m| m.data.insert_temp(row_id, ()));
                 let response = response.on_hover_ui(|ui| cards::tooltip(ui, node, lane));
+                if self.scroll_to == Some(node.id) {
+                    response.scroll_to_me(None);
+                }
                 if response.clicked() {
                     clicked = Some(node.id);
                 }
@@ -585,6 +716,8 @@ impl App {
                 }
             }
         });
+        self.visible_rows = shown_rows;
+        self.scroll_to = None;
         if let Some(id) = toggled {
             if !self.folded.remove(&id) {
                 self.folded.insert(id);
@@ -883,19 +1016,32 @@ impl App {
                 ui.fonts_mut(|f| f.layout_job(job))
             };
             let edit = egui::TextEdit::singleline(&mut self.input)
-                .hint_text(RichText::new("type a command (help lists them)").color(theme::DIM).italics())
+                .hint_text(
+                    RichText::new("type a command (help lists them) · arrows walk the roadmap, Enter runs the selected card")
+                        .color(theme::DIM)
+                        .italics(),
+                )
                 .desired_width(f32::INFINITY)
                 .frame(Frame::new())
                 .lock_focus(true)
                 .layouter(&mut layouter);
             let response = ui.add(edit);
             if response.has_focus() {
+                if self.input.is_empty() && self.browsing.is_none() {
+                    // an empty line hands its keys to the roadmap: the arrows walk and fold the
+                    // rows, Enter runs the selected card, Escape clears the search
+                    if ui.input(|i| i.key_pressed(Key::Escape)) {
+                        self.search.clear();
+                    }
+                    self.roadmap_keys(ui.ctx(), true);
+                }
+                // the history: Up and Down while the line has text, Ctrl+Up and Ctrl+Down always
                 let (enter, up, down, tab) = ui.input_mut(|i| {
                     (
-                        i.consume_key(egui::Modifiers::NONE, Key::Enter),
-                        i.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
-                        i.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
-                        i.consume_key(egui::Modifiers::NONE, Key::Tab),
+                        i.consume_key(Modifiers::NONE, Key::Enter),
+                        i.consume_key(Modifiers::NONE, Key::ArrowUp) | i.consume_key(Modifiers::COMMAND, Key::ArrowUp),
+                        i.consume_key(Modifiers::NONE, Key::ArrowDown) | i.consume_key(Modifiers::COMMAND, Key::ArrowDown),
+                        i.consume_key(Modifiers::NONE, Key::Tab),
                     )
                 });
                 if enter {
@@ -909,15 +1055,13 @@ impl App {
                     self.browsing = Some(i);
                     self.input = self.history[i].clone();
                 }
-                if down {
-                    if let Some(i) = self.browsing {
-                        if i + 1 < self.history.len() {
-                            self.browsing = Some(i + 1);
-                            self.input = self.history[i + 1].clone();
-                        } else {
-                            self.browsing = None;
-                            self.input.clear();
-                        }
+                if down && let Some(i) = self.browsing {
+                    if i + 1 < self.history.len() {
+                        self.browsing = Some(i + 1);
+                        self.input.clone_from(&self.history[i + 1]);
+                    } else {
+                        self.browsing = None;
+                        self.input.clear();
                     }
                 }
                 if tab && completions.len() == 1 {
@@ -998,6 +1142,28 @@ fn measure_roadmap(ctx: &egui::Context, nodes: &[Node]) -> f32 {
         widest = widest.max(depth * 16.0 + 86.0 + title + badges);
     }
     widest + 24.0
+}
+
+/// The rows a search keeps: every node whose title or id contains `needle` (lowercase, trimmed),
+/// and every ancestor of one, so a hit keeps its place in the tree. A `#` in front of a number
+/// is allowed, the way ids are written.
+fn search_matches(nodes: &[Node], needle: &str) -> HashSet<i64> {
+    let id_part = needle.trim_start_matches('#');
+    let mut kept = HashSet::new();
+    for node in nodes {
+        let hit = node.title.to_lowercase().contains(needle) || (!id_part.is_empty() && node.id.to_string().contains(id_part));
+        if !hit {
+            continue;
+        }
+        let mut current = Some(node.id);
+        while let Some(id) = current {
+            if !kept.insert(id) {
+                break;
+            }
+            current = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent);
+        }
+    }
+    kept
 }
 
 /// A field of the card as its own glowing card, titled in `color`.
