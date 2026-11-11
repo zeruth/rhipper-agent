@@ -1149,9 +1149,15 @@ impl App {
             // whose queue and run would leave it empty grows into its share, so a tall window
             // shows more of the queue and more of the run, not a blank band under the cards.
             // The gauges above keep their size. Measured from the window, as the width is
+            // A project with nothing queued and nothing running keeps its natural height (as
+            // it drew last frame) and the share goes to the projects with work: an idle
+            // agent's card is a header and a finished run, not a third of the window
             let count = self.tabs.len().max(1) as f32;
             let left = ctx.content_rect().bottom() - ui.next_widget_position().y - 12.0 - 4.0;
-            let budget = ((left - 10.0 * (count - 1.0)) / count).max(0.0);
+            let small: Vec<bool> = self.tabs.iter().map(Workspace::dashboard_small).collect();
+            let kept: f32 = self.tabs.iter().zip(&small).filter(|(_, s)| **s).map(|(t, _)| t.dash_height).sum();
+            let growing = small.iter().filter(|s| !**s).count().max(1) as f32;
+            let budget = ((left - kept - 10.0 * (count - 1.0)) / growing).max(0.0);
             egui::ScrollArea::vertical().id_salt("dashboard").auto_shrink([false, false]).show(ui, |ui| {
                 // the page's width, handed down: a card holds itself to it, so nothing in it
                 // takes the room a scroll area's content would otherwise be allowed
@@ -1159,7 +1165,7 @@ impl App {
                 ui.set_max_width(page);
                 for i in 0..self.tabs.len() {
                     let lane = theme::lane(1 + i % 9);
-                    if self.tabs[i].dashboard_card(ui, lane, page, budget) {
+                    if self.tabs[i].dashboard_card(ui, lane, page, if small[i] { 0.0 } else { budget }) {
                         open = Some(i);
                     }
                     ui.add_space(10.0);
@@ -1525,6 +1531,9 @@ struct Workspace {
     layout_saved: WindowLayout,
     /// The report's toggle, as the layout file had it; the window keeps every tab's the same.
     report_by_project: bool,
+    /// The height the project's dashboard card drew at last frame, margins included: a card
+    /// with nothing queued and nothing running keeps it, and the others share the rest.
+    dash_height: f32,
     /// The command palette while Ctrl+K holds it open.
     palette: Option<input::Palette>,
     /// The project's directory: every file of the workspace is under it.
@@ -1659,6 +1668,7 @@ impl Workspace {
             console_height: layout.console,
             zoom: if layout.zoom > 0.0 { layout.zoom.clamp(ZOOM_MIN, ZOOM_MAX) } else { 1.0 },
             report_by_project: layout.report_by_project,
+            dash_height: 0.0,
             layout_saved: layout.clone(),
             palette: None,
             root,
@@ -3994,6 +4004,13 @@ impl Workspace {
     /// `budget` is the height the card grows to: the queue adds rows past its six while they
     /// fit and then takes the rest of the share as its band, and the run card beside it is
     /// exactly as tall; the two fill the share together, equally.
+    /// Whether the project's card stays at its natural height on the dashboard: no card is
+    /// ready and no run is live, so there is nothing for a taller card to show.
+    fn dashboard_small(&self) -> bool {
+        self.sink.live_run().is_none()
+            && ra_console::agent::walk_order(&self.roadmap, &self.gambits, ra_console::agent::limits_tight(&self.limits)).is_empty()
+    }
+
     fn dashboard_card(&mut self, ui: &mut egui::Ui, lane: Color32, page: f32, budget: f32) -> bool {
         let nodes = self.roadmap.clone();
         let order = ra_console::agent::walk_order(&nodes, &self.gambits, ra_console::agent::limits_tight(&self.limits));
@@ -4034,7 +4051,7 @@ impl Workspace {
         };
         let mut out = Walked::default();
         let mut open = false;
-        cards::bubble(ui, lane, live.is_some(), |ui| {
+        let drawn = cards::bubble(ui, lane, live.is_some(), |ui| {
             // the bubble's inner width: the page less its margins and its stroke, two of each
             let inner = (page - 18.0).max(300.0);
             ui.set_width(inner);
@@ -4144,6 +4161,8 @@ impl Workspace {
                 });
             });
         });
+        // the card's height, outer margins included, for next frame's sharing of the window
+        self.dash_height = drawn.response.rect.height() + 6.0;
         if let Some(id) = out.clicked {
             self.select(Some(id));
             open = true;
