@@ -377,8 +377,22 @@ enum WorktreeAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // the commands' futures are one state machine, and in a debug build it outgrew the main
+    // thread's stack (one megabyte on Windows) once the walk, the review, the plan and the
+    // parallel runs were in it: every command overflowed before it began. The work runs on a
+    // thread with room.
+    let worker = std::thread::Builder::new()
+        .name("rc".to_owned())
+        .stack_size(256 << 20)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            runtime.block_on(run_main())
+        })?;
+    worker.join().map_err(|_| anyhow::anyhow!("the command's thread panicked"))?
+}
+
+async fn run_main() -> anyhow::Result<()> {
     let options = Options::parse();
     match options.command {
         Command::Show { id, markdown } => {
