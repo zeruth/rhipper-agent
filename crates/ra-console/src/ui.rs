@@ -1,9 +1,9 @@
-//! The terminal UI: the layout, the key handling and the draw loop. It mirrors the structure of
-//! the CrystalCore console: a status line, a log, a prompt, and a footer with the keys.
+//! The terminal UI: the layout, the input handling and the draw loop. From the top: a status
+//! line, the usage pane, the roadmap tree, the log card with its prompt, and a footer with the keys.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ra_roadmap::store::Store;
 use ratatui::Frame;
@@ -67,6 +67,8 @@ struct App {
     hint: Option<String>,
     /// The last-known roadmap nodes, for the tree pane.
     roadmap: Option<Vec<ra_roadmap::model::Node>>,
+    /// The mtime of the roadmap file behind `roadmap`; the tick re-reads only when it moves.
+    roadmap_seen: Option<SystemTime>,
     /// The worker of the next session: the badge model and the provider it connected; `model`
     /// swaps the model and `key` drops the provider.
     worker: Worker,
@@ -113,6 +115,7 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
         started: Instant::now(),
         hint: None,
         roadmap: None,
+        roadmap_seen: None,
         all_time: worker.all_time().await,
         worker,
         selected: None,
@@ -171,85 +174,31 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
             input = keys.recv() => {
                 let Some(input) = input else { break Ok(()) };
                 dirty = true;
-                match input {
-                    Input::Click(x, y) => {
-                        // a click inside the tree pane: a button column runs its command, any other
-                        // row picks the card it names
-                        if let Some(area) = tree_area {
-                            if (area.y..area.y + area.height).contains(&y) {
-                                let index = (y - area.y) as usize;
-                                if let Some(hit) = tree_rows.get(index) {
-                                    let column = usize::from(x).saturating_sub(usize::from(area.x));
-                                    if let Some(&(_, _, button)) = hit.buttons.iter().find(|(start, end, _)| column >= usize::from(*start) && column < usize::from(*end)) {
-                                        let line = match button {
-                                            roadmap_pane::Button::Run => format!("run {}", hit.id),
-                                            roadmap_pane::Button::Reassess => format!("reassess {}", hit.id),
-                                            roadmap_pane::Button::ReassessTree => format!("reassess-tree {}", hit.id),
-                                        };
-                                        if execute_line(line, &store, &sink, &mut app, &job_tx).await {
-                                            break Ok(());
-                                        }
-                                        continue;
-                                    }
-                                    let id = hit.id;
-                                    if let Some(nodes) = &app.roadmap {
-                                        let has_children = nodes.iter().any(|n| n.parent == Some(id));
-                                        if app.selected == Some(id) {
-                                            if has_children {
-                                                if app.folded.contains(&id) {
-                                                    app.folded.retain(|f| *f != id);
-                                                } else {
-                                                    app.folded.push(id);
-                                                }
-                                            } else {
-                                                app.selected = None;
-                                            }
-                                        } else {
-                                            app.selected = Some(id);
-                                            // the details live in the card itself; the log stays for commands
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
+                let action = match input {
+                    Input::Click(x, y) => on_click(&mut app, x, y, tree_area, &tree_rows),
                     Input::Hover(x, y) => {
-                        let over_tree = tree_area.is_some_and(|area| (area.y..area.y + area.height).contains(&y));
+                        let over_tree = tree_area.is_some_and(|area| contains_row(area, y));
                         let next = over_tree.then_some((x, y));
-                        if app.hover != next {
-                            app.hover = next;
-                        } else {
+                        if app.hover == next {
                             dirty = false;
                         }
-                        continue;
+                        app.hover = next;
+                        Action::None
                     }
                     Input::Wheel(rows, y) => {
-                        let over_tree = tree_area.is_some_and(|area| (area.y..area.y + area.height).contains(&y));
-                        let over_log = log_area.is_some_and(|area| (area.y..area.y + area.height).contains(&y));
-                        if over_tree {
-                            // the tree skips rows from its top, so wheel-down reads downward
-                            app.tree_scroll = app.tree_scroll.saturating_add_signed(-rows as isize * WHEEL_ROWS as isize);
-                        } else if over_log {
-                            // the wheel over the log card grows or shrinks it; the roadmap takes the rest
-                            let next = i32::from(app.log_card) + rows * 2;
-                            let low = 7i32;
-                            let high = i32::from(frame_height).saturating_sub(12).max(low);
-                            app.log_card = next.clamp(low, high) as u16;
-                        } else {
-                            app.scroll = app.scroll.saturating_add_signed(rows as isize * WHEEL_ROWS as isize);
-                        }
-                        continue;
+                        on_wheel(&mut app, rows, y, Panes { tree: tree_area, log: log_area }, frame_height);
+                        Action::None
                     }
-                    Input::Key(key) => match on_key(&mut app, key) {
-                        Action::None => {}
-                        Action::Quit => break Ok(()),
-                        Action::Run(line) => {
-                            if execute_line(line, &store, &sink, &mut app, &job_tx).await {
-                                break Ok(());
-                            }
+                    Input::Key(key) => on_key(&mut app, key),
+                };
+                match action {
+                    Action::None => {}
+                    Action::Quit => break Ok(()),
+                    Action::Run(line) => {
+                        if execute_line(line, &store, &sink, &mut app, &job_tx).await {
+                            break Ok(());
                         }
-                    },
+                    }
                 }
             }
             Some(()) = job_done.recv() => {
@@ -270,11 +219,19 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                 if app.job.is_some() && app.ticks % 2 == 0 {
                     dirty = true;
                 }
-                // the roadmap pane follows the file, an outside edit included
-                if let Ok(nodes) = store.all().await {
-                    if app.roadmap.as_ref() != Some(&nodes) {
-                        app.roadmap = Some(nodes);
-                        dirty = true;
+                // the roadmap pane follows the file, an outside edit included; the mtime says
+                // when there is something new to parse
+                let modified = store.modified();
+                if modified != app.roadmap_seen {
+                    app.roadmap_seen = modified;
+                    match store.all().await {
+                        Ok(nodes) => {
+                            if app.roadmap.as_ref() != Some(&nodes) {
+                                app.roadmap = Some(nodes);
+                                dirty = true;
+                            }
+                        }
+                        Err(e) => tracing::warn!("the roadmap file does not parse: {e:#}"),
                     }
                 }
             }
@@ -336,6 +293,60 @@ enum Action {
     None,
     Run(String),
     Quit,
+}
+
+/// Whether screen row `y` lies inside `area`.
+fn contains_row(area: Rect, y: u16) -> bool {
+    (area.y..area.y + area.height).contains(&y)
+}
+
+/// A click inside the tree pane. A button column answers with its command line; any other row
+/// picks the card it names, and a second click on a picked card folds its children or lets it go.
+/// A click anywhere else does nothing.
+fn on_click(app: &mut App, x: u16, y: u16, tree_area: Option<Rect>, tree_rows: &[roadmap_pane::Hit]) -> Action {
+    let Some(area) = tree_area.filter(|area| contains_row(*area, y)) else { return Action::None };
+    let Some(hit) = tree_rows.get(usize::from(y - area.y)) else { return Action::None };
+    let column = usize::from(x).saturating_sub(usize::from(area.x));
+    let button = hit.buttons.iter().find(|(start, end, _)| column >= usize::from(*start) && column < usize::from(*end));
+    if let Some(&(_, _, button)) = button {
+        return Action::Run(match button {
+            roadmap_pane::Button::Run => format!("run {}", hit.id),
+            roadmap_pane::Button::Reassess => format!("reassess {}", hit.id),
+            roadmap_pane::Button::ReassessTree => format!("reassess-tree {}", hit.id),
+        });
+    }
+    let id = hit.id;
+    let has_children = app.roadmap.as_ref().is_some_and(|nodes| nodes.iter().any(|n| n.parent == Some(id)));
+    if app.selected != Some(id) {
+        // the details live in the card itself; the log stays for commands
+        app.selected = Some(id);
+    } else if has_children {
+        if app.folded.contains(&id) {
+            app.folded.retain(|f| *f != id);
+        } else {
+            app.folded.push(id);
+        }
+    } else {
+        app.selected = None;
+    }
+    Action::None
+}
+
+/// The wheel: over the tree it scrolls the tree, over the log card it resizes the card, and
+/// anywhere else it scrolls the log. `rows` is positive for a notch up.
+fn on_wheel(app: &mut App, rows: i32, y: u16, panes: Panes, frame_height: u16) {
+    let step = rows as isize * WHEEL_ROWS as isize;
+    if panes.tree.is_some_and(|area| contains_row(area, y)) {
+        // the tree skips rows from its top, so wheel-down reads downward
+        app.tree_scroll = app.tree_scroll.saturating_add_signed(-step);
+    } else if panes.log.is_some_and(|area| contains_row(area, y)) {
+        // the wheel over the log card grows or shrinks it; the roadmap takes the rest
+        let low = 7i32;
+        let high = i32::from(frame_height).saturating_sub(12).max(low);
+        app.log_card = (i32::from(app.log_card) + rows * 2).clamp(low, high) as u16;
+    } else {
+        app.scroll = app.scroll.saturating_add_signed(step);
+    }
 }
 
 fn on_key(app: &mut App, key: KeyEvent) -> Action {
@@ -514,10 +525,6 @@ async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, j
     }
 }
 
-/// Draws the console; returns how far back the log can scroll (in rows) and how far back the tree
-/// can, and fills `row_ids` with the node id under every visible tree row. `hover_id` names the
-/// card the pointer rests on. The panes from the top: the status line, the usage pane, the roadmap
-/// tree, the log, the prompt and the footer.
 /// The screen areas the wheel and the clicks route against.
 #[derive(Default, Clone, Copy)]
 struct Panes {
@@ -525,6 +532,10 @@ struct Panes {
     log: Option<Rect>,
 }
 
+/// Draws the console; returns how far back the log can scroll (in rows), how far back the tree
+/// can, and the panes, and fills `row_ids` with the node under every visible tree row. The panes
+/// from the top: the status line, the usage pane, the roadmap tree, the log card with its prompt,
+/// and the footer.
 fn draw(f: &mut Frame, app: &App, sink: &Sink, row_ids: &mut Vec<roadmap_pane::Hit>) -> (usize, usize, Panes) {
     let [header, usage, tree, log_card, footer] = pane_layout(app.log_card).areas(f.area());
     // every cell, so even gaps the widgets never touch paint the theme
@@ -831,10 +842,9 @@ fn wrap(text: &str, room: usize) -> Vec<String> {
             current.clear();
         }
         if current.is_empty() && word.chars().count() > room {
-            // a word longer than the room: split it hard
-            for chunk in word.as_bytes().chunks(room) {
-                rows.push(String::from_utf8_lossy(chunk).into_owned());
-            }
+            // a word longer than the room: split it hard, on characters, never inside one
+            let chars: Vec<char> = word.chars().collect();
+            rows.extend(chars.chunks(room).map(|chunk| chunk.iter().collect::<String>()));
             continue;
         }
         if !current.is_empty() {
@@ -842,7 +852,10 @@ fn wrap(text: &str, room: usize) -> Vec<String> {
         }
         current.push_str(word);
     }
-    rows.push(current);
+    // the last row, unless a hard split already took the whole text
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
     rows
 }
 
@@ -897,3 +910,6 @@ fn footer_line(app: &App, width: u16) -> Line<'static> {
     spans.push(Span::styled(right, Style::new().fg(theme::WARN_TEXT)));
     Line::from(spans)
 }
+
+#[cfg(test)]
+mod tests;

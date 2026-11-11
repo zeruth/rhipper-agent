@@ -46,6 +46,11 @@ impl Store {
         &self.path
     }
 
+    /// When the file last changed, for a reader that polls it; `None` when it cannot be read.
+    pub fn modified(&self) -> Option<std::time::SystemTime> {
+        std::fs::metadata(&self.path).ok()?.modified().ok()
+    }
+
     /// Reads every node, in tree order.
     pub async fn all(&self) -> anyhow::Result<Vec<Node>> {
         let text = std::fs::read_to_string(&self.path).with_context(|| format!("cannot read {}", self.path.display()))?;
