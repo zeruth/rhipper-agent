@@ -735,6 +735,9 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
     assert!(out[0].starts_with("✓ #2 Probe implemented on claude-opus-5-5"), "{out:?}");
     assert!(harness.requests.lock().last().unwrap().resume.is_none());
+    // the cap fell at turn 5, while the session was still reading in: the fresh session reads
+    // the same files, so it runs without the cap rather than hit it again (runelite #15)
+    assert_eq!(harness.requests.lock().last().unwrap().max_context, None, "no cap after a cap hit reading in");
 }
 
 /// A one-crate Cargo project in `dir` whose single test passes or fails.

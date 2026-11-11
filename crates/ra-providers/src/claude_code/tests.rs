@@ -215,22 +215,27 @@ fn the_stream_tallies_the_tokens_of_each_turn() {
 
 #[test]
 fn a_turn_past_the_context_cap_stops_the_run_once_its_tool_results_are_in() {
-    // the second turn reads 130k: the run goes on through its tool call and stops at the result
-    // of that call, before a third turn reads it all again
-    let stream = [
-        r#"{"type":"system","subtype":"init","session_id":"s"}"#,
-        r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":90000,"output_tokens":40},"content":[{"type":"text","text":"looking"}]}}"#,
-        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
-        r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":5,"cache_read_input_tokens":120000,"cache_creation_input_tokens":10000,"output_tokens":10},"content":[{"type":"text","text":"editing"}]}}"#,
-        r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":5,"cache_read_input_tokens":120000,"cache_creation_input_tokens":10000,"output_tokens":90},"content":[{"type":"tool_use","name":"Edit","input":{}}]}}"#,
-        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
-        r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":7,"cache_read_input_tokens":131000,"output_tokens":25},"content":[{"type":"text","text":"done"}]}}"#,
-    ];
+    // twelve reading-in turns at 90k, then one that reads 130k: the run goes on through its
+    // tool call and stops at the result of that call, before a further turn reads it all again
+    let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#.to_owned();
+    let mut stream = vec![r#"{"type":"system","subtype":"init","session_id":"s"}"#.to_owned()];
+    for n in 1..=READING_IN_TURNS {
+        stream.push(format!(
+            r#"{{"type":"assistant","message":{{"id":"r{n}","usage":{{"input_tokens":3,"cache_read_input_tokens":90000,"output_tokens":40}},"content":[{{"type":"text","text":"looking"}}]}}}}"#
+        ));
+        stream.push(user.clone());
+    }
+    stream.extend([
+        r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":5,"cache_read_input_tokens":120000,"cache_creation_input_tokens":10000,"output_tokens":10},"content":[{"type":"text","text":"editing"}]}}"#.to_owned(),
+        r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":5,"cache_read_input_tokens":120000,"cache_creation_input_tokens":10000,"output_tokens":90},"content":[{"type":"tool_use","name":"Edit","input":{}}]}}"#.to_owned(),
+        user.clone(),
+        r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":7,"cache_read_input_tokens":131000,"output_tokens":25},"content":[{"type":"text","text":"done"}]}}"#.to_owned(),
+    ]);
     let mut tally = TurnTally::default();
     let mut watch = ContextWatch::new(Some(120_000));
     let mut stopped = None;
     let mut read = 0;
-    for line in stream {
+    for line in &stream {
         tally.note(line);
         read += 1;
         if let Some(size) = watch.note(line, &tally) {
@@ -238,23 +243,30 @@ fn a_turn_past_the_context_cap_stops_the_run_once_its_tool_results_are_in() {
             break;
         }
     }
-    assert_eq!((stopped, read), (Some(130_005), 6), "the run stops at the tool result of the crossing turn");
+    let reading_in = 1 + 2 * READING_IN_TURNS;
+    assert_eq!((stopped, read), (Some(130_005), reading_in + 3), "the run stops at the tool result of the crossing turn");
     let answer = tally.completion();
-    assert_eq!(answer.turns, 2);
-    assert_eq!(answer.usage.prompt_tokens, 90_003 + 130_005);
-    assert_eq!(answer.usage.completion_tokens, 130);
-    assert_eq!(answer.usage.cached_tokens, 210_000);
+    let turns = READING_IN_TURNS as u64;
+    assert_eq!(answer.turns, turns + 1);
+    assert_eq!(answer.usage.prompt_tokens, turns * 90_003 + 130_005);
+    assert_eq!(answer.usage.completion_tokens, turns * 40 + 90);
+    assert_eq!(answer.usage.cached_tokens, turns * 90_000 + 120_000);
     assert_eq!(answer.usage.cost_usd, None);
     assert_eq!(answer.text, "editing");
-    assert_eq!(answer.turn_usage.len(), 2);
-    // without a cap nothing stops, and under it neither
+    assert_eq!(answer.turn_usage.len(), READING_IN_TURNS + 1);
+    // without a cap nothing stops, and under it neither; and a crossing within the reading-in
+    // turns is left alone (a resumed session already past the cap answers its verdict)
     let mut tally = TurnTally::default();
     let mut none = ContextWatch::new(None);
     let mut wide = ContextWatch::new(Some(200_000));
-    for line in stream {
+    let mut early = ContextWatch::new(Some(80_000));
+    for (i, line) in stream.iter().enumerate() {
         tally.note(line);
         assert_eq!(none.note(line, &tally), None);
         assert_eq!(wide.note(line, &tally), None);
+        if i < reading_in {
+            assert_eq!(early.note(line, &tally), None, "line {i} is within the reading-in turns");
+        }
     }
 }
 

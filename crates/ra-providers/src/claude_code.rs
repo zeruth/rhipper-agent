@@ -502,9 +502,16 @@ impl TurnTally {
     }
 }
 
-/// Watches a stream for the turn whose input passes the context cap. The run stops after that
-/// turn, once its tool results are in, so an edit in flight lands and the handoff can name it;
-/// a result that comes first means the run finished on its own and stands.
+/// The turns of a run the context cap leaves alone: a fresh session spends them reading its
+/// files in, and a resumed one answers its verdict in them. A cap that fell in them ended a
+/// run on what the next one would read again (runelite #15 at turn 7, rhipper-asm #134's
+/// resumed rerun at turn 1).
+pub const READING_IN_TURNS: usize = 12;
+
+/// Watches a stream for the turn whose input passes the context cap, past the reading-in
+/// turns. The run stops after that turn, once its tool results are in, so an edit in flight
+/// lands and the handoff can name it; a result that comes first means the run finished on its
+/// own and stands.
 struct ContextWatch {
     cap: Option<u64>,
     /// The input of the turn that crossed the cap, once one has.
@@ -521,7 +528,9 @@ impl ContextWatch {
     fn note(&mut self, line: &str, turns: &TurnTally) -> Option<u64> {
         let cap = self.cap?;
         if line.contains(r#""type":"assistant""#) {
-            if let Some(input) = turns.last_input().filter(|input| *input > cap) {
+            if turns.turns.len() > READING_IN_TURNS
+                && let Some(input) = turns.last_input().filter(|input| *input > cap)
+            {
                 self.crossed = Some(input);
             }
             return None;

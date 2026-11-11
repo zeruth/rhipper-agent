@@ -2596,7 +2596,10 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     let caps = Caps {
         hard: worker.turns,
         restart: router.as_ref().and_then(|router| router.worker.turns()),
-        context: router.as_ref().and_then(|router| router.worker.context()),
+        // no context cap on a run whose last session hit it while still reading in: the fresh
+        // session reads the same files and hits it again, and the card never gets past them
+        // (runelite #15: AffineTransform and Arc2D from the JDK, 161k at turn 7)
+        context: router.as_ref().and_then(|router| router.worker.context()).filter(|_| !capped_reading_in(&task)),
     };
     let effort = worker.effort.unwrap_or(node.effort);
     Ok(Prepared { workspace, root, task, project, budget, caps, effort })
@@ -4020,6 +4023,27 @@ fn resume_of(node: &Node, now: u64) -> Result<Option<String>, String> {
         return Err("the session is older than a day".to_owned());
     }
     Ok(Some(session.to_owned()))
+}
+
+/// The turns a session spends reading in, a few past the harness's own reading-in allowance:
+/// a context cap hit within them says the card's files alone fill the context, and a restart
+/// would only read them again.
+const READING_IN_TURNS: u32 = 20;
+
+/// Whether the card's last session ended on the context cap within its reading-in turns, so
+/// this run goes without the cap.
+fn capped_reading_in(task: &ra_context::TaskContext) -> bool {
+    let Some(last) = task.handoffs.last() else { return false };
+    if last.outcome != "continues" || !last.check.contains("the context cap") {
+        return false;
+    }
+    // the report opens "the context cap of … ended the run after N turn(s)"
+    let turns = last
+        .report
+        .split_once(" ended the run after ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|n| n.parse::<u32>().ok());
+    turns.is_some_and(|n| n <= READING_IN_TURNS)
 }
 
 /// Whether a run of `node` is a rerun: the card came back from its check or its reviewer, or a
