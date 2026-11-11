@@ -6,6 +6,7 @@
 //! the aggregator for every other vendor.
 
 pub mod claude_code;
+pub mod limits;
 pub mod openrouter;
 
 use std::future::Future;

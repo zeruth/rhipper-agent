@@ -16,6 +16,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvider, ProviderError, Usage};
 
+/// Where the plan's limits are kept, beside the roadmap.
+pub const LIMITS_FILE: &str = "var/limits.json";
+
 /// The Claude Code provider.
 pub struct ClaudeCode {
     /// The command; `claude` on the path unless told otherwise.
@@ -205,6 +208,15 @@ impl ClaudeCode {
                 }
                 if line.contains(r#""type":"result""#) {
                     result = Some(line.clone());
+                }
+                // the plan's windows, kept for the console and the window to show
+                if let Some(newer) = crate::limits::Limits::from_event(&line) {
+                    let path = request.workspace.clone().unwrap_or_default().join(LIMITS_FILE);
+                    let mut limits = crate::limits::Limits::load(&path);
+                    limits.merge(newer);
+                    if let Err(e) = limits.save(&path) {
+                        tracing::warn!("cannot write the limits: {e:#}");
+                    }
                 }
                 if !line.trim().is_empty() {
                     last_line = line;

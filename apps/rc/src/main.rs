@@ -268,6 +268,14 @@ async fn open_ledger() -> anyhow::Result<UsageStore> {
 
 /// Prints the ledger by model, the costliest first, and the total.
 async fn usage() -> anyhow::Result<()> {
+    // the plan's windows first: the room left matters more than the dollars already spent
+    let limits = ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE));
+    if limits.fresh() {
+        println!("Claude plan ({}): {}", limits.status, limits.summary().join(" · "));
+    } else {
+        println!("Claude plan: no fresh report; a Claude Code run brings one");
+    }
+    println!();
     let ledger = open_ledger().await?;
     let rows = ledger.by_model().await?;
     if rows.is_empty() {

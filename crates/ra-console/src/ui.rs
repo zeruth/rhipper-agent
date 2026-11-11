@@ -1,6 +1,7 @@
 //! The terminal UI: the layout, the input handling and the draw loop. From the top: a status
 //! line, the usage pane, the roadmap tree, the log card with its prompt, and a footer with the keys.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -90,6 +91,8 @@ struct App {
     job: Option<String>,
     /// The ledger's all-time totals, refreshed when a job completes; `None` without a ledger.
     all_time: Option<ra_usage::Totals>,
+    /// The plan's windows as the harness last reported them, re-read every few seconds.
+    limits: ra_providers::limits::Limits,
 }
 
 /// Runs the console until it is told to quit. `worker` carries the badge model, the provider and
@@ -123,6 +126,7 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
         // the activity of other processes from here on; what they did before stays in the file
         activity_offset: std::fs::metadata(ACTIVITY_FILE).map_or(0, |m| m.len()),
         all_time: worker.all_time().await,
+        limits: ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE)),
         worker,
         selected: None,
         hover: None,
@@ -227,6 +231,14 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                     break Ok(());
                 }
                 app.ticks = app.ticks.wrapping_add(1);
+                // the plan's windows, every five seconds: a run of any instance may have moved them
+                if app.ticks % 50 == 0 {
+                    let limits = ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE));
+                    if limits != app.limits {
+                        app.limits = limits;
+                        dirty = true;
+                    }
+                }
                 // the marquee walks a step every fourth tick, a pace the eye follows
                 if app.ticks % 4 == 0 && app.worker.model.chars().count() + 3 > 14 {
                     app.marquee = (app.marquee + 1) % (app.worker.model.chars().count() + 3);
@@ -779,14 +791,36 @@ fn status_line(app: &App) -> Line<'static> {
     let dim = Style::new().fg(theme::DIM);
     let sep = || Span::styled("  │  ", Style::new().fg(theme::RULE));
     let secs = app.started.elapsed().as_secs();
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(" ✦ ", Style::new().fg(theme::ACCENT).bold()),
         Span::styled("Rhipper", Style::new().fg(theme::ACCENT).bold()),
         Span::styled(" Agent", Style::new().fg(theme::TEXT).bold()),
         Span::styled(format!(" {}", crate::VERSION), dim),
         sep(),
         Span::styled(format!("up {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60), dim),
-    ])
+    ];
+    // the plan's windows, colored by how full they are
+    if app.limits.fresh() {
+        for (name, window) in &app.limits.windows {
+            let label = match name.as_str() {
+                "five_hour" => "5h",
+                "seven_day" => "week",
+                other => other,
+            };
+            let color = if window.utilization >= 0.8 {
+                theme::ERROR_TEXT
+            } else if window.utilization >= 0.5 {
+                theme::WARN_TEXT
+            } else {
+                theme::ONLINE
+            };
+            spans.push(sep());
+            spans.push(Span::styled(format!("{label} "), dim));
+            spans.push(Span::styled(format!("{:.0}%", window.utilization * 100.0), Style::new().fg(color).bold()));
+            spans.push(Span::styled(format!(" · resets in {}", ra_providers::limits::until(window.resets_at)), dim));
+        }
+    }
+    Line::from(spans)
 }
 
 /// Draws the log at the app's scroll; returns how far back it can scroll, and fills `row_runs`
