@@ -7,11 +7,11 @@
 //! request are not forwarded: the harness owns its tool set, and the answer carries no tool
 //! calls. `temperature` and `max_tokens` have no flag on the command line and are not sent.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvider, ProviderError, Usage};
 
@@ -59,7 +59,8 @@ impl ClaudeCode {
     fn args(&self, request: &CompletionRequest) -> Vec<String> {
         // not --bare: it skips the hooks and plugins, but it also skips the OAuth login the
         // subscription route runs on (card #11 found out)
-        let mut args = ["-p", "--output-format", "json", "--no-session-persistence"].map(str::to_owned).to_vec();
+        // stream-json: the events arrive as the harness works, so the console can show the work
+        let mut args = ["-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"].map(str::to_owned).to_vec();
         args.extend(["--model".to_owned(), request.model.clone()]);
         let system = system_prompt(&request.messages);
         if !system.is_empty() {
@@ -99,21 +100,103 @@ impl ClaudeCode {
             stdin.write_all(prompt.as_bytes()).await.map_err(|e| ProviderError::Other(format!("cannot write the prompt: {e}")))?;
             drop(stdin);
         }
-        let output = child.wait_with_output().await.map_err(|e| ProviderError::Other(format!("claude did not finish: {e}")))?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // a result on stdout names the reason itself, exit code or not; only without one does the
-        // exit code speak, with the last line either stream said
-        let has_result = stdout.trim_start().starts_with('{');
-        parse_result(&stdout).map_err(|parse| {
-            if output.status.success() || has_result {
-                parse
-            } else {
-                let reason =
-                    stderr.lines().chain(stdout.lines()).map(str::trim).filter(|l| !l.is_empty()).next_back().unwrap_or("no output");
-                ProviderError::Other(format!("claude exited with {}: {}", output.status, snippet(reason)))
+        // stderr drains on its own task, so a chatty harness cannot fill the pipe and stall
+        let stderr_task = child.stderr.take().map(|mut pipe| {
+            tokio::spawn(async move {
+                let mut text = String::new();
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut pipe, &mut text).await;
+                text
+            })
+        });
+        // the events, one JSON object per line: the work goes to the progress trace as it
+        // happens, and the last `result` event is the answer
+        let mut result: Option<String> = None;
+        let mut last_line = String::new();
+        if let Some(pipe) = child.stdout.take() {
+            let mut lines = tokio::io::BufReader::new(pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                for step in progress_of(&line, request.workspace.as_deref()) {
+                    tracing::info!(target: "ra::progress", "{step}");
+                }
+                if line.contains(r#""type":"result""#) {
+                    result = Some(line.clone());
+                }
+                if !line.trim().is_empty() {
+                    last_line = line;
+                }
             }
+        }
+        let status = child.wait().await.map_err(|e| ProviderError::Other(format!("claude did not finish: {e}")))?;
+        let stderr = match stderr_task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => String::new(),
+        };
+        match result {
+            // a result names the reason itself, exit code or not
+            Some(result) => parse_result(&result),
+            None => {
+                let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).next_back().unwrap_or(last_line.trim());
+                let reason = if reason.is_empty() { "no output" } else { reason };
+                Err(ProviderError::Other(format!("claude exited with {status} and no result: {}", snippet(reason))))
+            }
+        }
+    }
+}
+
+/// The steps of the work one stream event shows, as short lines: a tool call as its name and
+/// its target, a text block as its first line. Thinking stays out; it is not shown and not ours.
+fn progress_of(line: &str, workspace: Option<&Path>) -> Vec<String> {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { return Vec::new() };
+    if event.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(blocks) = event.pointer("/message/content").and_then(serde_json::Value::as_array) else { return Vec::new() };
+    blocks
+        .iter()
+        .filter_map(|block| match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("tool_use") => {
+                let name = block.get("name").and_then(serde_json::Value::as_str).unwrap_or("tool");
+                Some(describe_call(name, block.get("input").unwrap_or(&serde_json::Value::Null), workspace))
+            }
+            Some("text") => {
+                let text = block.get("text").and_then(serde_json::Value::as_str)?.trim();
+                let first = text.lines().find(|l| !l.trim().is_empty())?.trim();
+                Some(format!("… {}", clip_line(first, 140)))
+            }
+            _ => None,
         })
+        .collect()
+}
+
+/// One tool call as a line: `$ cargo test` for a command, `Read src/main.rs` for a file tool,
+/// `Grep pattern` for a search; a path inside the workspace is shown relative to it.
+fn describe_call(name: &str, input: &serde_json::Value, workspace: Option<&Path>) -> String {
+    let field = |key: &str| input.get(key).and_then(serde_json::Value::as_str);
+    let relative = |path: &str| {
+        let shown = workspace
+            .and_then(|root| Path::new(path).strip_prefix(root).ok())
+            .map_or_else(|| path.to_owned(), |p| p.to_string_lossy().into_owned());
+        shown.replace('\\', "/")
+    };
+    match name {
+        "Bash" | "PowerShell" => format!("$ {}", clip_line(field("command").unwrap_or(""), 120)),
+        _ => match field("file_path").or_else(|| field("path")).or_else(|| field("notebook_path")) {
+            Some(path) => format!("{name} {}", relative(path)),
+            None => match field("pattern").or_else(|| field("description")).or_else(|| field("query")) {
+                Some(what) => format!("{name} {}", clip_line(what, 100)),
+                None => name.to_owned(),
+            },
+        },
+    }
+}
+
+/// One line of at most `room` characters, with an ellipsis when it gives some up.
+fn clip_line(text: &str, room: usize) -> String {
+    let line = text.lines().next().unwrap_or("");
+    if line.chars().count() <= room {
+        line.to_owned()
+    } else {
+        format!("{}…", line.chars().take(room.saturating_sub(1)).collect::<String>())
     }
 }
 

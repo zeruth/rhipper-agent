@@ -17,7 +17,7 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
 #[test]
 fn a_chat_request_runs_with_no_tools_and_one_turn() {
     let args = ClaudeCode::new().args(&request(None));
-    assert_eq!(&args[..4], ["-p", "--output-format", "json", "--no-session-persistence"]);
+    assert_eq!(&args[..5], ["-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"]);
     // --bare would drop the OAuth login the subscription route runs on
     assert!(!args.contains(&"--bare".to_owned()), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--model", "claude-opus-5-5"]), "{args:?}");
@@ -76,6 +76,27 @@ fn an_error_result_maps_its_status() {
 fn a_logged_out_harness_is_an_auth_error_even_without_a_status() {
     let json = r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":null,"terminal_reason":"api_error","result":"Not logged in · Please run /login"}"#;
     assert!(matches!(parse_result(json).unwrap_err(), ProviderError::Auth(text) if text.contains("Not logged in")));
+}
+
+#[test]
+fn the_stream_shows_tool_calls_and_text_but_not_thinking() {
+    let root = Path::new(r"C:\work\repo");
+    let line = r#"{"type":"assistant","message":{"content":[
+        {"type":"thinking","thinking":"secret"},
+        {"type":"text","text":"\nI will check the store first.\nThen the tests."},
+        {"type":"tool_use","name":"Read","input":{"file_path":"C:\\work\\repo\\crates\\store.rs"}},
+        {"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap"}},
+        {"type":"tool_use","name":"Grep","input":{"pattern":"fn insert"}},
+        {"type":"tool_use","name":"TodoWrite","input":{}}]}}"#
+        .replace('\n', " ");
+    assert_eq!(
+        progress_of(&line, Some(root)),
+        ["… I will check the store first.", "Read crates/store.rs", "$ cargo test -p ra-roadmap", "Grep fn insert", "TodoWrite"]
+    );
+    // the other events show nothing
+    assert!(progress_of(r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#, Some(root)).is_empty());
+    assert!(progress_of(r#"{"type":"result","result":"done"}"#, Some(root)).is_empty());
+    assert!(progress_of("not json", Some(root)).is_empty());
 }
 
 #[test]

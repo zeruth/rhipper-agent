@@ -20,6 +20,9 @@ pub enum Kind {
     Diff,
     /// A logged event, at a level.
     Log(tracing::Level),
+    /// One step of a worker's work: a file it read or edited, a command it ran, a note on what
+    /// it does next. One compact row each, no bubble.
+    Progress,
     /// A failure.
     Error,
 }

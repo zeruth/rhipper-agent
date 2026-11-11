@@ -199,7 +199,9 @@ fn store_path() -> PathBuf {
 fn plain_tracing() -> anyhow::Result<()> {
     std::fs::create_dir_all("var")?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open("var/console.log")?;
-    ra_console::trace::init(log, None);
+    // the progress of a worker goes to the activity file, which a running console tails
+    let activity = std::fs::OpenOptions::new().create(true).append(true).open("var/activity.log")?;
+    ra_console::trace::init(log, None, Some(activity));
     Ok(())
 }
 
@@ -284,7 +286,7 @@ async fn console(roadmap: PathBuf, replace: bool) -> anyhow::Result<()> {
     let replaced = if replace { ra_console::instance::stop_running() } else { None };
     ra_console::instance::claim()?;
     let sink = ra_console::logs::Sink::new();
-    ra_console::trace::init(log, Some(sink.clone()));
+    ra_console::trace::init(log, Some(sink.clone()), None);
     if let Some(what) = replaced {
         tracing::info!("{what}");
     }

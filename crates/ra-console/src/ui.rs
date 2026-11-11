@@ -69,6 +69,8 @@ struct App {
     roadmap: Option<Vec<ra_roadmap::model::Node>>,
     /// The mtime of the roadmap file behind `roadmap`; the tick re-reads only when it moves.
     roadmap_seen: Option<SystemTime>,
+    /// How far into the activity file the log has read.
+    activity_offset: u64,
     /// The worker of the next session: the badge model and the provider it connected; `model`
     /// swaps the model and `key` drops the provider.
     worker: Worker,
@@ -118,6 +120,8 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
         hint: None,
         roadmap: None,
         roadmap_seen: None,
+        // the activity of other processes from here on; what they did before stays in the file
+        activity_offset: std::fs::metadata(ACTIVITY_FILE).map_or(0, |m| m.len()),
         all_time: worker.all_time().await,
         worker,
         selected: None,
@@ -227,6 +231,10 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                 }
                 // the roadmap pane follows the file, an outside edit included; the mtime says
                 // when there is something new to parse
+                // the work of a run started elsewhere, from `rc run` or over MCP, as it happens
+                if tail_activity(&mut app.activity_offset, &sink) {
+                    dirty = true;
+                }
                 let modified = store.modified();
                 if modified != app.roadmap_seen {
                     app.roadmap_seen = modified;
@@ -299,6 +307,34 @@ enum Action {
     None,
     Run(String),
     Quit,
+}
+
+/// The file the processes without a console write their progress lines to.
+const ACTIVITY_FILE: &str = "var/activity.log";
+
+/// Pushes the lines the activity file gained since `offset` into the log, as progress; a file
+/// that shrank was rotated and reads from its start. Returns whether any line came in.
+fn tail_activity(offset: &mut u64, sink: &Sink) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(len) = std::fs::metadata(ACTIVITY_FILE).map(|m| m.len()) else { return false };
+    if len < *offset {
+        *offset = 0;
+    }
+    if len == *offset {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(ACTIVITY_FILE) else { return false };
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(*offset)).is_err() || file.read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    // only whole lines; a line still being written waits for the next tick
+    let Some(end) = bytes.iter().rposition(|b| *b == b'\n') else { return false };
+    *offset += end as u64 + 1;
+    for line in String::from_utf8_lossy(&bytes[..end]).lines().filter(|l| !l.trim().is_empty()) {
+        sink.push(Kind::Progress, line.to_owned());
+    }
+    true
 }
 
 /// Whether screen row `y` lies inside `area`.
@@ -779,6 +815,14 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// error and the banner stay red. A diff entry colors its lines like a patch: `+` green, `-` red,
 /// commentary in the bubble's color.
 fn rows_of(line: &crate::logs::Line, width: usize, lane_index: usize) -> Vec<Line<'static>> {
+    if line.kind == Kind::Progress {
+        // a step of the work: one dim row under the bubble of the run, clipped to the width
+        let room = width.saturating_sub(4).max(4);
+        return vec![Line::from(vec![
+            Span::styled("  ▸ ", Style::new().fg(theme::ACCENT)),
+            Span::styled(short_title(&line.text, room), Style::new().fg(theme::DIM)),
+        ])];
+    }
     let (border, text) = match line.kind {
         Kind::Input => (theme::ACCENT, theme::TEXT),
         Kind::Output | Kind::Diff => {
@@ -791,7 +835,7 @@ fn rows_of(line: &crate::logs::Line, width: usize, lane_index: usize) -> Vec<Lin
         Kind::Log(tracing::Level::WARN) => (theme::WARN, theme::WARN_TEXT),
         Kind::Log(tracing::Level::DEBUG) => (theme::DEBUG, theme::DEBUG),
         Kind::Log(tracing::Level::TRACE) => (theme::TRACE, theme::TRACE),
-        Kind::Log(_) => (theme::DIM, theme::TEXT),
+        Kind::Log(_) | Kind::Progress => (theme::DIM, theme::TEXT),
     };
     let border_style = Style::new().fg(border);
     let text_style = Style::new().fg(text).bg(theme::PANEL);
