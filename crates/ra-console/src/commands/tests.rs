@@ -51,7 +51,7 @@ async fn sets_states() {
     let (out, _) = run("set 2 in_progress", &store, MODEL).await.unwrap();
     assert_eq!(out, vec!["#2 is now in_progress"]);
     let error = run("set 2 nonsense", &store, MODEL).await.unwrap_err();
-    assert_eq!(format!("{error:#}"), "that is no state of the lifecycle");
+    assert!(format!("{error:#}").starts_with("the state is defined, ready, "), "{error:#}");
 }
 
 #[tokio::test]
@@ -61,35 +61,21 @@ async fn completes_names() {
 }
 
 #[tokio::test]
-async fn depths_grow_down_the_tree() {
+async fn show_indents_by_depth_and_names_a_missing_node() {
     let store = store().await;
     run("add task T parent 1", &store, MODEL).await.unwrap();
-    let nodes = store.all().await.unwrap();
-    assert_eq!(depth(&nodes, &nodes[0]), 0);
-    assert_eq!(depth(&nodes, &nodes[1]), 1);
+    let (out, _) = run("show", &store, MODEL).await.unwrap();
+    assert!(out[0].starts_with("#1 "), "{out:?}");
+    assert!(out[1].starts_with("  #2 T"), "{out:?}");
+    let error = run("show 9", &store, MODEL).await.unwrap_err();
+    assert_eq!(format!("{error:#}"), "no node 9");
 }
 
-#[test]
-fn the_subtree_walks_preorder() {
-    use crate::agent::subtree_preorder;
-    use ra_roadmap::model::{Node, NodeKind, TaskState};
-    let node = |id: i64, parent: Option<i64>| Node {
-        id,
-        parent,
-        kind: NodeKind::Task,
-        title: String::new(),
-        objective: None,
-        acceptance: None,
-        depends_on: Vec::new(),
-        state: TaskState::Defined,
-        assignee: None,
-        complexity: 3,
-        notes: None,
-    };
-    let nodes = vec![node(1, None), node(2, Some(1)), node(3, Some(2)), node(4, Some(2)), node(5, Some(1))];
-    assert_eq!(subtree_preorder(&nodes, 2), vec![2, 3, 4]);
-    assert_eq!(subtree_preorder(&nodes, 1), vec![1, 2, 3, 4, 5]);
-    assert_eq!(subtree_preorder(&nodes, 5), vec![5]);
+#[tokio::test]
+async fn add_names_the_kinds_on_a_bad_one() {
+    let store = store().await;
+    let error = run("add epic T parent 1", &store, MODEL).await.unwrap_err();
+    assert_eq!(format!("{error:#}"), "the kind is project, milestone, section, task or subtask");
 }
 
 #[tokio::test]

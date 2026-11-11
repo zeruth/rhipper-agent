@@ -32,6 +32,19 @@ async fn insert_grows_the_ids() {
 }
 
 #[tokio::test]
+async fn insert_keeps_the_file_in_tree_order() {
+    let (_dir, store) = store().await;
+    let root = store.all().await.unwrap().remove(0).id;
+    let a = store.insert(Some(root), NodeKind::Milestone, "A", None, None, 2).await.unwrap();
+    let b = store.insert(Some(root), NodeKind::Milestone, "B", None, None, 2).await.unwrap();
+    // a late child of the first milestone lands under it, not under the second
+    let child = store.insert(Some(a), NodeKind::Task, "A.1", None, None, 2).await.unwrap();
+    let nodes = store.all().await.unwrap();
+    assert_eq!(nodes.iter().map(|n| n.id).collect::<Vec<_>>(), vec![root, a, child, b]);
+    assert_eq!(store.read(child).await.unwrap().parent, Some(a));
+}
+
+#[tokio::test]
 async fn mutations_persist_through_a_reopen() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("rhipper.md");

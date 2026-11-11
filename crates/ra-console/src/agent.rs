@@ -1,12 +1,11 @@
 //! The agent loop: the console's live path to a model. `ping` proves the connection; `run` sends
 //! one roadmap task to the badge model and records what came back.
 
-use std::collections::HashMap;
-
 use crate::secret;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError};
 use ra_roadmap::model::{Node, TaskState};
 use ra_roadmap::store::Store;
+use ra_roadmap::tree;
 
 /// The model of the next run, as the badge holds it.
 pub type Model = String;
@@ -80,7 +79,7 @@ pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> a
     let provider = ra_providers::openrouter::OpenRouter::new(key)?;
     let nodes = store.all().await?;
     // one pass over the tree before any call, so the recursion cannot stall midway
-    let order = if recursive { subtree_preorder(&nodes, id) } else { vec![id] };
+    let order: Vec<i64> = if recursive { tree::subtree(&nodes, id).iter().map(|n| n.id).collect() } else { vec![id] };
     let mut revised: Vec<String> = Vec::new();
     let mut verified: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -114,30 +113,6 @@ pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> a
     out.extend(receipts);
     out.extend(warnings);
     Ok(out)
-}
-
-/// The subtree of `root` in preorder: the node first, then each child's subtree in id order.
-pub fn subtree_preorder(nodes: &[Node], root: i64) -> Vec<i64> {
-    let mut kids: HashMap<i64, Vec<i64>> = HashMap::new();
-    for node in nodes {
-        if let Some(parent) = node.parent {
-            kids.entry(parent).or_default().push(node.id);
-        }
-    }
-    for list in kids.values_mut() {
-        list.sort_unstable();
-    }
-    let mut out = Vec::new();
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        out.push(id);
-        if let Some(children) = kids.get(&id) {
-            for child in children.iter().rev() {
-                stack.push(*child);
-            }
-        }
-    }
-    out
 }
 
 /// One reassessment: the model returns two lines, and the store takes them. The prompt carries the

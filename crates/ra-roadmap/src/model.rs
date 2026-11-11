@@ -14,6 +14,9 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
+    /// Every kind, from the root down.
+    pub const ALL: [Self; 5] = [Self::Project, Self::Milestone, Self::Section, Self::Task, Self::Subtask];
+
     /// The name the store persists.
     pub fn serde_name(self) -> &'static str {
         match self {
@@ -23,6 +26,21 @@ impl NodeKind {
             Self::Task => "task",
             Self::Subtask => "subtask",
         }
+    }
+}
+
+impl std::fmt::Display for NodeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.serde_name())
+    }
+}
+
+impl std::str::FromStr for NodeKind {
+    type Err = anyhow::Error;
+
+    /// The kind of its store name; the error lists the names.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::ALL.into_iter().find(|kind| kind.serde_name() == text).ok_or_else(|| anyhow::anyhow!("the kind is {}", name_list(&Self::ALL)))
     }
 }
 
@@ -46,6 +64,22 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    /// Every state: the main path in order, then the side states.
+    pub const ALL: [Self; 12] = [
+        Self::Defined,
+        Self::Ready,
+        Self::Assigned,
+        Self::InProgress,
+        Self::Implemented,
+        Self::Testing,
+        Self::Review,
+        Self::Accepted,
+        Self::Blocked,
+        Self::Failed,
+        Self::NeedsRevision,
+        Self::Cancelled,
+    ];
+
     /// The name the store persists.
     pub fn serde_name(self) -> &'static str {
         match self {
@@ -67,6 +101,34 @@ impl TaskState {
     /// Whether the state is on the main lifecycle path, not a side state.
     pub fn on_main_path(self) -> bool {
         !matches!(self, Self::Blocked | Self::Failed | Self::NeedsRevision | Self::Cancelled)
+    }
+}
+
+impl std::fmt::Display for TaskState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.serde_name())
+    }
+}
+
+impl std::str::FromStr for TaskState {
+    type Err = anyhow::Error;
+
+    /// The state of its store name; the error lists the names.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|state| state.serde_name() == text)
+            .ok_or_else(|| anyhow::anyhow!("the state is {}", name_list(&Self::ALL)))
+    }
+}
+
+/// The names of a list of kinds or states as prose: `a, b, c or d`.
+fn name_list<T: std::fmt::Display>(items: &[T]) -> String {
+    let names: Vec<String> = items.iter().map(ToString::to_string).collect();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
     }
 }
 

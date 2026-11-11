@@ -11,6 +11,7 @@ use anyhow::Context;
 
 use crate::markdown::{self, render};
 use crate::model::{Assignment, Node, NodeKind, TaskState};
+use crate::tree;
 
 /// The store over one `rhipper.md`.
 #[derive(Clone, Debug)]
@@ -67,15 +68,24 @@ impl Store {
         complexity: u8,
     ) -> anyhow::Result<i64> {
         let mut nodes = self.all().await?;
-        if kind != NodeKind::Project {
-            anyhow::ensure!(parent.is_some(), "a node below a project needs a parent");
-            let parent = parent.unwrap();
-            anyhow::ensure!(nodes.iter().any(|n| n.id == parent), "no node {parent}");
-        }
+        let parent = parent.filter(|_| kind != NodeKind::Project);
+        // the new node goes after the last descendant of its parent, so the file keeps its tree
+        // order and the node reads back under the right parent; a project goes last
+        let position = match parent {
+            Some(parent) => {
+                anyhow::ensure!(nodes.iter().any(|n| n.id == parent), "no node {parent}");
+                let last = tree::subtree(&nodes, parent).last().map(|n| n.id);
+                nodes.iter().position(|n| Some(n.id) == last).map_or(nodes.len(), |i| i + 1)
+            }
+            None => {
+                anyhow::ensure!(kind == NodeKind::Project, "a node below a project needs a parent");
+                nodes.len()
+            }
+        };
         let id = nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
         let node = Node {
             id,
-            parent: parent.filter(|_| kind != NodeKind::Project),
+            parent,
             kind,
             title: title.to_owned(),
             objective: objective.map(str::to_owned),
@@ -86,7 +96,7 @@ impl Store {
             complexity,
             notes: None,
         };
-        nodes.push(node);
+        nodes.insert(position, node);
         self.write(nodes).await?;
         Ok(id)
     }

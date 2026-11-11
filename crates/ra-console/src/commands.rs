@@ -4,6 +4,7 @@
 use anyhow::Context;
 use ra_roadmap::model::{NodeKind, TaskState};
 use ra_roadmap::store::Store;
+use ra_roadmap::tree;
 
 pub struct Spec {
     pub name: &'static str,
@@ -68,7 +69,7 @@ pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<
             let nodes = store.all().await?;
             let picked: Vec<&ra_roadmap::model::Node> = match args.parse::<i64>() {
                 Ok(root) => {
-                    let subtree = collect_subtree(&nodes, root);
+                    let subtree = tree::subtree(&nodes, root);
                     anyhow::ensure!(!subtree.is_empty(), "no node {root}");
                     subtree
                 }
@@ -77,10 +78,10 @@ pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<
             for node in &picked {
                 out.push(format!(
                     "{}#{} {} [{}]{}",
-                    "  ".repeat(u64::from(depth(&nodes, node)) as usize),
+                    "  ".repeat(tree::depth(&nodes, node.id)),
                     node.id,
                     node.title,
-                    node.state.serde_name(),
+                    node.state,
                     match &node.assignee {
                         Some(a) => format!(" ← {}:{}", a.role, a.model),
                         None => String::new(),
@@ -96,7 +97,7 @@ pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<
         }
         "add" => {
             let (kind_text, rest) = args.split_once(char::is_whitespace).context("usage: add <kind> <title>")?;
-            let kind = kind_of(kind_text).context("the kind is project, milestone, section, task or subtask")?;
+            let kind: NodeKind = kind_text.parse()?;
             let (title, parent) = match rest.split_once(" parent ") {
                 Some((title, parent_text)) => {
                     let parent = parent_text.trim().parse::<i64>().context("the parent is a node id")?;
@@ -124,9 +125,9 @@ pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<
         "set" => {
             let (id_text, state_text) = args.split_once(char::is_whitespace).context("usage: set <id> <state>")?;
             let id = id_text.parse::<i64>().context("the id is a node id")?;
-            let state = state_of(state_text).context("that is no state of the lifecycle")?;
+            let state: TaskState = state_text.parse()?;
             store.set_state(id, state).await?;
-            out.push(format!("#{id} is now {}", state.serde_name()));
+            out.push(format!("#{id} is now {state}"));
         }
         "seed" => {
             anyhow::ensure!(args.is_empty(), "usage: seed");
@@ -267,60 +268,6 @@ async fn seed(store: &Store) -> anyhow::Result<Vec<i64>> {
     store.depend_on(t4, t2).await?;
     store.depend_on(t4, t3).await?;
     Ok(ids)
-}
-
-fn kind_of(text: &str) -> Option<NodeKind> {
-    match text {
-        "project" => Some(NodeKind::Project),
-        "milestone" => Some(NodeKind::Milestone),
-        "section" => Some(NodeKind::Section),
-        "task" => Some(NodeKind::Task),
-        "subtask" => Some(NodeKind::Subtask),
-        _ => None,
-    }
-}
-
-fn state_of(text: &str) -> Option<TaskState> {
-    let states = [
-        ("defined", TaskState::Defined),
-        ("ready", TaskState::Ready),
-        ("assigned", TaskState::Assigned),
-        ("in_progress", TaskState::InProgress),
-        ("implemented", TaskState::Implemented),
-        ("testing", TaskState::Testing),
-        ("review", TaskState::Review),
-        ("accepted", TaskState::Accepted),
-        ("blocked", TaskState::Blocked),
-        ("failed", TaskState::Failed),
-        ("needs_revision", TaskState::NeedsRevision),
-        ("cancelled", TaskState::Cancelled),
-    ];
-    states.iter().find(|(name, _)| *name == text).map(|(_, state)| *state)
-}
-
-fn collect_subtree<'a>(nodes: &'a [ra_roadmap::model::Node], root: i64) -> Vec<&'a ra_roadmap::model::Node> {
-    let mut out = Vec::new();
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if let Some(node) = nodes.iter().find(|n| n.id == id) {
-            out.push(node);
-            for child in nodes.iter().filter(|n| n.parent == Some(id)).map(|n| n.id) {
-                stack.push(child);
-            }
-        }
-    }
-    out.sort_by_key(|n| n.id);
-    out
-}
-
-fn depth(nodes: &[ra_roadmap::model::Node], node: &ra_roadmap::model::Node) -> u64 {
-    let mut depth = 0u64;
-    let mut parent = node.parent;
-    while let Some(id) = parent {
-        parent = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent);
-        depth += 1;
-    }
-    depth
 }
 
 #[cfg(test)]

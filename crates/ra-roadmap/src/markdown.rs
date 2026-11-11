@@ -18,11 +18,10 @@
 //!         notes: ...
 //! ```
 
-use std::collections::HashMap;
-
 use anyhow::Context;
 
 use crate::model::{Assignment, Node, NodeKind, TaskState};
+use crate::tree::depths;
 
 /// The indent of one hierarchy level, in spaces.
 const INDENT: usize = 2;
@@ -107,22 +106,6 @@ fn detail_lines(node: &Node, level: usize) -> Vec<String> {
     lines
 }
 
-/// The depth of every node: the distance from its project root.
-fn depths(nodes: &[Node]) -> HashMap<i64, usize> {
-    let by_id: HashMap<i64, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
-    let mut depth = HashMap::new();
-    for node in nodes {
-        let mut level = 0;
-        let mut parent = node.parent;
-        while let Some(id) = parent {
-            parent = by_id.get(&id).and_then(|n| n.parent);
-            level += 1;
-        }
-        depth.insert(node.id, level);
-    }
-    depth
-}
-
 /// Parses the text of a `rhipper.md` into the nodes. It fails on a line it cannot read and names
 /// the line number.
 pub fn parse(text: &str) -> anyhow::Result<Vec<Node>> {
@@ -174,14 +157,7 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
     let id = id_text.parse::<i64>().context("the id is a number")?;
     let rest = rest.trim_start();
     let (kind_text, title_and_fields) = rest.strip_prefix('‹').and_then(|r| r.split_once('›')).context("the kind sits in ‹ ›")?;
-    let kind = match kind_text {
-        "project" => NodeKind::Project,
-        "milestone" => NodeKind::Milestone,
-        "section" => NodeKind::Section,
-        "task" => NodeKind::Task,
-        "subtask" => NodeKind::Subtask,
-        other => anyhow::bail!("unknown kind {other}"),
-    };
+    let kind: NodeKind = kind_text.parse().with_context(|| format!("unknown kind {kind_text}"))?;
 
     let mut title = title_and_fields.trim().to_owned();
     let mut assignee = None;
@@ -193,13 +169,13 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         let Some((before, field)) = title.rsplit_once(" [") else { break };
         let field = field.strip_suffix(']').unwrap_or(field);
         if let Some((role, model)) = field.split_once(':') {
-            if !role.contains('‹') && TaskState::parse(role).is_none() {
+            if !role.contains('‹') && role.parse::<TaskState>().is_err() {
                 assignee = Some(Assignment { role: role.to_owned(), model: model.to_owned() });
                 title = before.trim_end().to_owned();
                 continue;
             }
         }
-        if let Some(parsed) = TaskState::parse(field) {
+        if let Ok(parsed) = field.parse::<TaskState>() {
             state = parsed;
             title = before.trim_end().to_owned();
             continue;
@@ -228,27 +204,6 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         complexity,
         notes: None,
     })
-}
-
-impl TaskState {
-    /// The state of its store name, for the parser.
-    fn parse(text: &str) -> Option<Self> {
-        Some(match text {
-            "defined" => Self::Defined,
-            "ready" => Self::Ready,
-            "assigned" => Self::Assigned,
-            "in_progress" => Self::InProgress,
-            "implemented" => Self::Implemented,
-            "testing" => Self::Testing,
-            "review" => Self::Review,
-            "accepted" => Self::Accepted,
-            "blocked" => Self::Blocked,
-            "failed" => Self::Failed,
-            "needs_revision" => Self::NeedsRevision,
-            "cancelled" => Self::Cancelled,
-            _ => return None,
-        })
-    }
 }
 
 #[cfg(test)]
