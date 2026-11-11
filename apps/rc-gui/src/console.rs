@@ -292,13 +292,18 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     // cap or fewer. In the console the room is the clip rect, and the card's own frame, title,
     // folded line and the spacing under it come off it before the rows: with the rows alone
     // counted the card overshot the view and its top was always cut off
-    let overhead = if bounded { 96.0 } else { 136.0 };
+    // A bounded card (the dashboard) pads itself to its room after the rows, so its overhead
+    // is only what sits above them: the title row, the space under it, the frame's margins
+    // and stroke (24 + 4 + 19). The folded line, when the steps overflow, takes one of the
+    // rows. With the console's 96 here the card drew half its rows and padded the rest blank
+    let overhead = if bounded { 50.0 } else { 136.0 };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let fit = ((room - overhead) / 24.0).floor().max(0.0) as usize;
     let body = if bounded {
-        // the dashboard: the rows the room holds, live or finished; the card pads to its
-        // room after them, so a finished run with few steps still fills its band
-        fit.max(1)
+        // the dashboard: the rows the room holds, less the folded line when steps fell off
+        // the top; a run with fewer steps than rows shows them all and pads to its room
+        let rows = fit.max(1);
+        if folded.len() > rows { rows.saturating_sub(1).max(1) } else { folded.len().max(1) }
     } else if run.live() {
         height.max(fit)
     } else {
