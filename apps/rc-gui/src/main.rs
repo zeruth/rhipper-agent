@@ -267,9 +267,10 @@ struct Ledger {
     /// up the tree, so the root reads as the total.
     by_node: Vec<(Option<i64>, Totals)>,
     all_time: Option<Totals>,
-    /// The totals since the window opened this project, from the ledger: the walks' runs are
-    /// child processes, so the window's own worker never tallies them (the pill bar read 0
-    /// all evening); `None` without a ledger.
+    /// Today's totals (the UTC day, as `rc status` counts it), from the ledger: the walks' runs
+    /// are child processes, so the window's own worker never tallies them, and a count from
+    /// the window's start reset with every restart (the pill bar read 0 all evening); `None`
+    /// without a ledger.
     session: Option<Totals>,
     /// The calls of the selected card, the latest first, with the turns and the tokens of each;
     /// read again when the selection moves.
@@ -543,19 +544,21 @@ impl TokenGauges {
         let (mut session, mut all) = (Vec::new(), Vec::new());
         let (mut session_totals, mut all_totals) = (Totals::default(), Totals::default());
         let shown = u32::try_from(RUNS_SHOWN).unwrap_or(u32::MAX);
+        // the session is the day (UTC, as `rc status` counts today): a count from the window's
+        // start reset with every restart and read 0 through an evening of runs
+        let today = utc_day();
         for tab in tabs {
             let Some(usage) = &tab.usage else { continue };
             let read = tab.rt.block_on(async {
                 anyhow::Ok((
-                    usage.recent(tab.session_from, shown).await?,
-                    usage.totals_after(tab.session_from).await?,
+                    usage.totals_between(since_utc_midnight(), Duration::ZERO).await?,
                     usage.recent(0, shown).await?,
                     usage.totals().await?,
                 ))
             });
             match read {
-                Ok((runs, totals, every, every_totals)) => {
-                    session.extend(runs);
+                Ok((totals, every, every_totals)) => {
+                    session.extend(every.iter().filter(|s| s.at.starts_with(&today)).cloned());
                     session_totals.merge(&totals);
                     all.extend(every);
                     all_totals.merge(&every_totals);
@@ -573,15 +576,37 @@ impl TokenGauges {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             cards::gauge(ui, "TOKENS / TASK", &self.task.value, &self.task.samples, theme::lane(4), width);
-            cards::gauge(ui, "SESSION", &self.session.value, &self.session.samples, theme::lane(5), width);
+            cards::gauge(ui, "TODAY", &self.session.value, &self.session.samples, theme::lane(5), width);
             cards::gauge(ui, "ALL TIME", &self.all.value, &self.all.samples, theme::lane(6), width);
         });
     }
 }
 
-/// The token gauges from what the ledgers answered: `session` the rows since the window
-/// started and `all` the newest rows of each project, both merged by time and cut to the last
-/// [`RUNS_SHOWN`]; the totals cover every row of their span, not only the ones shown.
+/// Seconds since midnight UTC, the span of today's ledger rows.
+fn since_utc_midnight() -> Duration {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+    Duration::from_secs(now % 86_400)
+}
+
+/// Today's date, UTC, as the ledger stamps its rows (`YYYY-MM-DD`): days since the epoch to a
+/// civil date, the usual arithmetic.
+fn utc_day() -> String {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = i64::try_from(now / 86_400).unwrap_or(0) + 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// The token gauges from what the ledgers answered: `session` today's rows and `all` the
+/// newest rows of each project, both merged by time and cut to the last [`RUNS_SHOWN`]; the
+/// totals cover every row of their span, not only the ones shown.
 fn token_gauges(
     mut session: Vec<ra_usage::Spend>,
     session_totals: &Totals,
@@ -1075,7 +1100,7 @@ impl App {
                 &format!("in {} · out {} · {}", compact(prompt), compact(completion), dollars(Some(cost))),
                 theme::warn_text(),
             )
-            .on_hover_text("this session's tokens and cost, every project");
+            .on_hover_text("today's tokens and cost, every project");
             if any_ledger {
                 cards::badge_marked(ui, "◉", &format!("ledger {} · {all_calls} calls", dollars(Some(all_cost))), theme::online())
                     .on_hover_text("all time, every project's var/usage.db");
@@ -1493,8 +1518,6 @@ struct Workspace {
     /// The project's ledger, the same the worker writes, for the dashboard's token gauges;
     /// `None` when it did not open.
     usage: Option<UsageStore>,
-    /// The ledger's newest row when the workspace opened: the rows after it are this session's.
-    session_from: i64,
     context: ContextView,
     diff: DiffView,
     /// The reviewer's verdict on the selected card's last run, read from its context when the
@@ -1610,7 +1633,6 @@ impl Workspace {
             }
             Err(e) => tracing::warn!("no ledger: {e:#}"),
         }
-        let session_from = usage.as_ref().map_or(0, |u| rt.block_on(u.last_id()).unwrap_or(0));
         sink.push(
             Kind::Banner,
             format!(
@@ -1658,7 +1680,6 @@ impl Workspace {
             job_done,
             ledger: Ledger::default(),
             usage,
-            session_from,
             context: ContextView::default(),
             diff: DiffView::default(),
             verdict: VerdictView::default(),
@@ -1854,7 +1875,7 @@ impl Workspace {
                     None => None,
                 },
                 match &self.usage {
-                    Some(usage) => usage.totals_after(self.session_from).await.ok(),
+                    Some(usage) => usage.totals_between(since_utc_midnight(), Duration::ZERO).await.ok(),
                     None => None,
                 },
             )
@@ -2527,7 +2548,7 @@ impl Workspace {
                 ),
                 theme::warn_text(),
             )
-            .on_hover_text("this session's tokens and cost, from the ledger");
+            .on_hover_text("today's tokens and cost, from the ledger");
             match &self.ledger.all_time {
                 Some(all) => {
                     cards::badge_marked(ui, "◉", &format!("ledger {} · {} calls", dollars(all.cost_usd), all.calls), theme::online())
