@@ -287,6 +287,12 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     // counted after the folding, so the card shows as many entries as it has rows for
     let mut folded: Vec<(&str, usize)> = Vec::new();
     for step in &run.steps {
+        // a tool call with nothing after its name (a Grep over the whole tree) is no line
+        if let (Some(_), rest, _) = step_tool(step)
+            && rest.trim().is_empty()
+        {
+            continue;
+        }
         match folded.last_mut() {
             Some((last, count)) if *last == step.as_str() => *count += 1,
             _ => folded.push((step.as_str(), 1)),
@@ -328,7 +334,9 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     if bounded {
         // the rows drawn: the folded line stands in for one of the body's when steps hid
         let rows = body.max(1) as u32 as f32;
-        let extra = ((room - rows * row) / rows).clamp(0.0, row);
+        // a thin space at most: with few lines the rest of the room stays under them rather
+        // than spread them apart
+        let extra = ((room - rows * row) / rows).clamp(0.0, 3.0);
         // on the pixel grid: a fraction of a pixel between rows put the text between pixels,
         // and it snapped up or down a pixel from frame to frame
         let ppp = ui.pixels_per_point();
