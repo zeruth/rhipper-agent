@@ -316,6 +316,9 @@ enum Command {
         /// Ends the running walk after the card it is in.
         #[arg(long)]
         stop: bool,
+        /// Runs that many ready cards at once, each in its own worktree; one when left out.
+        #[arg(long)]
+        parallel: Option<u32>,
     },
     /// An observation for the next runs: what slowed one, a quirk of the machine, a direction. The workers read the latest with their own look-backs.
     Note {
@@ -643,9 +646,9 @@ async fn run_main() -> anyhow::Result<()> {
             println!("{}", ra_console::hub::restart()?);
             Ok(())
         }
-        Command::Walk { dir, stop } => {
+        Command::Walk { dir, stop, parallel } => {
             let dir = dir.unwrap_or_else(|| PathBuf::from("."));
-            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            let dir = std::fs::canonicalize(&dir).map_or(dir, |p| PathBuf::from(p.display().to_string().trim_start_matches(r"\\?\")));
             if stop {
                 println!("{}", ra_console::agent::stop_walk(&dir));
             } else if ra_console::agent::walk_running(&dir) {
@@ -653,9 +656,9 @@ async fn run_main() -> anyhow::Result<()> {
             } else if ra_console::instance::claimed(&dir) && ra_console::hub::window_running() {
                 // the window has the project: it starts the walk, so the tab shows it from its
                 // first line and the walk is nobody's child but the system's
-                println!("{}", ra_console::agent::request_walk(&dir));
+                println!("{}", ra_console::agent::request_walk(&dir, parallel));
             } else {
-                let pid = ra_console::agent::spawn_walk(&dir, true)?;
+                let pid = ra_console::agent::spawn_walk(&dir, true, parallel)?;
                 println!("walk started in {} (pid {pid}); `rc pair` and var/activity.log follow it", dir.display());
             }
             Ok(())

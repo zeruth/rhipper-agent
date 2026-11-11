@@ -500,6 +500,26 @@ pub struct TaskContext {
     pub outlines: String,
     /// The handoffs of the earlier runs, oldest first.
     pub handoffs: Vec<Handoff>,
+    /// The latest `review by` block of the card's notes, verbatim, when the card is rerun after
+    /// a reject; `None` for a fresh card. The notes are in the roadmap, which the worker does not
+    /// read, so the prompt quotes them.
+    pub review: Option<String>,
+}
+
+/// The heading of the review in the file and the prompt.
+pub const REVIEW_HEADING: &str = "## Review";
+
+/// The latest reviewer's block at the head of a card's notes: its `review by` line and the
+/// `- ` points under it, verbatim; `None` when the notes do not open with one.
+#[must_use]
+pub fn review_of(notes: &str) -> Option<String> {
+    let mut lines = notes.lines().peekable();
+    let first = lines.find(|l| l.starts_with("review by "))?;
+    let mut block = vec![first];
+    while let Some(point) = lines.next_if(|l| l.starts_with("- ")) {
+        block.push(point);
+    }
+    Some(block.join("\n"))
 }
 
 impl TaskContext {
@@ -510,9 +530,10 @@ impl TaskContext {
 
     /// The context of task `id`: the handoffs of its file when there is one, nothing else yet;
     /// the run sets the brief and the outlines.
+    #[must_use]
     pub fn open(workspace: &Path, id: i64) -> Self {
         let handoffs = std::fs::read_to_string(Self::path(workspace, id)).map(|text| parse_handoffs(&text)).unwrap_or_default();
-        Self { id, brief: String::new(), outlines: String::new(), handoffs }
+        Self { id, brief: String::new(), outlines: String::new(), handoffs, review: None }
     }
 
     /// The text a run sends the worker: the brief, the outlines, and the last handoffs.
@@ -521,6 +542,10 @@ impl TaskContext {
         if !self.outlines.is_empty() {
             text.push_str("\nFiles: read the regions the outline points at, not whole files.\n");
             text.push_str(&self.outlines);
+        }
+        if let Some(review) = &self.review {
+            let _ =
+                write!(text, "\n{REVIEW_HEADING}\nThe reviewer sent the last run back on these points; answer each:\n{}\n", review.trim());
         }
         let shown = &self.handoffs[self.handoffs.len().saturating_sub(HANDOFFS_SHOWN)..];
         if !shown.is_empty() {
@@ -578,7 +603,11 @@ impl TaskContext {
         }
         let mut text = format!("# Task #{} context\n\n## Brief\n\n{}\n", self.id, self.brief.trim_end());
         if !self.outlines.is_empty() {
-            text.push_str(&format!("\n## Files\n\n{}", self.outlines));
+            let _ = write!(text, "\n## Files\n\n{}", self.outlines);
+        }
+        // the review rides before the handoffs, where the reader of the handoffs skips it
+        if let Some(review) = &self.review {
+            let _ = write!(text, "\n{REVIEW_HEADING}\n\n{}\n", review.trim());
         }
         for handoff in &self.handoffs {
             text.push('\n');

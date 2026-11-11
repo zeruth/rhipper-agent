@@ -102,6 +102,16 @@ fn a_quoted_argument_stays_one_argument() {
 }
 
 #[test]
+fn a_backslash_before_a_path_character_is_the_separator() {
+    // runelite #9: `.\gw.ps1 :android-awt:stubReport` reached powershell as `-File .gw.ps1`
+    assert_eq!(split(r".\gw.ps1 :android-awt:stubReport").unwrap(), [r".\gw.ps1", ":android-awt:stubReport"]);
+    assert_eq!(split(r"python tools\run.py C:\Users\me\a.txt").unwrap(), ["python", r"tools\run.py", r"C:\Users\me\a.txt"]);
+    assert_eq!(split(r"echo d\ e a\\b").unwrap(), ["echo", "d e", r"a\b"]);
+    let err = split(r"echo a\").unwrap_err().to_string();
+    assert!(err.contains("ends in a backslash"), "{err}");
+}
+
+#[test]
 fn clip_keeps_the_head_and_the_tail() {
     let long = "a".repeat(MAX_OUTPUT + 100);
     let out = clip(&long);
@@ -117,11 +127,25 @@ async fn a_long_command_output_reaches_the_agent_clipped_to_its_head_and_tail() 
     let out = tools.execute(&call("run", json!({"command": "cargo build"}))).await;
     // the lines of the output and the exit line, less what the marker stands for
     assert!(out.lines().count() <= MAX_LINES + 1, "{} lines", out.lines().count());
-    assert!(out.contains("… 801 lines clipped …"), "{out}");
+    assert!(out.contains("… 801 lines dropped …"), "{out}");
     assert!(out.starts_with("   Compiling crate-1 v0.1.0\n"), "the head stays");
     assert!(out.ends_with("   Compiling crate-1000 v0.1.0\nexit code 0"), "the tail and the verdict stay");
     // a check is the lint's, not a turn's: it reads the whole output
     assert_eq!(tools.check("cargo build").await.unwrap().1.lines().count(), 1001);
+}
+
+#[tokio::test]
+async fn a_heavy_tool_result_is_clipped_to_its_head_and_tail_with_the_dropped_count() {
+    let (_dir, tools) = workspace().await;
+    let log: String = (1..=5000).map(|n| format!("test case_{n} ... ok\n")).collect();
+    let tools = tools.with_script(Arc::new(move |_: &str| Ok((0, log.clone()))));
+    let out = tools.execute(&call("run", json!({"command": "cargo test"}))).await;
+    // the 5,000 lines and the exit line, less the 200 the marker stands between
+    assert!(out.contains("… 4801 lines dropped …"), "{out}");
+    assert!(out.lines().count() <= MAX_LINES + 1, "{} lines", out.lines().count());
+    assert!(out.chars().count() <= MAX_OUTPUT + 1, "{} chars", out.chars().count());
+    assert!(out.starts_with("test case_1 ... ok\n"), "the head stays");
+    assert!(out.ends_with("test case_5000 ... ok\nexit code 0"), "the tail and the verdict stay");
 }
 
 #[test]

@@ -167,6 +167,30 @@ pub fn record_saving(root: &Path, node: i64, held: bool, why: &str) -> anyhow::R
     Ok(text)
 }
 
+/// The tag of the line a run writes when its turns were heavier than the ledger's ceiling.
+pub const HEAVY: &str = "[heavy]";
+
+/// The ledger's ceiling on the tokens a turn: a run whose mean turn passes it carried more
+/// context than the work needed (#119 ran at 70,606 a turn, #114 at 48,703), and is noted.
+pub const TURN_CEILING: u64 = 40_000;
+
+/// Keeps `[heavy] #id N tokens/turn over the ceiling of C; biggest tool result: … (M chars)`
+/// under the card when a run's mean turn passes [`TURN_CEILING`], naming the tool call whose
+/// answer was the largest, so the next walk reads which read or command to make smaller; the
+/// line as written. `biggest` is `None` when the harness ran the tools out of sight.
+///
+/// # Errors
+/// When the file cannot be written.
+pub fn record_heavy(root: &Path, node: i64, per_turn: u64, biggest: Option<(&str, usize)>) -> anyhow::Result<String> {
+    let result = match biggest {
+        Some((call, chars)) => format!("biggest tool result: {call} ({chars} chars)"),
+        None => "the tool results were the harness's, out of sight".to_owned(),
+    };
+    let text = format!("{HEAVY} #{node} {per_turn} tokens/turn over the ceiling of {TURN_CEILING}; {result}");
+    record(root, Some(node), &[Note { when: 0, node: Some(node), machine: false, pair: false, text: text.clone() }])?;
+    Ok(text)
+}
+
 /// How many landed cards a card is measured against: the median of the last twenty.
 pub const MEDIAN_OF: u32 = 20;
 
@@ -363,8 +387,9 @@ pub fn machine_lines(root: &Path) -> String {
 pub fn machine_lines_with(root: &Path, shared: &Path) -> String {
     let mut seen: Vec<String> = Vec::new();
     for note in recent(root, SHOWN * 2) {
-        // the walk's verdicts on the plan's claims are the planner's to read, not a worker's
-        if note.text.starts_with(SAVING) {
+        // the walk's verdicts on the plan's claims and on a run's weight are the planner's to
+        // read, not a worker's
+        if note.text.starts_with(SAVING) || note.text.starts_with(HEAVY) {
             continue;
         }
         // the person's notes are told from the workers' own

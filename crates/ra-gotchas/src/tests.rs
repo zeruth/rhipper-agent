@@ -45,6 +45,27 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
 }
 
 #[test]
+fn a_kill_by_pid_is_handed_to_the_person_and_a_process_listing_passes() {
+    let catalogue = Catalogue::seed();
+    for command in [
+        "Stop-Process -Id 13656 -Force",
+        "taskkill /PID 13656 /F",
+        "Get-CimInstance Win32_Process -Filter \"ProcessId = 13656\"",
+        "Get-Process rc | Stop-Process",
+    ] {
+        match catalogue.command(command, Conditions::default()) {
+            Verdict::Deny { id, reason } => {
+                assert_eq!(id, "stuck-process", "{command}");
+                assert!(reason.contains("name the pid in the report"), "{reason}");
+            }
+            other => panic!("{command}: {other:?}"),
+        }
+    }
+    assert_eq!(catalogue.command("Get-Process rc", Conditions::default()), Verdict::Pass);
+    assert_eq!(catalogue.command("Get-Process | Select-Object -First 5", Conditions::default()), Verdict::Pass);
+}
+
+#[test]
 fn a_workspace_build_is_rewritten_only_while_a_console_runs() {
     let catalogue = Catalogue::seed();
     let running = Conditions { console_running: true };

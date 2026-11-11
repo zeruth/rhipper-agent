@@ -908,7 +908,7 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
 }
 
 /// What the reviewer is told: the verdict on the first line, the points after it.
-const REVIEW_INSTRUCTION: &str = "You review one card of a roadmap after a worker implemented it. You get the card's objective and acceptance, the worker's handoff, and the git diff of the card's files. Judge whether the diff meets the acceptance and whether the handoff tells the truth about it. Answer with one word on the first line: `accepted` or `needs_revision`. After `needs_revision`, list the points as `- ` lines, each naming the file and what is wrong or missing; after `accepted`, nothing or one line of why. No other text.";
+const REVIEW_INSTRUCTION: &str = "You review one card of a roadmap after a worker implemented it. You get the card's objective and acceptance, the worker's handoff, the files the card names and the run changed with their diff stat, and the git diff of those files. A change may live in any file of that list, not only the one you expect; read the stat before judging something missing. Judge whether the diff meets the acceptance and whether the handoff tells the truth about it. Answer with one word on the first line: `accepted` or `needs_revision`. After `needs_revision`, list the points as `- ` lines, each naming the file and what is wrong or missing; after `accepted`, nothing or one line of why. No other text.";
 
 /// How much of the diff the reviewer reads: a card's files, not a reformat of the tree.
 const REVIEW_DIFF: usize = 60_000;
@@ -1209,9 +1209,11 @@ async fn review_brief(root: &Path, node: &Node) -> String {
     }
     let _ = writeln!(text, "\nAcceptance: {}", node.acceptance.as_deref().unwrap_or("none written; the workspace tests are the check"));
     let mut files = node.files.clone();
+    let mut changed = Vec::new();
     match ra_context::TaskContext::open(root, node.id).handoffs.last() {
         Some(last) => {
             let _ = writeln!(text, "\n## Handoff of the last run\n{} on {} · {}\n{}", last.outcome, last.model, last.check, last.report);
+            changed.clone_from(&last.changed);
             for file in &last.changed {
                 if !files.contains(file) {
                     files.push(file.clone());
@@ -1219,6 +1221,12 @@ async fn review_brief(root: &Path, node: &Node) -> String {
             }
         }
         None => text.push_str("\n## Handoff of the last run\nnone: no run of this card left one\n"),
+    }
+    // the list and the stat come before the diff: the reviewer of #159 looked for the change in
+    // the one file it expected and judged the card unfinished for code that lived in another
+    text.push_str(&crate::review::files_section(&node.files, &changed));
+    if !files.is_empty() {
+        text.push_str(&crate::review::diff_stat_section(root, &files).await);
     }
     // the notes hold the worker's report whole where the handoff holds its summary
     if let Some(notes) = node.notes.as_deref().filter(|notes| !notes.trim().is_empty()) {
@@ -1810,33 +1818,47 @@ pub fn walk_running(root: &Path) -> bool {
     take_walk_lock(root).is_none()
 }
 
-/// Asks the window that has the project to start the walk: leaves the file its tick reads.
+/// Asks the window that has the project to start the walk: leaves the file its tick reads,
+/// with the number of cards to run at once when more than one.
 #[must_use]
-pub fn request_walk(root: &Path) -> String {
+pub fn request_walk(root: &Path, parallel: Option<u32>) -> String {
     let _ = std::fs::create_dir_all(root.join("var"));
-    match std::fs::write(root.join(WALK_START), "") {
-        Ok(()) => "the window starts the walk; its cards land in the project's tab and in var/pair.log".to_owned(),
+    let text = parallel.filter(|n| *n > 1).map(|n| n.to_string()).unwrap_or_default();
+    match std::fs::write(root.join(WALK_START), text) {
+        Ok(()) => match parallel.filter(|n| *n > 1) {
+            Some(n) => {
+                format!("the window starts the walk, {n} cards at once in worktrees; they land in the project's tab and in var/pair.log")
+            }
+            None => "the window starts the walk; its cards land in the project's tab and in var/pair.log".to_owned(),
+        },
         Err(e) => format!("cannot ask the window to start the walk: {e}"),
     }
 }
 
-/// Whether `rc walk` asked for a walk; the request is consumed.
+/// Whether `rc walk` asked for a walk, and how many cards at once when more than one; the
+/// request is consumed.
 #[must_use]
-pub fn walk_requested(root: &Path) -> bool {
+pub fn walk_requested(root: &Path) -> Option<Option<u32>> {
     let path = root.join(WALK_START);
-    path.exists() && std::fs::remove_file(path).is_ok()
+    let text = std::fs::read_to_string(&path).ok()?;
+    std::fs::remove_file(path).ok()?;
+    Some(text.trim().parse::<u32>().ok().filter(|n| *n > 1))
 }
 
 /// Starts the walk as a process of its own in `root`, detached from whoever asked: the
-/// installed `rc run --all`, or the one beside this binary. Returns the process id.
+/// installed `rc run --all`, or the one beside this binary, `--parallel N` when more than one
+/// card runs at once. Returns the process id.
 ///
 /// # Errors
 /// When a walk is running already, or `rc` cannot start.
-pub fn spawn_walk(root: &Path, debug: bool) -> anyhow::Result<u32> {
+pub fn spawn_walk(root: &Path, debug: bool, parallel: Option<u32>) -> anyhow::Result<u32> {
     anyhow::ensure!(!walk_running(root), "a walk is already running in this project");
     let rc = std::env::current_exe()?.with_file_name(format!("rc{}", std::env::consts::EXE_SUFFIX));
     let mut command = std::process::Command::new(&rc);
     command.args(["run", "--all"]).current_dir(root);
+    if let Some(n) = parallel.filter(|n| *n > 1) {
+        command.args(["--parallel", &n.to_string()]);
+    }
     if !debug {
         command.arg("--no-debug");
     }
@@ -2143,6 +2165,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                     cap: caps.limit(),
                     capped: None,
                     reads: answer.reads,
+                    biggest: None,
                 })
             }
             // the harness reports its turns running out as an error, with what the run read,
@@ -2162,6 +2185,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                         cap: Some(restart),
                         capped: Some(restart),
                         reads: answer.reads,
+                        biggest: None,
                     }),
                     None => Err(map_error(ProviderError::TurnsOut(answer))),
                 }
@@ -2271,11 +2295,29 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // a failed check leads the notes and the handoff: the failed command with its tests and the
     // tail of its output first, then the commands that passed before it with their exit codes,
     // then the worker's answer, so the next run reads the failures before anything
+    // a worker's own run of the check decides nothing: a report that says the check is still
+    // running (a background shell the session outlived; #159 handed one off twice) is a
+    // placeholder, and the agent's run, exit and clipped tail, stands in the notes and the
+    // handoff where the claim was
+    let claimed = without_check_claims(&session.text);
+    let placeholder = claimed.is_some();
+    if let Some(text) = claimed {
+        session.text = text;
+    }
     let mut report = session.text.clone();
-    // what leads the answer in the notes and the handoff alike: the failed check, when one did
+    // what leads the answer in the notes and the handoff alike: the failed check, when one did,
+    // else the agent's run of the checks when the worker's report claimed its own was running
     let mut lead = String::new();
     let (mut passed, mut check_line) = match checks.iter().find(|run| !run.passed) {
-        None => (true, format!("  check passed: {command}")),
+        None => {
+            if placeholder {
+                let ran: Vec<String> =
+                    checks.iter().map(|run| format!("check passed: {} · {}\n{}", run.command, run.exit, run.text)).collect();
+                lead = format!("{}\n\n", ran.join("\n\n"));
+                report = format!("{lead}{}", session.text);
+            }
+            (true, format!("  check passed: {command}"))
+        }
         Some(failed) => {
             let before: Vec<String> = checks
                 .iter()
@@ -2327,7 +2369,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         }
     }
     if passed {
-        store.set_notes(id, &session.text).await?;
+        store.set_notes(id, &report).await?;
         store.set_state_by(id, TaskState::Implemented, Source::Run).await?;
     } else {
         // a rerun that fails its check leaves no new verdict, so the reviewer's points stay at
@@ -2388,6 +2430,16 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     lines.extend(fresh);
     lines.extend(noted);
     lines.extend(lint_lines);
+    // a run whose mean turn passed the ledger's ceiling names its biggest tool result, for the
+    // next walk to make that read or command smaller
+    let per_turn = average_turn(&session);
+    if per_turn > crate::retro::TURN_CEILING {
+        let biggest = session.biggest.as_ref().map(|(call, chars)| (call.as_str(), *chars));
+        match crate::retro::record_heavy(&root, id, per_turn, biggest) {
+            Ok(text) => lines.push(format!("  ⚠ {text}")),
+            Err(e) => tracing::warn!("the weight of #{id} was not noted: {e:#}"),
+        }
+    }
     // in debug mode the files the run read again, the context every later turn carried, and
     // the worker's own look back: kept for the next runs, and named here
     if worker.debug {
@@ -2476,6 +2528,9 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     let brief = context_of(store, node).await?;
     task.brief = brief.text;
     task.outlines = ra_context::outline_files(&root, &brief.files, &last_change(&root, node, &task).await);
+    // a card sent back by its reviewer carries the verdict's points in its context: the notes
+    // that hold them are in the roadmap, which the worker does not read
+    task.review = if is_rerun(node, worker) { ra_context::review_of(node.notes.as_deref().unwrap_or_default()) } else { None };
     let project =
         if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
     // the active gambits ride after the project context as the person's standing direction,
@@ -2874,8 +2929,8 @@ pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// The check of a node when its acceptance names none.
-const DEFAULT_CHECK: &str = "cargo test --workspace -q";
+/// The check of a node when its acceptance names none and its files name no crate.
+const DEFAULT_CHECK: &str = ra_roadmap::check::WORKSPACE_TESTS;
 
 /// The checks of a node: every backticked span of its acceptance that reads as a command line,
 /// in the order written, else the tests of the whole workspace. A span is a command when its
@@ -2884,15 +2939,15 @@ const DEFAULT_CHECK: &str = "cargo test --workspace -q";
 /// `git log` style reference is not.
 #[must_use]
 pub fn check_commands(acceptance: Option<&str>) -> Vec<String> {
-    check_commands_or(acceptance, DEFAULT_CHECK)
+    let commands = named_checks(acceptance);
+    if commands.is_empty() { vec![DEFAULT_CHECK.to_owned()] } else { commands }
 }
 
-/// [`check_commands`] with `default` in place of the workspace tests.
-fn check_commands_or(acceptance: Option<&str>, default: &str) -> Vec<String> {
-    let commands: Vec<String> = acceptance
+/// The command lines an acceptance names, possibly none.
+fn named_checks(acceptance: Option<&str>) -> Vec<String> {
+    acceptance
         .map(|text| text.split('`').skip(1).step_by(2).map(str::trim).filter(|span| is_command(span)).map(str::to_owned).collect())
-        .unwrap_or_default();
-    if commands.is_empty() { vec![default.to_owned()] } else { commands }
+        .unwrap_or_default()
 }
 
 /// What a card is judged by in its project: the checks and the lint.
@@ -2920,14 +2975,20 @@ impl Checks {
 }
 
 /// The checks of `node` under the `[worker]` table of the project at `root`; a table that will
-/// not parse is the default one, as the run already said so when it picked the model.
+/// not parse is the default one, as the run already said so when it picked the model. Without a
+/// named check the card's files pick the crates to test: a full workspace run outlives a session
+/// on a large workspace.
 fn checks_of(root: &Path, node: &Node) -> Checks {
     let worker = crate::router::Router::load(root).map(|router| router.worker).unwrap_or_default();
-    Checks {
-        commands: check_commands_or(node.acceptance.as_deref(), worker.check().unwrap_or(DEFAULT_CHECK)),
-        lint: worker.lint().map(str::to_owned),
-        timeout: worker.check_timeout(),
-    }
+    let own = named_checks(node.acceptance.as_deref());
+    let commands = if !own.is_empty() {
+        own
+    } else if let Some(check) = worker.check() {
+        vec![check.to_owned()]
+    } else {
+        ra_roadmap::check::commands(&node.files)
+    };
+    Checks { commands, lint: worker.lint().map(str::to_owned), timeout: worker.check_timeout() }
 }
 
 /// The programs an acceptance runs a check through. `git` is not one: a backticked `git log`
@@ -3059,6 +3120,24 @@ fn check_failure(output: &str) -> CheckFailure {
     CheckFailure { failed: seen.len(), text }
 }
 
+/// The words a worker's report uses for a check it started and did not wait for.
+const CHECK_CLAIMS: [&str; 5] = ["running", "background", "pending", "not finished", "not yet returned"];
+
+/// A worker's report without the lines that say its check is still running: a check the
+/// session outlived in a background shell is not a result, and the agent's own run of the
+/// checks takes the lines' place. `None` when the report makes no such claim.
+fn without_check_claims(report: &str) -> Option<String> {
+    let is_claim = |line: &str| {
+        let lower = line.to_lowercase();
+        (lower.contains("check") || lower.contains("cargo test")) && CHECK_CLAIMS.iter().any(|word| lower.contains(word))
+    };
+    if !report.lines().any(is_claim) {
+        return None;
+    }
+    let kept: Vec<&str> = report.lines().filter(|line| !is_claim(line)).collect();
+    Some(kept.join("\n").trim().to_owned())
+}
+
 /// The warnings the last run of the card left, as a machine note: the lint found them in the
 /// lines that run changed, and they are what sent the card back. Empty when it left none.
 fn warnings_note(task: &ra_context::TaskContext) -> String {
@@ -3101,6 +3180,9 @@ struct Session {
     capped: Option<u32>,
     /// The files the run read, one entry per read, relative to the workspace.
     reads: Vec<String>,
+    /// The tool call whose answer was the largest and its size in characters, when the loop
+    /// ran the tools itself: a harness keeps its tool results out of sight.
+    biggest: Option<(String, usize)>,
 }
 
 /// What a tool call did, for the handoff of a run its cap ended: the tool and the path or the
@@ -3287,6 +3369,7 @@ async fn tool_loop(
     let mut calls = 0usize;
     let mut turn = 0u32;
     let mut reads: Vec<String> = Vec::new();
+    let mut biggest: Option<(String, usize)> = None;
     // what the worker said and did, for the handoff when the restart cap ends the run
     let mut said: Vec<String> = Vec::new();
     let mut did: Vec<String> = Vec::new();
@@ -3308,7 +3391,17 @@ async fn tool_loop(
                 let _ = write!(text, "\ncalls: {}", did.join(" · "));
             }
             let text = text.trim().to_owned();
-            return Ok(Session { text, usage, calls, turns: u64::from(restart), turn_usage, cap: limit, capped: Some(restart), reads });
+            return Ok(Session {
+                text,
+                usage,
+                calls,
+                turns: u64::from(restart),
+                turn_usage,
+                cap: limit,
+                capped: Some(restart),
+                reads,
+                biggest,
+            });
         }
         let answer = provider
             .complete(CompletionRequest {
@@ -3330,7 +3423,17 @@ async fn tool_loop(
         add_usage(&mut usage, &answer.usage);
         turn_usage.push(TurnUsage::of(&answer.usage));
         if answer.tool_calls.is_empty() {
-            return Ok(Session { text: answer.text, usage, calls, turns: u64::from(turn), turn_usage, cap: limit, capped: None, reads });
+            return Ok(Session {
+                text: answer.text,
+                usage,
+                calls,
+                turns: u64::from(turn),
+                turn_usage,
+                cap: limit,
+                capped: None,
+                reads,
+                biggest,
+            });
         }
         // the budget is checked before the tools run: the work it would pay for is not done
         if let Some((budget, spent)) = budget.zip(usage.cost_usd).filter(|(budget, spent)| spent > budget) {
@@ -3350,6 +3453,11 @@ async fn tool_loop(
                 reads.push(path);
             }
             let result = toolbox.execute(call).await;
+            // the largest answer is what a heavy run is noted by
+            let chars = result.chars().count();
+            if biggest.as_ref().is_none_or(|(_, most)| chars > *most) {
+                biggest = Some((call_summary(call), chars));
+            }
             messages.push(Message::tool(&call.id, result));
             calls += 1;
         }
@@ -3865,9 +3973,10 @@ fn is_rerun(node: &Node, worker: &Worker) -> bool {
 const RERUN_CHECK_LINES: usize = 30;
 
 /// What a rerun reads in place of the handoffs: the last run's check line, its verdict and the
-/// files it changed, then from the head of the notes the reviewer's points and the failing
-/// check's output, clipped. The reports of the earlier runs stay in the file: a rerun pays for
-/// the judgment, not the transcript. `None` when no run is behind the card.
+/// files it changed, then from the head of the notes the failing check's output, clipped; the
+/// reviewer's points ride in the context's Review section. The reports of the earlier runs stay
+/// in the file: a rerun pays for the judgment, not the transcript. `None` when no run is behind
+/// the card.
 fn rerun_block(task: &ra_context::TaskContext, node: &Node) -> Option<String> {
     let last = task.handoffs.last()?;
     let mut text = format!("The last run of this card came back; take it up on these lines, not afresh:\ncheck: {}\n", last.check.trim());
@@ -3877,27 +3986,14 @@ fn rerun_block(task: &ra_context::TaskContext, node: &Node) -> Option<String> {
     if !last.changed.is_empty() {
         writeln!(text, "changed: {}", last.changed.join(" ")).unwrap();
     }
+    // the reviewer's block is the task context's Review section, quoted whole; the failing
+    // check's output goes here
     for block in judgment_of(node.notes.as_deref().unwrap_or_default()) {
-        match review_points(&block) {
-            Some((head, points)) => {
-                writeln!(text, "\n{head}\nReviewer's points, each one to be answered:").unwrap();
-                for (n, point) in points.iter().enumerate() {
-                    writeln!(text, "{}. {point}", n + 1).unwrap();
-                }
-            }
-            None => writeln!(text, "\n{block}").unwrap(),
+        if !block.starts_with("review by ") {
+            writeln!(text, "\n{block}").unwrap();
         }
     }
     Some(text)
-}
-
-/// A reviewer's block of the notes as its first line and its points without their bullets, or
-/// `None` for a block that is not a review. The points go to the worker verbatim, every one
-/// and whole: a count sends the worker to the roadmap for them.
-fn review_points(block: &str) -> Option<(&str, Vec<&str>)> {
-    let mut lines = block.lines();
-    let head = lines.next().filter(|first| first.starts_with("review by "))?;
-    Some((head, lines.map(|line| line.trim_start_matches("- ")).collect()))
 }
 
 /// The latest reviewer's block at the head of a card's notes, which a run that fails its check
@@ -3967,7 +4063,7 @@ fn first_line(text: &str) -> String {
 
 /// The system prompt of a worker session. A harness with tools implements in the workspace; a
 /// bare model answers with the plan and the changes.
-const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory, check it against the acceptance criteria, and answer with a short report of what you changed and what you verified. Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through tail. After your report the orchestrator runs the check and lints the files you changed, and any warning comes back to you; do not hunt warnings yourself. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
+const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory, check it against the acceptance criteria, and answer with a short report of what you changed, naming the file each change landed in in backticks, and what you verified. Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through tail. After your report the orchestrator runs the check and lints the files you changed, and any warning comes back to you; do not hunt warnings yourself. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
 
 /// The system prompt of a reassessment.
 const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done. When the objective and the acceptance already name only the remaining work and are checkable, you answer with the same text rather than rewording it.";

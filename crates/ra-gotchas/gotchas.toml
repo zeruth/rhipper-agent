@@ -36,6 +36,14 @@ pattern = '^\s*cargo\s+(build|test|clippy|check|run)\b'
 message = "a console or a window holds its binary while it runs, so a workspace build cannot relink it; build and test the crates (-p) or exclude the binaries"
 remedy = { kind = "rewrite", insert = "--workspace --exclude rc --exclude rc-gui", after = 2, unless = '(-p |--package |--exclude rc|--bin )', when = "console-running" }
 
+# a port stuck in a message loop cannot be killed from a worker; the person does that, by pid
+[[gotcha]]
+id = "stuck-process"
+where = "command"
+pattern = '(^|&&|\|\||;|\|)\s*(Stop-Process|taskkill(\.exe)?|Get-CimInstance|Get-WmiObject)\b|\bWin32_Process\b'
+message = "a process cannot be killed from here (Stop-Process, taskkill and Get-CimInstance are refused); hand it to the person: name the pid in the report"
+remedy = { kind = "hint" }
+
 # a refusal the worker talks about is a gotcha whether or not an entry above named it: the
 # count and the journal see every one, and the report names the command so the catalogue grows
 [[gotcha]]

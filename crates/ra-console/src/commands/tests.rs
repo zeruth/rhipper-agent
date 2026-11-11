@@ -511,6 +511,45 @@ async fn run_on_a_bare_model_loops_through_the_tools_and_lands_the_answer() {
     assert_eq!(last[last.len() - 3].tool_call_id.as_deref(), Some("call_1"));
 }
 
+/// A turn that read and wrote `tokens` in all, past or under the ledger's ceiling.
+fn says_at(tokens: u64, text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Completion {
+    let mut answer = says(text, calls);
+    answer.usage.prompt_tokens = tokens - answer.usage.completion_tokens;
+    answer.turn_usage = vec![ra_providers::TurnUsage::of(&answer.usage)];
+    answer
+}
+
+#[tokio::test]
+async fn a_run_whose_mean_turn_passes_the_ceiling_is_noted_heavy_with_its_biggest_tool_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Read it all parent 1", &store, &worker()).await.unwrap();
+    cargo_project(dir.path(), true);
+    std::fs::write(dir.path().join("big.txt"), "a line of the big file\n".repeat(50)).unwrap();
+    let big = ra_providers::ToolCall { id: "call_1".into(), name: "read_file".into(), arguments: r#"{"path":"big.txt"}"#.into() };
+    let small = ra_providers::ToolCall { id: "call_2".into(), name: "list_dir".into(), arguments: r#"{"path":"."}"#.into() };
+    let ceiling = crate::retro::TURN_CEILING;
+    // two turns at 60,000 tokens and one at 10: the mean passes the ceiling
+    let provider = Scripted::new(vec![says_at(60_000, "", vec![big, small]), says_at(60_000, "", vec![]), says("accepted", vec![])]);
+    let heavy = Worker::new("z-ai/glm-5.3-flash").with_provider(provider);
+    let (out, _) = run("/run 2", &store, &heavy).await.unwrap();
+    let heavy = out.iter().find(|l| l.contains("[heavy]")).unwrap_or_else(|| panic!("{out:?}"));
+    let expected = format!("[heavy] #2 60000 tokens/turn over the ceiling of {ceiling}; biggest tool result: read_file big.txt (");
+    assert!(heavy.starts_with(&format!("  ⚠ {expected}")), "{heavy}");
+    // the line is kept under the card for the next walk, and left out of the next worker's prompt
+    let notes = crate::retro::recent(dir.path(), 5);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].node, Some(2));
+    assert!(notes[0].text.starts_with(&expected), "{}", notes[0].text);
+    assert!(!crate::retro::machine_lines(dir.path()).contains("[heavy]"));
+    // a run under the ceiling writes nothing
+    run("/add task Light parent 1", &store, &worker()).await.unwrap();
+    let light = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![]), says("accepted", vec![])]));
+    let (out, _) = run("/run 3", &store, &light).await.unwrap();
+    assert!(!out.iter().any(|l| l.contains("[heavy]")), "{out:?}");
+    assert_eq!(crate::retro::recent(dir.path(), 5).len(), 1);
+}
+
 #[tokio::test]
 async fn a_project_turn_cap_ends_the_run_with_a_handoff_and_the_walk_takes_the_card_up_fresh() {
     let dir = tempfile::tempdir().unwrap();
@@ -1298,6 +1337,8 @@ async fn a_review_diff_covers_the_reported_files() {
     std::fs::File::options().write(true).open(&other).unwrap().set_modified(old).unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // the card names a file the run leaves alone: the reviewer still sees it listed
+    run("/files 2 src/lib.rs", &store, &worker()).await.unwrap();
     let script = Scripted::new(vec![says("edited `other.txt` and left `missing.txt` alone", vec![]), says("accepted", vec![])]);
     let check: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(check);
@@ -1311,6 +1352,15 @@ async fn a_review_diff_covers_the_reported_files() {
     assert_eq!(seen.len(), 2);
     let brief = &seen[1].messages.last().unwrap().content;
     assert!(brief.contains("+edited by another card"), "{brief}");
+    // the brief lists the card's files and the run's, then the stat of exactly those, before
+    // the diff: a change in a file the reviewer did not expect is not a missing one (#159)
+    assert!(brief.contains("## Files of the card\n- src/lib.rs\n- other.txt (changed by the run, not on the card)\n"), "{brief}");
+    let stat = brief.find("## git diff --stat HEAD of the card's files\n").expect("the stat section");
+    assert!(brief[stat..].contains("other.txt | 2 +-"), "{brief}");
+    assert!(stat < brief.find("## git diff HEAD of the card's files\n").unwrap(), "{brief}");
+    assert!(seen[1].messages[0].content.contains("with their diff stat"), "{}", seen[1].messages[0].content);
+    // the worker's instruction asks for the file of each change, which is what the list reads
+    assert!(seen[0].messages[0].content.contains("naming the file each change landed in"), "{}", seen[0].messages[0].content);
 }
 
 /// A trivial verdict of the reviewer.
@@ -1692,6 +1742,34 @@ async fn a_passing_check_leaves_the_node_implemented() {
     assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented);
     assert_eq!(node.notes.as_deref(), Some("done"));
     assert!(out.iter().any(|l| l.contains("check passed: cargo test --workspace -q")), "{out:?}");
+}
+
+#[tokio::test]
+async fn a_report_that_says_its_check_is_running_is_overwritten_by_the_agents_own_run_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    run("/edit 2 acceptance `cargo test -p ra-console -q` passes", &store, &worker()).await.unwrap();
+    // the agent runs the check itself, after the worker's last turn, and waits for it
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        log.lock().push(command.to_owned());
+        Ok((0, "running 3 tests\n...\ntest result: ok. 3 passed\n".to_owned()))
+    });
+    // the worker went on without its check: a background shell the session outlived (#159)
+    let report = "wrote hello.txt\ncheck running: `cargo test -p ra-console -q` in a background shell, result pending\nsee the handoff";
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(report, vec![])])).with_script(script);
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    assert_eq!(*seen.lock(), ["cargo test -p ra-console -q"]);
+    assert!(out.iter().any(|l| l.contains("check passed: cargo test -p ra-console -q")), "{out:?}");
+    // the handoff and the notes carry the agent's run, its exit and clipped tail, where the
+    // claim was; the claim itself is gone
+    let ran = "check passed: cargo test -p ra-console -q · exit code 0\nrunning 3 tests\n...\ntest result: ok. 3 passed\nexit code 0\n\nwrote hello.txt\nsee the handoff";
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    assert_eq!(task.handoffs.last().unwrap().report, ran);
+    assert_eq!(store.read(2).await.unwrap().notes.as_deref(), Some(ran));
 }
 
 /// A run over a git-tracked cargo project whose worker writes `src/extra.rs`; the check and the
@@ -2310,7 +2388,11 @@ async fn a_rerun_of_a_card_sent_back_starts_fresh_on_the_verdict_without_the_tra
     assert_eq!(seen.len(), 4);
     let prompt = &seen[2].messages.last().unwrap().content;
     assert!(prompt.contains("Task #2: Greet"), "{prompt}");
-    assert!(prompt.contains("verdict: needs revision (") && prompt.contains("1. rename greet to salute"), "{prompt}");
+    assert!(prompt.contains("verdict: needs revision (") && prompt.contains("## Review\n"), "{prompt}");
+    assert!(
+        prompt.contains("\nreview by z-ai/glm-5.3-flash: needs revision (") && prompt.contains(")\n- rename greet to salute\n"),
+        "{prompt}"
+    );
     assert!(!prompt.contains("wrote the greeting into hello.rs"), "the transcript of the first run went along:\n{prompt}");
     assert!(!prompt.contains("Earlier runs of this task"), "{prompt}");
     assert_eq!(seen[2].resume, None);
@@ -2349,12 +2431,12 @@ async fn a_revision_prompt_lists_the_reviewers_points() {
     run("/run 2", &store, &worker).await.unwrap();
     let seen = provider.seen.lock();
     assert_eq!(seen.len(), 5);
-    let points =
-        format!("Reviewer's points, each one to be answered:\n1. rename greet to salute\n2. {long}\n3. no test covers the empty name\n");
+    let points = format!(")\n- rename greet to salute\n- {long}\n- no test covers the empty name\n");
     // the first rerun reads them from the verdict, the second from the notes the failed rerun
-    // left, whole both times; neither prompt says only how many there were
+    // left, whole both times and verbatim; neither prompt says only how many there were
     for request in &seen[2..4] {
         let prompt = &request.messages.last().unwrap().content;
+        assert!(prompt.contains("## Review\nThe reviewer sent the last run back on these points; answer each:\nreview by z-ai/glm-5.3-flash: needs revision ("), "{prompt}");
         assert!(prompt.contains(&points), "{prompt}");
     }
     assert!(seen[3].messages.last().unwrap().content.contains("check failed: cargo test"), "{}", seen[3].messages.last().unwrap().content);

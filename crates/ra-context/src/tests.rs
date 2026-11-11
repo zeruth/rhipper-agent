@@ -197,6 +197,53 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
 }
 
 #[test]
+fn a_rerun_after_a_reject_quotes_the_review_block_and_a_fresh_card_has_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let notes = "review by z-ai/glm-5.3-flash: needs revision (substantive)\n- hello.txt: the greeting lacks a newline\n- no test covers it\n\ncheck passed: cargo test -q · exit code 0\nok\n\nwrote hello.txt";
+    let review = review_of(notes).expect("the notes open with a review");
+    assert_eq!(
+        review,
+        "review by z-ai/glm-5.3-flash: needs revision (substantive)\n- hello.txt: the greeting lacks a newline\n- no test covers it"
+    );
+    // a card whose notes hold no verdict has no review
+    assert_eq!(review_of("check passed: cargo test -q · exit code 0\nok"), None);
+    assert_eq!(review_of(""), None);
+    // the fresh card's prompt has no section
+    let mut task = TaskContext::open(root, 9);
+    task.brief = "Task #9: a thing\n".to_owned();
+    assert!(!task.prompt().contains(REVIEW_HEADING), "{}", task.prompt());
+    // the rejected card's prompt quotes the block verbatim, and its file keeps it
+    task.review = Some(review);
+    let prompt = task.prompt();
+    assert!(prompt.contains("## Review\n"), "{prompt}");
+    assert!(
+        prompt.contains(
+            "review by z-ai/glm-5.3-flash: needs revision (substantive)\n- hello.txt: the greeting lacks a newline\n- no test covers it\n"
+        ),
+        "{prompt}"
+    );
+    task.record(Handoff {
+        when: 1,
+        model: "m".into(),
+        outcome: "needs revision (substantive)".into(),
+        check: "check passed: cargo test -q".into(),
+        verdict: Some("needs revision (substantive) · 2 points by z".into()),
+        changed: vec!["hello.txt".into()],
+        report: "wrote hello.txt".into(),
+        warnings: vec![],
+    });
+    task.save(root).unwrap();
+    let file = std::fs::read_to_string(TaskContext::path(root, 9)).unwrap();
+    assert!(file.contains("\n## Review\n\nreview by z-ai/glm-5.3-flash: needs revision (substantive)\n- hello.txt"), "{file}");
+    // the section does not read back as a handoff, nor into one
+    let again = TaskContext::open(root, 9);
+    assert_eq!(again.handoffs.len(), 1);
+    assert_eq!(again.handoffs[0].report, "wrote hello.txt");
+    assert_eq!(again.review, None);
+}
+
+#[test]
 fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_carries_them() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

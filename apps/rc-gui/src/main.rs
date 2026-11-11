@@ -1911,8 +1911,8 @@ impl Workspace {
             self.closing = true;
         }
         // `rc walk` from a session: the window starts the walk, so the tab shows it
-        if ra_console::agent::walk_requested(&self.root) {
-            self.start_walk();
+        if let Some(parallel) = ra_console::agent::walk_requested(&self.root) {
+            self.start_walk(parallel);
         }
         ra_console::ui::tail_activity_at(&self.root.join(ra_console::ui::ACTIVITY_FILE), &mut self.activity_offset, &self.sink);
         self.raise_toasts();
@@ -2274,7 +2274,9 @@ impl Workspace {
             let words: Vec<String> = line.trim_start_matches(['/', '.']).split_whitespace().skip(1).map(str::to_owned).collect();
             // the walk is a process of its own, hours long and nobody's child: not a job
             if words.iter().any(|w| w == "--all") {
-                self.start_walk();
+                // `/run --all --parallel N` runs that many cards at once
+                let parallel = words.iter().position(|w| w == "--parallel").and_then(|at| words.get(at + 1)).and_then(|n| n.parse().ok());
+                self.start_walk(parallel);
                 return;
             }
             let id = words.first().cloned().unwrap_or_default();
@@ -3965,11 +3967,14 @@ impl Workspace {
 impl Workspace {
     /// Starts the walk in this project as a detached `rc run --all`, and says so in the log;
     /// its cards' starts and ends arrive through the activity log like any run's.
-    fn start_walk(&mut self) {
-        match ra_console::agent::spawn_walk(&self.root, self.worker.debug) {
+    fn start_walk(&mut self, parallel: Option<u32>) {
+        match ra_console::agent::spawn_walk(&self.root, self.worker.debug, parallel) {
             Ok(pid) => self.sink.push(
                 Kind::Output,
-                format!("walk started (pid {pid}): the ready cards run one after another; /stop ends it after the card it is in"),
+                match parallel.filter(|n| *n > 1) {
+                    Some(n) => format!("walk started (pid {pid}): {n} ready cards at once, each in its own worktree; /stop ends it after the cards it is in"),
+                    None => format!("walk started (pid {pid}): the ready cards run one after another; /stop ends it after the card it is in"),
+                },
             ),
             Err(e) => self.sink.push(Kind::Error, format!("{e:#}")),
         }

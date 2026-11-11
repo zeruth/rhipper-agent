@@ -276,9 +276,12 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     }
     let height = usize::from(run.height);
     // a live run takes the rows the console has room for, the cap at least; a finished one its
-    // cap or fewer
+    // cap or fewer. In the console the room is the clip rect, and the card's own frame, title,
+    // folded line and the spacing under it come off it before the rows: with the rows alone
+    // counted the card overshot the view and its top was always cut off
+    let overhead = if bounded { 96.0 } else { 136.0 };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let fit = ((room - 96.0) / 24.0).floor().max(0.0) as usize;
+    let fit = ((room - overhead) / 24.0).floor().max(0.0) as usize;
     let body = if bounded {
         // the dashboard: the rows the room holds, and no more than the steps there are
         let rows = fit.max(1);

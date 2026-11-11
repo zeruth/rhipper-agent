@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod pair;
 pub mod plan;
 pub mod retro;
+pub mod review;
 pub mod roadmap_pane;
 pub mod roles;
 pub mod router;

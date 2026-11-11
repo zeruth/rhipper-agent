@@ -9,6 +9,8 @@ use anyhow::Context;
 use crate::Toolbox;
 
 /// The most lines a tool answer carries into the turn; a longer one keeps its head and its tail.
+/// A whole test or build log carried in would pass the ledger's ceiling on a turn by itself,
+/// and every later turn would carry it again.
 pub(crate) const MAX_LINES: usize = 200;
 /// The most characters a tool answer carries; a longer one is cut and says so.
 pub(crate) const MAX_OUTPUT: usize = 16_000;
@@ -151,8 +153,10 @@ async fn kill_tree(child: &mut tokio::process::Child) {
 }
 
 /// The words of a command by shell quoting, not whitespace: a `"…"` or `'…'` group stays one
-/// argument, a backslash outside single quotes keeps the next character, and an unbalanced quote
-/// is refused by name rather than split into a command that passes on nothing.
+/// argument, a backslash outside single quotes keeps the next character when that is a space, a
+/// quote or a backslash, and is a path separator otherwise (`.\gw.ps1 :task` names the script,
+/// not `.gw.ps1`), and an unbalanced quote is refused by name rather than split into a command
+/// that passes on nothing.
 pub(crate) fn split(command: &str) -> anyhow::Result<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -171,7 +175,14 @@ pub(crate) fn split(command: &str) -> anyhow::Result<Vec<String>> {
                     }
                 }
             }
-            '\\' => word.push(chars.next().context("the command ends in a backslash")?),
+            '\\' => match chars.clone().next() {
+                Some(next) if next.is_whitespace() || matches!(next, '"' | '\'' | '\\') => {
+                    word.push(next);
+                    chars.next();
+                }
+                Some(_) => word.push('\\'),
+                None => anyhow::bail!("the command ends in a backslash: {command}"),
+            },
             c if c.is_whitespace() => {
                 if quoted || !word.is_empty() {
                     words.push(std::mem::take(&mut word));
@@ -216,7 +227,7 @@ pub(crate) fn clip(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let text = if lines.len() > MAX_LINES {
         let half = MAX_LINES / 2;
-        format!("{}\n… {} lines clipped …\n{}", lines[..half].join("\n"), lines.len() - MAX_LINES, lines[lines.len() - half..].join("\n"))
+        format!("{}\n… {} lines dropped …\n{}", lines[..half].join("\n"), lines.len() - MAX_LINES, lines[lines.len() - half..].join("\n"))
     } else {
         text.to_owned()
     };
