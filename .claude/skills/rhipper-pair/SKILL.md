@@ -27,6 +27,21 @@ commit, accept, and keep the window good. The agent in turn reads what you tell 
 Everything under `var/` is per project; two projects run two windows at once. One window or
 console per project: a newcomer in the same directory replaces the other.
 
+## The link: arm it first
+
+The agent writes `var/pair.log` in the project — one line per event: `start #id title · model`,
+`end ✓|✗ #id … · cost · ↯ bullets`, `walk ran N card(s) · why it stopped`, `note …`. It cannot
+push into a session, so the session subscribes. **First thing in a Rhipper project, arm a
+Monitor on it** and re-arm it on every expiry while runs are going:
+
+```
+Monitor(command: "tail -n 0 -F var/pair.log", description: "the agent's pair feed (<project>)", timeout_ms: 1800000)
+```
+
+Every line arrives as a notification: a card started, a card ended (then review it), the walk
+ended (then do the pass), a note the person left. `rc pair` prints the last twenty. Do not tail
+`var/activity.log` for this; that is the step-by-step stream the window draws.
+
 ## The cycle (what this session does for every card)
 
 1. **Run**: `rc run <id>` (foreground ~3–10 min; run it in the background and wait for the
