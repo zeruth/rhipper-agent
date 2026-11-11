@@ -167,33 +167,43 @@ pub fn record_saving(root: &Path, node: i64, held: bool, why: &str) -> anyhow::R
     Ok(text)
 }
 
-/// The walk's verdict on a card's claim the moment it lands: the ledger's tokens a turn up to
-/// `mark` (the newest row before the run) against the rows after it, the run's own; held when
-/// the run's are fewer. One `[saving]` line under the card in `var/retro.log`, returned too;
-/// nothing when the card did not land, claims no saving, was judged already, or the ledger has
-/// no rows on one side (the day-later reading of `plan::read_back` takes that claim). A claim
-/// that holds across projects, its evidence cited from another project's `notes.log`, is a
-/// `[machine]` note too: it reaches the hub, and every project's planner reads it through
-/// [`evidence`] as a lesson that paid off twice; a worker's prompt ([`machine_lines`]) leaves
-/// every verdict out.
+/// How many landed cards a card is measured against: the median of the last twenty.
+pub const MEDIAN_OF: u32 = 20;
+
+/// The walk's verdict on a card's claim the moment it lands, measured: the card's own turns,
+/// tokens a turn and cost from the ledger against the median tokens a turn of the last
+/// [`MEDIAN_OF`] cards the ledger wrote up to `mark` (the newest row before the run), the card
+/// itself left out; held when the card's are fewer. One `[saving]` line under the card in
+/// `var/retro.log`, the card's own claim quoted beside the figures, returned too; nothing when
+/// the card did not land, claims no saving, was judged already, or the ledger has no rows on
+/// one side (the day-later reading of `plan::read_back` takes that claim). A claim that holds
+/// across projects, its evidence cited from another project's `notes.log`, is a `[machine]`
+/// note too: it reaches the hub, and every project's planner reads it through [`evidence`] as
+/// a lesson that paid off twice; a worker's prompt ([`machine_lines`]) leaves every verdict out.
 pub async fn landed(root: &Path, card: &ra_roadmap::model::Node, ledger: &ra_usage::UsageStore, mark: i64) -> Vec<String> {
     use ra_roadmap::model::TaskState;
     let Some(saving) = card.saving.as_deref() else { return Vec::new() };
     if !matches!(card.state, TaskState::Implemented | TaskState::Accepted) || saving_read(root, card.id) {
         return Vec::new();
     }
-    let (Ok(before), Ok(after)) = (ledger.totals_until(mark).await, ledger.totals_after(mark).await) else { return Vec::new() };
-    let per_turn = |totals: &ra_usage::Totals| totals.tokens() / totals.turns.max(1);
-    let (before, after) = (per_turn(&before), per_turn(&after));
-    if before == 0 || after == 0 {
+    let (Ok(own), Ok(others)) = (ledger.card_cost(card.id).await, ledger.recent_cards(mark, MEDIAN_OF + 1).await) else {
+        return Vec::new();
+    };
+    let Some(median) = median_tokens_per_turn(others.iter().filter(|c| c.node != card.id).take(MEDIAN_OF as usize)) else {
+        return Vec::new();
+    };
+    let per_turn = own.tokens_per_turn();
+    if per_turn == 0 {
         return Vec::new();
     }
-    let held = after < before;
+    let held = per_turn < median;
     let across = card.evidence.as_deref().is_some_and(|e| e.contains("notes.log"));
+    let cost = own.totals.cost_usd.map(|c| format!(", ${c:.2}")).unwrap_or_default();
     let text = format!(
-        "{SAVING} #{} {}: claimed \"{saving}\"; {before} tokens a turn before, {after} after",
+        "{SAVING} #{} {}: {} turns, {per_turn} tokens/turn{cost} vs median {median}; claimed \"{saving}\"",
         card.id,
-        if held { "held" } else { "missed" }
+        if held { "held" } else { "missed" },
+        own.totals.turns
     );
     let note = Note { when: 0, node: Some(card.id), machine: held && across, pair: false, text: text.clone() };
     match record(root, Some(card.id), &[note]) {
@@ -203,6 +213,14 @@ pub async fn landed(root: &Path, card: &ra_roadmap::model::Node, ledger: &ra_usa
             Vec::new()
         }
     }
+}
+
+/// The median tokens a turn over `cards`, the lower middle of an even count; `None` when there
+/// are none or none had a turn, so a first card is not judged against nothing.
+fn median_tokens_per_turn<'a>(cards: impl Iterator<Item = &'a ra_usage::CardCost>) -> Option<u64> {
+    let mut rates: Vec<u64> = cards.map(ra_usage::CardCost::tokens_per_turn).filter(|&rate| rate > 0).collect();
+    rates.sort_unstable();
+    rates.get((rates.len().checked_sub(1)?) / 2).copied()
 }
 
 /// Whether the log already holds the walk's verdict on the card's claim: a claim is read back

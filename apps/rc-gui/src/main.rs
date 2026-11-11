@@ -2790,20 +2790,22 @@ impl Workspace {
         let (done, live): (Vec<&Gambit>, Vec<&Gambit>) = gambits.iter().partition(|g| g.state == GambitState::Done);
         let mut pick: Option<(u32, cards::GambitPick)> = None;
         let mut open_field = false;
-        ui.horizontal_wrapped(|ui| {
+        // the heading and the add button on one line, then one gambit a row, each the width of
+        // the column: side by side they ran the column past its edge
+        ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(RichText::new("GAMBITS").small().strong().color(theme::dim()));
-            for gambit in &live {
-                if let Some(p) = cards::gambit_bubble(ui, gambit) {
-                    pick = Some((gambit.id, p));
-                }
-            }
             if self.new_gambit.is_none()
                 && ui.small_button(RichText::new("+").color(theme::accent())).on_hover_text("add a gambit").clicked()
             {
                 open_field = true;
             }
         });
+        for gambit in &live {
+            if let Some(p) = cards::gambit_bubble(ui, gambit) {
+                pick = Some((gambit.id, p));
+            }
+        }
         if open_field {
             self.new_gambit = Some(String::new());
         }
@@ -2842,14 +2844,11 @@ impl Workspace {
                 self.done_gambits_open = !self.done_gambits_open;
             }
             if self.done_gambits_open {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    for gambit in &done {
-                        if let Some(p) = cards::gambit_bubble(ui, gambit) {
-                            pick = Some((gambit.id, p));
-                        }
+                for gambit in &done {
+                    if let Some(p) = cards::gambit_bubble(ui, gambit) {
+                        pick = Some((gambit.id, p));
                     }
-                });
+                }
             }
         }
         ui.add_space(2.0);
@@ -4018,8 +4017,8 @@ impl Workspace {
         let mut out = Walked::default();
         let mut open = false;
         cards::bubble(ui, lane, live.is_some(), |ui| {
-            // the bubble's inner width: the page less its own margins, and no more
-            let inner = (page - 16.0).max(300.0);
+            // the bubble's inner width: the page less its margins and its stroke, two of each
+            let inner = (page - 18.0).max(300.0);
             ui.set_width(inner);
             ui.set_max_width(inner);
             ui.horizontal(|ui| {

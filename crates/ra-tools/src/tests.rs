@@ -1,6 +1,6 @@
 //! The tests of the toolbox: each tool over a temp workspace, the confinement and the allowlist.
 
-use super::commands::{MAX_LINES, MAX_OUTPUT, clip};
+use super::commands::{MAX_LINES, MAX_OUTPUT, clip, split};
 use super::*;
 
 fn call(name: &str, args: serde_json::Value) -> ToolCall {
@@ -92,6 +92,16 @@ async fn a_bad_tool_or_bad_arguments_answer_in_words() {
 }
 
 #[test]
+fn a_quoted_argument_stays_one_argument() {
+    assert_eq!(split(r#"python -c "import time; time.sleep(9)""#).unwrap(), ["python", "-c", "import time; time.sleep(9)"]);
+    assert_eq!(split("git log --format='%h %s' -n 1").unwrap(), ["git", "log", "--format=%h %s", "-n", "1"]);
+    assert_eq!(split(r#"echo "a \"b\" c" '' d\ e"#).unwrap(), ["echo", "a \"b\" c", "", "d e"]);
+    assert_eq!(split("  cargo   test  ").unwrap(), ["cargo", "test"]);
+    let err = split(r#"python -c "import time"#).unwrap_err().to_string();
+    assert!(err.contains("unbalanced \" quote"), "{err}");
+}
+
+#[test]
 fn clip_keeps_the_head_and_the_tail() {
     let long = "a".repeat(MAX_OUTPUT + 100);
     let out = clip(&long);
@@ -162,10 +172,12 @@ async fn a_scripted_toolbox_answers_a_command_from_the_script() {
 #[tokio::test]
 async fn a_command_past_the_toolboxs_limit_is_stopped_and_names_the_limit() {
     let (_dir, tools) = workspace().await;
-    // the command splits on whitespace, so the program sleeps without a space
-    let sleep = "python -c __import__('time').sleep(3)";
-    let error = tools.clone().with_timeout(Duration::from_secs(1)).check_acceptance(&sleep).await.unwrap_err();
-    assert!(error.to_string().contains("ran past 1 s and was stopped"), "{error:#}");
+    // the quoted program is one argument, so the sleep keeps its space; what it printed before
+    // the limit stays
+    let sleep = r#"python -c "print('started', flush=True); import time; time.sleep(3)""#;
+    let (passed, text) = tools.clone().with_timeout(Duration::from_secs(1)).check_acceptance(sleep).await.unwrap();
+    assert!(!passed);
+    assert_eq!(text.replace("\r\n", "\n"), "started\ntimed out after 1s");
     // under a longer limit the same command finishes
     let tools = tools.with_timeout(Duration::from_secs(1800));
     assert_eq!(tools.timeout(), Duration::from_secs(1800));

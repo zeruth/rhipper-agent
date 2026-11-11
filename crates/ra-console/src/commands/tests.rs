@@ -730,12 +730,12 @@ async fn a_walk_judges_a_landed_cards_saving_on_the_ledger_before_and_after_its_
     // the card claims fewer tokens a turn, on a lesson another project shared
     let card = Card { saving: Some("fewer tokens a turn"), evidence: Some("notes.log:3"), ..Card::new() };
     let id = store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, "Smaller reads", &card).await.unwrap();
-    // the ledger carried 1000 tokens a turn before the run; the scripted run's calls carry 110
+    // the one card the ledger saw before took 1000 tokens a turn; the scripted run's calls carry 110
     let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
     let before = ra_usage::Entry {
         model: "claude-opus-5-5".to_owned(),
         role: None,
-        node: None,
+        node: Some(99),
         prompt_tokens: 1800,
         completion_tokens: 200,
         cached_tokens: 0,
@@ -746,7 +746,8 @@ async fn a_walk_judges_a_landed_cards_saving_on_the_ledger_before_and_after_its_
     ledger.record(&before).await.unwrap();
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(accepted_runs(&["did it"]))).with_ledger(ledger);
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
-    let held = format!("[saving] #{id} held: claimed \"fewer tokens a turn\"; 1000 tokens a turn before, 110 after");
+    // the run's two turns, its cost from the list prices, against the one card before it
+    let held = format!("[saving] #{id} held: 2 turns, 110 tokens/turn, $0.02 vs median 1000; claimed \"fewer tokens a turn\"");
     assert!(out.contains(&held), "{out:?}");
     assert_eq!(out.last().unwrap(), "ran 1 card(s) · no card is ready");
     // the verdict is under the card, shared as a machine note since the lesson held here too
@@ -761,6 +762,54 @@ async fn a_walk_judges_a_landed_cards_saving_on_the_ledger_before_and_after_its_
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
     assert_eq!(out, vec!["ran 0 card(s) · no card is ready"]);
     assert_eq!(crate::retro::recent(dir.path(), 5).len(), 1);
+}
+
+#[tokio::test]
+async fn a_saving_line_compares_the_card_to_the_median() {
+    use ra_roadmap::store::Card;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    let card = Card { saving: Some("one verdict line instead of rc usage"), ..Card::new() };
+    let id = store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, "Measured", &card).await.unwrap();
+    run(&format!("/set {id} implemented"), &store, &worker()).await.unwrap();
+    let node = store.read(id).await.unwrap();
+    // three landed cards at 300, 1000 and 5000 tokens a turn: the median is 1000
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    let row = |node: i64, turns: u64, prompt_tokens: u64, cost_usd: Option<f64>| ra_usage::Entry {
+        model: "claude-opus-5-5".to_owned(),
+        role: None,
+        node: Some(node),
+        prompt_tokens,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        cost_usd,
+        cost_computed: false,
+        turns,
+    };
+    for (other, turns, tokens) in [(11, 2, 600), (12, 4, 4000), (13, 1, 5000)] {
+        ledger.record(&row(other, turns, tokens, None)).await.unwrap();
+    }
+    let mark = ledger.last_id().await.unwrap();
+    // the card's run: 3 turns at 110 tokens a turn, its cost reported
+    ledger.record(&row(id, 3, 330, Some(0.05))).await.unwrap();
+    let lines = crate::retro::landed(dir.path(), &node, &ledger, mark).await;
+    let held =
+        format!("[saving] #{id} held: 3 turns, 110 tokens/turn, $0.05 vs median 1000; claimed \"one verdict line instead of rc usage\"");
+    assert_eq!(lines, vec![held.clone()]);
+    assert_eq!(crate::retro::recent(dir.path(), 5).iter().map(|n| (n.node, n.text.clone())).collect::<Vec<_>>(), [(Some(id), held)]);
+    // a second card, over the median, misses; the first card's rows now count among the twenty
+    let card = Card { saving: Some("fewer turns"), ..Card::new() };
+    let second = store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, "Heavy", &card).await.unwrap();
+    run(&format!("/set {second} implemented"), &store, &worker()).await.unwrap();
+    let node = store.read(second).await.unwrap();
+    let mark = ledger.last_id().await.unwrap();
+    ledger.record(&row(second, 10, 20_000, None)).await.unwrap();
+    let lines = crate::retro::landed(dir.path(), &node, &ledger, mark).await;
+    assert_eq!(lines, vec![format!("[saving] #{second} missed: 10 turns, 2000 tokens/turn vs median 300; claimed \"fewer turns\"")]);
+    // a card with no other card to measure against gets no verdict
+    let empty = ra_usage::UsageStore::in_memory().await.unwrap();
+    empty.record(&row(second, 1, 100, None)).await.unwrap();
+    assert!(crate::retro::landed(tempfile::tempdir().unwrap().path(), &node, &empty, 0).await.is_empty());
 }
 
 #[tokio::test]
@@ -1232,6 +1281,36 @@ async fn a_logic_verdict_stays_substantive_even_beside_a_lint_point() {
     assert_eq!(classify(&points(&["the greeting lacks a newline"])), Weight::Substantive);
     assert_eq!(classify(&points(&["the reviewer gave no points"])), Weight::Substantive);
     assert_eq!(classify(&points(&["missing docs on the `Weight` enum", "cargo fmt differs in agent.rs"])), Weight::Trivial);
+}
+
+#[tokio::test]
+async fn a_review_diff_covers_the_reported_files() {
+    let dir = tempfile::tempdir().unwrap();
+    git_ok(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join("other.txt"), "old\n").unwrap();
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "probe"]);
+    // another card left the file dirty before this run, and its time is older than the run:
+    // the status lines and the modification time alone say nothing of this card's hand in it
+    let other = dir.path().join("other.txt");
+    std::fs::write(&other, "edited by another card\n").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options().write(true).open(&other).unwrap().set_modified(old).unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let script = Scripted::new(vec![says("edited `other.txt` and left `missing.txt` alone", vec![]), says("accepted", vec![])]);
+    let check: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(check);
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(out[0].starts_with("✓ #2 Probe implemented"), "{out:?}");
+    // the handoff records the set: the named file that is in the tree and dirty, not the other
+    let handoff = ra_context::TaskContext::open(dir.path(), 2).handoffs.pop().unwrap();
+    assert_eq!(handoff.changed, vec!["other.txt".to_owned()]);
+    // and the reviewer's diff extends to it
+    let seen = script.seen.lock();
+    assert_eq!(seen.len(), 2);
+    let brief = &seen[1].messages.last().unwrap().content;
+    assert!(brief.contains("+edited by another card"), "{brief}");
 }
 
 /// A trivial verdict of the reviewer.
@@ -1837,7 +1916,7 @@ async fn the_projects_check_timeout_shows_on_the_dry_run_and_bounds_the_checks()
     cargo_project(dir.path(), true);
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
-    // without the key the toolbox's ten minutes stand, and the line does not say so
+    // without the key the agent's twenty minutes stand, and the line does not say so
     let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
     assert!(out.iter().any(|l| l.contains("check: cargo test --workspace -q · lint: clippy over the changed crates")), "{out:?}");
     std::fs::write(
@@ -1856,6 +1935,61 @@ async fn the_projects_check_timeout_shows_on_the_dry_run_and_bounds_the_checks()
         pair.iter().any(|l| l.starts_with("start #2 Probe") && l.contains("check: .\\gw.ps1 :m:task · 1800 s · lint: none")),
         "{pair:?}"
     );
+}
+
+#[tokio::test]
+async fn a_check_that_outlives_its_budget_is_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // a real process, so the limit has something to kill: the sleep outlives the budget by far
+    run(r#"/edit 2 acceptance `python -c "print('started', flush=True); import time; time.sleep(60)"` passes"#, &store, &worker())
+        .await
+        .unwrap();
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 1\n").unwrap();
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])]));
+    let started = std::time::Instant::now();
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "the walk did not wait for the sleep: {out:?}");
+    assert!(out.iter().any(|l| l.contains("check failed: python -c") && l.contains(" · timed out after 1s")), "{out:?}");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
+    // python ends its line the platform's way; the output before the limit and the line stay
+    let notes = node.notes.unwrap_or_default().replace("\r\n", "\n");
+    assert!(notes.starts_with("check failed: python -c"), "{notes}");
+    assert!(notes.contains("started\ntimed out after 1s\n\ndone"), "{notes}");
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    assert!(task.handoffs.last().is_some_and(|h| h.report.contains("timed out after 1s")), "{:?}", task.handoffs.last());
+}
+
+#[tokio::test]
+async fn a_long_check_output_is_clipped() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    run("/edit 2 acceptance `cargo test -q` passes", &store, &worker()).await.unwrap();
+    // three hundred lines with two failures early on: only the first leads the tail
+    let mut lines: Vec<String> = (0..300).map(|i| format!("test a_passing_test_{i} ... ok")).collect();
+    lines[10] = "test the_first_broken ... FAILED".to_owned();
+    lines[20] = "test the_second_broken ... FAILED".to_owned();
+    let output = format!("{}\n", lines.join("\n"));
+    let script: ra_tools::Script = std::sync::Arc::new(move |_: &str| Ok((101, output.clone())));
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])])).with_script(script);
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("check failed: cargo test -q · 2 test(s) failed")), "{out:?}");
+    let notes = store.read(2).await.unwrap().notes.unwrap_or_default();
+    let kept: Vec<&str> = notes.lines().collect();
+    assert_eq!(kept[0], "check failed: cargo test -q");
+    assert_eq!(kept[1], "test the_first_broken ... FAILED");
+    assert_eq!(kept[2], "");
+    // the tail: sixty lines of output, the exit line last, then the worker's answer
+    assert_eq!(kept[3], "test a_passing_test_241 ... ok");
+    assert_eq!(kept[3 + 59], "exit code 101");
+    assert_eq!(&kept[kept.len() - 2..], ["", "done"]);
+    assert!(!notes.contains("the_second_broken"), "{notes}");
+    assert!(!notes.contains("a_passing_test_240 "), "{notes}");
 }
 
 /// The answer of a reassessment that keeps the text: the three lines the prompt asks for.
@@ -2176,13 +2310,54 @@ async fn a_rerun_of_a_card_sent_back_starts_fresh_on_the_verdict_without_the_tra
     assert_eq!(seen.len(), 4);
     let prompt = &seen[2].messages.last().unwrap().content;
     assert!(prompt.contains("Task #2: Greet"), "{prompt}");
-    assert!(prompt.contains("verdict: needs revision (") && prompt.contains("- rename greet to salute"), "{prompt}");
+    assert!(prompt.contains("verdict: needs revision (") && prompt.contains("1. rename greet to salute"), "{prompt}");
     assert!(!prompt.contains("wrote the greeting into hello.rs"), "the transcript of the first run went along:\n{prompt}");
     assert!(!prompt.contains("Earlier runs of this task"), "{prompt}");
     assert_eq!(seen[2].resume, None);
     // the file keeps both runs for the person; the rerun did not pay for them
     let task = ra_context::TaskContext::open(dir.path(), 2);
     assert_eq!(task.handoffs.len(), 2, "{:?}", task.handoffs);
+}
+
+#[tokio::test]
+async fn a_revision_prompt_lists_the_reviewers_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Greet parent 1", &store, &worker()).await.unwrap();
+    // the check passes on the first run and the reviewer sends the card back with three points,
+    // one of them long; the rerun fails its check, and the run after that reads the points still
+    let tests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = tests.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        if command.starts_with("cargo test") && counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            return Ok((101, "test greet ... FAILED\nexit code 101\n".to_owned()));
+        }
+        Ok((0, "ok\nexit code 0\n".to_owned()))
+    });
+    let long = "the greeting is built by hand where format! would do;".repeat(5);
+    let provider = Scripted::new(vec![
+        says("wrote the greeting into hello.rs", vec![]),
+        says(&format!("needs revision\n- rename greet to salute\n- {long}\n- no test covers the empty name"), vec![]),
+        says("renamed it", vec![]),
+        says("tested it", vec![]),
+        says("accepted", vec![]),
+    ]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(script);
+    run("/run 2", &store, &worker).await.unwrap();
+    run("/run 2", &store, &worker).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+    run("/run 2", &store, &worker).await.unwrap();
+    let seen = provider.seen.lock();
+    assert_eq!(seen.len(), 5);
+    let points =
+        format!("Reviewer's points, each one to be answered:\n1. rename greet to salute\n2. {long}\n3. no test covers the empty name\n");
+    // the first rerun reads them from the verdict, the second from the notes the failed rerun
+    // left, whole both times; neither prompt says only how many there were
+    for request in &seen[2..4] {
+        let prompt = &request.messages.last().unwrap().content;
+        assert!(prompt.contains(&points), "{prompt}");
+    }
+    assert!(seen[3].messages.last().unwrap().content.contains("check failed: cargo test"), "{}", seen[3].messages.last().unwrap().content);
 }
 
 #[test]

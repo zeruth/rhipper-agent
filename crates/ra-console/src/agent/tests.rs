@@ -33,7 +33,8 @@ fn the_files_read_again_are_named_most_first_and_three_at_most() {
     assert_eq!(reread(&[]), None);
 }
 
-/// A `cargo test` output with two failures among many passing tests, longer than the tail.
+/// A `cargo test` output with two failures among many passing tests, longer than the tail, the
+/// failures farther from the end than the tail reaches.
 fn sample_output() -> String {
     let mut lines = vec!["running 60 tests".to_owned()];
     for i in 0..50 {
@@ -41,6 +42,9 @@ fn sample_output() -> String {
     }
     lines.push("test store::tests::a_run_records_its_handoff ... FAILED".to_owned());
     lines.push("test agent::tests::a_check_names_its_failures ... FAILED".to_owned());
+    for i in 50..100 {
+        lines.push(format!("test store::tests::a_passing_test_{i} ... ok"));
+    }
     lines.push(String::new());
     lines.push("failures:".to_owned());
     lines.push(String::new());
@@ -67,15 +71,17 @@ fn the_failed_tests_lead_the_notes_of_a_failed_check() {
     let failure = check_failure(&sample_output());
     assert_eq!(failure.failed, 2);
     let lines: Vec<&str> = failure.text.lines().collect();
+    // the first failure leads the tail; the second is counted and left to the `failures:` list
     assert_eq!(lines[0], "test store::tests::a_run_records_its_handoff ... FAILED");
-    assert_eq!(lines[1], "test agent::tests::a_check_names_its_failures ... FAILED");
-    assert!(lines[2].contains("panicked at crates/ra-roadmap/src/store.rs:42:9"));
-    assert!(lines[3].contains("panicked at crates/ra-console/src/agent.rs:7:5"));
-    assert_eq!(lines[4], "");
-    // the tail follows the failures and is no longer than the forty lines kept
-    assert_eq!(lines.len(), 5 + TAIL_LINES);
+    assert_eq!(lines[1], "");
+    assert_eq!(lines.len(), 2 + TAIL_LINES);
+    assert!(!failure.text.contains("test agent::tests::a_check_names_its_failures ... FAILED"));
     assert!(failure.text.ends_with("test result: FAILED. 58 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out"));
     assert!(!failure.text.contains("a_passing_test_0 "));
+    // a short output still leads with its failure, so the notes read the same way every time
+    let short = check_failure("running 1 test\ntest probe ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed\nexit code 101");
+    assert_eq!(short.failed, 1);
+    assert!(short.text.starts_with("test probe ... FAILED\n\nrunning 1 test\n"), "{}", short.text);
 }
 
 #[test]

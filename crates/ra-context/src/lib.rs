@@ -366,6 +366,76 @@ pub fn outline_files(workspace: &Path, files: &[String], changed: &ChangedLines)
     out
 }
 
+/// The heading under which the untracked source files ride with the project context.
+pub const UNTRACKED_HEADING: &str = "## Untracked sources";
+
+/// How many untracked sources the list names before it counts the rest.
+const UNTRACKED_ROOM: usize = 20;
+
+/// The extensions an untracked file needs to count as a source.
+const SOURCE_EXTENSIONS: [&str; 3] = ["rs", "py", "ps1"];
+
+/// The source files git does not track yet, as `git ls-files --others --exclude-standard`
+/// lists them, in its order. An outline only names the files a card names, and a card is
+/// written from the tracked tree: a change that landed in a new file is invisible to both the
+/// architect and the worker until it is committed, and this list is where it shows. With
+/// `files`, the card's files, only the sources under the same crates (the first two components
+/// of a card file's path, or its directory) are kept; empty `files` keeps them all. A tree
+/// that is not a git repository, or git missing, has none.
+#[must_use]
+pub fn untracked_sources(workspace: &Path, files: &[String]) -> Vec<String> {
+    let listed = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    let crates: Vec<String> = files.iter().map(|f| crate_of(f)).collect();
+    listed
+        .lines()
+        .map(|line| line.trim().trim_matches('"'))
+        .filter(|path| Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXTENSIONS.contains(&e)))
+        .filter(|path| crates.is_empty() || crates.iter().any(|c| c.is_empty() || path.starts_with(c.as_str())))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The crate a card file belongs to, as a path prefix: `crates/ra-tools/` of
+/// `crates/ra-tools/src/lib.rs`; a file at the root or one level down has no crate and keeps
+/// everything.
+fn crate_of(file: &str) -> String {
+    let parts: Vec<&str> = file.split('/').collect();
+    if parts.len() < 3 {
+        return String::new();
+    }
+    format!("{}/{}/", parts[0], parts[1])
+}
+
+/// The project context with the untracked sources after it, one per line under
+/// [`UNTRACKED_HEADING`], the first [`UNTRACKED_ROOM`] named and the rest counted; the context
+/// alone when there is none.
+#[must_use]
+pub fn with_untracked(project: &str, untracked: &[String]) -> String {
+    if untracked.is_empty() {
+        return project.to_owned();
+    }
+    let mut text = project.trim_end().to_owned();
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(UNTRACKED_HEADING);
+    text.push('\n');
+    for file in &untracked[..untracked.len().min(UNTRACKED_ROOM)] {
+        let _ = writeln!(text, "- {file}");
+    }
+    if untracked.len() > UNTRACKED_ROOM {
+        let _ = writeln!(text, "… and {} more", untracked.len() - UNTRACKED_ROOM);
+    }
+    text
+}
+
 /// The changed line ranges of each path, 1-based and inclusive, keyed by the path as the diff
 /// names it.
 pub type ChangedLines = std::collections::HashMap<String, Vec<(usize, usize)>>;

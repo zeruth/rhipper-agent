@@ -184,6 +184,23 @@ async fn the_costliest_cards_of_the_day_rank_by_cost_and_average_their_tokens_a_
 }
 
 #[tokio::test]
+async fn the_recent_cards_up_to_a_mark_come_newest_first_and_sum_their_rows_in_it() {
+    let store = UsageStore::in_memory().await.unwrap();
+    // card 3 ran first, then 4, then 3 again; a chat in between; card 5 after the mark
+    store.record(&Entry { turns: 2, ..entry("claude-opus-5-5", Some(3), None) }).await.unwrap();
+    store.record(&Entry { turns: 4, ..entry("claude-opus-5-5", Some(4), None) }).await.unwrap();
+    store.record(&entry("claude-opus-5-5", None, None)).await.unwrap();
+    store.record(&Entry { turns: 3, ..entry("claude-opus-5-5", Some(3), None) }).await.unwrap();
+    let mark = store.last_id().await.unwrap();
+    store.record(&Entry { turns: 9, ..entry("claude-opus-5-5", Some(5), None) }).await.unwrap();
+    let cards = store.recent_cards(mark, 20).await.unwrap();
+    assert_eq!(cards.iter().map(|c| (c.node, c.totals.calls, c.totals.turns)).collect::<Vec<_>>(), [(3, 2, 5), (4, 1, 4)]);
+    // the limit keeps the newest; a mark before a card's second run sums only its first
+    assert_eq!(store.recent_cards(mark, 1).await.unwrap().iter().map(|c| c.node).collect::<Vec<_>>(), [3]);
+    assert_eq!(store.recent_cards(2, 20).await.unwrap().iter().map(|c| (c.node, c.totals.turns)).collect::<Vec<_>>(), [(4, 4), (3, 2)]);
+}
+
+#[tokio::test]
 async fn a_card_the_ledger_has_not_seen_costs_nothing() {
     let store = UsageStore::in_memory().await.unwrap();
     let card = store.card_cost(9).await.unwrap();

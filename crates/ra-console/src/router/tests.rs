@@ -34,13 +34,13 @@ fn the_worker_table_allows_a_projects_commands_in_both_shells_and_sets_its_envir
 }
 
 #[test]
-fn the_check_timeout_is_the_tables_seconds_and_the_toolboxs_default_without_it() {
+fn the_check_timeout_is_the_tables_seconds_and_the_agents_default_without_it() {
     let router = Router::parse("[worker]\ncheck_timeout = 1800\n").unwrap();
     assert_eq!(router.worker.check_timeout(), std::time::Duration::from_secs(1800));
-    assert_eq!(WorkerConfig::default().check_timeout(), std::time::Duration::from_secs(600));
+    assert_eq!(WorkerConfig::default().check_timeout(), std::time::Duration::from_secs(1200));
     assert_eq!(
         Router::parse("[worker]\ncheck_timeout = 0\n").unwrap().worker.check_timeout(),
-        ra_tools::DEFAULT_TIMEOUT,
+        crate::agent::CHECK_TIMEOUT,
         "zero is no limit of its own"
     );
 }

@@ -331,6 +331,45 @@ fn the_leftovers_are_the_files_of_a_rejected_card_still_dirty_and_a_clean_tree_h
 }
 
 #[test]
+fn the_context_lists_untracked_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for d in ["crates/ra-tools/src", "crates/ra-usage/src", "tools", "target"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    std::fs::write(root.join("crates/ra-tools/src/lib.rs"), "pub mod commands;\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+    git_ok(root, &["init", "-q"]);
+    git_ok(root, &["add", "-A"]);
+    git_ok(root, &["commit", "-q", "-m", "base"]);
+    // a clean tree: nothing to list, and the context stands as it is
+    assert!(untracked_sources(root, &[]).is_empty());
+    assert_eq!(with_untracked("# P\n", &[]), "# P\n");
+    // the new source under the card's crate, one in another crate, a script, a note and an ignored file
+    std::fs::write(root.join("crates/ra-tools/src/commands.rs"), "pub fn run() {}\n").unwrap();
+    std::fs::write(root.join("crates/ra-usage/src/new.rs"), "fn n() {}\n").unwrap();
+    std::fs::write(root.join("tools/check.py"), "print(1)\n").unwrap();
+    std::fs::write(root.join("gw.ps1"), "echo 1\n").unwrap();
+    std::fs::write(root.join("NOTES.md"), "notes\n").unwrap();
+    std::fs::write(root.join("target/out.rs"), "fn built() {}\n").unwrap();
+    let all = untracked_sources(root, &[]);
+    assert_eq!(all, ["crates/ra-tools/src/commands.rs", "crates/ra-usage/src/new.rs", "gw.ps1", "tools/check.py"]);
+    // the card's files narrow the list to their crates
+    let card = vec!["crates/ra-tools/src/lib.rs".to_owned()];
+    assert_eq!(untracked_sources(root, &card), ["crates/ra-tools/src/commands.rs"]);
+    assert_eq!(
+        with_untracked("# P\n\nA project.\n", &untracked_sources(root, &card)),
+        "# P\n\nA project.\n\n## Untracked sources\n- crates/ra-tools/src/commands.rs\n"
+    );
+    // a long list is clipped and the rest counted
+    let many: Vec<String> = (0..23).map(|i| format!("src/f{i}.rs")).collect();
+    let text = with_untracked("", &many);
+    assert!(text.starts_with(UNTRACKED_HEADING));
+    assert!(text.contains("- src/f19.rs\n… and 3 more\n"));
+    assert!(!text.contains("src/f20.rs"));
+}
+
+#[test]
 fn the_plan_context_carries_one_clipped_line_from_each_source_of_evidence() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("alpha");

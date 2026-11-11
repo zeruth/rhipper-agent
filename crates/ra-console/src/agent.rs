@@ -1200,7 +1200,8 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
 }
 
 /// What the reviewer reads: the card, the last handoff when there is one, and the diff of the
-/// card's files and the handoff's changed ones against `HEAD`, clipped.
+/// card's files and the handoff's changed ones (what the run touched and the dirty files its
+/// report named, [`reported_files`]) against `HEAD`, clipped.
 async fn review_brief(root: &Path, node: &Node) -> String {
     let mut text = format!("# #{} {}\n", node.id, node.title);
     if let Some(objective) = &node.objective {
@@ -2250,7 +2251,13 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // two builds do not fight over the directory
     let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root).await } else { None };
     let checks = run_checks(&toolbox, &commands).await;
-    let mut changed = run_changed(&acting, &dirty_before, &git_status(&acting).await, run_started);
+    let status_after = git_status(&acting).await;
+    let mut changed = run_changed(&acting, &dirty_before, &status_after, run_started);
+    // the worker's report names the files it worked in: on a tree other cards share, a file
+    // another run left dirty and this one edited through a path git status does not retell
+    // (a rename, an editor that keeps the old time) is the card's own and the reviewer would
+    // judge the card without it (#157). The named files that are dirty join the set
+    changed.extend(reported_files(&acting, &session.text, &status_after));
     // a fix pass edits the files the run before it dirtied, which `git status` shows no
     // differently: its change is the run's and its own together, so the lint reads the lines
     // it was sent to fix and the handoff still names them
@@ -2258,9 +2265,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         && let Some(last) = task.handoffs.last()
     {
         changed.extend(last.changed.iter().cloned());
-        changed.sort();
-        changed.dedup();
     }
+    changed.sort();
+    changed.dedup();
     // a failed check leads the notes and the handoff: the failed command with its tests and the
     // tail of its output first, then the commands that passed before it with their exit codes,
     // then the worker's answer, so the next run reads the failures before anything
@@ -2323,6 +2330,12 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         store.set_notes(id, &session.text).await?;
         store.set_state_by(id, TaskState::Implemented, Source::Run).await?;
     } else {
+        // a rerun that fails its check leaves no new verdict, so the reviewer's points stay at
+        // the head of the notes until a reviewer judges the card again: the next rerun reads
+        // them there, not off the roadmap
+        if let Some(review) = carried_review(node.notes.as_deref()) {
+            report = format!("{review}\n\n{report}");
+        }
         if report != session.text {
             store.set_notes(id, &report).await?;
         }
@@ -2465,8 +2478,11 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     task.outlines = ra_context::outline_files(&root, &brief.files, &last_change(&root, node, &task).await);
     let project =
         if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
-    // the active gambits ride after the project context as the person's standing direction
+    // the active gambits ride after the project context as the person's standing direction,
+    // and the sources git does not track yet under the card's crates after that: a card's
+    // outline cannot name a file the tree does not show
     let project = ra_context::with_direction(&project, &direction_lines(&store.gambits().await?));
+    let project = ra_context::with_untracked(&project, &ra_context::untracked_sources(&root, &brief.files));
     // an explicit budget, else the complexity's while budgets are on, else none at all; a turn
     // cap only when one was asked for. No limit stands by default: the person asked for none
     let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
@@ -2789,7 +2805,8 @@ pub fn direction_lines(gambits: &[Gambit]) -> Vec<String> {
 /// # Errors
 /// When the roadmap cannot be read.
 pub async fn project_direction(store: &Store) -> anyhow::Result<String> {
-    Ok(ra_context::with_direction(&project_context(store), &direction_lines(&store.gambits().await?)))
+    let project = ra_context::with_direction(&project_context(store), &direction_lines(&store.gambits().await?));
+    Ok(ra_context::with_untracked(&project, &ra_context::untracked_sources(&workspace_of(store), &[])))
 }
 
 /// The workspace: the directory of the roadmap file.
@@ -2818,6 +2835,31 @@ fn run_changed(root: &Path, before: &str, after: &str, since: std::time::SystemT
     changed.sort();
     changed.dedup();
     changed
+}
+
+/// The files a worker's report names in backticks that are in the tree and that `status`
+/// (`git status --porcelain`) lists as dirty or new: what the run says it changed, held to
+/// what git can show of it. A clean file would add nothing to the reviewer's diff and would
+/// read to the lint as new, so it stays out; a span with spaces or a line of a command is not
+/// a path.
+fn reported_files(root: &Path, report: &str, status: &str) -> Vec<String> {
+    let dirty: Vec<String> = status
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"').to_owned())
+        .collect();
+    let mut files: Vec<String> = report
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::trim)
+        .filter(|span| !span.is_empty() && !span.contains(char::is_whitespace))
+        .map(|span| span.trim_start_matches("./").replace('\\', "/"))
+        .filter(|path| root.join(path).is_file() && dirty.iter().any(|d| d == path))
+        .collect();
+    files.sort();
+    files.dedup();
+    files
 }
 
 /// `git status --porcelain` of `root`, or nothing where git has nothing to say.
@@ -2872,7 +2914,7 @@ impl Checks {
             Some("") => "none",
             Some(command) => command,
         };
-        let limit = if self.timeout == ra_tools::DEFAULT_TIMEOUT { String::new() } else { format!(" · {} s", self.timeout.as_secs()) };
+        let limit = if self.timeout == CHECK_TIMEOUT { String::new() } else { format!(" · {} s", self.timeout.as_secs()) };
         format!("check: {}{limit} · lint: {lint}", self.commands.join(" · then "))
     }
 }
@@ -2980,34 +3022,41 @@ fn last_lines(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-/// How many lines of a failed check's output the notes keep after the failures.
-const TAIL_LINES: usize = 40;
+/// How many lines of a failed check's output the notes keep after the first failure.
+const TAIL_LINES: usize = 60;
+
+/// How long a card's check, or its lint, may run unless the project's `check_timeout` says
+/// otherwise: a full workspace test run outlives a session here (notes.log), and the walk
+/// must not hang on it.
+pub const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(20);
 
 /// What a failed check's output comes to for the notes.
 struct CheckFailure {
     /// The tests cargo marked `FAILED`; zero where the output is not a test run's.
     failed: usize,
-    /// The `test … FAILED` and `panicked at` lines first, then the last [`TAIL_LINES`] lines.
+    /// The first `test … FAILED` line, then the last [`TAIL_LINES`] lines.
     text: String,
 }
 
-/// Reads a failed check's output: the failed tests and the panics lead, the tail follows, so a
-/// reader (the next run, the person) sees what broke before the noise around it. A failed test
-/// is `test name ... FAILED`, or `name --- FAILED` under `-q`; cargo names it again in its
-/// `failures:` list, and the first names are kept, once.
+/// Reads a failed check's output: the first failed test leads, the tail follows, so a reader
+/// (the next run, the person) sees what broke before the noise around it, and a long run's
+/// output does not carry whole into the next turn. A failed test is `test name ... FAILED`, or
+/// `name --- FAILED` under `-q`; cargo names it again in its `failures:` list, and each name
+/// counts once.
 fn check_failure(output: &str) -> CheckFailure {
-    let mut leading: Vec<&str> = Vec::new();
-    let mut failed = 0;
+    let mut seen: Vec<&str> = Vec::new();
     for line in output.lines().map(str::trim) {
         let is_failure = line.ends_with(" FAILED") && (line.starts_with("test ") || line.contains(" --- "));
-        if (is_failure || line.contains("panicked at")) && !leading.contains(&line) {
-            leading.push(line);
-            failed += usize::from(is_failure);
+        if is_failure && !seen.contains(&line) {
+            seen.push(line);
         }
     }
     let tail = last_lines(output, TAIL_LINES);
-    let text = if leading.is_empty() { tail } else { format!("{}\n\n{tail}", leading.join("\n")) };
-    CheckFailure { failed, text }
+    let text = match seen.first() {
+        Some(first) => format!("{first}\n\n{tail}"),
+        None => tail,
+    };
+    CheckFailure { failed: seen.len(), text }
 }
 
 /// The warnings the last run of the card left, as a machine note: the lint found them in the
@@ -3829,9 +3878,32 @@ fn rerun_block(task: &ra_context::TaskContext, node: &Node) -> Option<String> {
         writeln!(text, "changed: {}", last.changed.join(" ")).unwrap();
     }
     for block in judgment_of(node.notes.as_deref().unwrap_or_default()) {
-        writeln!(text, "\n{block}").unwrap();
+        match review_points(&block) {
+            Some((head, points)) => {
+                writeln!(text, "\n{head}\nReviewer's points, each one to be answered:").unwrap();
+                for (n, point) in points.iter().enumerate() {
+                    writeln!(text, "{}. {point}", n + 1).unwrap();
+                }
+            }
+            None => writeln!(text, "\n{block}").unwrap(),
+        }
     }
     Some(text)
+}
+
+/// A reviewer's block of the notes as its first line and its points without their bullets, or
+/// `None` for a block that is not a review. The points go to the worker verbatim, every one
+/// and whole: a count sends the worker to the roadmap for them.
+fn review_points(block: &str) -> Option<(&str, Vec<&str>)> {
+    let mut lines = block.lines();
+    let head = lines.next().filter(|first| first.starts_with("review by "))?;
+    Some((head, lines.map(|line| line.trim_start_matches("- ")).collect()))
+}
+
+/// The latest reviewer's block at the head of a card's notes, which a run that fails its check
+/// carries onto the notes it leaves: the points stand until the card is judged again.
+fn carried_review(notes: Option<&str>) -> Option<String> {
+    judgment_of(notes.unwrap_or_default()).into_iter().find(|block| block.starts_with("review by "))
 }
 
 /// The judgment at the head of a card's notes: the reviewer's verdict with its points, and the
@@ -3850,15 +3922,16 @@ pub(crate) fn judgment_of(notes: &str) -> Vec<String> {
             blocks.push(block.join("\n"));
         } else if first.starts_with("check failed: ") {
             let mut block = vec![first];
-            // the output ends at its exit line; a command that could not run has none, so the
-            // scan also stops where the next block starts, and past what the notes keep of a
-            // failed check (its failures and the tail) regardless
+            // the output ends at its exit line, or at the line that says the limit stopped it;
+            // a command that could not run has neither, so the scan also stops where the next
+            // block starts, and past what the notes keep of a failed check (its first failure
+            // and the tail) regardless
             for line in lines.by_ref() {
                 if line.starts_with("check passed: ") || block.len() >= 3 * TAIL_LINES {
                     break;
                 }
                 block.push(line);
-                if line.starts_with("exit code ") {
+                if line.starts_with("exit code ") || line.starts_with("timed out after ") {
                     break;
                 }
             }

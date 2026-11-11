@@ -250,8 +250,8 @@ pub(crate) fn gauge(ui: &mut Ui, name: &str, value: &str, samples: &[f32], color
     use egui::epaint::{Mesh, Vertex, WHITE_UV};
     let fill = theme::mix(theme::bg(), color, 0.07);
     bubble(ui, color, false, |ui| {
-        // the bubble's inner width: the card less its own margins
-        let inner = (width - 16.0).max(60.0);
+        // the bubble's inner width: the card less its margins and its stroke, two of each
+        let inner = (width - 18.0).max(60.0);
         ui.set_width(inner);
         ui.set_max_width(inner);
         ui.horizontal(|ui| {
@@ -546,14 +546,27 @@ pub(crate) fn weight(ui: &mut Ui, weight: u8) -> egui::Response {
 pub(crate) fn gambit_bubble(ui: &mut Ui, gambit: &Gambit) -> Option<GambitPick> {
     let color = gambit_color(gambit.state);
     let active = gambit.state == GambitState::Active;
+    // one gambit a row, the width of the column: the text truncates short of the weight and
+    // the state at the right rather than carrying the column past its edge. The width is read
+    // inside the frame, where its margins and its stroke are already off: a content set to
+    // "the column less the margins" came out two stroke widths wider than the column, and a
+    // resizable panel takes its content's width, so the column grew every frame
     let inner = bubble(ui, color, active, |ui| {
+        ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(RichText::new(format!("g{}", gambit.id)).small().color(theme::dim()));
             let text = RichText::new(&gambit.text).color(if gambit.state == GambitState::Done { theme::dim() } else { theme::text() });
-            ui.label(if gambit.state == GambitState::Done { text.strikethrough() } else { text });
-            weight(ui, gambit.weight);
-            badge(ui, gambit.state.serde_name(), color);
+            let text = if gambit.state == GambitState::Done { text.strikethrough() } else { text };
+            let room = (ui.available_width() - 150.0).max(80.0);
+            ui.scope(|ui| {
+                ui.set_max_width(room);
+                ui.add(egui::Label::new(text).truncate());
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                badge(ui, gambit.state.serde_name(), color);
+                weight(ui, gambit.weight);
+            });
         });
     });
     let response = ui.interact(inner.response.rect, ui.scope_id().with(("gambit", gambit.id)), egui::Sense::click());

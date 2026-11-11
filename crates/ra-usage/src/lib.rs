@@ -256,6 +256,25 @@ impl UsageStore {
         Ok(totals_of(&row))
     }
 
+    /// The `limit` cards whose rows the ledger wrote most recently, up to and including the row
+    /// `until`, the newest first, each summed over its rows in that range: the cards a landed
+    /// card is measured against. The rows that served no node are left out.
+    ///
+    /// # Errors
+    /// When the query fails.
+    pub async fn recent_cards(&self, until: i64, limit: u32) -> anyhow::Result<Vec<query::CardCost>> {
+        let rows = sqlx::query(concat!(
+            "select node, ",
+            sums!(),
+            " from usage where node is not null and id <= ? group by node order by max(id) desc limit ?"
+        ))
+        .bind(until)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|row| query::CardCost { node: row.get("node"), totals: totals_of(row) }).collect())
+    }
+
     /// The newest `limit` rows written after the row `after`, the oldest first, with the tokens
     /// and the cost of each; 0 reads from the start.
     ///

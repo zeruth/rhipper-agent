@@ -36,6 +36,15 @@ pattern = '^\s*cargo\s+(build|test|clippy|check|run)\b'
 message = "a console or a window holds its binary while it runs, so a workspace build cannot relink it; build and test the crates (-p) or exclude the binaries"
 remedy = { kind = "rewrite", insert = "--workspace --exclude rc --exclude rc-gui", after = 2, unless = '(-p |--package |--exclude rc|--bin )', when = "console-running" }
 
+# a refusal the worker talks about is a gotcha whether or not an entry above named it: the
+# count and the journal see every one, and the report names the command so the catalogue grows
+[[gotcha]]
+id = "refused"
+where = "text"
+pattern = '(?i)\b(refused|refuses|denied|not permitted|not allowed|permission (was )?denied|blocked by the hook)\b'
+message = "a refusal cost a turn: put the exact command and the refusal's words under a `refused:` line in the report, so the allowlist or the catalogue grows"
+remedy = { kind = "hint" }
+
 [[gotcha]]
 id = "long-output"
 where = "command"
