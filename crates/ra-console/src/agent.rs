@@ -410,6 +410,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         check: check.to_owned(),
         changed,
         report: report.to_owned(),
+        warnings: Vec::new(),
     };
     let session = match session {
         Ok(session) => session,
@@ -456,6 +457,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     // warnings so the worker spends no turns on them. A lint that cannot run is a line, not a
     // verdict; a warning in a changed file is.
     let mut lint_lines = Vec::new();
+    let mut lint_warnings = Vec::new();
     if passed && let Ok(toolbox) = &toolbox {
         let lint = lint_changed(toolbox, &root, &changed).await;
         for skipped in &lint.skipped {
@@ -473,6 +475,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
                 lint.warnings.len(),
                 lint.crates.join(" -p ")
             );
+            lint_warnings = lint.warnings;
         }
     }
     if passed {
@@ -488,7 +491,16 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     // reads what the last one spent against what the card was sized at
     let verdict = estimate_verdict(estimate_of(&node), &session.usage, session.turns);
     check_line = format!("{check_line} · {verdict}");
-    task.record(handoff(if passed { "implemented" } else { "needs revision" }, check_line.trim(), &report, changed));
+    // the warnings ride in their own section of the handoff, not at the head of its report: the
+    // notes lead with them, the next run gets them in its machine notes
+    let mut last = handoff(
+        if passed { "implemented" } else { "needs revision" },
+        check_line.trim(),
+        if lint_warnings.is_empty() { &report } else { &session.text },
+        changed,
+    );
+    last.warnings = lint_warnings;
+    task.record(last);
     save_context(store, &root, &task).await;
     let turns = match session.cap {
         Some(cap) => format!("{}/{cap}", session.turns),
@@ -572,13 +584,14 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
 
 /// The messages of a harness run: the worker's role, the project context and the machine notes
 /// as system messages, the task as the user turn. The machine notes name what tripped the last
-/// runs, so the worker does not find out the hard way again.
+/// runs, so the worker does not find out the hard way again, and the warnings the last run of
+/// the card left, so a second attempt opens on the exact lines.
 fn harness_messages(task: &ra_context::TaskContext, project: &str, root: &Path, debug: bool) -> Vec<Message> {
     let mut messages = vec![Message::system(SYSTEM)];
     if !project.is_empty() {
         messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
     }
-    let notes = machine_notes(root);
+    let notes = [machine_notes(root), warnings_note(task)].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     if !notes.is_empty() {
         messages.push(Message::system(notes));
     }
@@ -854,6 +867,20 @@ fn check_failure(output: &str) -> CheckFailure {
     let tail = last_lines(output, TAIL_LINES);
     let text = if leading.is_empty() { tail } else { format!("{}\n\n{tail}", leading.join("\n")) };
     CheckFailure { failed, text }
+}
+
+/// The warnings the last run of the card left, as a machine note: the lint found them in the
+/// lines that run changed, and they are what sent the card back. Empty when it left none.
+fn warnings_note(task: &ra_context::TaskContext) -> String {
+    let warnings = task.last_warnings();
+    if warnings.is_empty() {
+        return String::new();
+    }
+    format!(
+        "The lint of the last run of this card left {} warning(s) in the lines it changed; they sent the card back. Fix these lines first:\n\n{}",
+        warnings.len(),
+        warnings.join("\n\n")
+    )
 }
 
 /// The machine notes of a run: what the gotchas say about the last hits in the journal, for the

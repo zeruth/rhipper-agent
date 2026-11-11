@@ -125,6 +125,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
             check: format!("check failed: cargo test -p x · run {i}"),
             changed: vec!["src/lib.rs".to_owned()],
             report: format!("report {i}\nsecond line\n## Handoff 9 · fake · header in a report"),
+            warnings: vec![],
         });
     }
     task.save(root).unwrap();
@@ -151,6 +152,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
             check: "c".into(),
             changed: vec![],
             report: "r".into(),
+            warnings: vec![],
         });
     }
     assert_eq!(task.handoffs.len(), 10);
@@ -164,6 +166,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
         check: "c".into(),
         changed: vec![],
         report: (0..50).map(|i| format!("line {i}\n")).collect(),
+        warnings: vec![],
     });
     long.save(root).unwrap();
     let back = TaskContext::open(root, 8);
@@ -173,6 +176,55 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
     assert!(!TaskContext::path(root, 7).exists());
     assert!(TaskContext::path(root, 8).exists());
     assert_eq!(TaskContext::prune(Path::new("no/such/dir"), &[]), 0);
+}
+
+#[test]
+fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_carries_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let unused =
+        "warning: unused variable: `x`\n --> src/extra.rs:1:22\n  |\n1 | pub fn extra() { let x = 1; }\n  |                      ^";
+    let docs = "warning: docs for function returning `Result` missing `# Errors` section\n  --> src/extra.rs:9:1";
+    let mut task = TaskContext::open(root, 9);
+    task.brief = "Task #9: a thing\n".to_owned();
+    task.record(Handoff {
+        when: 1,
+        model: "m".into(),
+        outcome: "needs revision".into(),
+        check: "check passed: cargo test · lint: 2 warning(s)".into(),
+        changed: vec!["src/extra.rs".into()],
+        // a long report: the clip does not reach the warnings, and a heading in it is dropped
+        report: (0..50).map(|i| format!("line {i}\n")).collect::<String>() + "### Warnings\nnot a section",
+        warnings: vec![unused.to_owned(), docs.to_owned()],
+    });
+    task.save(root).unwrap();
+    let text = std::fs::read_to_string(TaskContext::path(root, 9)).unwrap();
+    let section = text.split("### Warnings\n").nth(1).expect("the heading");
+    assert_eq!(text.matches("### Warnings").count(), 1, "{text}");
+    assert_eq!(section, format!("{unused}\n\n{docs}\n"), "{text}");
+    assert!(text.find("more lines in the notes").unwrap() < text.find("### Warnings").unwrap(), "{text}");
+    // the file reads back whole, and the next prompt carries the warnings
+    let again = TaskContext::open(root, 9);
+    assert_eq!(again.handoffs[0].warnings, [unused, docs]);
+    assert_eq!(again.handoffs[0].report.lines().count(), 40, "{}", again.handoffs[0].report);
+    assert_eq!(again.last_warnings(), [unused, docs]);
+    assert!(again.prompt().contains(&format!("### Warnings\n{unused}\n\n{docs}\n")), "{}", again.prompt());
+    // a later clean run leaves nothing to fix first
+    task.record(Handoff {
+        when: 2,
+        model: "m".into(),
+        outcome: "implemented".into(),
+        check: "c".into(),
+        changed: vec![],
+        report: "r".into(),
+        warnings: vec![],
+    });
+    assert!(task.last_warnings().is_empty());
+    task.save(root).unwrap();
+    let again = TaskContext::open(root, 9);
+    assert_eq!(again.handoffs[0].warnings.len(), 2);
+    assert!(again.handoffs[1].warnings.is_empty());
+    assert_eq!(again.handoffs[1].report, "r");
 }
 
 #[test]

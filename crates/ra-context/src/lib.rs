@@ -351,7 +351,13 @@ pub struct Handoff {
     pub changed: Vec<String>,
     /// The worker's report, clipped to its first lines.
     pub report: String,
+    /// The clippy diagnostics the lint of the run found in the changed files, whole; empty when
+    /// the lint was clean or did not run. Kept apart from the report so the clip never eats them.
+    pub warnings: Vec<String>,
 }
+
+/// The heading of a handoff's warnings in the file.
+const WARNINGS_HEADING: &str = "### Warnings";
 
 /// A task's context: the brief, the outlines and the handoffs, in `var/context/<id>.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +399,13 @@ impl TaskContext {
             }
         }
         text
+    }
+
+    /// The warnings of the last run: what its lint found, which the next run fixes first. Only
+    /// the last run's count; an earlier run's warnings are stale once a later one came clean.
+    #[must_use]
+    pub fn last_warnings(&self) -> &[String] {
+        self.handoffs.last().map_or(&[], |h| h.warnings.as_slice())
     }
 
     /// Adds the handoff of a run, keeping the newest [`HANDOFFS_KEPT`].
@@ -444,39 +457,90 @@ impl Handoff {
     /// The handoff as a block of the file and of the prompt.
     fn render(&self) -> String {
         let mut text = format!("## Handoff {} · {} · {}\n", self.when, self.model, self.outcome);
-        text.push_str(&format!("check: {}\n", self.check.trim()));
+        let _ = writeln!(text, "check: {}", self.check.trim());
         if !self.changed.is_empty() {
-            text.push_str(&format!("changed: {}\n", self.changed.join(" ")));
+            let _ = writeln!(text, "changed: {}", self.changed.join(" "));
         }
-        let report: Vec<&str> = self.report.lines().filter(|l| !l.starts_with("## Handoff ")).collect();
+        let report: Vec<&str> = self.report.lines().filter(|l| !l.starts_with("## Handoff ") && l.trim_end() != WARNINGS_HEADING).collect();
         let shown = &report[..report.len().min(REPORT_LINES)];
         if !shown.is_empty() {
             text.push_str(&shown.join("\n"));
             text.push('\n');
         }
         if report.len() > shown.len() {
-            text.push_str(&format!("… {} more lines in the notes of the card\n", report.len() - shown.len()));
+            let _ = writeln!(text, "… {} more lines in the notes of the card", report.len() - shown.len());
+        }
+        // the warnings close the block, whole and after the clip, each a paragraph
+        if !self.warnings.is_empty() {
+            let _ = writeln!(text, "{WARNINGS_HEADING}\n{}", self.warnings.join("\n\n"));
         }
         text
     }
 }
 
+/// The diagnostics of a warnings section, one per `warning`/`error` opening line; the blank
+/// lines between them are not part of any.
+fn parse_warnings(text: &str) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("warning") || line.starts_with("error") || warnings.is_empty() {
+            if !line.trim().is_empty() {
+                warnings.push(line.to_owned());
+            }
+        } else if let Some(last) = warnings.last_mut()
+            && !line.trim().is_empty()
+        {
+            last.push('\n');
+            last.push_str(line);
+        }
+    }
+    warnings
+}
+
 /// The handoffs of a task's file, oldest first; a file without any gives none.
 fn parse_handoffs(text: &str) -> Vec<Handoff> {
     let mut handoffs: Vec<Handoff> = Vec::new();
+    // the warnings section of the current handoff, gathered to its end
+    let mut warnings: Option<String> = None;
+    let close = |handoffs: &mut Vec<Handoff>, warnings: &mut Option<String>| {
+        if let Some(text) = warnings.take()
+            && let Some(current) = handoffs.last_mut()
+        {
+            current.warnings = parse_warnings(&text);
+        }
+    };
     for line in text.lines() {
         if let Some(header) = line.strip_prefix("## Handoff ") {
+            close(&mut handoffs, &mut warnings);
             let mut parts = header.split(" · ");
             let when = parts.next().and_then(|w| w.trim().parse().ok()).unwrap_or(0);
             let model = parts.next().unwrap_or("").trim().to_owned();
             let outcome = parts.next().unwrap_or("").trim().to_owned();
-            handoffs.push(Handoff { when, model, outcome, check: String::new(), changed: Vec::new(), report: String::new() });
+            handoffs.push(Handoff {
+                when,
+                model,
+                outcome,
+                check: String::new(),
+                changed: Vec::new(),
+                report: String::new(),
+                warnings: Vec::new(),
+            });
             continue;
         }
         let Some(current) = handoffs.last_mut() else { continue };
         if line.starts_with("## ") {
             // another section after the handoffs; nothing of the format writes one, but a hand
             // edit may
+            close(&mut handoffs, &mut warnings);
+            continue;
+        }
+        if line.trim_end() == WARNINGS_HEADING {
+            warnings = Some(String::new());
+            continue;
+        }
+        if let Some(section) = &mut warnings {
+            section.push_str(line);
+            section.push('\n');
             continue;
         }
         if current.check.is_empty()
@@ -498,6 +562,7 @@ fn parse_handoffs(text: &str) -> Vec<Handoff> {
             current.report.push_str(line);
         }
     }
+    close(&mut handoffs, &mut warnings);
     for handoff in &mut handoffs {
         handoff.report = handoff.report.trim().to_owned();
     }

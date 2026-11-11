@@ -433,6 +433,27 @@ async fn a_warning_in_a_changed_file_sends_the_card_to_needs_revision() {
     let handoff = context.split("## Handoff ").nth(1).unwrap();
     assert!(handoff.contains("needs revision") && handoff.contains("changed: src/extra.rs"), "{handoff}");
     assert!(handoff.contains("warning: unused variable: `x`"), "the handoff carries the warning: {handoff}");
+    // under its own heading, after the report, not at the head of the report
+    assert!(handoff.contains("\nadded extra\n### Warnings\nwarning: unused variable: `x`\n --> src/extra.rs:1:22\n"), "{handoff}");
+    // the next run of the card gets the warning in its prompt and, on a harness, in its machine
+    // notes as a system message
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    let ok: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let provider = Scripted::new(vec![says("fixed", vec![])]);
+    let worker = Worker::new("claude-fable-5-1").with_provider(std::sync::Arc::new(Harness(provider.clone()))).with_script(ok.clone());
+    run("run 2", &store, &worker).await.unwrap();
+    let request = provider.seen.lock().pop().unwrap();
+    let note = request.messages.iter().find(|m| m.role == "system" && m.content.contains("Fix these lines first")).expect("the note");
+    assert!(note.content.contains("left 1 warning(s)") && note.content.contains("--> src/extra.rs:1:22"), "{}", note.content);
+    // that run changed nothing and came out clean: the note is gone, the handoff before still
+    // shows the lines in the prompt of a bare model
+    let provider = Scripted::new(vec![says("fixed", vec![])]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(ok);
+    run("run 2", &store, &worker).await.unwrap();
+    let request = provider.seen.lock().pop().unwrap();
+    assert!(!request.messages.iter().any(|m| m.content.contains("Fix these lines first")), "{:?}", request.messages);
+    let prompt = &request.messages.last().unwrap().content;
+    assert!(prompt.contains("### Warnings\nwarning: unused variable: `x`\n --> src/extra.rs:1:22"), "{prompt}");
 }
 
 #[tokio::test]
