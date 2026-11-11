@@ -140,5 +140,6 @@ fn request() -> CompletionRequest {
         max_tokens: Some(16),
         tools: Vec::new(),
         workspace: None,
+        budget_usd: None,
     }
 }

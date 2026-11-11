@@ -308,6 +308,43 @@ async fn run_on_a_bare_model_fails_the_node_when_the_provider_does() {
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Failed);
 }
 
+#[test]
+fn the_complexity_sets_the_budget() {
+    use crate::agent::budget_for;
+    assert_eq!([1, 2, 3, 4, 5].map(budget_for), [0.25, 0.50, 1.00, 2.00, 5.00]);
+}
+
+#[tokio::test]
+async fn a_run_past_its_budget_stops_and_fails_the_node_with_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    // c3: a $1.00 budget
+    run("add task T parent 1", &store, &worker()).await.unwrap();
+    let read = |n: &str| ra_providers::ToolCall { id: n.into(), name: "list_dir".into(), arguments: r#"{"path":"."}"#.into() };
+    let costly = |calls| {
+        let mut answer = says("working", calls);
+        answer.usage.cost_usd = Some(0.6);
+        answer
+    };
+    let provider = Scripted::new(vec![costly(vec![read("c1")]), costly(vec![read("c2")]), says("never reached", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+    let error = run("run 2", &store, &runner).await.unwrap_err();
+    assert!(format!("{error:#}").contains("budget"), "{error:#}");
+    assert_eq!(provider.seen.lock().len(), 2, "the loop stopped at the turn that crossed the budget");
+    assert_eq!(provider.seen.lock()[0].budget_usd, Some(1.0));
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Failed);
+    let note = node.notes.unwrap();
+    assert!(note.contains("budget") && note.contains("$1.00") && note.contains("$1.2000"), "{note}");
+
+    // --budget overrides the complexity
+    run("add task U parent 1", &store, &worker()).await.unwrap();
+    let provider = Scripted::new(vec![says("done", vec![])]);
+    let capped = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_budget(Some(0.1));
+    run("run 3", &store, &capped).await.unwrap();
+    assert_eq!(provider.seen.lock()[0].budget_usd, Some(0.1));
+}
+
 #[tokio::test]
 async fn run_refuses_a_project_and_names_a_missing_key() {
     let store = store().await;

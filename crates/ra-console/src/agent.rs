@@ -43,12 +43,26 @@ pub struct Worker {
     ledger: Option<UsageStore>,
     /// The session's running totals, shared by every clone.
     tally: Arc<Mutex<Totals>>,
+    /// The dollar budget of a run, from `--budget`; `None` takes it from the node's complexity.
+    pub budget: Option<f64>,
 }
 
 impl Worker {
     /// A worker on `model`, not yet connected and without a ledger.
     pub fn new(model: impl Into<String>) -> Self {
-        Self { model: model.into(), provider: Arc::new(Mutex::new(None)), ledger: None, tally: Arc::new(Mutex::new(Totals::default())) }
+        Self {
+            model: model.into(),
+            provider: Arc::new(Mutex::new(None)),
+            ledger: None,
+            tally: Arc::new(Mutex::new(Totals::default())),
+            budget: None,
+        }
+    }
+
+    /// The same worker, with every run capped at `budget` dollars instead of the complexity's.
+    pub fn with_budget(mut self, budget: Option<f64>) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// The same worker, writing every completion to `ledger`.
@@ -141,6 +155,7 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
             max_tokens: Some(16),
             tools: Vec::new(),
             workspace: None,
+            budget_usd: None,
         })
         .await
         .map_err(map_error)?;
@@ -184,8 +199,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     // the worker acts in the directory of the roadmap file: the project it describes
     let workspace =
         store.path().parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
+    let budget = worker.budget.unwrap_or_else(|| budget_for(node.complexity));
     let session = if provider.has_own_tools() {
-        // a harness acts in the workspace by itself: one call carries the whole task
+        // a harness acts in the workspace by itself: one call carries the whole task, and the
+        // harness holds it to the budget
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
@@ -194,6 +211,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
                 max_tokens: Some(4096),
                 tools: Vec::new(),
                 workspace,
+                budget_usd: Some(budget),
             })
             .await
             .map_err(map_error);
@@ -205,11 +223,15 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             Err(error) => Err(error),
         }
     } else {
-        tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref()).await
+        tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref(), budget).await
     };
     let session = match session {
         Ok(session) => session,
         Err(error) => {
+            // a spent budget is worth a note: the next attempt sees what the last one cost
+            if let Some(over) = error.downcast_ref::<OverBudget>() {
+                store.set_notes(id, &over.to_string()).await?;
+            }
             store.set_state(id, TaskState::Failed).await?;
             return Err(error);
         }
@@ -245,14 +267,49 @@ struct Session {
 /// The most turns a tool loop takes before it stops the worker.
 const MAX_TURNS: usize = 40;
 
+/// The dollar budget of a run on a node of `complexity`, when `--budget` names none: c1 $0.25,
+/// c2 $0.50, c3 $1.00, c4 $2.00, c5 $5.00. An out-of-range complexity takes the nearest end.
+pub fn budget_for(complexity: u8) -> f64 {
+    match complexity {
+        0 | 1 => 0.25,
+        2 => 0.50,
+        3 => 1.00,
+        4 => 2.00,
+        _ => 5.00,
+    }
+}
+
+/// A run stopped because its summed cost crossed its budget. Its text is the note on the node.
+#[derive(Debug)]
+struct OverBudget {
+    budget: f64,
+    spent: f64,
+    turns: usize,
+    calls: usize,
+}
+
+impl std::fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stopped over budget: spent ${:.4} of a ${:.2} budget in {} turn(s), {} tool call(s); raise it with --budget or split the task",
+            self.spent, self.budget, self.turns, self.calls
+        )
+    }
+}
+
+impl std::error::Error for OverBudget {}
+
 /// The tool loop of a bare model: the model answers with tool calls, the toolbox executes them in
-/// the workspace, the results go back, until the model answers in words or the turns run out.
+/// the workspace, the results go back, until the model answers in words, the turns run out, or
+/// the summed cost crosses `budget`.
 async fn tool_loop(
     provider: &dyn ModelProvider,
     worker: &Worker,
     id: i64,
     context: String,
     workspace: Option<&Path>,
+    budget: f64,
 ) -> anyhow::Result<Session> {
     let workspace = workspace.context("the worker has no workspace to act in")?;
     let toolbox = ra_tools::Toolbox::new(workspace)?;
@@ -268,6 +325,7 @@ async fn tool_loop(
                 max_tokens: Some(4096),
                 tools: ra_tools::Toolbox::specs(),
                 workspace: Some(workspace.to_path_buf()),
+                budget_usd: Some(budget),
             })
             .await
             .map_err(map_error)?;
@@ -276,6 +334,10 @@ async fn tool_loop(
         add_usage(&mut usage, &answer.usage);
         if answer.tool_calls.is_empty() {
             return Ok(Session { text: answer.text, usage, calls, turns: turn });
+        }
+        // the budget is checked before the tools run: the work it would pay for is not done
+        if let Some(spent) = usage.cost_usd.filter(|spent| *spent > budget) {
+            return Err(OverBudget { budget, spent, turns: turn, calls }.into());
         }
         messages.push(Message::assistant_calls(answer.text, answer.tool_calls.clone()));
         for call in &answer.tool_calls {
@@ -403,6 +465,7 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
             max_tokens: Some(512),
             tools: Vec::new(),
             workspace: None,
+            budget_usd: None,
         })
         .await
         .map_err(map_error)?;

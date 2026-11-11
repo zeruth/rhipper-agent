@@ -11,7 +11,18 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
         max_tokens: None,
         tools: Vec::new(),
         workspace,
+        budget_usd: None,
     }
+}
+
+#[test]
+fn a_budget_goes_on_the_command_line() {
+    let mut worker = request(Some(PathBuf::from(".")));
+    worker.budget_usd = Some(0.5);
+    let args = ClaudeCode::new().args(&worker);
+    assert!(args.windows(2).any(|w| w == ["--max-budget-usd", "0.50"]), "{args:?}");
+    // no budget, no flag
+    assert!(!ClaudeCode::new().args(&request(None)).contains(&"--max-budget-usd".to_owned()));
 }
 
 #[test]

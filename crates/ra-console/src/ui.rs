@@ -1063,16 +1063,24 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
     let room = (area.width as usize).saturating_sub(PROMPT.chars().count() + 1).max(1);
     // keep the cursor in view
     let skip = app.cursor.saturating_sub(room);
-    let text: String = app.input.iter().skip(skip).take(room).collect();
+    let shown: Vec<char> = app.input.iter().skip(skip).take(room).copied().collect();
+    let at = app.cursor - skip;
+    // the cursor is a cell of its own, drawn steady: the terminal's cursor stays hidden, so it
+    // neither blinks nor jumps around the screen while the frames repaint
+    let caret = Style::new().fg(theme::BG).bg(theme::TEXT);
     let mut spans = vec![Span::styled(PROMPT, Style::new().fg(theme::ACCENT).bold())];
     if app.input.is_empty() {
+        spans.push(Span::styled(" ", caret));
         spans.push(Span::styled("type a command (help lists them)", Style::new().fg(theme::DIM).italic()));
     } else {
-        spans.push(Span::styled(text, Style::new().fg(theme::TEXT)));
+        let before: String = shown[..at.min(shown.len())].iter().collect();
+        let under = shown.get(at).map_or(" ".to_owned(), char::to_string);
+        let after: String = shown.get(at + 1..).map(|rest| rest.iter().collect()).unwrap_or_default();
+        spans.push(Span::styled(before, Style::new().fg(theme::TEXT)));
+        spans.push(Span::styled(under, caret));
+        spans.push(Span::styled(after, Style::new().fg(theme::TEXT)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
-    let x = area.x + (PROMPT.chars().count() + app.cursor - skip) as u16;
-    f.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
 }
 
 fn footer_line(app: &App, width: u16) -> Line<'static> {

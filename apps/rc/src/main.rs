@@ -71,6 +71,10 @@ enum Command {
         /// The model for this run; left out, the node's own model, else the default.
         #[arg(long)]
         model: Option<String>,
+        /// The most dollars the run may spend; left out, the node's complexity sets it
+        /// (c1 0.25, c2 0.50, c3 1.00, c4 2.00, c5 5.00).
+        #[arg(long)]
+        budget: Option<f64>,
     },
     /// Starts the console over the orchestrator.
     Console {
@@ -123,14 +127,17 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             usage().await
         }
-        Command::Run { id, model } => {
+        Command::Run { id, model, budget } => {
             plain_tracing()?;
+            if let Some(budget) = budget {
+                anyhow::ensure!(budget.is_finite() && budget > 0.0, "the budget is a positive number of dollars");
+            }
             let store = open_store().await?;
             let picked = match model {
                 Some(model) => model,
                 None => store.read(id).await?.assignee.map_or_else(|| ra_console::ui::DEFAULT_MODEL.to_owned(), |a| a.model),
             };
-            let worker = Worker::new(picked).with_ledger(open_ledger().await?);
+            let worker = Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget);
             for line in ra_console::agent::run(&store, id, &worker).await? {
                 println!("{line}");
             }

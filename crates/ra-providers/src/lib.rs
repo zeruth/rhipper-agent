@@ -77,6 +77,9 @@ pub struct CompletionRequest {
     /// The directory the worker may act in. `None` is a pure chat completion; a provider with
     /// tools of its own, such as Claude Code, runs them inside this directory and nowhere else.
     pub workspace: Option<PathBuf>,
+    /// The most dollars the run may spend; `None` sets no cap. A harness such as Claude Code
+    /// enforces it itself; for a bare model the caller's tool loop does.
+    pub budget_usd: Option<f64>,
 }
 
 /// One answer, with the usage the provider reported.

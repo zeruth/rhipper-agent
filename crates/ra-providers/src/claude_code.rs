@@ -78,6 +78,10 @@ impl ClaudeCode {
             // a chat completion: no tools, one turn
             args.extend(["--tools".to_owned(), String::new(), "--max-turns".to_owned(), "1".to_owned()]);
         }
+        if let Some(budget) = request.budget_usd {
+            // the harness stops the run itself once it has spent this much
+            args.extend(["--max-budget-usd".to_owned(), format!("{budget:.2}")]);
+        }
         args
     }
 
