@@ -30,8 +30,8 @@ remedy = { kind = "hint" }
 id = "binary-locked"
 where = "command"
 pattern = '^\s*cargo\s+(build|test|clippy|check|run)\b'
-message = "a console holds target/debug/rc.exe while it runs, so a workspace build cannot relink it; build and test the crates (-p) or exclude the binary"
-remedy = { kind = "rewrite", insert = "--workspace --exclude rc", after = 2, unless = '(-p |--package |--exclude rc|--bin )', when = "console-running" }
+message = "a console or a window holds its binary while it runs, so a workspace build cannot relink it; build and test the crates (-p) or exclude the binaries"
+remedy = { kind = "rewrite", insert = "--workspace --exclude rc --exclude rc-gui", after = 2, unless = '(-p |--package |--exclude rc|--bin )', when = "console-running" }
 
 [[gotcha]]
 id = "binary-locked-result"

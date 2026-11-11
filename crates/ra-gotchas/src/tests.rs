@@ -37,14 +37,14 @@ fn a_workspace_build_is_rewritten_only_while_a_console_runs() {
     match catalogue.command("cargo test -q", running) {
         Verdict::Rewrite { id, command, .. } => {
             assert_eq!(id, "binary-locked");
-            assert_eq!(command, "cargo test --workspace --exclude rc -q");
+            assert_eq!(command, "cargo test --workspace --exclude rc --exclude rc-gui -q");
         }
         other => panic!("{other:?}"),
     }
     assert_eq!(catalogue.command("cargo test -p ra-roadmap", running), Verdict::Pass);
     assert_eq!(catalogue.command("cargo test -q", Conditions::default()), Verdict::Pass);
     match catalogue.command("cargo build", running) {
-        Verdict::Rewrite { command, .. } => assert_eq!(command, "cargo build --workspace --exclude rc"),
+        Verdict::Rewrite { command, .. } => assert_eq!(command, "cargo build --workspace --exclude rc --exclude rc-gui"),
         other => panic!("{other:?}"),
     }
 }
