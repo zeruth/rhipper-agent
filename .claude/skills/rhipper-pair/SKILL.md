@@ -1,6 +1,6 @@
 ---
 name: rhipper-pair
-description: Pair with Rhipper Agent as the external architect session — run its cards, review and commit what its workers produce, iterate on the window, and feed it notes — the way this project is developed. Use when working in a Rhipper project (a directory with rhipper.md), or when asked to drive, review or improve the agent.
+description: Pair with Rhipper Agent as the external architect session — run its cards, review and commit what its workers produce, iterate on the window, feed it notes, and coordinate with other sessions before changing the agent's own source. Use when working in any Rhipper project (a directory with rhipper.md), when using rc or rc-gui, or when asked to drive, review or improve the agent.
 ---
 
 # Pairing with Rhipper Agent
@@ -101,6 +101,33 @@ cell takes the panel's whole height (allocate one text line); `Id::new` is depre
   `git commit -F <file>`. `Remove-Item` on repo files is blocked; use `git clean -f -- <path>`.
 - PowerShell 5.1 strips quotes from a JSON argument to an exe: pass `--settings` as a file.
 - The ledger's `turns` column and other schema changes migrate on open; `var/` carries over.
+
+## Working on the agent itself from another project
+
+The agent's source is `C:\Users\tyler\Documents\code\rhipper-agent` (its own `rhipper.md` is the
+agent's roadmap). A session using the agent in some other repo will meet things worth fixing in
+it. Other sessions may be on it at the same time, one of them often with a walk running. Before
+you change anything there:
+
+1. **Look**: in the agent repo, `git status --short` (uncommitted work is someone's), the last
+   `◆start`/`◆end` in `var/activity.log` (a start without an end is a live worker run),
+   `var/console.pid` (a window or console is open there).
+2. **Ask**: `ListAgents`, then `SendMessage` to any session whose working directory is the agent
+   repo: what you want to change, which files. Wait for the answer. If no session is listed and
+   nothing is live, you are alone; say so in a note (`rc note "<session> taking <files> for
+   <change>"` run in the agent repo) so the next one sees it in `var/retro.log`.
+3. **Prefer the roadmap**: a change that is not urgent goes on the agent's roadmap as a card
+   (`rc add task "…" --parent <phase>` in the agent repo, with objective, acceptance, files) and
+   the agent implements it on its next walk. A note (`rc note`) is right for an observation
+   without a fix.
+4. **If you edit**: stay on files no live run names (`var/context/<id>.md` of the running card
+   lists them), keep the cycle (test, build, `rc install`, commit with the message that says
+   why), and tell the session you spoke to when you are done. Never `git stash`, reset or amend
+   another session's work. `rc install` is how every project gets the new build; the running
+   windows keep going and pick it up on their next launch.
+5. **The reply side**: if a session asks you about the agent repo, answer with what is live,
+   what is uncommitted and whether the files they name are safe; agree a handoff or ask them
+   to add a card instead.
 
 ## Reading the roadmap fast
 
