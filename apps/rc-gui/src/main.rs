@@ -10,6 +10,7 @@ mod cards;
 mod console;
 mod fonts;
 mod input;
+mod markdown;
 mod theme;
 
 use std::collections::HashSet;
@@ -74,6 +75,9 @@ struct App {
     job_tx: mpsc::UnboundedSender<()>,
     job_done: mpsc::UnboundedReceiver<()>,
     all_time: Option<Totals>,
+    /// The plan's windows as the harness last reported them, and when they were last read.
+    limits: ra_providers::limits::Limits,
+    limits_read: Instant,
     show_debug: bool,
     /// The model typed into the card view, to assign to the selected card.
     assign_model: String,
@@ -150,6 +154,8 @@ impl App {
             job_tx,
             job_done,
             all_time,
+            limits: ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE)),
+            limits_read: Instant::now(),
             show_debug: false,
             assign_model: String::new(),
             fault,
@@ -183,6 +189,11 @@ impl App {
         while self.job_done.try_recv().is_ok() {
             self.job = None;
             self.all_time = self.rt.block_on(self.worker.all_time());
+        }
+        // the plan's windows, every five seconds: a run of any instance may have moved them
+        if self.limits_read.elapsed() >= Duration::from_secs(5) {
+            self.limits = ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE));
+            self.limits_read = Instant::now();
         }
     }
 
@@ -331,6 +342,28 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let secs = self.started.elapsed().as_secs();
                 ui.label(RichText::new(format!("up {:02}:{:02}:{:02} ", secs / 3600, secs / 60 % 60, secs % 60)).color(theme::DIM).small());
+                // the plan's windows, colored by how full they are
+                if self.limits.fresh() {
+                    for (name, window) in self.limits.windows.iter().rev() {
+                        let label = match name.as_str() {
+                            "five_hour" => "5h",
+                            "seven_day" => "week",
+                            other => other,
+                        };
+                        let color = if window.utilization >= 0.8 {
+                            theme::ERROR_TEXT
+                        } else if window.utilization >= 0.5 {
+                            theme::WARN_TEXT
+                        } else {
+                            theme::ONLINE
+                        };
+                        cards::badge_marked(ui, "◔", &format!("{label} {:.0}%", window.utilization * 100.0), color).on_hover_text(format!(
+                            "the plan's {label} window: {:.0}% used, resets in {}\nfrom the harness's last run",
+                            window.utilization * 100.0,
+                            ra_providers::limits::until(window.resets_at)
+                        ));
+                    }
+                }
                 match &self.all_time {
                     Some(all) => {
                         cards::badge_marked(ui, "◉", &format!("ledger {} · {} calls", dollars(all.cost_usd), all.calls), theme::ONLINE)
@@ -596,7 +629,7 @@ impl App {
                     ui.set_width(ui.available_width());
                     cards::section(ui, "NOTES", theme::DIM);
                     // the whole of the notes: the worker's report is the point of the card
-                    ui.label(RichText::new(notes).monospace().color(theme::mix(theme::TEXT, theme::DIM, 0.3)));
+                    markdown::render(ui, notes, theme::DIM);
                 });
                 ui.add_space(6.0);
             }
