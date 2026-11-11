@@ -267,6 +267,10 @@ struct Ledger {
     /// up the tree, so the root reads as the total.
     by_node: Vec<(Option<i64>, Totals)>,
     all_time: Option<Totals>,
+    /// The totals since the window opened this project, from the ledger: the walks' runs are
+    /// child processes, so the window's own worker never tallies them (the pill bar read 0
+    /// all evening); `None` without a ledger.
+    session: Option<Totals>,
     /// The calls of the selected card, the latest first, with the turns and the tokens of each;
     /// read again when the selection moves.
     calls: Vec<ra_usage::Call>,
@@ -1055,7 +1059,7 @@ impl App {
             let (mut prompt, mut completion, mut cost) = (0u64, 0u64, 0f64);
             let (mut all_cost, mut all_calls, mut any_ledger) = (0f64, 0u64, false);
             for t in &self.tabs {
-                let session = t.worker.tally();
+                let session = t.ledger.session.clone().unwrap_or_else(|| t.worker.tally());
                 prompt += session.prompt_tokens;
                 completion += session.completion_tokens;
                 cost += session.cost_usd.unwrap_or(0.0);
@@ -1840,13 +1844,17 @@ impl Workspace {
     /// Reads the ledger and the gotchas again: the same queries as `rc usage` and the same
     /// journal as `rc gotchas`, so the tab shows their numbers.
     fn refresh_ledger(&mut self) {
-        let (all_time, by_model, by_node, calls) = self.rt.block_on(async {
+        let (all_time, by_model, by_node, calls, session) = self.rt.block_on(async {
             (
                 self.worker.all_time().await,
                 self.worker.by_model().await,
                 self.worker.by_node().await,
                 match self.selected {
                     Some(id) => self.worker.calls_of(Some(id)).await,
+                    None => None,
+                },
+                match &self.usage {
+                    Some(usage) => usage.totals_after(self.session_from).await.ok(),
                     None => None,
                 },
             )
@@ -1872,6 +1880,7 @@ impl Workspace {
             by_model: by_model.unwrap_or_default(),
             by_node: by_node.unwrap_or_default(),
             all_time,
+            session,
             calls: calls.unwrap_or_default(),
             gotchas,
             unmatched: journal.unmatched(),
@@ -2504,7 +2513,9 @@ impl Workspace {
             // the counts, left to right after a gap: a right-aligned group pushed its first
             // badges past the edge as it grew
             ui.add_space(18.0);
-            let session = self.worker.tally();
+            // the session's counts from the ledger, which the walks' child runs write; the
+            // window's own tally only when there is no ledger
+            let session = self.ledger.session.clone().unwrap_or_else(|| self.worker.tally());
             cards::badge_marked(
                 ui,
                 "⇅",
@@ -2516,7 +2527,7 @@ impl Workspace {
                 ),
                 theme::warn_text(),
             )
-            .on_hover_text("this session's tokens and cost");
+            .on_hover_text("this session's tokens and cost, from the ledger");
             match &self.ledger.all_time {
                 Some(all) => {
                     cards::badge_marked(ui, "◉", &format!("ledger {} · {} calls", dollars(all.cost_usd), all.calls), theme::online())
@@ -4052,7 +4063,9 @@ impl Workspace {
             holds_shown: HashSet::new(),
             hidden: HashSet::new(),
             folded: HashSet::new(),
-            selected: self.selected,
+            // no row is the selected one here: the run and reassess buttons a selected row
+            // wears belong to the project's tab, not the dashboard's queue
+            selected: None,
             scroll_to: None,
             depths: tree::depths(&nodes),
             last_changes: self.last_changes.clone(),
