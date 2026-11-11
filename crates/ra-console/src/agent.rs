@@ -2124,7 +2124,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
     let (resume, fresh) = match resume_of(&node, unix_now()) {
         Ok(Some(session)) => {
-            let noted = rerun.as_ref().map(|_| "  rerun on the session: the verdict and the failing check ride as the new prompt".to_owned());
+            let noted =
+                rerun.as_ref().map(|_| "  rerun on the session: the verdict and the failing check ride as the new prompt".to_owned());
             (Some(session), noted)
         }
         Ok(None) => (
@@ -2136,6 +2137,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     if let Some(fresh) = &fresh {
         tracing::info!(target: crate::trace::PROGRESS, "{}", fresh.trim_start());
     }
+    // whether the report was asked for a second time, for the end line
+    let mut asked_twice = false;
     let session = if provider.has_own_tools() {
         // a harness acts in the workspace by itself: one call carries the whole task, and the
         // harness holds it to the budget; its hooks learn the card from the environment
@@ -2156,13 +2159,52 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             })
             .await;
         match answer {
-            Ok(answer) => {
+            Ok(mut answer) => {
                 worker.record(Some(id), &answer.usage, answer.turns).await;
                 gotcha_hits.clone_from(&answer.gotchas);
                 if let Some(session) = answer.session_id.as_deref() {
                     // kept on the node with the card's fingerprint: the next run of it resumes
                     // this session while the card reads the same
                     store.set_session(id, Some((session, &card_fingerprint(&node))), unix_now()).await?;
+                }
+                // a report that names no file and no result is not sent to the reviewer, who
+                // would only send the card back for it (#47, #134): the session, which still
+                // holds the work, is asked for the report once more, with the files git status
+                // shows changed as the prompt, and that answer is the handoff, whatever it says
+                if is_empty_handoff(&answer.text)
+                    && let Some(session) = answer.session_id.clone()
+                {
+                    asked_twice = true;
+                    let changed = run_changed(&acting, &dirty_before, &git_status(&acting).await, run_started);
+                    tracing::info!(target: crate::trace::PROGRESS, "the report named no file and no result; asking the session again");
+                    let again = provider
+                        .complete(CompletionRequest {
+                            model: worker.model.clone(),
+                            messages: vec![Message::user(report_ask(&changed))],
+                            temperature: Some(0.4),
+                            max_tokens: Some(4096),
+                            tools: Vec::new(),
+                            workspace: workspace_dir.clone(),
+                            budget_usd: budget,
+                            resume: Some(session),
+                            max_turns: Some(REPORT_TURNS),
+                            max_context: None,
+                            effort: Some(effort.to_string()),
+                        })
+                        .await;
+                    match again {
+                        Ok(second) => {
+                            worker.record(Some(id), &second.usage, second.turns).await;
+                            gotcha_hits.extend(second.gotchas);
+                            add_usage(&mut answer.usage, &second.usage);
+                            answer.turns += second.turns;
+                            answer.turn_usage.extend(second.turn_usage);
+                            answer.reads.extend(second.reads);
+                            answer.text = second.text;
+                        }
+                        // the first answer stands: the check and the review judge what landed
+                        Err(e) => tracing::warn!("the second ask for the report of #{id} failed: {e}"),
+                    }
                 }
                 Ok(Session {
                     text: answer.text,
@@ -2439,7 +2481,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     };
     let mut lines = vec![
         format!(
-            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · in {} out {} · {sizes} · {} · {verdict}",
+            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · in {} out {} · {sizes} · {} · {verdict}{}",
             if passed { "✓" } else { "✗" },
             id,
             node.title,
@@ -2448,7 +2490,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             session.calls,
             session.usage.prompt_tokens,
             session.usage.completion_tokens,
-            cost_text(session.usage.cost_usd)
+            cost_text(session.usage.cost_usd),
+            if asked_twice { " · report asked twice" } else { "" }
         ),
         check_line,
     ];
@@ -2584,9 +2627,11 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     task.review = if is_rerun(node, worker) { ra_context::review_of(node.notes.as_deref().unwrap_or_default()) } else { None };
     let project =
         if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
-    // the active gambits ride after the project context as the person's standing direction,
-    // and the sources git does not track yet under the card's crates after that: a card's
-    // outline cannot name a file the tree does not show
+    // the context rides cut to the card's crates (whole on rhipper-asm it is 12k tokens a run);
+    // the active gambits ride after it as the person's standing direction, and the sources git
+    // does not track yet under the card's crates after that: a card's outline cannot name a
+    // file the tree does not show
+    let project = ra_context::cut_to(&project, &brief.files);
     let project = ra_context::with_direction(&project, &direction_lines(&store.gambits().await?));
     let project = ra_context::with_untracked(&project, &ra_context::untracked_sources(&root, &brief.files));
     // an explicit budget, else the complexity's while budgets are on, else none at all; a turn
@@ -2615,7 +2660,7 @@ fn harness_messages(task: &ra_context::TaskContext, rerun: Option<&str>, project
     if !project.is_empty() {
         messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
     }
-    let notes = [machine_notes(root), warnings_note(task), digest_block(&crate::hub::digest_lines(root))]
+    let notes = [machine_notes(root, project), warnings_note(task), digest_block(&crate::hub::digest_lines(root))]
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
@@ -3199,6 +3244,62 @@ fn without_check_claims(report: &str) -> Option<String> {
     Some(kept.join("\n").trim().to_owned())
 }
 
+/// The turns a second ask for the report gets: the work is done and in the session, a `git
+/// diff` at most stands between the session and its report.
+const REPORT_TURNS: u32 = 3;
+
+/// The lines a check prints that a worker pastes in place of a report: cargo's build and test
+/// lines, a compiler note, a gradle task line.
+const CHECK_OUTPUT: [&str; 12] =
+    ["running ", "test ", "test result:", "Compiling", "Finished", "Running", "Doc-tests", "warning", "error", "-->", "BUILD ", "> Task"];
+
+/// Whether a worker's report hands nothing off: it names no file in backticks, and what is
+/// left once the check's own output and the words for a check still running are taken out is
+/// under a sentence (four words). A reviewer would judge the placeholder and send the card back
+/// for it, so the run asks the session for the report once more instead.
+pub(crate) fn is_empty_handoff(report: &str) -> bool {
+    let is_path = |span: &str| {
+        !span.is_empty()
+            && !span.contains(char::is_whitespace)
+            && (span.contains('/')
+                || span.contains('\\')
+                || span
+                    .rsplit_once('.')
+                    .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty() && ext.chars().all(char::is_alphanumeric)))
+    };
+    if report.split('`').skip(1).step_by(2).map(str::trim).any(is_path) {
+        return false;
+    }
+    // a line that says the suite, the build or the tests are still running says nothing either
+    let is_claim = |line: &str| {
+        let lower = line.to_lowercase();
+        ["check", "cargo", "test", "suite", "build"].iter().any(|word| lower.contains(word))
+            && CHECK_CLAIMS.iter().any(|word| lower.contains(word))
+    };
+    let words: usize = report
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty() && !line.starts_with('#') && !is_claim(line) && !CHECK_OUTPUT.iter().any(|lead| line.starts_with(lead))
+        })
+        .map(|line| line.split_whitespace().count())
+        .sum();
+    words < 4
+}
+
+/// The prompt of the second ask: the report the first answer was not, and the files git status
+/// shows the run changed, so the session reports on those rather than on the check.
+fn report_ask(changed: &[String]) -> String {
+    let files = if changed.is_empty() {
+        "git status shows no file changed by this run".to_owned()
+    } else {
+        format!("The files git status shows changed by this run: {}", changed.join(", "))
+    };
+    format!(
+        "Your answer named no file and no result, and the check is the orchestrator's to run, not yours. Give the report now, in a few lines: what you changed, naming the file each change landed in in backticks, and what you verified; do not run the check again.\n{files}"
+    )
+}
+
 /// The warnings the last run of the card left, as a machine note: the lint found them in the
 /// lines that run changed, and they are what sent the card back. Empty when it left none.
 fn warnings_note(task: &ra_context::TaskContext) -> String {
@@ -3214,15 +3315,17 @@ fn warnings_note(task: &ra_context::TaskContext) -> String {
 }
 
 /// The machine notes of a run: what the gotchas say about the last hits in the journal, for the
-/// system prompt, so the worker does not find out the hard way again. Empty when nothing fired.
-fn machine_notes(workspace: &Path) -> String {
+/// system prompt, so the worker does not find out the hard way again, less what `project`, the
+/// context the prompt already carries, or an earlier note says. Empty when nothing fired.
+fn machine_notes(workspace: &Path, project: &str) -> String {
     let gotchas = match Catalogue::load(&workspace.join(GOTCHAS_FILE)) {
         Ok(catalogue) => catalogue.notes(&Journal::at(&workspace.join(GOTCHAS_LOG)).recent(RECENT_HITS)),
         Err(_) => String::new(),
     };
     // what the earlier runs said themselves, in debug mode, rides along
     let retro = crate::retro::machine_lines(workspace);
-    [gotchas, retro].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n")
+    let notes = [gotchas, retro].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+    ra_context::dedupe_notes(&notes, project)
 }
 
 /// What one worker session came to: the final answer, the usage summed over its turns, and how

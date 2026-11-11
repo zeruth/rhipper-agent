@@ -740,6 +740,72 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
     assert_eq!(harness.requests.lock().last().unwrap().max_context, None, "no cap after a cap hit reading in");
 }
 
+#[tokio::test]
+async fn a_placeholder_report_is_asked_again_on_its_session_and_a_real_one_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    git_ok(dir.path(), &["init", "-q"]);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    run("/add task Second parent 1", &store, &worker()).await.unwrap();
+    // the first answer only says its check is running; the session, asked again, reports
+    let mut placeholder = says("cargo test -p probe is still running in the background", vec![]);
+    placeholder.session_id = Some("s-probe".to_owned());
+    // popped from the end; the review of each implemented card reads its verdict off the same
+    // provider, so one `accepted` follows each report
+    let script = vec![
+        Ok(says("accepted", vec![])),
+        Ok(says("added the probe in `src/lib.rs` and read it back", vec![])),
+        Ok(says("accepted", vec![])),
+        Ok(says("changed `src/lib.rs`: the probe asserts the flag", vec![])),
+        Ok(placeholder),
+    ];
+    let harness = CappedHarness::new(script);
+    let runner =
+        Worker::new("claude-opus-5-5").with_provider(harness.clone()).with_ledger(ra_usage::UsageStore::in_memory().await.unwrap());
+
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(out[0].starts_with("✓ #2 Probe implemented on claude-opus-5-5 · turns 2,"), "{out:?}");
+    assert!(out[0].ends_with(" · report asked twice"), "{out:?}");
+    {
+        let requests = harness.requests.lock();
+        let asked: Vec<(Option<&str>, Option<u32>, String)> = requests
+            .iter()
+            .map(|r| (r.resume.as_deref(), r.max_turns, r.messages.last().unwrap().content.chars().take(100).collect()))
+            .collect();
+        // the task, the second ask on its session, and the review
+        assert_eq!(requests.len(), 3, "{asked:?}");
+        assert_eq!(requests[0].resume, None);
+        assert_eq!(requests[1].resume.as_deref(), Some("s-probe"));
+        assert_eq!(requests[1].max_turns, Some(3));
+        let prompt = &requests[1].messages.last().unwrap().content;
+        assert!(prompt.contains("named no file and no result") && prompt.contains("git status"), "{prompt}");
+    }
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    assert_eq!(task.handoffs.len(), 1);
+    assert!(task.handoffs[0].report.contains("the probe asserts the flag"), "{}", task.handoffs[0].report);
+    assert!(!task.handoffs[0].report.contains("still running"), "{}", task.handoffs[0].report);
+    // both asks are on the ledger under the card, as the worker's own calls
+    let worker_calls = runner.calls_of(Some(2)).await.unwrap().iter().filter(|call| call.role.is_none()).count();
+    assert_eq!(worker_calls, 2);
+
+    // a real report goes to the check and the review as it is: one ask, then the review
+    let (out, _) = run("/run 3", &store, &runner).await.unwrap();
+    assert!(out[0].starts_with("✓ #3 Second implemented on claude-opus-5-5 · turns 1,"), "{out:?}");
+    assert!(!out[0].contains("asked twice"), "{out:?}");
+    assert_eq!(harness.requests.lock().len(), 5);
+}
+
+#[test]
+fn a_report_is_a_placeholder_when_it_names_no_file_and_says_nothing_beyond_the_check() {
+    assert!(crate::agent::is_empty_handoff(""));
+    assert!(crate::agent::is_empty_handoff("the suite is still running"));
+    assert!(crate::agent::is_empty_handoff("running 3 tests\ntest a ... ok\ntest result: ok. 3 passed"));
+    assert!(crate::agent::is_empty_handoff("## Report\n\nDone."));
+    assert!(!crate::agent::is_empty_handoff("changed `crates/x/src/lib.rs`"));
+    assert!(!crate::agent::is_empty_handoff("Nothing to change: the card is already implemented in the store."));
+}
+
 /// A one-crate Cargo project in `dir` whose single test passes or fails.
 fn cargo_project(dir: &std::path::Path, passing: bool) {
     std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n")
@@ -1256,6 +1322,36 @@ async fn a_dry_run_shows_the_active_gambits_in_the_system_messages_and_not_the_p
     let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
     let text = out.join("\n");
     assert!(text.contains("- g1 Local first {w3} · focus: local") && !text.contains("Polish the window"), "{text}");
+}
+
+#[tokio::test]
+async fn a_dry_run_sends_the_project_context_cut_to_the_card_s_crate_and_a_machine_note_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    std::fs::create_dir_all(dir.path().join("crates/ra-tools/src")).unwrap();
+    std::fs::write(dir.path().join("crates/ra-tools/src/lib.rs"), "pub fn t() {}\n").unwrap();
+    let project = "# Rhipper\n\nA project.\n\n## Layout\n\n- `crates/ra-roadmap` — the roadmap\n- `crates/ra-tools` — the tools\n- `crates/ra-usage` — the ledger\n\n## Build and checks\n\n- build with -p while the window runs\n";
+    std::fs::write(dir.path().join(agent::PROJECT_FILE), project).unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    run("/files 2 crates/ra-tools/src/lib.rs", &store, &worker()).await.unwrap();
+    // a look-back that says what the project context already says rides once; a new one rides
+    crate::retro::record(
+        dir.path(),
+        Some(2),
+        &crate::retro::parse("## Faster next time\n- [machine] build with -p while the window runs\n- [machine] sed is refused\n"),
+    )
+    .unwrap();
+    let (out, _) = run("/run 2 dry", &store, &Worker::new("claude-sonnet-5-5")).await.unwrap();
+    let system_end = out.iter().position(|l| l == "--- user ---").expect("the user turn follows the system messages");
+    let system = out[..system_end].join("\n");
+    assert!(system.contains("- `crates/ra-tools` — the tools") && system.contains("## Build and checks"), "{system}");
+    assert!(!system.contains("ra-roadmap") && !system.contains("ra-usage"), "{system}");
+    assert_eq!(system.matches("build with -p while the window runs").count(), 1, "{system}");
+    assert!(system.contains("sed is refused"), "{system}");
+    // a card with no files reads the whole context
+    run("/add task Bare parent 1", &store, &worker()).await.unwrap();
+    let (out, _) = run("/run 3 dry", &store, &Worker::new("claude-sonnet-5-5")).await.unwrap();
+    assert!(out.join("\n").contains("- `crates/ra-usage` — the ledger"), "{}", out.join("\n"));
 }
 
 #[tokio::test]
@@ -2423,7 +2519,8 @@ async fn a_second_run_of_a_node_resumes_its_session() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task T parent 1", &store, &worker()).await.unwrap();
-    let mut first = says("done", vec![]);
+    // a report, not a placeholder: a bare "done" would be asked again and spend the script
+    let mut first = says("done: the tree already holds the work", vec![]);
     first.session_id = Some("sess-1".into());
     let script = Scripted::new(vec![first, says("done again", vec![])]);
     let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
@@ -2591,7 +2688,7 @@ async fn a_changed_objective_drops_the_resume() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task T parent 1", &store, &worker()).await.unwrap();
-    let mut first = says("done", vec![]);
+    let mut first = says("done: the tree already holds the work", vec![]);
     first.session_id = Some("sess-1".into());
     let script = Scripted::new(vec![first, says("done again", vec![])]);
     let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
