@@ -1,27 +1,57 @@
 //! The agent loop: the console's live path to a model. `ping` proves the connection; `run` sends
-//! one roadmap task to the badge model and records what came back.
+//! one roadmap task to the badge model and records what came back. The functions talk to a
+//! [`ModelProvider`] through a [`Worker`], never to a vendor.
 
-use crate::secret;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError};
-use ra_roadmap::model::{Node, TaskState};
+use ra_roadmap::model::{Node, NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 
-/// The model of the next run, as the badge holds it.
-pub type Model = String;
+use crate::secret;
 
-/// Reads the OpenRouter key: the credential store, with the environment as the override.
-pub fn api_key() -> anyhow::Result<String> {
-    secret::api_key()
+/// The console's handle on a worker session: the model of the badge and the provider behind it.
+/// The provider connects on first use and stays for the session; the clones in the background
+/// jobs share it. [`Worker::forget`] drops it when the key changes.
+#[derive(Clone)]
+pub struct Worker {
+    /// The model the next session runs on, as the badge holds it.
+    pub model: String,
+    provider: Arc<Mutex<Option<Arc<dyn ModelProvider>>>>,
+}
+
+impl Worker {
+    /// A worker on `model`, not yet connected.
+    pub fn new(model: impl Into<String>) -> Self {
+        Self { model: model.into(), provider: Arc::new(Mutex::new(None)) }
+    }
+
+    /// The provider, connected on the first call: the key comes from the credential store or the
+    /// environment, and a missing one is the error.
+    pub fn provider(&self) -> anyhow::Result<Arc<dyn ModelProvider>> {
+        let mut slot = self.provider.lock();
+        if let Some(provider) = slot.as_ref() {
+            return Ok(provider.clone());
+        }
+        let provider: Arc<dyn ModelProvider> = Arc::new(ra_providers::openrouter::OpenRouter::new(secret::api_key()?)?);
+        *slot = Some(provider.clone());
+        Ok(provider)
+    }
+
+    /// Drops the connected provider, so the next call connects with the current key.
+    pub fn forget(&self) {
+        *self.provider.lock() = None;
+    }
 }
 
 /// Sends one message and returns the answer and the usage as log lines.
-pub async fn ping(model: &str) -> anyhow::Result<Vec<String>> {
-    let key = api_key()?;
-    let provider = ra_providers::openrouter::OpenRouter::new(key)?;
+pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
+    let provider = worker.provider()?;
     let answer = provider
         .complete(CompletionRequest {
-            model: model.to_owned(),
+            model: worker.model.clone(),
             messages: vec![Message::user("Reply with the single word: pong.")],
             temperature: Some(0.0),
             max_tokens: Some(16),
@@ -30,32 +60,38 @@ pub async fn ping(model: &str) -> anyhow::Result<Vec<String>> {
         .await
         .map_err(map_error)?;
     Ok(vec![
-        format!("{} says: {}", short(model), answer.text.trim()),
+        format!("{} says: {}", short(&worker.model), answer.text.trim()),
         format!("  tokens: in {} out {} cached {}", answer.usage.prompt_tokens, answer.usage.completion_tokens, answer.usage.cached_tokens),
     ])
 }
 
 /// Runs one roadmap task: builds the context from the node, its ancestors and its dependencies,
-/// sends it to the model, and writes the answer and the state back.
-pub async fn run(store: &Store, id: i64, model: &str) -> anyhow::Result<Vec<String>> {
+/// sends it to the model, and writes the answer and the state back. A failed call leaves the node
+/// failed, not in progress.
+pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
     // the node first, so a bad id or a project is named before the key matters
     let node = store.read(id).await?;
-    anyhow::ensure!(node.kind != ra_roadmap::model::NodeKind::Project, "#{} is a project; run a task", id);
-    let key = api_key()?;
+    anyhow::ensure!(node.kind != NodeKind::Project, "#{} is a project; run a task", id);
+    let provider = worker.provider()?;
     store.set_state(id, TaskState::InProgress).await?;
 
     let context = context_of(store, &node).await?;
-    let provider = ra_providers::openrouter::OpenRouter::new(key)?;
     let answer = provider
         .complete(CompletionRequest {
-            model: model.to_owned(),
+            model: worker.model.clone(),
             messages: vec![Message::system(SYSTEM), Message::user(context)],
             temperature: Some(0.4),
             max_tokens: Some(1024),
             tools: Vec::new(),
         })
-        .await
-        .map_err(map_error)?;
+        .await;
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(error) => {
+            store.set_state(id, TaskState::Failed).await?;
+            return Err(map_error(error));
+        }
+    };
 
     store.set_notes(id, &answer.text).await?;
     store.set_state(id, TaskState::Implemented).await?;
@@ -63,7 +99,7 @@ pub async fn run(store: &Store, id: i64, model: &str) -> anyhow::Result<Vec<Stri
         format!(
             "✓ #{} implemented on {} · in {} out {}",
             node.title,
-            short(model),
+            short(&worker.model),
             answer.usage.prompt_tokens,
             answer.usage.completion_tokens
         ),
@@ -74,9 +110,8 @@ pub async fn run(store: &Store, id: i64, model: &str) -> anyhow::Result<Vec<Stri
 /// Reassesses one node: the model revises the objective and the acceptance for the work still
 /// ahead, from the node's current text and its notes. With `recursive`, the whole subtree follows,
 /// parent first.
-pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> anyhow::Result<Vec<String>> {
-    let key = api_key()?;
-    let provider = ra_providers::openrouter::OpenRouter::new(key)?;
+pub async fn reassess(store: &Store, id: i64, worker: &Worker, recursive: bool) -> anyhow::Result<Vec<String>> {
+    let provider = worker.provider()?;
     let nodes = store.all().await?;
     // one pass over the tree before any call, so the recursion cannot stall midway
     let order: Vec<i64> = if recursive { tree::subtree(&nodes, id).iter().map(|n| n.id).collect() } else { vec![id] };
@@ -91,11 +126,11 @@ pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> a
         };
         // a node whose work is done is verified, not recreated: no model call, no chance to drift
         if matches!(node.state, TaskState::Implemented | TaskState::Accepted) {
-            receipts.push(format!("#{} {} [{}] verified: no revision needed", node.id, node.title, node.state.serde_name()));
+            receipts.push(format!("#{} {} [{}] verified: no revision needed", node.id, node.title, node.state));
             verified.push(format!("#{}", current));
             continue;
         }
-        match reassess_one(store, &provider, model, current, &nodes).await {
+        match reassess_one(store, provider.as_ref(), &worker.model, current, &nodes).await {
             Ok(receipt) => {
                 revised.push(format!("#{}", current));
                 receipts.push(receipt);
@@ -106,7 +141,7 @@ pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> a
     let mut out = vec![format!(
         "✓ {} node(s) reassessed on {} ({} verified): {}",
         revised.len() + verified.len(),
-        short(model),
+        short(&worker.model),
         verified.len(),
         revised.join(" ")
     )];
@@ -118,13 +153,7 @@ pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> a
 /// One reassessment: the model returns two lines, and the store takes them. The prompt carries the
 /// node's own notes and its children with their states, so the revision names only the work the
 /// subtree still owes.
-async fn reassess_one(
-    store: &Store,
-    provider: &ra_providers::openrouter::OpenRouter,
-    model: &str,
-    id: i64,
-    nodes: &[Node],
-) -> anyhow::Result<String> {
+async fn reassess_one(store: &Store, provider: &dyn ModelProvider, model: &str, id: i64, nodes: &[Node]) -> anyhow::Result<String> {
     let node = store.read(id).await?;
     let old_objective = node.objective.clone();
     let old_acceptance = node.acceptance.clone();
@@ -137,13 +166,7 @@ async fn reassess_one(
     if !children.is_empty() {
         ask.push_str("\nWhat this node's children already cover:\n");
         for kid in children {
-            ask.push_str(&format!(
-                "- #{} {} [{}]: {}\n",
-                kid.id,
-                kid.title,
-                kid.state.serde_name(),
-                kid.objective.as_deref().unwrap_or("no objective")
-            ));
+            ask.push_str(&format!("- #{} {} [{}]: {}\n", kid.id, kid.title, kid.state, kid.objective.as_deref().unwrap_or("no objective")));
         }
     }
     ask.push_str(
@@ -182,7 +205,7 @@ async fn reassess_one(
         } else if let Some(rest) = line.strip_prefix("acceptance:") {
             let rest = rest.trim();
             if !rest.is_empty() && !is_placeholder(rest) {
-                acceptance = Some(rest.trim_start().to_owned());
+                acceptance = Some(rest.to_owned());
             }
         }
     }
@@ -239,8 +262,11 @@ const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orche
 /// The system prompt of a reassessment.
 const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done.";
 
-/// The prompt of one task: the node, its ancestors, and its dependencies.
+/// The prompt of one task: the node, its ancestors, and its dependencies. One read of the store
+/// serves them all.
 async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
+    let nodes = store.all().await?;
+    let find = |id: i64| nodes.iter().find(|n| n.id == id);
     let mut text = format!("Task #{}: {}\n", node.id, node.title);
     if let Some(objective) = &node.objective {
         text.push_str(&format!("Objective: {objective}\n"));
@@ -249,25 +275,27 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
         text.push_str(&format!("Acceptance criteria: {acceptance}\n"));
     }
     // the ancestors: the chain of parents above the task, nearest first
-    let mut parent = node.parent;
-    while let Some(id) = parent {
-        let ancestor = store.read(id).await?;
+    let mut parent = node.parent.and_then(find);
+    while let Some(ancestor) = parent {
         text.push_str(&format!("Under #{} {}: {}\n", ancestor.id, ancestor.title, ancestor.objective.as_deref().unwrap_or("no objective")));
-        parent = ancestor.parent;
+        parent = ancestor.parent.and_then(find);
     }
-    // the dependencies, with their own context and the notes of earlier attempts
+    // the dependencies, with their own context and the notes of earlier attempts; a dangling id
+    // is named, so a hand-edited file shows its mistake
     for id in &node.depends_on {
-        if let Ok(dep) = store.read(*id).await {
-            text.push_str(&format!(
-                "Depends on #{} {} [{}]: {}\n",
-                dep.id,
-                dep.title,
-                dep.state.serde_name(),
-                dep.objective.as_deref().unwrap_or("no objective")
-            ));
-            if let Some(notes) = &dep.notes {
-                text.push_str(&format!("  notes of #{}: {notes}\n", dep.id));
-            }
+        let Some(dep) = find(*id) else {
+            text.push_str(&format!("Depends on #{id}: no such node\n"));
+            continue;
+        };
+        text.push_str(&format!(
+            "Depends on #{} {} [{}]: {}\n",
+            dep.id,
+            dep.title,
+            dep.state,
+            dep.objective.as_deref().unwrap_or("no objective")
+        ));
+        if let Some(notes) = &dep.notes {
+            text.push_str(&format!("  notes of #{}: {notes}\n", dep.id));
         }
     }
     Ok(text)
@@ -276,9 +304,9 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
 /// Maps a provider error to a refusal that names what to do.
 fn map_error(error: ProviderError) -> anyhow::Error {
     match error {
-        ProviderError::Auth(_) => anyhow::anyhow!("OpenRouter refused the key: check OPENROUTER_API_KEY"),
-        ProviderError::UnknownModel(model) => anyhow::anyhow!("OpenRouter knows no model {model}"),
-        ProviderError::Unavailable(text) => anyhow::anyhow!("OpenRouter is unreachable: {text}"),
+        ProviderError::Auth(_) => anyhow::anyhow!("the provider refused the key: check OPENROUTER_API_KEY, or set one with key <paste>"),
+        ProviderError::UnknownModel(model) => anyhow::anyhow!("the provider knows no model {model}"),
+        ProviderError::Unavailable(text) => anyhow::anyhow!("the provider is unreachable: {text}"),
         ProviderError::Other(text) => anyhow::anyhow!("the run failed: {text}"),
     }
 }

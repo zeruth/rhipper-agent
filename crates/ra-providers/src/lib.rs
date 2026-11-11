@@ -7,6 +7,7 @@
 pub mod openrouter;
 
 use std::future::Future;
+use std::pin::Pin;
 
 use serde::Deserialize;
 
@@ -107,8 +108,12 @@ pub enum ProviderError {
     Other(String),
 }
 
-/// The one interface every provider implements.
+/// The future of one completion, boxed so a provider can stand behind `dyn ModelProvider`.
+pub type CompletionFuture<'a> = Pin<Box<dyn Future<Output = Result<Completion, ProviderError>> + Send + 'a>>;
+
+/// The one interface every provider implements. It is object-safe on purpose: the router hands
+/// out `Arc<dyn ModelProvider>` and the workers never learn the vendor.
 pub trait ModelProvider: Send + Sync {
     /// Runs one completion.
-    fn complete(&self, request: CompletionRequest) -> impl Future<Output = Result<Completion, ProviderError>> + Send;
+    fn complete(&self, request: CompletionRequest) -> CompletionFuture<'_>;
 }

@@ -6,6 +6,8 @@ use ra_roadmap::model::{NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 
+use crate::agent::{self, Worker};
+
 pub struct Spec {
     pub name: &'static str,
     pub usage: &'static str,
@@ -50,9 +52,9 @@ pub fn complete(prefix: &str) -> Vec<&'static str> {
     COMMANDS.iter().map(|c| c.name).filter(|n| n.starts_with(prefix)).collect()
 }
 
-/// Runs one line against the store; the lines to show, or an error to show. `model` is the model
-/// of the badge, which `ping` and `run` talk to.
-pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<String>, Outcome)> {
+/// Runs one line against the store; the lines to show, or an error to show. `worker` holds the
+/// badge model and the provider, which `ping`, `run` and the reassessments talk to.
+pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(Vec<String>, Outcome)> {
     let line = line.trim().trim_start_matches(['/', '.']);
     let (name, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let args = rest.trim();
@@ -137,6 +139,7 @@ pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<
         "key" => {
             if args == "clear" {
                 crate::secret::clear()?;
+                worker.forget();
                 out.push("the stored key is gone; the environment variable still wins when it is set".into());
             } else if args.is_empty() {
                 if crate::secret::has_key() {
@@ -146,20 +149,22 @@ pub async fn run(line: &str, store: &Store, model: &str) -> anyhow::Result<(Vec<
                 }
             } else {
                 crate::secret::set_key(args)?;
+                // the next call connects with the new key
+                worker.forget();
                 out.push(format!("the key is in the credential store ({})", crate::secret::masked()?));
             }
         }
         "ping" => {
             anyhow::ensure!(args.is_empty(), "usage: ping");
-            return Ok((crate::agent::ping(&model).await?, Outcome::Continue));
+            return Ok((agent::ping(worker).await?, Outcome::Continue));
         }
         "run" => {
             let id = args.parse::<i64>().context("usage: run <id>")?;
-            return Ok((crate::agent::run(store, id, &model).await?, Outcome::Continue));
+            return Ok((agent::run(store, id, worker).await?, Outcome::Continue));
         }
         "reassess" | "reassess-tree" => {
             let id = args.parse::<i64>().context(format!("usage: {name} <id>"))?;
-            return Ok((crate::agent::reassess(store, id, &model, name == "reassess-tree").await?, Outcome::Continue));
+            return Ok((agent::reassess(store, id, worker, name == "reassess-tree").await?, Outcome::Continue));
         }
         "clear" | "cls" => return Ok((out, Outcome::Clear)),
         "debug" => {

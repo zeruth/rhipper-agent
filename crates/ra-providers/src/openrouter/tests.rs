@@ -115,6 +115,23 @@ async fn a_tool_call_answer_with_no_text_is_not_a_refusal() {
     assert_eq!(answer.tool_calls.len(), 1);
 }
 
+#[test]
+fn a_plain_message_sends_no_tool_calls_key() {
+    let wire = serde_json::to_value(to_wire(&Message::user("hello"))).unwrap();
+    assert_eq!(wire, serde_json::json!({"role": "user", "content": "hello"}));
+}
+
+#[test]
+fn an_assistant_message_with_calls_and_no_text_sends_no_content() {
+    let calls = vec![ToolCall { id: "call_1".into(), name: "read_file".into(), arguments: "{}".into() }];
+    let wire = serde_json::to_value(to_wire(&Message::assistant_calls("", calls))).unwrap();
+    assert!(wire.get("content").is_none(), "{wire}");
+    assert_eq!(wire["tool_calls"][0]["function"]["name"], "read_file");
+    // a tool result keeps its content even when empty
+    let wire = serde_json::to_value(to_wire(&Message::tool("call_1", ""))).unwrap();
+    assert_eq!(wire, serde_json::json!({"role": "tool", "content": "", "tool_call_id": "call_1"}));
+}
+
 fn request() -> CompletionRequest {
     CompletionRequest {
         model: model().to_owned(),

@@ -4,7 +4,12 @@
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-use crate::{Completion, CompletionRequest, Message, ModelProvider, ProviderError, ToolCall, ToolSpec, Usage};
+use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvider, ProviderError, ToolCall, ToolSpec, Usage};
+
+/// The API root of the public service.
+const BASE_URL: &str = "https://openrouter.ai/api/v1";
+/// What the requests say they are.
+const USER_AGENT: &str = concat!("rhipper-agent/", env!("CARGO_PKG_VERSION"));
 
 /// The OpenRouter provider.
 pub struct OpenRouter {
@@ -17,20 +22,12 @@ pub struct OpenRouter {
 impl OpenRouter {
     /// Builds the provider from an OpenRouter API key.
     pub fn new(key: impl Into<String>) -> anyhow::Result<Self> {
-        Ok(Self {
-            client: reqwest::Client::builder().user_agent("rhipper-cmd/0.1").build()?,
-            key: key.into(),
-            base_url: "https://openrouter.ai/api/v1".into(),
-        })
+        Self::at(BASE_URL, key)
     }
 
     /// Builds the provider against another base URL, for tests.
     pub fn at(base_url: &str, key: impl Into<String>) -> anyhow::Result<Self> {
-        Ok(Self {
-            client: reqwest::Client::builder().user_agent("rhipper-cmd/0.1").build()?,
-            key: key.into(),
-            base_url: base_url.to_owned(),
-        })
+        Ok(Self { client: reqwest::Client::builder().user_agent(USER_AGENT).build()?, key: key.into(), base_url: base_url.to_owned() })
     }
 }
 
@@ -41,6 +38,7 @@ struct WireMessage<'a> {
     role: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<&'a str>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<WireToolCall<'a>>,
     /// The id of the call a tool message answers; `tool_call_id` on the wire.
     #[serde(rename = "tool_call_id", skip_serializing_if = "Option::is_none")]
@@ -172,7 +170,14 @@ struct WireErrorBody {
 }
 
 impl ModelProvider for OpenRouter {
-    async fn complete(&self, request: CompletionRequest) -> Result<Completion, ProviderError> {
+    fn complete(&self, request: CompletionRequest) -> CompletionFuture<'_> {
+        Box::pin(self.post(request))
+    }
+}
+
+impl OpenRouter {
+    /// One POST to `chat/completions`, with the statuses mapped to the provider errors.
+    async fn post(&self, request: CompletionRequest) -> Result<Completion, ProviderError> {
         let wire = WireRequest {
             model: &request.model,
             messages: request.messages.iter().map(|m| to_wire(m)).collect(),
@@ -242,12 +247,13 @@ fn snippet(body: &str) -> String {
 }
 
 /// Maps one message of the conversation onto the wire. A tool message sends `content` even when it
-/// is empty; an assistant message sends `content` only when it has text, since the OpenRouter
-/// validation rejects an empty string next to tool calls.
+/// is empty; an assistant message that asks for tool calls sends `content` only when it has text,
+/// since the OpenRouter validation rejects an empty string next to tool calls.
 fn to_wire(message: &Message) -> WireMessage<'_> {
+    let empty_beside_calls = !message.tool_calls.is_empty() && message.content.trim().is_empty();
     WireMessage {
         role: &message.role,
-        content: Some(message.content.as_str()),
+        content: (!empty_beside_calls).then_some(message.content.as_str()),
         tool_calls: message.tool_calls.iter().map(|c| to_wire_call(c)).collect(),
         answering: message.tool_call_id.as_deref(),
     }

@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use tokio::sync::mpsc;
 
+use crate::agent::Worker;
 use crate::commands::{self, Outcome};
 use crate::logs::{Kind, Sink};
 use crate::roadmap_pane;
@@ -65,8 +66,9 @@ struct App {
     hint: Option<String>,
     /// The last-known roadmap nodes, for the tree pane.
     roadmap: Option<Vec<ra_roadmap::model::Node>>,
-    /// The model the next worker session would run on; `model` swaps it.
-    model: String,
+    /// The worker of the next session: the badge model and the provider it connected; `model`
+    /// swaps the model and `key` drops the provider.
+    worker: Worker,
     /// The node a click picked; the tree highlights its row.
     selected: Option<i64>,
     /// The screen position the pointer is over, for the hover surface and the buttons.
@@ -107,7 +109,7 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         started: Instant::now(),
         hint: None,
         roadmap: None,
-        model: DEFAULT_MODEL.to_owned(),
+        worker: Worker::new(DEFAULT_MODEL),
         selected: None,
         hover: None,
         marquee: 0,
@@ -253,8 +255,8 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
             _ = tick.tick() => {
                 app.ticks = app.ticks.wrapping_add(1);
                 // the marquee walks a step every fourth tick, a pace the eye follows
-                if app.ticks % 4 == 0 && app.model.chars().count() + 3 > 14 {
-                    app.marquee = (app.marquee + 1) % (app.model.chars().count() + 3);
+                if app.ticks % 4 == 0 && app.worker.model.chars().count() + 3 > 14 {
+                    app.marquee = (app.marquee + 1) % (app.worker.model.chars().count() + 3);
                     dirty = true;
                 }
                 // the working status flashes while a call is in flight
@@ -454,10 +456,10 @@ async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, j
         });
         let store = store.clone();
         let sink = sink.clone();
-        let model = app.model.clone();
+        let worker = app.worker.clone();
         let tx = job_done.clone();
         tokio::spawn(async move {
-            match commands::run(&line, &store, &model).await {
+            match commands::run(&line, &store, &worker).await {
                 Ok((out, _)) => {
                     for l in out {
                         // a multi-line answer is a change report; the bubble colors it as a diff
@@ -472,7 +474,7 @@ async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, j
         return false;
     }
     sink.push(Kind::Input, line.clone());
-    match commands::run(&line, store, &app.model).await {
+    match commands::run(&line, store, &app.worker).await {
         Ok((out, outcome)) => {
             for l in out {
                 sink.push(Kind::Output, l);
@@ -485,7 +487,7 @@ async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, j
                 }
                 Outcome::Quit => true,
                 Outcome::Model(model) => {
-                    app.model = model;
+                    app.worker.model = model;
                     false
                 }
                 Outcome::ToggleDebug => {
@@ -575,7 +577,7 @@ fn draw_usage(f: &mut Frame, area: Rect, app: &App) {
         Layout::horizontal([Constraint::Length(18), Constraint::Min(14), Constraint::Length(20), Constraint::Length(17)]).areas(area);
     // the model badge: the model the next worker session would run on, marqueeing when it overflows
     let inner = usage_panel(f, model);
-    let model_text = app.model.as_str();
+    let model_text = app.worker.model.as_str();
     let room = usize::from(inner.width).saturating_sub(2);
     let shown = marquee(model_text, room, app.marquee);
     f.render_widget(
