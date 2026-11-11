@@ -6,7 +6,7 @@
 //! the lifecycle buttons beneath. The outlines take the lane color of the depth, bright on the
 //! hovered chain, dim elsewhere. The wheel and the keys scroll it, the mouse clicks it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ra_roadmap::model::{Node, NodeKind, TaskState};
 use ratatui::Frame;
@@ -65,7 +65,7 @@ fn rows_of(
     shape: &Shape,
     folded: &[i64],
     selected: Option<i64>,
-    chain: &std::collections::HashSet<i64>,
+    chain: &HashSet<i64>,
     hover_button: Option<Button>,
     depth: usize,
     width: usize,
@@ -320,6 +320,49 @@ fn wrap(text: &str, room: usize) -> Vec<String> {
     rows
 }
 
+/// The nodes the pane shows under a filter: a task or subtask whose state, as the tree computes
+/// it, is one of `hidden` goes, with everything under it; a project, milestone or section stays
+/// only while something is shown under it. No filter shows every node.
+#[must_use]
+pub fn visible(nodes: &[Node], hidden: &[TaskState]) -> Vec<Node> {
+    if hidden.is_empty() {
+        return nodes.to_vec();
+    }
+    let states = ra_roadmap::tree::effective_states(nodes);
+    let parents: HashMap<i64, Option<i64>> = nodes.iter().map(|n| (n.id, n.parent)).collect();
+    let is_card = |n: &Node| matches!(n.kind, NodeKind::Task | NodeKind::Subtask);
+    let gone: HashSet<i64> =
+        nodes.iter().filter(|n| is_card(n) && hidden.contains(&states.get(&n.id).copied().unwrap_or(n.state))).map(|n| n.id).collect();
+    let ancestors = |id: i64| std::iter::successors(parents.get(&id).copied().flatten(), |p| parents.get(p).copied().flatten());
+    let mut kept: HashSet<i64> = HashSet::new();
+    for node in nodes.iter().filter(|n| is_card(n) && !gone.contains(&n.id)) {
+        if ancestors(node.id).any(|a| gone.contains(&a)) {
+            continue;
+        }
+        kept.insert(node.id);
+        // the structure above a shown card stays with it
+        for a in ancestors(node.id) {
+            if !kept.insert(a) {
+                break;
+            }
+        }
+    }
+    nodes.iter().filter(|n| kept.contains(&n.id)).cloned().collect()
+}
+
+/// The roots and the shape of `nodes`, as the rows walk them.
+fn shape_of(nodes: &[Node]) -> (Vec<Node>, Shape) {
+    let mut children: HashMap<i64, Vec<Node>> = HashMap::new();
+    let mut roots: Vec<Node> = Vec::new();
+    for node in nodes {
+        match node.parent {
+            None => roots.push(node.clone()),
+            Some(parent) => children.entry(parent).or_default().push(node.clone()),
+        }
+    }
+    (roots, Shape { children, states: ra_roadmap::tree::effective_states(nodes) })
+}
+
 /// Draws the pane at `scroll`; returns how far back the rows can scroll and the hit test under
 /// every visible screen row. `hover` is the pointer's position; the hovered card and its ancestors
 /// carry their lane colors bright and the hovered button runs hot, all resolved on the layout of
@@ -333,17 +376,9 @@ pub fn draw(
     scroll: usize,
     area: Rect,
 ) -> (usize, Vec<Hit>) {
-    let mut children: HashMap<i64, Vec<Node>> = HashMap::new();
-    let mut roots: Vec<Node> = Vec::new();
-    for node in nodes {
-        match node.parent {
-            None => roots.push(node.clone()),
-            Some(parent) => children.entry(parent).or_default().push(node.clone()),
-        }
-    }
-    let shape = Shape { children, states: ra_roadmap::tree::effective_states(nodes) };
+    let (roots, shape) = shape_of(nodes);
     let width = area.width as usize;
-    let empty = std::collections::HashSet::new();
+    let empty = HashSet::new();
     let mut rows: Vec<Row> = Vec::new();
     for root in &roots {
         rows.extend(rows_of(root, &shape, folded, selected, &empty, None, 0, width));
@@ -359,7 +394,7 @@ pub fn draw(
         })
     });
     if let Some(hover_id) = hover_id {
-        let mut chain: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut chain: HashSet<i64> = HashSet::new();
         let mut next = Some(hover_id);
         while let Some(id) = next {
             chain.insert(id);
@@ -403,3 +438,6 @@ fn state_color(state: TaskState) -> ratatui::style::Color {
         TaskState::Defined | TaskState::Ready => theme::TEXT,
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -6,6 +6,7 @@
 //! The roadmap owns the work. Models are replaceable workers. The orchestrator owns coordination
 //! and acceptance; it lives in another crate.
 
+pub mod history;
 pub mod markdown;
 pub mod model;
 pub mod outline;

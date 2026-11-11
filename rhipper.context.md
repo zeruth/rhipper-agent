@@ -26,6 +26,8 @@ A roadmap-driven, provider-independent AI development orchestrator in Rust. It b
 
 - Match the surrounding code: its comment density, naming and idiom. Doc comments say what and why, not how; comments inside functions name the reason, not the step.
 - Tests live in a `tests.rs` beside the code (`mod tests;`), named as sentences: `a_run_records_its_handoff`.
+- A new field on `Node` touches every `Node { .. }` literal: `crates/ra-roadmap/src/store.rs` (two), `markdown.rs` (`node_of_line`), `markdown/tests.rs`, `tree/tests.rs`; `ra-console` tests call `markdown::parse` and read `Vec<Node>`. Give it `#[serde(default)]` and a line in `detail_lines`/`parse` of `markdown.rs`.
+- The scripted provider and the `says(...)` fixture the agent tests use live in `crates/ra-console/src/commands/tests.rs`; the toolbox is scripted with `Worker::with_script`, so a test never compiles a temp project for real.
 - Read the files the card names first, by the regions the outline points at; search with Grep and Glob before exploring; do not read `rhipper.md` itself, the card's text is in your prompt.
 - Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through `tail`.
 - Report what changed and what was verified in a few lines; the check decides whether the card is done, not the report.

@@ -80,6 +80,21 @@ impl Limits {
         Ok(())
     }
 
+    /// Appends the event to the log at `path`, one JSON line each, so the week's history
+    /// outlives the latest in `limits.json`.
+    ///
+    /// # Errors
+    /// When the file cannot be written.
+    pub fn append(&self, path: &Path) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(file, "{}", serde_json::to_string(self)?)?;
+        Ok(())
+    }
+
     /// Whether the limits are from the last day; older ones are stale.
     pub fn fresh(&self) -> bool {
         now().saturating_sub(self.seen_at) < 24 * 3600
@@ -91,6 +106,74 @@ impl Limits {
             .iter()
             .map(|(name, window)| format!("{} {:.0}% · resets in {}", label(name), window.utilization * 100.0, until(window.resets_at)))
             .collect()
+    }
+}
+
+/// The week's utilization over the last seven days, read from the log: the last reading of
+/// each day, oldest first, and the rise each day brought, so a sparkline and the steepest day
+/// come without a model call.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Week {
+    /// The `seven_day` utilization at the end of each of the last seven days, today last;
+    /// `None` for a day without a run.
+    pub days: [Option<f64>; 7],
+    /// How much each day added, against the last reading before it.
+    pub rises: [f64; 7],
+    /// Today, as days since the Unix epoch, so the days can be named.
+    pub today: u64,
+}
+
+impl Week {
+    /// Reads the log at `path`; an empty week when there is none.
+    pub fn load(path: &Path) -> Self {
+        Self::of_log(&std::fs::read_to_string(path).unwrap_or_default(), now())
+    }
+
+    /// Builds the week from the log's lines, as of `now`; a line that does not read is skipped.
+    pub fn of_log(log: &str, now: u64) -> Self {
+        let today = now / 86_400;
+        let first = today.saturating_sub(6);
+        let mut week = Self { today, ..Self::default() };
+        let mut last = None;
+        let readings = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Limits>(line).ok())
+            .filter_map(|limits| Some((limits.seen_at / 86_400, limits.windows.get("seven_day")?.utilization)));
+        for (day, utilization) in readings {
+            if day < first || day > today {
+                last = Some(utilization);
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let slot = (day - first) as usize;
+            // the rise of a day counts from the reading before it; the day's own first reading
+            // when it is the first ever
+            let before = last.unwrap_or(utilization);
+            week.rises[slot] = utilization - before;
+            week.days[slot] = Some(utilization);
+            last = Some(utilization);
+        }
+        week
+    }
+
+    /// The day the week's usage climbed most and the climb, `("Tue", 0.12)`; `None` when no
+    /// day rose.
+    pub fn steepest(&self) -> Option<(&'static str, f64)> {
+        let mut best: Option<(usize, f64)> = None;
+        for (slot, rise) in self.rises.iter().copied().enumerate() {
+            if rise > 0.0 && best.is_none_or(|(_, b)| rise > b) {
+                best = Some((slot, rise));
+            }
+        }
+        best.map(|(slot, rise)| (self.day_name(slot), rise))
+    }
+
+    /// The weekday name of slot `slot`, today being the last.
+    pub fn day_name(&self, slot: usize) -> &'static str {
+        const NAMES: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        // the epoch began on a Thursday
+        let day = self.today.saturating_sub(6) + slot as u64;
+        NAMES[usize::try_from(day % 7).unwrap_or(0)]
     }
 }
 
@@ -156,6 +239,35 @@ mod tests {
         limits.save(&path).unwrap();
         assert_eq!(Limits::load(&path), limits);
         assert!(limits.fresh());
+    }
+
+    #[test]
+    fn two_events_append_two_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("var/limits.log");
+        let limits = Limits::from_event(EVENT).unwrap();
+        limits.append(&path).unwrap();
+        limits.append(&path).unwrap();
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(log.lines().count(), 2);
+        assert_eq!(serde_json::from_str::<Limits>(log.lines().next().unwrap()).unwrap(), limits);
+    }
+
+    #[test]
+    fn the_week_reads_its_days_and_names_the_steepest() {
+        let now = 1_794_600_000;
+        let line = |days_ago: u64, utilization: f64| {
+            let mut limits = Limits::from_event(EVENT).unwrap();
+            limits.seen_at = now - days_ago * 86_400;
+            limits.windows.get_mut("seven_day").unwrap().utilization = utilization;
+            serde_json::to_string(&limits).unwrap()
+        };
+        let log = [line(9, 0.5), line(3, 0.1), line(3, 0.2), line(1, 0.5), line(0, 0.55), "junk".to_owned()].join("\n");
+        let week = Week::of_log(&log, now);
+        assert_eq!(week.days, [None, None, None, Some(0.2), None, Some(0.5), Some(0.55)]);
+        assert_eq!(week.steepest().map(|(_, rise)| (rise * 100.0).round()), Some(30.0));
+        assert_eq!(week.steepest().unwrap().0, week.day_name(5));
+        assert_eq!(Week::of_log("", now).steepest(), None);
     }
 
     #[test]

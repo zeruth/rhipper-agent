@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use ra_console::agent::Worker;
+use ra_roadmap::history::Source;
 use ra_roadmap::model::{NodeKind, TaskState};
-use ra_roadmap::store::Store;
-use ra_roadmap::tree;
+use ra_roadmap::store::{Card, Edit, Store};
+use ra_roadmap::{history, markdown, tree};
 use ra_usage::UsageStore;
 
 #[derive(Parser)]
@@ -23,6 +24,9 @@ enum Command {
     Show {
         /// The id of the node; the whole roadmap when left out.
         id: Option<i64>,
+        /// Prints a plain Markdown checklist instead, for a README or an issue.
+        #[arg(long)]
+        markdown: bool,
     },
     /// Adds a node to the roadmap.
     Add {
@@ -42,9 +46,44 @@ enum Command {
         /// Complexity 1..=5.
         #[arg(long, default_value_t = 3)]
         complexity: u8,
+        /// The workspace-relative files the worker reads first.
+        #[arg(long, num_args = 1..)]
+        files: Vec<String>,
+        /// The cards this one waits on.
+        #[arg(long, num_args = 1..)]
+        waits_on: Vec<i64>,
+        /// The model that runs the card: a claude-* id on Claude Code, local/<name> on the local
+        /// server, vendor/model on OpenRouter; left out, the default route.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Rewrites the named fields of a card and nothing else: the notes, the state and the session stay.
+    Edit {
+        id: i64,
+        /// The title, one line.
+        #[arg(long)]
+        title: Option<String>,
+        /// The objective.
+        #[arg(long)]
+        objective: Option<String>,
+        /// The acceptance criteria.
+        #[arg(long)]
+        acceptance: Option<String>,
+        /// Complexity 1..=5.
+        #[arg(long)]
+        complexity: Option<u8>,
+        /// The workspace-relative files the worker reads first; replaces the list.
+        #[arg(long, num_args = 1..)]
+        files: Option<Vec<String>>,
+        /// Forgets the harness session, so the next run starts fresh instead of resuming.
+        #[arg(long)]
+        clear_session: bool,
     },
     /// Prints the first ready card: a defined task whose waits-on are all accepted.
     Next,
+    /// Lints the roadmap: placeholder text, a card without acceptance or files, a waits-on that names
+    /// no card or comes back to its own, a complexity outside 1..5; one line each, exit code 1 when any.
+    Check,
     /// Links a node to the nodes it waits for.
     Depend {
         /// The node that waits.
@@ -58,12 +97,40 @@ enum Command {
         /// The state: one of the twelve lifecycle names.
         state: TaskState,
     },
+    /// The state changes so far, oldest first: when, the card, from what to what, and by whom
+    /// (console, window, cli, mcp or run); of one card with an id.
+    History {
+        /// The card; left out, every card.
+        id: Option<i64>,
+    },
     /// Removes a card; every waits-on reference to it goes with it.
     Remove {
         id: i64,
         /// The card and everything under it; a card with children is refused without it.
         #[arg(long)]
         tree: bool,
+    },
+    /// Moves a card with everything under it to another parent; never under itself.
+    Move {
+        id: i64,
+        /// The new parent.
+        #[arg(long)]
+        under: i64,
+        /// The sibling under the new parent it goes after; last when left out.
+        #[arg(long)]
+        after: Option<i64>,
+    },
+    /// Adds a plain Markdown outline under a node: `##` headings as milestones, `###` as sections, bullets as tasks,
+    /// an indented line as the objective, `accept:` (or `acceptance:`) as the acceptance; no model call.
+    Import {
+        /// The outline file.
+        file: PathBuf,
+        /// The node the outline goes under: the project for milestones, a milestone for sections and tasks.
+        #[arg(long)]
+        under: i64,
+        /// Prints what it would add and adds nothing.
+        #[arg(long)]
+        dry: bool,
     },
     /// One round trip to a model: the answer and the usage.
     Ping {
@@ -90,7 +157,8 @@ enum Command {
         /// With --all: a card that needs revision stops the batch too.
         #[arg(long, requires = "all")]
         stop_on_revision: bool,
-        /// The model for this run; left out, the node's own model, else the default.
+        /// The model for this run; left out, each card's own model, else the rule of rhipper.toml
+        /// that fits it, else the default.
         #[arg(long)]
         model: Option<String>,
         /// The most dollars the run may spend; none unless given. With budgets on (RHIPPER_BUDGETS=on, or
@@ -112,6 +180,12 @@ enum Command {
         /// command line) and calls no model; the card keeps its state and its session.
         #[arg(long)]
         dry: bool,
+    },
+    /// Prints the model a run of the card would take and why: the card's own, the `[[route]]` rule of
+    /// rhipper.toml that fits its complexity and kind, or the default. No model call.
+    Route {
+        /// The node id.
+        id: i64,
     },
     /// Starts the console over the orchestrator.
     Console {
@@ -137,6 +211,20 @@ enum Command {
     },
     /// The gotchas that fired, by id, and the refused commands no gotcha names yet.
     Gotchas,
+    /// The link to a paired session: the latest events of var/pair.log (a run's start and end, a walk's end, a note), which a pairing session watches.
+    Pair,
+    /// Opens a project in the window: as a tab of the one running, or in a new window from the install directory.
+    Open {
+        /// The project directory; this one when left out.
+        dir: Option<PathBuf>,
+    },
+    /// Quits the window and starts the installed one again on the same tabs: how a new build comes up after `rc install`.
+    Restart,
+    /// An observation for the next runs: what slowed one, a quirk of the machine, a direction. The workers read the latest with their own look-backs.
+    Note {
+        /// The note, one line.
+        text: Vec<String>,
+    },
     /// Makes this directory a project: drafts rhipper.md with a strong model from what the directory shows, imports a roadmap-shaped file, or starts empty.
     Init {
         /// A roadmap-shaped file (ROADMAP.md, TODO.md, a plan) the model converts, keeping every item.
@@ -154,6 +242,9 @@ enum Command {
         /// The directory; left out, %LOCALAPPDATA%\Programs\rhipper on Windows, ~/.local/bin elsewhere.
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Also puts a shortcut to the window on the desktop when there is none, opening this project.
+        #[arg(long)]
+        desktop: bool,
     },
     /// The context a run carries: the project's (rhipper.context.md), or a task's with the outlines of its files and its handoffs.
     Context {
@@ -169,17 +260,43 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let options = Options::parse();
     match options.command {
-        Command::Show { id } => {
+        Command::Show { id, markdown } => {
             plain_tracing()?;
-            show(id).await
+            if markdown { show_markdown(id).await } else { show(id).await }
         }
-        Command::Add { kind, title, parent, objective, acceptance, complexity } => {
+        Command::Add { kind, title, parent, objective, acceptance, complexity, files, waits_on, model } => {
             plain_tracing()?;
-            add(kind, &title, parent, objective.as_deref(), acceptance.as_deref(), complexity).await
+            let card = Card {
+                objective: objective.as_deref(),
+                acceptance: acceptance.as_deref(),
+                complexity,
+                files: &files,
+                waits_on: &waits_on,
+                model: model.as_deref(),
+            };
+            add(kind, &title, parent, &card).await
+        }
+        Command::Edit { id, title, objective, acceptance, complexity, files, clear_session } => {
+            plain_tracing()?;
+            // a path is stored with forward slashes, so the file reads the same on every platform
+            let files: Option<Vec<String>> = files.map(|files| files.iter().map(|p| p.replace('\\', "/")).collect());
+            let edit = Edit {
+                title: title.as_deref(),
+                objective: objective.as_deref(),
+                acceptance: acceptance.as_deref(),
+                complexity,
+                files: files.as_deref(),
+                clear_session,
+            };
+            edit_card(id, &edit).await
         }
         Command::Next => {
             plain_tracing()?;
             next().await
+        }
+        Command::Check => {
+            plain_tracing()?;
+            check().await
         }
         Command::Depend { id, waits_for } => {
             plain_tracing()?;
@@ -189,11 +306,28 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             set(id, state).await
         }
+        Command::History { id } => {
+            plain_tracing()?;
+            show_history(id).await
+        }
         Command::Remove { id, tree } => {
             plain_tracing()?;
             let removed = open_store().await?.remove(id, tree).await?;
             println!("removed {}", removed.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" "));
             Ok(())
+        }
+        Command::Move { id, under, after } => {
+            plain_tracing()?;
+            open_store().await?.move_node(id, under, after).await?;
+            match after {
+                Some(after) => println!("#{id} moved under #{under}, after #{after}"),
+                None => println!("#{id} moved under #{under}"),
+            }
+            Ok(())
+        }
+        Command::Import { file, under, dry } => {
+            plain_tracing()?;
+            import(&file, under, dry).await
         }
         Command::Ping { model } => {
             plain_tracing()?;
@@ -215,15 +349,13 @@ async fn main() -> anyhow::Result<()> {
             anyhow::ensure!(turns != Some(0), "the turn cap is at least one");
             anyhow::ensure!(!(dry && (next || all)), "--dry takes a node id: a dry run sends nothing and picks nothing");
             let store = open_store().await?;
-            // a card named by id runs on its own model unless one is given; --next and --all run
-            // on the given model, else the default
-            let picked = match (model, id) {
-                (Some(model), _) => model,
-                (None, Some(id)) => store.read(id).await?.assignee.map_or_else(|| ra_console::ui::DEFAULT_MODEL.to_owned(), |a| a.model),
-                (None, None) => ra_console::ui::DEFAULT_MODEL.to_owned(),
+            // a given model pins every run of the command; without one each card picks its own,
+            // through the rules of rhipper.toml, with the default last
+            let worker = match model {
+                Some(model) => Worker::new(model),
+                None => Worker::new(ra_console::ui::DEFAULT_MODEL).with_routing(true),
             };
-            let mut worker =
-                Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns).with_effort(effort);
+            let mut worker = worker.with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns).with_effort(effort);
             if no_debug {
                 worker = worker.with_debug(false);
             }
@@ -238,14 +370,15 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Route { id } => route(id).await,
         Command::Stop => {
-            println!("{}", ra_console::instance::stop_running().unwrap_or_else(|| "no console is running".to_owned()));
+            println!("{}", ra_console::instance::stop_running(Path::new(".")).unwrap_or_else(|| "no console is running".to_owned()));
             Ok(())
         }
         Command::Mcp { roadmap } => {
             plain_tracing()?;
             ensure_roadmap(&roadmap)?;
-            let store = Store::open(&roadmap, "Rhipper Agent").await?;
+            let store = Store::open(&roadmap, "Rhipper Agent").await?.with_source(Source::Mcp);
             let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
             ra_console::mcp::serve(store, worker).await
         }
@@ -253,6 +386,31 @@ async fn main() -> anyhow::Result<()> {
         // a hook answers fast and stays silent on anything it cannot judge; no trace file either
         Command::Hook { event } => hook(&event),
         Command::Gotchas => gotchas(),
+        Command::Open { dir } => {
+            let dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            println!("{}", ra_console::hub::open(&dir)?);
+            Ok(())
+        }
+        Command::Restart => {
+            println!("{}", ra_console::hub::restart()?);
+            Ok(())
+        }
+        Command::Pair => {
+            let events = ra_console::pair::recent(Path::new("."), 20);
+            if events.is_empty() {
+                println!("no events yet in {}; a run writes its start and its end there", ra_console::pair::PAIR_FILE);
+            }
+            for event in events {
+                println!("{event}");
+            }
+            println!("\na pairing session watches {} (tail -F) and is told of each line", ra_console::pair::PAIR_FILE);
+            Ok(())
+        }
+        Command::Note { text } => {
+            ra_console::retro::record_pair(Path::new("."), &text.join(" "))?;
+            println!("noted; the next runs read it with the workers' own look-backs");
+            Ok(())
+        }
         Command::Init { import, empty, model } => {
             plain_tracing()?;
             let mode = match (import, empty) {
@@ -266,9 +424,13 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Install { dir } => {
+        Command::Install { dir, desktop } => {
             for line in ra_console::install::install(dir.as_deref())? {
                 println!("{line}");
+            }
+            if desktop {
+                let dir = dir.unwrap_or_else(ra_console::install::default_dir);
+                println!("{}", ra_console::install::desktop_shortcut(&dir, Path::new(".")));
             }
             Ok(())
         }
@@ -322,7 +484,18 @@ fn hook(event: &str) -> anyhow::Result<()> {
     let answer = match event {
         "pre" => {
             let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str).unwrap_or("");
-            match catalogue.command(command, conditions) {
+            // a command the project's `[worker] allow` names is the project's own: the shell
+            // allowlist gotcha stands aside for it, the other gotchas do not
+            let own = ra_console::router::Router::load(&cwd).is_ok_and(|r| r.worker.allows(command));
+            let verdict = match catalogue.command(command, conditions) {
+                ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. }
+                    if own && id == "shell-outside-allowlist" =>
+                {
+                    ra_gotchas::Verdict::Pass
+                }
+                other => other,
+            };
+            match verdict {
                 ra_gotchas::Verdict::Pass => None,
                 ra_gotchas::Verdict::Deny { reason, .. } => Some(serde_json::json!({
                     "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
@@ -470,7 +643,18 @@ fn ensure_roadmap(roadmap: &Path) -> anyhow::Result<()> {
 
 async fn show(id: Option<i64>) -> anyhow::Result<()> {
     let store = open_store().await?;
-    let nodes = store.all().await?;
+    let roadmap = store.load().await?;
+    let nodes = roadmap.nodes;
+    // the gambits come first, as in the file: the direction before the work
+    if id.is_none() && !roadmap.gambits.is_empty() {
+        for gambit in &roadmap.gambits {
+            println!("g{} {} {{w{}}} [{}]", gambit.id, gambit.text, gambit.weight, gambit.state);
+            if !gambit.focus.is_empty() {
+                println!("    focus: {}", gambit.focus.join(" "));
+            }
+        }
+        println!();
+    }
     let picked: Vec<_> = match id {
         Some(id) => {
             let subtree = tree::subtree(&nodes, id);
@@ -489,14 +673,31 @@ async fn show(id: Option<i64>) -> anyhow::Result<()> {
             None => String::new(),
         };
         let mark = if node.is_final() { " [final]" } else { "" };
-        println!("{}#{} {} [{}]{mark}{assignee}", indent, node.id, node.title, state_label(states[&node.id], node.state));
+        let priority = node.priority.map(|p| format!(" {{p{p}}}")).unwrap_or_default();
+        println!("{}#{} {}{priority} [{}]{mark}{assignee}", indent, node.id, node.title, state_label(states[&node.id], node.state));
         if let Some(objective) = &node.objective {
             println!("{indent}    {objective}");
         }
         if !node.files.is_empty() {
             println!("{indent}    files: {}", node.files.join(" "));
         }
+        if !node.depends_on.is_empty() {
+            println!("{indent}    waits on: {}", node.depends_on.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" "));
+        }
     }
+    Ok(())
+}
+
+/// Prints the roadmap, or the subtree under `id`, as a Markdown checklist.
+async fn show_markdown(id: Option<i64>) -> anyhow::Result<()> {
+    let store = open_store().await?;
+    let nodes = store.load().await?.nodes;
+    if let Some(id) = id
+        && !nodes.iter().any(|n| n.id == id)
+    {
+        anyhow::bail!("no node {id}");
+    }
+    print!("{}", markdown::checklist(&nodes, id));
     Ok(())
 }
 
@@ -519,15 +720,48 @@ async fn next() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn add(
-    kind: NodeKind,
-    title: &str,
-    parent: Option<i64>,
-    objective: Option<&str>,
-    acceptance: Option<&str>,
-    complexity: u8,
-) -> anyhow::Result<()> {
-    if complexity == 0 || complexity > 5 {
+/// Prints the model a run of the card would take, the effort when a rule sets one, and the
+/// reason: the card's own model, the rule that fits, or the default with no rule to name.
+async fn route(id: i64) -> anyhow::Result<()> {
+    use ra_console::router::{IMPLEMENTER, ROUTES_FILE, Router, Why};
+    let store = open_store().await?;
+    let node = store.read(id).await?;
+    let root = ra_console::agent::workspace_of(&store);
+    let router = Router::load(&root)?;
+    let choice = router.choose(&node, IMPLEMENTER, ra_console::ui::DEFAULT_MODEL);
+    let effort = choice.effort.map_or_else(String::new, |effort| format!(" (effort {effort})"));
+    println!("#{} {} → {}{effort}", node.id, node.title, choice.model);
+    let reason = match choice.why {
+        Why::Card => "the card's own model".to_owned(),
+        Why::Rule(place) => format!("rule {place} of {ROUTES_FILE}: {}", router.rules[place - 1]),
+        Why::Default if router.rules.is_empty() => format!("the default: no {ROUTES_FILE} beside the roadmap"),
+        Why::Default => {
+            format!("the default: none of the {} rules of {ROUTES_FILE} fits c{} {}", router.rules.len(), node.complexity, node.kind)
+        }
+    };
+    println!("    {reason}");
+    Ok(())
+}
+
+/// Prints every fault the lint finds and exits 1 when there is one, so a script or a hook can
+/// gate on a clean roadmap.
+async fn check() -> anyhow::Result<()> {
+    let nodes = open_store().await?.all().await?;
+    let faults = tree::lint(&nodes);
+    if faults.is_empty() {
+        println!("the roadmap is clean");
+        return Ok(());
+    }
+    for line in &faults {
+        println!("{line}");
+    }
+    let count = faults.len();
+    eprintln!("{count} fault{} on the roadmap", if count == 1 { "" } else { "s" });
+    std::process::exit(1)
+}
+
+async fn add(kind: NodeKind, title: &str, parent: Option<i64>, card: &Card<'_>) -> anyhow::Result<()> {
+    if card.complexity == 0 || card.complexity > 5 {
         anyhow::bail!("complexity is 1 to 5");
     }
     let store = open_store().await?;
@@ -537,8 +771,64 @@ async fn add(
     if kind != NodeKind::Project && parent.is_none() {
         anyhow::bail!("{}{kind} needs --parent", if kind == NodeKind::Milestone { "a" } else { "a " });
     }
-    let id = store.insert(parent, kind, title, objective, acceptance, complexity).await?;
+    let id = store.insert_card(parent, kind, title, card).await?;
     println!("#{id} {title}");
+    if !card.files.is_empty() {
+        println!("    files: {}", card.files.join(" "));
+    }
+    if !card.waits_on.is_empty() {
+        println!("    waits on: {}", card.waits_on.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" "));
+    }
+    Ok(())
+}
+
+/// Reads a plain outline and adds it under `under`; with `dry`, prints the items as they would
+/// nest and touches nothing.
+async fn import(file: &Path, under: i64, dry: bool) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let text = std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
+    let outline = ra_roadmap::outline::parse(&text)?;
+    let store = open_store().await?;
+    let root = store.read(under).await?;
+    if dry {
+        println!("would add {} under #{under} {}:", outline.summary(), root.title);
+        for line in outline.preview() {
+            println!("  {line}");
+        }
+        return Ok(());
+    }
+    let ids = store.import(under, &outline).await?;
+    let nodes = store.all().await?;
+    for id in &ids {
+        if let Some(node) = nodes.iter().find(|n| n.id == *id) {
+            println!("#{id} {} {}", node.kind, node.title);
+        }
+    }
+    println!("added {} under #{under} {}", outline.summary(), root.title);
+    Ok(())
+}
+
+async fn edit_card(id: i64, edit: &Edit<'_>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !edit.is_empty(),
+        "nothing to edit: name a field (--title, --objective, --acceptance, --complexity, --files, --clear-session)"
+    );
+    let store = open_store().await?;
+    store.edit(id, edit).await?;
+    let node = store.read(id).await?;
+    println!("#{id} {}", node.title);
+    let changed: Vec<&str> = [
+        edit.title.map(|_| "title"),
+        edit.objective.map(|_| "objective"),
+        edit.acceptance.map(|_| "acceptance"),
+        edit.complexity.map(|_| "complexity"),
+        edit.files.map(|_| "files"),
+        edit.clear_session.then_some("session cleared"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    println!("    edited: {}", changed.join(", "));
     Ok(())
 }
 
@@ -548,6 +838,29 @@ async fn depend(id: i64, waits_for: &[i64]) -> anyhow::Result<()> {
         store.depend_on(id, *other).await?;
     }
     println!("#{id} waits for {:?}", waits_for);
+    Ok(())
+}
+
+/// Prints the history, one change a line as the log holds it; a card without any says so.
+async fn show_history(id: Option<i64>) -> anyhow::Result<()> {
+    let store = open_store().await?;
+    if let Some(id) = id {
+        store.read(id).await?;
+    }
+    let changes = store.history(id)?;
+    if changes.is_empty() {
+        println!(
+            "{}",
+            id.map_or_else(|| "no state change recorded yet".to_owned(), |id| format!("#{id} has no state change recorded yet"))
+        );
+    }
+    for change in &changes {
+        println!("{}", change.line());
+    }
+    if let Some(last) = changes.last() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        println!("last change {} ago", history::age(now.saturating_sub(last.at)));
+    }
     Ok(())
 }
 
@@ -566,12 +879,13 @@ async fn console(roadmap: PathBuf, replace: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all("var")?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open("var/console.log")?;
     ensure_roadmap(&roadmap)?;
-    let store = Store::open(&roadmap, "Rhipper Agent").await?;
+    let store = Store::open(&roadmap, "Rhipper Agent").await?.with_source(Source::Console);
     if !ra_console::ui::is_terminal() {
         anyhow::bail!("the console needs a terminal");
     }
-    let replaced = if replace { ra_console::instance::stop_running() } else { None };
-    ra_console::instance::claim()?;
+    let root = roadmap.parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let replaced = if replace { ra_console::instance::stop_running(&root) } else { None };
+    ra_console::instance::claim(&root)?;
     let sink = ra_console::logs::Sink::new();
     ra_console::trace::init(log, Some(sink.clone()), None);
     if let Some(what) = replaced {
@@ -579,6 +893,6 @@ async fn console(roadmap: PathBuf, replace: bool) -> anyhow::Result<()> {
     }
     let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
     let result = ra_console::ui::run(store, worker, sink).await;
-    ra_console::instance::release();
+    ra_console::instance::release(&root);
     result
 }

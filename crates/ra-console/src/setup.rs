@@ -186,12 +186,14 @@ pub async fn init(root: &Path, worker: &Worker, mode: Mode) -> anyhow::Result<Ve
                 }
                 Mode::Draft | Mode::Empty => None,
             };
-            let text = outline_from_model(worker, root, import.as_deref()).await?;
-            let parsed = match outline::parse(&text) {
+            let answer = outline_from_model(worker, root, import.as_deref()).await?;
+            // the one answer carries the outline and, after the marker, the project context
+            let (text, context) = answer.split_once(CONTEXT_MARK).map_or((answer.as_str(), None), |(o, c)| (o, Some(c.trim())));
+            let parsed = match outline::parse(text) {
                 Ok(parsed) => parsed,
                 Err(e) => {
                     let _ = std::fs::create_dir_all(root.join("var"));
-                    let _ = std::fs::write(root.join(DRAFT_FILE), &text);
+                    let _ = std::fs::write(root.join(DRAFT_FILE), &answer);
                     anyhow::bail!("the model's outline did not parse ({e:#}); its text is in {DRAFT_FILE}, fix it and `rc import` it");
                 }
             };
@@ -205,16 +207,30 @@ pub async fn init(root: &Path, worker: &Worker, mode: Mode) -> anyhow::Result<Ve
                 worker.model
             ));
             lines.push("review it with `rc show`, edit the file by hand, and `rc run <id>` the first card".to_owned());
+            if let Some(context) = context.filter(|c| c.lines().count() >= 4) {
+                std::fs::write(root.join(ra_context::PROJECT_FILE), format!("{context}\n"))
+                    .with_context(|| format!("cannot write {}", ra_context::PROJECT_FILE))?;
+                lines.push(format!(
+                    "{} written by {}; every run reads it, edit it as the project moves",
+                    ra_context::PROJECT_FILE,
+                    worker.model
+                ));
+            }
         }
     }
-    // the project context goes with the roadmap, drafted from the same directory
-    if let Ok(text) = ra_context::Project::ensure(root)
+    // the project context goes with the roadmap: the model's when it wrote one, else a draft
+    // from the directory
+    if !root.join(ra_context::PROJECT_FILE).exists()
+        && let Ok(text) = ra_context::Project::ensure(root)
         && !text.is_empty()
     {
-        lines.push(format!("{} written; edit it by hand, every run reads it", ra_context::PROJECT_FILE));
+        lines.push(format!("{} drafted from the directory; edit it by hand, every run reads it", ra_context::PROJECT_FILE));
     }
     Ok(lines)
 }
+
+/// The line that parts the outline from the project context in the model's answer.
+const CONTEXT_MARK: &str = "---context---";
 
 /// One chat completion that answers with the outline: the brief of the directory, and the file
 /// to convert when there is one.
@@ -248,8 +264,8 @@ async fn outline_from_model(worker: &Worker, root: &Path, import: Option<&str>) 
     Ok(answer.text)
 }
 
-/// The system prompt of a draft: the outline and nothing else.
-const ARCHITECT: &str = "You are the architect of a roadmap-driven development orchestrator. You answer with a roadmap as a plain outline and nothing else: a `# <project title>` line; `## <milestone> {cN}` lines, each followed by an `objective:` line and an `acceptance:` line; under each milestone `- <task> {cN}` lines, each followed by indented `objective:`, `acceptance:` and, when the files are known, `files:` lines (workspace-relative paths separated by spaces). `{cN}` is the complexity from 1 (an hour) to 5 (days). An objective says what the task must achieve, one topic per sentence, and names no work already done. An acceptance is checkable by a person or a command: a command in backticks when there is one. No prose before or after the outline, no code fence.";
+/// The system prompt of a draft: the outline, the marker, the project context, nothing else.
+const ARCHITECT: &str = "You are the architect of a roadmap-driven development orchestrator. You answer with two parts and nothing else. First the roadmap as a plain outline: a `# <project title>` line; `## <milestone> {cN}` lines, each followed by an `objective:` line and an `acceptance:` line; under each milestone `- <task> {cN}` lines, each followed by indented `objective:`, `acceptance:` and, when the files are known, `files:` lines (workspace-relative paths separated by spaces). `{cN}` is the complexity from 1 (an hour) to 5 (days). An objective says what the task must achieve, one topic per sentence, and names no work already done. An acceptance is checkable by a person or a command: a command in backticks when there is one. Then a line that is exactly `---context---`, then the project context: the Markdown file every worker run of this project reads first, under sixty lines: `# <project title>` and one paragraph of what the project is; `## Layout`, one line per directory or crate as the brief shows them, what each holds; `## Build and checks`, the commands that build, test and lint, from the manifest and the README, and the check a card runs; `## Conventions`, what the code shows (language and edition, where tests live, naming, formatting) and these standing ones: read the files the card names first, by the regions the outline points at; search before exploring; run the check before reporting; report what changed and what was verified, briefly. No prose outside the two parts, no code fence.";
 
 #[cfg(test)]
 mod tests;

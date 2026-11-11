@@ -8,7 +8,7 @@
 
 use anyhow::Context;
 use ra_roadmap::model::NodeKind;
-use ra_roadmap::store::Store;
+use ra_roadmap::store::{Card, Store};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -89,14 +89,17 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "add",
-            "Adds a node under its parent and returns its id. A project takes no parent.",
+            "Adds a node under its parent, complete in one call, and returns its id. A project takes no parent.",
             json!({
                 "kind": {"type": "string", "enum": ["project", "milestone", "section", "task", "subtask"]},
                 "title": {"type": "string"},
                 "parent": {"type": "integer", "description": "The parent node id."},
                 "objective": {"type": "string", "description": "What the node must achieve."},
                 "acceptance": {"type": "string", "description": "How acceptance is checked: concrete, command-checkable."},
-                "complexity": {"type": "integer", "minimum": 1, "maximum": 5}
+                "complexity": {"type": "integer", "minimum": 1, "maximum": 5},
+                "files": {"type": "array", "items": {"type": "string"}, "description": "The workspace-relative files the worker reads first."},
+                "waits_on": {"type": "array", "items": {"type": "integer"}, "description": "The cards this one waits on."},
+                "model": {"type": "string", "description": "The model that runs the card: a claude-* id on Claude Code, local/<name> on the local server, vendor/model on OpenRouter."}
             }),
             &["kind", "title"],
         ),
@@ -163,7 +166,7 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
     let need_id = || int("id").context("id is required");
     match name {
         "show" => {
-            let line = int("id").map_or_else(|| "show".to_owned(), |id| format!("show {id}"));
+            let line = int("id").map_or_else(|| "/show".to_owned(), |id| format!("/show {id}"));
             Ok(commands::run(&line, store, worker).await?.0)
         }
         "add" => {
@@ -174,7 +177,33 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
             let parent = int("parent");
             anyhow::ensure!(kind != NodeKind::Project || parent.is_none(), "a project has no parent");
             anyhow::ensure!(kind == NodeKind::Project || parent.is_some(), "a {kind} needs a parent");
-            let id = store.insert(parent, kind, title, text("objective"), text("acceptance"), complexity).await?;
+            let files: Vec<String> = match args.get("files") {
+                None => Vec::new(),
+                Some(list) => list
+                    .as_array()
+                    .context("files is a list of paths")?
+                    .iter()
+                    .map(|f| f.as_str().map(str::to_owned).context("files is a list of paths"))
+                    .collect::<anyhow::Result<_>>()?,
+            };
+            let waits_on: Vec<i64> = match args.get("waits_on") {
+                None => Vec::new(),
+                Some(list) => list
+                    .as_array()
+                    .context("waits_on is a list of ids")?
+                    .iter()
+                    .map(|i| i.as_i64().context("waits_on is a list of ids"))
+                    .collect::<anyhow::Result<_>>()?,
+            };
+            let card = Card {
+                objective: text("objective"),
+                acceptance: text("acceptance"),
+                complexity,
+                files: &files,
+                waits_on: &waits_on,
+                model: text("model"),
+            };
+            let id = store.insert_card(parent, kind, title, &card).await?;
             Ok(vec![format!("#{id} {title}")])
         }
         "details" => {
@@ -198,7 +227,7 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
             Ok(vec![format!("#{id}: {} set", changed.join(", "))])
         }
         "set" => {
-            let line = format!("set {} {}", need_id()?, text("state").context("state is required")?);
+            let line = format!("/set {} {}", need_id()?, text("state").context("state is required")?);
             Ok(commands::run(&line, store, worker).await?.0)
         }
         "depend" => {
@@ -210,7 +239,7 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
                 .filter_map(Value::as_i64)
                 .map(|i| i.to_string())
                 .collect();
-            let line = format!("depend {} {}", need_id()?, ids.join(" "));
+            let line = format!("/depend {} {}", need_id()?, ids.join(" "));
             Ok(commands::run(&line, store, worker).await?.0)
         }
         "run" => {

@@ -271,6 +271,25 @@ fn garbage_names_its_start() {
     assert!(format!("{error}").contains("Not a JSON"), "{error}");
 }
 
+#[test]
+fn a_run_s_stream_is_kept_line_by_line_and_the_next_run_replaces_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stream = Stream::open(Some(dir.path()));
+    stream.note(r#"{"type":"system","subtype":"init"}"#);
+    stream.note("");
+    stream.note(r#"{"type":"result","result":"done"}"#);
+    drop(stream);
+    let text = std::fs::read_to_string(dir.path().join(STREAM_FILE)).unwrap();
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(text.ends_with("\"done\"}\n"), "{text}");
+    // the next run starts the file over; a chat completion keeps none
+    let mut stream = Stream::open(Some(dir.path()));
+    stream.note(r#"{"type":"result","result":"again"}"#);
+    drop(stream);
+    assert_eq!(std::fs::read_to_string(dir.path().join(STREAM_FILE)).unwrap().lines().count(), 1);
+    assert!(Stream::open(None).0.is_none());
+}
+
 #[tokio::test]
 async fn a_missing_binary_is_unavailable() {
     let provider = ClaudeCode::new().with_binary("no-such-claude-binary-anywhere");

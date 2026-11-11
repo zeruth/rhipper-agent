@@ -47,6 +47,28 @@ fn the_failed_tests_lead_the_notes_of_a_failed_check() {
     assert!(!failure.text.contains("a_passing_test_0 "));
 }
 
+#[test]
+fn a_routed_worker_takes_the_model_of_the_card_or_the_rules_and_a_pinned_one_keeps_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(crate::router::ROUTES_FILE),
+        "[[route]]\ncomplexity = [1, 2]\nmodel = \"local/qwen3\"\neffort = \"low\"\n",
+    )
+    .unwrap();
+    let mut node = ra_roadmap::markdown::parse("- 2 ‹task› T {c1}\n    objective: a goal\n").unwrap().remove(0);
+    let routed = Worker::new("claude-fable-5-1").with_routing(true);
+    let picked = routed.for_card(dir.path(), &node).unwrap();
+    assert_eq!((picked.model.as_str(), picked.effort), ("local/qwen3", Some(Effort::Low)));
+    // the flag's effort stands over the rule's; a card's own model wins over the rule
+    let picked = routed.clone().with_effort(Some(Effort::High)).for_card(dir.path(), &node).unwrap();
+    assert_eq!(picked.effort, Some(Effort::High));
+    node.assignee = Some(ra_roadmap::model::Assignment { model: "z-ai/glm-5.3-flash".into(), role: "implementer".into() });
+    assert_eq!(routed.for_card(dir.path(), &node).unwrap().model, "z-ai/glm-5.3-flash");
+    // `--model` pins the run: neither the card nor the rules move it
+    let pinned = Worker::new("claude-opus-5-5").for_card(dir.path(), &node).unwrap();
+    assert_eq!(pinned.model, "claude-opus-5-5");
+}
+
 /// A task with a session made an `age` of seconds before `now`, for the card as it stands.
 fn with_session(age: u64, now: u64) -> Node {
     let mut node = ra_roadmap::markdown::parse("- 2 ‹task› T\n    objective: a goal\n    files: a.rs\n").unwrap().remove(0);

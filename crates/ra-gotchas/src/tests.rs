@@ -38,10 +38,7 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
     }
     // the git state is the person's, wherever in a chain the write sits
     for command in ["git stash -q && cargo clippy", "git add -A", "cargo test && git commit -m x", "git branch -D card"] {
-        assert!(
-            matches!(catalogue.command(command, Conditions::default()), Verdict::Deny { id, .. } if id == "git-writes"),
-            "{command}"
-        );
+        assert!(matches!(catalogue.command(command, Conditions::default()), Verdict::Deny { id, .. } if id == "git-writes"), "{command}");
     }
     assert_eq!(catalogue.command("git diff --stat", Conditions::default()), Verdict::Pass);
     assert_eq!(catalogue.command("git branch --show-current", Conditions::default()), Verdict::Pass);

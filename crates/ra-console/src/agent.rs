@@ -2,12 +2,14 @@
 //! one roadmap task to the badge model and records what came back. The functions talk to a
 //! [`ModelProvider`] through a [`Worker`], never to a vendor.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
 use parking_lot::Mutex;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError, TurnUsage, Usage};
+use ra_roadmap::history::Source;
 use ra_roadmap::model::{Effort, Estimate, Node, NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
@@ -84,6 +86,9 @@ pub struct Worker {
     /// The effort of a run, from `--effort`; `None` takes the card's own, medium when it names
     /// none.
     pub effort: Option<Effort>,
+    /// Whether a run picks its model per card: the card's own, else the rule of `rhipper.toml`
+    /// that fits, else [`Worker::model`] as the default. Off, every run is on the badge model.
+    pub routed: bool,
     /// Debug mode, on unless `RHIPPER_DEBUG=off`: a run asks the worker to end its report with
     /// what would have made it faster, keeps the answer, and hands the latest to the next runs.
     pub debug: bool,
@@ -105,6 +110,7 @@ impl Worker {
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes")),
             turns: None,
             effort: None,
+            routed: false,
             debug: !std::env::var("RHIPPER_DEBUG")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
             script: None,
@@ -164,6 +170,30 @@ impl Worker {
     pub fn with_ledger(mut self, ledger: UsageStore) -> Self {
         self.ledger = Some(ledger);
         self
+    }
+
+    /// The same worker, picking its model per card or not.
+    #[must_use]
+    pub fn with_routing(mut self, on: bool) -> Self {
+        self.routed = on;
+        self
+    }
+
+    /// The worker a run of `node` in `root` goes to: this one unless it is routed; then the one
+    /// on the model the card, the rules or the default name, with the rule's effort when
+    /// `--effort` named none.
+    ///
+    /// # Errors
+    /// When `rhipper.toml` is there but cannot be read.
+    pub fn for_card(&self, root: &Path, node: &Node) -> anyhow::Result<Self> {
+        if !self.routed {
+            return Ok(self.clone());
+        }
+        let choice = crate::router::Router::load(root)?.choose(node, crate::router::IMPLEMENTER, &self.model);
+        let mut worker = self.clone();
+        worker.model = choice.model;
+        worker.effort = self.effort.or(choice.effort);
+        Ok(worker)
     }
 
     /// The same worker, already connected to `provider` for its model's route; the tests hand in
@@ -270,6 +300,20 @@ impl Worker {
                 // the gotchas guard every harness run: the hooks call this very binary, and the
                 // catalogue lives beside the roadmap; without either, the harness runs unguarded
                 let mut harness = ra_providers::claude_code::ClaudeCode::new();
+                // the project's own commands and environment, from the `[worker]` table of
+                // its rhipper.toml, when it has one
+                match crate::router::Router::load(Path::new(".")) {
+                    Ok(router) => {
+                        let worker = router.worker;
+                        if !worker.allow.is_empty() {
+                            harness = harness.with_allowed(worker.rules());
+                        }
+                        if !worker.env.is_empty() {
+                            harness = harness.with_env(worker.env);
+                        }
+                    }
+                    Err(e) => tracing::warn!("the worker table is off: {e:#}"),
+                }
                 // the project's catalogue when it has one; the seed otherwise, written by the
                 // hook in the run's own directory, not here (a test runs where no var/ belongs)
                 let catalogue =
@@ -334,14 +378,27 @@ pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<
     // the node first, so a bad id or a project is named before the key matters
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != NodeKind::Project, "#{} is a project; run a task", id);
+    // the model of this card, when the command left the choice to the card and the rules
+    let root = workspace_of(store);
+    let worker = &worker.for_card(&root, &node)?;
     tracing::info!(target: crate::trace::PROGRESS, "{}#{} {} · {}", crate::logs::RUN_START, id, node.title, short(&worker.model));
+    // the paired session hears of the start and the end through the feed it watches
+    let title = node.title.clone();
+    crate::pair::event(&root, &format!("start #{id} {title} · {}", short(&worker.model)));
     let outcome = run_task(store, node, worker).await;
     match &outcome {
-        Ok((_, cost, 0)) => tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, cost_text(*cost)),
-        Ok((_, cost, gotchas)) => {
-            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {} · {gotchas} gotchas", crate::logs::RUN_END, cost_text(*cost));
+        Ok((lines, cost, 0)) => {
+            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, cost_text(*cost));
+            crate::pair::event(&root, &format!("end {}", lines.first().map_or("", String::as_str)));
         }
-        Err(e) => tracing::info!(target: crate::trace::PROGRESS, "{}✗ {}", crate::logs::RUN_END, first_line(&format!("{e:#}"))),
+        Ok((lines, cost, gotchas)) => {
+            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {} · {gotchas} gotchas", crate::logs::RUN_END, cost_text(*cost));
+            crate::pair::event(&root, &format!("end {} · {gotchas} gotcha(s)", lines.first().map_or("", String::as_str)));
+        }
+        Err(e) => {
+            tracing::info!(target: crate::trace::PROGRESS, "{}✗ {}", crate::logs::RUN_END, first_line(&format!("{e:#}")));
+            crate::pair::event(&root, &format!("end ✗ #{id} {title} failed: {}", first_line(&format!("{e:#}"))));
+        }
     }
     outcome.map(|(lines, _, _)| lines)
 }
@@ -371,23 +428,67 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     let mut ran = 0;
     loop {
         let nodes = store.all().await?;
+        let root = workspace_of(store);
+        // the walk's end, whichever way, goes to the paired session's feed
+        let done = |lines: &mut Vec<String>, text: String| {
+            crate::pair::event(&root, &format!("walk {text}"));
+            lines.push(text);
+        };
         let Some(id) = batch_ready(&nodes).map(|n| n.id) else {
-            lines.push(format!("ran {ran} card(s) · no card is ready"));
+            done(&mut lines, format!("ran {ran} card(s) · no card is ready"));
             return Ok(lines);
         };
         match run(store, id, worker).await {
             Ok(run_lines) => lines.extend(run_lines),
             Err(error) => {
-                lines.push(format!("ran {ran} card(s) · stopped: the run of #{id} failed: {error:#}"));
+                done(&mut lines, format!("ran {ran} card(s) · stopped: the run of #{id} failed: {error:#}"));
                 return Ok(lines);
             }
         }
         ran += 1;
         if stop_on_revision && store.read(id).await?.state == TaskState::NeedsRevision {
-            lines.push(format!("ran {ran} card(s) · stopped: #{id} needs revision"));
+            done(&mut lines, format!("ran {ran} card(s) · stopped: #{id} needs revision"));
+            return Ok(lines);
+        }
+        // `stop` from the console or the window: the walk ends after the run it was in
+        let stop = root.join(WALK_STOP);
+        if stop.exists() {
+            let _ = std::fs::remove_file(&stop);
+            done(&mut lines, format!("ran {ran} card(s) · stopped after #{id}, as asked"));
             return Ok(lines);
         }
     }
+}
+
+/// The file a `stop` leaves for a walk, which reads it between runs.
+const WALK_STOP: &str = "var/walk.stop";
+
+/// Asks the walk to stop after the task it is in: leaves the file it reads between runs. A
+/// walk that is not running finds the file at its next start and stops after one card, so the
+/// line says what to do about that.
+pub fn stop_walk(root: &Path) -> String {
+    let path = root.join(WALK_STOP);
+    let _ = std::fs::create_dir_all(root.join("var"));
+    match std::fs::write(&path, "") {
+        Ok(()) => "the walk stops after the task it is in; `quit` is the word that closes the window".to_owned(),
+        Err(e) => format!("cannot ask the walk to stop: {e}"),
+    }
+}
+
+/// The order a walk would take the cards in, as `rc run --all` picks them one after another,
+/// each pick counted as implemented for the next: the projected order of the work, for the
+/// window's walk view. Nothing is written.
+#[must_use]
+pub fn walk_order(nodes: &[Node]) -> Vec<i64> {
+    let mut nodes = nodes.to_vec();
+    let mut order = Vec::new();
+    while let Some(id) = batch_ready(&nodes).map(|n| n.id) {
+        order.push(id);
+        if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
+            node.state = TaskState::Implemented;
+        }
+    }
+    order
 }
 
 /// The first card a batch runs, in tree order: a defined task whose waits-on are each accepted or
@@ -407,7 +508,7 @@ fn batch_ready(nodes: &[Node]) -> Option<&Node> {
 async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<(Vec<String>, Option<f64>, usize)> {
     let id = node.id;
     let provider = worker.provider()?;
-    store.set_state(id, TaskState::InProgress).await?;
+    store.set_state_by(id, TaskState::InProgress, Source::Run).await?;
 
     let Prepared { workspace, root, mut task, project, budget, cap, effort } = prepare(store, &node, worker, true).await?;
     let workspace_dir = workspace.clone();
@@ -475,7 +576,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             if let Some(over) = error.downcast_ref::<OverBudget>() {
                 store.set_notes(id, &over.to_string()).await?;
             }
-            store.set_state(id, TaskState::Failed).await?;
+            store.set_state_by(id, TaskState::Failed, Source::Run).await?;
             let changed = ra_context::changed_between(&dirty_before, &git_status(&root).await);
             task.record(handoff("failed", "no check: the run failed", &format!("{error:#}"), changed));
             save_context(store, &root, &task).await;
@@ -536,12 +637,12 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     }
     if passed {
         store.set_notes(id, &session.text).await?;
-        store.set_state(id, TaskState::Implemented).await?;
+        store.set_state_by(id, TaskState::Implemented, Source::Run).await?;
     } else {
         if report != session.text {
             store.set_notes(id, &report).await?;
         }
-        store.set_state(id, TaskState::NeedsRevision).await?;
+        store.set_state_by(id, TaskState::NeedsRevision, Source::Run).await?;
     }
     // the run against its estimate, on the check line so the handoff carries it: the next run
     // reads what the last one spent against what the card was sized at
@@ -626,8 +727,9 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
         store.path().parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
     let root = workspace.clone().unwrap_or_else(|| PathBuf::from("."));
     let mut task = ra_context::TaskContext::open(&root, node.id);
-    task.brief = context_of(store, node).await?;
-    task.outlines = ra_context::outline_files(&root, &node.files, &last_change(&root, node, &task).await);
+    let brief = context_of(store, node).await?;
+    task.brief = brief.text;
+    task.outlines = ra_context::outline_files(&root, &brief.files, &last_change(&root, node, &task).await);
     let project =
         if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
     // an explicit budget, else the complexity's while budgets are on, else none at all; a turn
@@ -680,6 +782,7 @@ fn bare_context(task: &ra_context::TaskContext, project: &str, debug: bool) -> S
 pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; run a task");
+    let worker = &worker.for_card(&workspace_of(store), &node)?;
     let provider = worker.provider()?;
     let Prepared { workspace, root, task, project, budget, cap, effort } = prepare(store, &node, worker, false).await?;
     let harness = provider.has_own_tools();
@@ -805,12 +908,18 @@ async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[Strin
             ranges.push((file.replace('\\', "/"), 1, u32::MAX - 2));
         }
     }
-    for krate in &lint.crates {
-        let command = format!("cargo clippy -p {krate}");
-        match toolbox.check(&command).await {
-            Ok((_, output)) => lint.warnings.extend(ra_tools::warnings_within(&output, &ranges)),
-            Err(e) => lint.skipped.push(format!("{command} · {e:#}")),
+    // one clippy over every crate: a crate's warnings come out again under each crate that
+    // depends on it, so a run per crate counted the same warning three times (#92 read 68)
+    let command = format!("cargo clippy -p {}", lint.crates.join(" -p "));
+    match toolbox.check(&command).await {
+        Ok((_, output)) => {
+            for warning in ra_tools::warnings_within(&output, &ranges) {
+                if !lint.warnings.contains(&warning) {
+                    lint.warnings.push(warning);
+                }
+            }
         }
+        Err(e) => lint.skipped.push(format!("{command} · {e:#}")),
     }
     lint
 }
@@ -834,8 +943,9 @@ pub async fn context_preview(store: &Store, id: i64) -> anyhow::Result<String> {
     let node = store.read(id).await?;
     let root = workspace_of(store);
     let mut task = ra_context::TaskContext::open(&root, id);
-    task.brief = context_of(store, &node).await?;
-    task.outlines = ra_context::outline_files(&root, &node.files, &last_change(&root, &node, &task).await);
+    let brief = context_of(store, &node).await?;
+    task.brief = brief.text;
+    task.outlines = ra_context::outline_files(&root, &brief.files, &last_change(&root, &node, &task).await);
     Ok(task.prompt())
 }
 
@@ -863,7 +973,7 @@ pub fn project_context(store: &Store) -> String {
 }
 
 /// The workspace: the directory of the roadmap file.
-fn workspace_of(store: &Store) -> PathBuf {
+pub fn workspace_of(store: &Store) -> PathBuf {
     store.path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
@@ -1156,11 +1266,13 @@ pub async fn reassess(store: &Store, id: i64, worker: &Worker, recursive: bool) 
             verified.push(format!("#{}", current));
             continue;
         }
-        if node.assessed.as_deref() == Some(fingerprint(node, &nodes).as_str()) {
+        if assessed_mark(node) == Some(fingerprint(node, &nodes).as_str()) {
             receipts.push(format!("#{} {} assessed and unchanged: no call", node.id, node.title));
             unchanged.push(format!("#{}", current));
             continue;
         }
+        // a tree pass over a milestone also asks what cards its objective still lacks
+        let propose = recursive && node.kind == NodeKind::Milestone;
         let connected = match provider.clone() {
             Some(connected) => connected,
             None => {
@@ -1169,7 +1281,7 @@ pub async fn reassess(store: &Store, id: i64, worker: &Worker, recursive: bool) 
                 connected
             }
         };
-        match reassess_one(store, worker, connected.as_ref(), current, &nodes).await {
+        match reassess_one(store, worker, connected.as_ref(), current, &nodes, propose).await {
             Ok(receipt) => {
                 revised.push(format!("#{}", current));
                 receipts.push(receipt);
@@ -1192,13 +1304,20 @@ pub async fn reassess(store: &Store, id: i64, worker: &Worker, recursive: bool) 
 
 /// One reassessment: the model returns two lines, and the store takes them. The prompt carries the
 /// node's own notes and its children with their states, so the revision names only the work the
-/// subtree still owes.
-async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvider, id: i64, nodes: &[Node]) -> anyhow::Result<String> {
+/// subtree still owes. With `propose`, the model may add the cards the objective lacks; they wait
+/// in the proposals file for the person's word, less the ones declined before.
+async fn reassess_one(
+    store: &Store,
+    worker: &Worker,
+    provider: &dyn ModelProvider,
+    id: i64,
+    nodes: &[Node],
+    propose: bool,
+) -> anyhow::Result<String> {
     let node = store.read(id).await?;
     let old_objective = node.objective.clone();
     let old_acceptance = node.acceptance.clone();
-    let context = context_of(store, &node).await?;
-    let mut ask = context;
+    let mut ask = context_of(store, &node).await?.text;
     if let Some(notes) = &node.notes {
         ask.push_str(&format!("\nNotes of earlier work on this node: {}\n", first_line(notes)));
     }
@@ -1218,12 +1337,19 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
          overview: <one sentence on what you changed and why>\n\
          objective: <the revised objective, one line>\nacceptance: <the revised acceptance, one line>",
     );
+    if propose {
+        ask.push_str(
+            "\nThis node is a milestone. When its objective needs work that no child covers, add one line per missing \
+             card after the three, each as:\ncard: <title> | <objective, one line> | <acceptance, one line>\n\
+             Add none when the children cover the objective.",
+        );
+    }
     let answer = provider
         .complete(CompletionRequest {
             model: worker.model.clone(),
             messages: vec![Message::system(ARCHITECT), Message::user(ask)],
             temperature: Some(0.2),
-            max_tokens: Some(512),
+            max_tokens: Some(if propose { 1024 } else { 512 }),
             tools: Vec::new(),
             workspace: None,
             budget_usd: None,
@@ -1237,9 +1363,14 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
     let mut overview: Option<String> = None;
     let mut objective: Option<String> = None;
     let mut acceptance: Option<String> = None;
+    let mut proposals: Vec<Proposal> = Vec::new();
     for line in answer.text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("overview:") {
+        if let Some(rest) = line.strip_prefix("card:") {
+            if let Some(proposal) = Proposal::parse(rest) {
+                proposals.push(proposal);
+            }
+        } else if let Some(rest) = line.strip_prefix("overview:") {
             if !rest.trim().is_empty() {
                 overview = Some(rest.trim().to_owned());
             }
@@ -1264,7 +1395,19 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
     // the fingerprint of the text as it now stands, changed or not, so the next pass skips it
     let after = store.all().await?;
     if let Some(revised) = after.iter().find(|n| n.id == id) {
-        store.set_assessed(id, Some(&fingerprint(revised, &after))).await?;
+        store.set_assessed(id, assessed_line(revised, Some(&fingerprint(revised, &after))).as_deref()).await?;
+    }
+    // what the person declined before, and what a child already is, does not come back as new
+    if propose {
+        let declined: Vec<&str> = declined_of(&node).collect();
+        let mut seen: Vec<String> = nodes.iter().filter(|n| n.parent == Some(id)).map(|n| n.title.to_lowercase()).collect();
+        proposals.retain(|p| {
+            let key = p.title.to_lowercase();
+            let fresh = !declined.contains(&declined_mark(&p.title).as_str()) && !seen.contains(&key);
+            seen.push(key);
+            fresh
+        });
+        save_proposals(store, id, &proposals)?;
     }
 
     // the receipt reads like a patch: an overview line, then the old and the new of each field
@@ -1293,7 +1436,150 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
         }
     }
     receipt.push_str(&format!("\n{changed} field(s) changed"));
+    if !proposals.is_empty() {
+        for line in proposal_lines(id, &proposals) {
+            receipt.push('\n');
+            receipt.push_str(&line);
+        }
+    }
     Ok(receipt)
+}
+
+/// A card the architect found missing under a milestone, waiting for the person's word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proposal {
+    pub title: String,
+    pub objective: String,
+    pub acceptance: String,
+}
+
+impl Proposal {
+    /// A `card:` line of the architect's answer: title, objective and acceptance between bars; a
+    /// line without a real title is noise.
+    fn parse(rest: &str) -> Option<Self> {
+        let mut parts = rest.split('|').map(str::trim);
+        let title = parts.next().filter(|t| !t.is_empty() && !is_placeholder(t))?;
+        let field = |value: Option<&str>| value.filter(|v| !is_placeholder(v)).unwrap_or("").to_owned();
+        Some(Self { title: title.to_owned(), objective: field(parts.next()), acceptance: field(parts.next()) })
+    }
+}
+
+/// Where the proposals of a milestone wait: one per line, the fields tab-separated, so the window
+/// and the console read the same list.
+fn proposals_file(store: &Store, id: i64) -> PathBuf {
+    workspace_of(store).join("var").join("proposals").join(format!("{id}.txt"))
+}
+
+/// The proposals waiting on `id`, in the order the architect gave them.
+#[must_use]
+pub fn proposals_of(store: &Store, id: i64) -> Vec<Proposal> {
+    let Ok(text) = std::fs::read_to_string(proposals_file(store, id)) else { return Vec::new() };
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let title = parts.next()?.trim();
+            (!title.is_empty()).then(|| Proposal {
+                title: title.to_owned(),
+                objective: parts.next().unwrap_or("").to_owned(),
+                acceptance: parts.next().unwrap_or("").to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Writes the proposals of `id`; an empty list removes the file, so nothing stale waits.
+fn save_proposals(store: &Store, id: i64, proposals: &[Proposal]) -> anyhow::Result<()> {
+    let path = proposals_file(store, id);
+    if proposals.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+        }
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    let flat = |text: &str| text.replace(['\t', '\n'], " ");
+    let text: String = proposals.iter().map(|p| format!("{}\t{}\t{}\n", flat(&p.title), flat(&p.objective), flat(&p.acceptance))).collect();
+    std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// The list the person reads: a lead naming the commands, then one numbered line per proposal.
+#[must_use]
+pub fn proposal_lines(id: i64, proposals: &[Proposal]) -> Vec<String> {
+    let mut out =
+        vec![format!("? {} card(s) proposed under #{id}; /accept {id} <n> adds one, /decline {id} <n> drops it for good", proposals.len())];
+    for (n, p) in proposals.iter().enumerate() {
+        out.push(format!("  {}. {} — {}", n + 1, p.title, if p.objective.is_empty() { "no objective" } else { &p.objective }));
+    }
+    out
+}
+
+/// Takes proposal `n` (counted from 1) off the list of `id`, and writes the rest back.
+fn take_proposal(store: &Store, id: i64, n: usize) -> anyhow::Result<(Proposal, Vec<Proposal>)> {
+    let mut proposals = proposals_of(store, id);
+    anyhow::ensure!(!proposals.is_empty(), "no proposals wait on #{id}; a reassess-tree of a milestone makes them");
+    anyhow::ensure!((1..=proposals.len()).contains(&n), "the proposals of #{id} are 1 to {}", proposals.len());
+    let taken = proposals.remove(n - 1);
+    save_proposals(store, id, &proposals)?;
+    Ok((taken, proposals))
+}
+
+/// Accepts proposal `n` of milestone `id`: a task under it with the proposed text, then the list
+/// that still waits.
+pub async fn accept_proposal(store: &Store, id: i64, n: usize) -> anyhow::Result<Vec<String>> {
+    let (taken, rest) = take_proposal(store, id, n)?;
+    fn field(text: &str) -> Option<&str> {
+        (!text.is_empty()).then_some(text)
+    }
+    let new = store.insert(Some(id), NodeKind::Task, &taken.title, field(&taken.objective), field(&taken.acceptance), 3).await?;
+    let mut out = vec![format!("#{new} {} added under #{id}", taken.title)];
+    if !rest.is_empty() {
+        out.extend(proposal_lines(id, &rest));
+    }
+    Ok(out)
+}
+
+/// Declines proposal `n` of milestone `id`: its title's hash goes on the `assessed:` line, so no
+/// later reassessment proposes it again.
+pub async fn decline_proposal(store: &Store, id: i64, n: usize) -> anyhow::Result<Vec<String>> {
+    let node = store.read(id).await?;
+    let (taken, rest) = take_proposal(store, id, n)?;
+    let mark = declined_mark(&taken.title);
+    if !declined_of(&node).any(|h| h == mark) {
+        let line = format!("{} -{mark}", assessed_line(&node, assessed_mark(&node)).unwrap_or_default());
+        store.set_assessed(id, Some(line.trim())).await?;
+    }
+    let mut out = vec![format!("declined {}: it does not return", taken.title)];
+    if !rest.is_empty() {
+        out.extend(proposal_lines(id, &rest));
+    }
+    Ok(out)
+}
+
+/// The mark of a node's `assessed:` line: its first word, the fingerprint or `final`, when it has
+/// one; a line that holds only declined proposals has none.
+fn assessed_mark(node: &Node) -> Option<&str> {
+    node.assessed.as_deref().and_then(|a| a.split_whitespace().next()).filter(|w| !w.starts_with('-'))
+}
+
+/// The hashes of the proposals the person declined on the node: the `-` words of its `assessed:`.
+fn declined_of(node: &Node) -> impl Iterator<Item = &str> {
+    node.assessed.as_deref().into_iter().flat_map(str::split_whitespace).filter_map(|w| w.strip_prefix('-'))
+}
+
+/// The `assessed:` line that puts `mark` before the declined proposals the node keeps; `None`
+/// when neither is there.
+#[must_use]
+pub fn assessed_line(node: &Node, mark: Option<&str>) -> Option<String> {
+    let words: Vec<String> = mark.map(str::to_owned).into_iter().chain(declined_of(node).map(|h| format!("-{h}"))).collect();
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+/// The hash under which a declined title is remembered: of the title lowercased, so a reworded
+/// case does not bring it back.
+fn declined_mark(title: &str) -> String {
+    hash_fields([title.trim().to_lowercase().as_str()])
 }
 
 /// The fingerprint of what a reassessment of `node` reads: its objective, its acceptance, the
@@ -1374,9 +1660,16 @@ const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orche
 /// The system prompt of a reassessment.
 const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done. When the objective and the acceptance already name only the remaining work and are checkable, you answer with the same text rather than rewording it.";
 
+/// The brief of a card: the prompt text, and the files it works in, which the outlines read.
+struct Brief {
+    text: String,
+    /// The card's files, or those it inherits from the nearest ancestor that names any.
+    files: Vec<String>,
+}
+
 /// The prompt of one task: the node, its ancestors, and its dependencies. One read of the store
-/// serves them all.
-async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
+/// serves them all, and names the files a card without its own takes from a section above it.
+async fn context_of(store: &Store, node: &Node) -> anyhow::Result<Brief> {
     let nodes = store.all().await?;
     let find = |id: i64| nodes.iter().find(|n| n.id == id);
     let mut text = format!("Task #{}: {}\n", node.id, node.title);
@@ -1386,11 +1679,18 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
     if let Some(acceptance) = &node.acceptance {
         text.push_str(&format!("Acceptance criteria: {acceptance}\n"));
     }
-    // the files the task names: where the change lands; the task context outlines them
-    if !node.files.is_empty() {
-        text.push_str("Files of the card, where the change lands:\n");
-        for file in &node.files {
-            text.push_str(&format!("  {file}\n"));
+    // the files the task names, or its section's: where the change lands; the task context
+    // outlines them, and the card view says whose they are
+    let (files, from) = ra_roadmap::tree::files_of(&nodes, node);
+    if !files.is_empty() {
+        match from {
+            Some(owner) => {
+                let _ = writeln!(text, "Files of the card, where the change lands, from #{} {}:", owner.id, owner.title);
+            }
+            None => text.push_str("Files of the card, where the change lands:\n"),
+        }
+        for file in files {
+            let _ = writeln!(text, "  {file}");
         }
     }
     // the ancestors: the chain of parents above the task, nearest first
@@ -1417,7 +1717,7 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
             text.push_str(&format!("  notes of #{}: {notes}\n", dep.id));
         }
     }
-    Ok(text)
+    Ok(Brief { text, files: files.to_vec() })
 }
 
 /// Maps a provider error to a refusal that names what to do.

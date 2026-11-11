@@ -1,5 +1,7 @@
 /target
 /var
+# a crate's tests that write var/ relative to their own directory
+/crates/*/var
 /rhipper.md
 *.db
 *.db-wal

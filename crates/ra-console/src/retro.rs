@@ -28,7 +28,23 @@ pub struct Note {
     pub node: Option<i64>,
     /// Whether the worker marked the cause as this machine's.
     pub machine: bool,
+    /// Whether the note came from the person or a paired session (`rc note`, the `note` tool)
+    /// rather than from a run.
+    pub pair: bool,
     pub text: String,
+}
+
+/// Keeps an observation of the person or a paired session, for the next runs to read with
+/// the workers' own.
+///
+/// # Errors
+/// When the text is empty or the file cannot be written.
+pub fn record_pair(root: &Path, text: &str) -> anyhow::Result<()> {
+    let text = text.trim();
+    anyhow::ensure!(!text.is_empty(), "a note says something");
+    let note = Note { when: 0, node: None, machine: false, pair: true, text: text.chars().take(400).collect() };
+    crate::pair::event(root, &format!("note {}", note.text));
+    record(root, None, &[note])
 }
 
 /// The bullets of a report's `Faster next time` section, in order; none without the section.
@@ -63,7 +79,7 @@ pub fn parse(report: &str) -> Vec<Note> {
             continue;
         }
         let text: String = text.chars().take(240).collect();
-        notes.push(Note { when: 0, node: None, machine, text });
+        notes.push(Note { when: 0, node: None, machine, pair: false, text });
         if notes.len() == 3 {
             break;
         }
@@ -88,7 +104,9 @@ pub fn record(root: &Path, node: Option<i64>, notes: &[Note]) -> anyhow::Result<
     let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     for note in notes {
         let node = node.map_or(String::from("-"), |n| n.to_string());
-        writeln!(file, "{when}\t{node}\t{}\t{}", u8::from(note.machine), note.text.replace(['\t', '\n'], " "))?;
+        // the third column: 0 a worker's, 1 a worker's about this machine, 2 the person's
+        let kind = if note.pair { 2 } else { u8::from(note.machine) };
+        writeln!(file, "{when}\t{node}\t{kind}\t{}", note.text.replace(['\t', '\n'], " "))?;
     }
     Ok(())
 }
@@ -101,7 +119,13 @@ pub fn recent(root: &Path, limit: usize) -> Vec<Note> {
         .filter_map(|line| {
             let mut cols = line.split('\t');
             let (when, node, machine, text) = (cols.next()?, cols.next()?, cols.next()?, cols.next()?);
-            Some(Note { when: when.parse().ok()?, node: node.parse().ok(), machine: machine == "1", text: text.to_owned() })
+            Some(Note {
+                when: when.parse().ok()?,
+                node: node.parse().ok(),
+                machine: machine == "1",
+                pair: machine == "2",
+                text: text.to_owned(),
+            })
         })
         .collect();
     notes.reverse();
@@ -114,16 +138,18 @@ pub fn recent(root: &Path, limit: usize) -> Vec<Note> {
 pub fn machine_lines(root: &Path) -> String {
     let mut seen: Vec<String> = Vec::new();
     for note in recent(root, SHOWN * 2) {
-        if seen.len() == SHOWN || seen.contains(&note.text) {
+        // the person's notes are told from the workers' own
+        let line = if note.pair { format!("(the person) {}", note.text) } else { note.text };
+        if seen.len() == SHOWN || seen.contains(&line) {
             continue;
         }
-        seen.push(note.text);
+        seen.push(line);
     }
     if seen.is_empty() {
         return String::new();
     }
     let lines: Vec<String> = seen.iter().map(|t| format!("- {t}")).collect();
-    format!("What earlier runs here said would have made them faster:\n{}", lines.join("\n"))
+    format!("What earlier runs here, and the person, said would have made them faster:\n{}", lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -159,10 +185,17 @@ mod tests {
         assert_eq!(notes[3].node, Some(7));
         assert!(notes[3].machine && !notes[0].machine);
         let lines = machine_lines(dir.path());
-        assert!(lines.starts_with("What earlier runs here said"), "{lines}");
+        assert!(lines.starts_with("What earlier runs here, and the person, said"), "{lines}");
         assert_eq!(lines.matches("\n- ").count(), 3, "each once: {lines}");
         // nothing to record writes nothing
         record(dir.path(), None, &[]).unwrap();
         assert_eq!(recent(dir.path(), 10).len(), 4);
+        // the person's note is kept apart and read first, being newest
+        record_pair(dir.path(), "  the tooltip of the left panel is slow to show  ").unwrap();
+        assert!(record_pair(dir.path(), "   ").is_err());
+        let latest = &recent(dir.path(), 1)[0];
+        assert!(latest.pair && !latest.machine && latest.node.is_none());
+        assert_eq!(latest.text, "the tooltip of the left panel is slow to show");
+        assert!(machine_lines(dir.path()).contains("- (the person) the tooltip"), "{}", machine_lines(dir.path()));
     }
 }

@@ -1,7 +1,7 @@
 //! The tests of the markdown format: round trips, the inline fields and the error cases.
 
 use super::*;
-use crate::model::{Assignment, Effort, NodeKind, TaskState};
+use crate::model::{Assignment, Effort, Gambit, GambitState, NodeKind, Roadmap, TaskState};
 
 fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
     Node {
@@ -23,7 +23,50 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
         estimate: None,
         notes: None,
         assessed: None,
+        priority: None,
     }
+}
+
+fn gambit(id: u32, text: &str, weight: u8, state: GambitState) -> Gambit {
+    Gambit { id, text: text.to_owned(), weight, state, focus: Vec::new() }
+}
+
+#[test]
+fn round_trips_three_gambits_and_a_priority() {
+    let mut focused = gambit(1, "Local execution before dollars", 4, GambitState::Active);
+    focused.focus = vec!["provider".into(), "ra-providers".into()];
+    let gambits =
+        vec![focused, gambit(2, "Tests beside the code", 2, GambitState::Parked), gambit(3, "Ship the console", 5, GambitState::Done)];
+    let mut task = node(4, None, NodeKind::Task, "Storage");
+    task.priority = Some(5);
+    let roadmap = Roadmap { gambits, nodes: vec![task, node(5, None, NodeKind::Task, "Plain")] };
+    let text = render_file(&roadmap);
+    assert!(
+        text.contains("## Gambits\n\n- g1 ‹gambit› Local execution before dollars {w4} [active]\n    focus: provider ra-providers\n"),
+        "{text}"
+    );
+    assert!(text.contains("- g3 ‹gambit› Ship the console {w5} [done]"), "a done gambit stays in the file:\n{text}");
+    assert!(text.contains("    priority: 5"), "{text}");
+    assert_eq!(text.matches("priority:").count(), 1, "no priority writes no line:\n{text}");
+    let parsed = parse_file(&text).unwrap();
+    assert_eq!(parsed, roadmap);
+    assert_eq!(render_file(&parsed), text);
+    // the node-only reads leave the gambits aside
+    assert_eq!(parse(&text).unwrap(), roadmap.nodes);
+}
+
+#[test]
+fn a_gambit_with_an_unknown_state_names_its_line() {
+    let error = parse_file("- g1 ‹gambit› Fine {w3} [active]\n- g2 ‹gambit› Odd {w3} [sleeping]\n").unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("line 2"), "{message}");
+    assert!(message.contains("unknown gambit state sleeping"), "{message}");
+    let error = parse_file("- g1 ‹gambit› Heavy {w9} [active]").unwrap_err();
+    assert!(format!("{error:#}").contains("the weight is 1 to 5"), "{error:#}");
+    let error = parse("- 1 ‹task› T\n    priority: 0").unwrap_err();
+    assert!(format!("{error:#}").contains("line 2: the priority is 1 to 5"), "{error:#}");
+    let error = parse_file("- g1 ‹gambit› Fine {w3} [active]\n    notes: x").unwrap_err();
+    assert!(format!("{error:#}").contains("unknown gambit field notes"), "{error:#}");
 }
 
 #[test]
@@ -79,6 +122,25 @@ fn round_trips_the_assessed_line() {
     assert!(parsed[1].is_final());
     assert!(!parsed[0].is_final());
     assert_eq!(render(&parsed), text);
+}
+
+#[test]
+fn the_checklist_ticks_accepted_cards_and_indents_the_objective() {
+    let mut storage = node(4, Some(2), NodeKind::Task, "Storage layer");
+    storage.state = TaskState::Accepted;
+    storage.objective = Some("Keep the roadmap in a file.".into());
+    let nodes = vec![
+        node(1, None, NodeKind::Project, "Rhipper Agent"),
+        node(2, Some(1), NodeKind::Milestone, "Phase 1"),
+        storage,
+        node(5, Some(2), NodeKind::Task, "Console"),
+    ];
+    assert_eq!(
+        checklist(&nodes, None),
+        "- [ ] Rhipper Agent\n  - [ ] Phase 1\n    - [x] Storage layer\n      Keep the roadmap in a file.\n    - [ ] Console\n"
+    );
+    // a subtree starts at column 0
+    assert_eq!(checklist(&nodes, Some(2)), "- [ ] Phase 1\n  - [x] Storage layer\n    Keep the roadmap in a file.\n  - [ ] Console\n");
 }
 
 #[test]

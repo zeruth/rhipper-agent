@@ -2,7 +2,12 @@
 //! statuses to the provider errors so a caller can retry the transient ones.
 //!
 //! The same adapter serves a local OpenAI-compatible server such as llama.cpp: [`OpenRouter::local`]
-//! points it at the URL from `RHIPPER_LOCAL_URL` with no key.
+//! points it at the URL from `RHIPPER_LOCAL_URL` with no key. [`LocalProbe`] asks that server for
+//! its model list in the background, so a status dot can say whether it is up without a model call.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -17,6 +22,10 @@ pub const LOCAL_URL_VAR: &str = "RHIPPER_LOCAL_URL";
 pub const DEFAULT_LOCAL_URL: &str = "http://127.0.0.1:8080/v1";
 /// What the requests say they are.
 const USER_AGENT: &str = concat!("rhipper-agent/", env!("CARGO_PKG_VERSION"));
+/// How long a probe of the local server waits: it answers from memory or not at all.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often the status dots of the console and the window probe the local server.
+pub const PROBE_EVERY: Duration = Duration::from_secs(60);
 
 /// The OpenRouter provider.
 pub struct OpenRouter {
@@ -52,6 +61,88 @@ impl OpenRouter {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    /// Whether the key is empty: the sign of a local server, which has no accounts.
+    fn is_local(&self) -> bool {
+        self.key.is_empty()
+    }
+
+    /// The ids the server offers, from `GET models`. A local server lists the files it loaded;
+    /// `ping` names them when a model is unknown to it.
+    pub async fn models(&self) -> Result<Vec<String>, ProviderError> {
+        let url = format!("{}/models", self.base_url);
+        let mut get = self.client.get(&url).timeout(PROBE_TIMEOUT);
+        if !self.is_local() {
+            get = get.bearer_auth(&self.key);
+        }
+        let response = get.send().await.map_err(|e| ProviderError::Unavailable(format!("cannot reach {url}: {e}")))?;
+        let status = response.status();
+        let body = response.text().await.map_err(|e| ProviderError::Unavailable(format!("{url} dropped the answer: {e}")))?;
+        if status != StatusCode::OK {
+            return Err(ProviderError::Other(error_text(&body, status)));
+        }
+        let parsed: WireModels = serde_json::from_str(&body)
+            .map_err(|e| ProviderError::Other(format!("unparsable model list: {e}; body starts with: {}", snippet(&body))))?;
+        Ok(parsed.data.into_iter().map(|m| m.id).collect())
+    }
+
+    /// The text of an unknown-model error. On a local server it goes on to name what the server
+    /// offers, since the id was typed, not picked from a list.
+    async fn unknown_model_text(&self, body: &str, status: StatusCode) -> String {
+        let mut text = error_text(body, status);
+        if self.is_local()
+            && let Ok(models) = self.models().await
+            && !models.is_empty()
+        {
+            text.push_str(&format!("; the server at {} offers: {}", self.base_url, models.join(", ")));
+        }
+        text
+    }
+}
+
+/// The availability of the local server, as the status dots show it: probed in the background
+/// with one `GET models` and no model call, shared between the probe and the frame that reads it.
+#[derive(Clone, Default)]
+pub struct LocalProbe {
+    /// 0 unprobed, 1 down, 2 up.
+    state: Arc<AtomicU8>,
+}
+
+impl LocalProbe {
+    /// Whether the server answered the last probe; `None` before the first one answers.
+    pub fn up(&self) -> Option<bool> {
+        match self.state.load(Ordering::Relaxed) {
+            0 => None,
+            1 => Some(false),
+            _ => Some(true),
+        }
+    }
+
+    /// One probe of the server at `base_url`, to spawn on the runtime; it writes the outcome
+    /// where [`up`](Self::up) reads it.
+    pub async fn probe(self, base_url: &str) {
+        let answered = match OpenRouter::at(base_url, "") {
+            Ok(server) => server.models().await.is_ok(),
+            Err(_) => false,
+        };
+        self.state.store(if answered { 2 } else { 1 }, Ordering::Relaxed);
+    }
+
+    /// [`probe`](Self::probe) at [`local_url`].
+    pub async fn probe_local(self) {
+        self.probe(&local_url()).await;
+    }
+}
+
+#[derive(Deserialize)]
+struct WireModels {
+    #[serde(default)]
+    data: Vec<WireModel>,
+}
+
+#[derive(Deserialize)]
+struct WireModel {
+    id: String,
 }
 
 /// The API root of the local server: `RHIPPER_LOCAL_URL` when it is set to something, else
@@ -219,7 +310,7 @@ impl OpenRouter {
         };
         let url = format!("{}/chat/completions", self.base_url);
         let mut post = self.client.post(&url).json(&wire);
-        if !self.key.is_empty() {
+        if !self.is_local() {
             post = post.bearer_auth(&self.key);
         }
         // the URL is in the error on purpose: a local server that is not running is the usual
@@ -263,7 +354,7 @@ impl OpenRouter {
                 })
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ProviderError::Auth(error_text(&body, status))),
-            StatusCode::NOT_FOUND => Err(ProviderError::UnknownModel(error_text(&body, status))),
+            StatusCode::NOT_FOUND => Err(ProviderError::UnknownModel(self.unknown_model_text(&body, status).await)),
             StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY => {
                 Err(ProviderError::Unavailable(error_text(&body, status)))
             }

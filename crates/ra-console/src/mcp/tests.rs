@@ -76,6 +76,27 @@ async fn the_roadmap_tools_shape_the_tree() {
 }
 
 #[tokio::test]
+async fn the_add_tool_takes_the_files_the_model_and_the_dependencies() {
+    let (_dir, store) = store().await;
+    let mut worker = Worker::new("claude-opus-5-5");
+    let reply = send(&store, &mut worker, call(1, "add", json!({"kind": "task", "title": "A", "parent": 1}))).await.unwrap();
+    assert_eq!(text_of(&reply), "#2 A");
+    let args = json!({"kind": "task", "title": "B", "parent": 1, "files": ["src/b.rs"], "waits_on": [2], "model": "local/qwen"});
+    let reply = send(&store, &mut worker, call(2, "add", args)).await.unwrap();
+    assert_eq!(text_of(&reply), "#3 B");
+    let node = store.read(3).await.unwrap();
+    assert_eq!(node.files, ["src/b.rs"]);
+    assert_eq!(node.depends_on, [2]);
+    assert_eq!(node.assignee.as_ref().map(|a| a.model.as_str()), Some("local/qwen"));
+    // a dependency on a card that is not there is refused, and nothing is added
+    let reply =
+        send(&store, &mut worker, call(3, "add", json!({"kind": "task", "title": "C", "parent": 1, "waits_on": [9]}))).await.unwrap();
+    assert_eq!(reply["result"]["isError"], true);
+    assert!(text_of(&reply).contains("no node 9"), "{}", text_of(&reply));
+    assert_eq!(store.all().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn the_model_tool_swaps_the_badge() {
     let (_dir, store) = store().await;
     let mut worker = Worker::new("claude-opus-5-5");

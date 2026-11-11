@@ -59,12 +59,16 @@ fn the_candidates_are_the_roadmap_shaped_files_and_the_hint_names_them() {
 async fn an_init_writes_the_roadmap_the_mode_says_and_refuses_a_second() {
     let dir = project();
     let root = dir.path();
-    let outline = "# Demo\n## Foundations {c4}\nobjective: the base\nacceptance: `cargo test` passes\n- A store {c2}\n  objective: keep\n  acceptance: round trip\n  files: src/store.rs\n- A parser\n";
+    // the one answer: the outline, the marker, the project context
+    let outline = "# Demo\n## Foundations {c4}\nobjective: the base\nacceptance: `cargo test` passes\n- A store {c2}\n  objective: keep\n  acceptance: round trip\n  files: src/store.rs\n- A parser\n---context---\n# Demo\n\nA demo project, written by the model.\n\n## Layout\n- `src/` — the code\n\n## Build and checks\n- `cargo test` is the check.\n";
     let worker = Worker::new("claude-opus-5-5").with_provider(Arc::new(Answers(outline.to_owned())));
     let lines = init(root, &worker, Mode::Draft).await.unwrap();
     assert!(lines[0].starts_with("rhipper.md written: 1 milestone, 2 tasks (3 cards) drafted by claude-opus-5-5"), "{lines:?}");
     assert!(exists(root));
-    assert!(root.join(ra_context::PROJECT_FILE).exists());
+    // the context file is the model's part, not the draft from the directory
+    let context = std::fs::read_to_string(root.join(ra_context::PROJECT_FILE)).unwrap();
+    assert!(context.starts_with("# Demo\n\nA demo project, written by the model."), "{context}");
+    assert!(lines.iter().any(|l| l.contains("rhipper.context.md written by claude-opus-5-5")), "{lines:?}");
     let store = Store::open(&root.join(ROADMAP_FILE), "x").await.unwrap();
     let nodes = store.all().await.unwrap();
     assert_eq!(nodes[0].title, "Demo");

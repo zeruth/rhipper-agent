@@ -2,9 +2,10 @@
 //! goes through the orchestrator, which the console drives through the same store.
 
 use anyhow::Context;
-use ra_roadmap::model::{Effort, NodeKind, TaskState};
-use ra_roadmap::store::Store;
+use ra_roadmap::model::{Effort, Node, NodeKind, TaskState};
+use ra_roadmap::store::{Edit, Store};
 use ra_roadmap::tree;
+use ra_usage::Totals;
 
 use crate::agent::{self, Worker};
 
@@ -21,6 +22,11 @@ pub const COMMANDS: &[Spec] = &[
         name: "add",
         usage: "<project|milestone|section|task|subtask> <title> [parent <id>]",
         help: "adds a node under its parent; a project takes no parent",
+    },
+    Spec {
+        name: "edit",
+        usage: "<id> <title|objective|acceptance|complexity|files|session> <text>",
+        help: "rewrites one field of a card and nothing else; `session clear` forgets the harness session",
     },
     Spec { name: "depend", usage: "<id> <id>...", help: "makes the first node wait for the others" },
     Spec {
@@ -45,18 +51,50 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "key", usage: "[<paste> | clear]", help: "stores, shows the state of, or clears the OpenRouter key" },
     Spec { name: "ping", usage: "", help: "one round trip to the badge model" },
     Spec {
+        name: "usage",
+        usage: "[id]",
+        help: "the ledger by card, summed up the tree, for the subtree of a node; the whole roadmap without an id",
+    },
+    Spec {
+        name: "context",
+        usage: "[id]",
+        help: "the context a run of the card would send, or the project context without an id; folded, Enter on the empty prompt unfolds it",
+    },
+    Spec {
         name: "run",
         usage: "<id> [dry]",
         help: "executes one roadmap task on the badge model; dry prints what it would send and calls nothing",
     },
     Spec { name: "reassess", usage: "<id>", help: "the model revises the objective and acceptance of one node" },
-    Spec { name: "reassess-tree", usage: "<id>", help: "reassess for the node and its whole subtree" },
+    Spec {
+        name: "reassess-tree",
+        usage: "<id>",
+        help: "reassess for the node and its whole subtree; on a milestone it also proposes the cards its objective lacks",
+    },
+    Spec { name: "proposals", usage: "<id>", help: "the cards a reassess-tree proposed under a milestone, waiting for a word" },
+    Spec { name: "accept", usage: "<id> <n>", help: "adds proposal n of the milestone as a task under it" },
+    Spec { name: "decline", usage: "<id> <n>", help: "drops proposal n of the milestone; it is remembered and not proposed again" },
     Spec { name: "final", usage: "<id> [off]", help: "marks a node final, so no reassessment rewrites it; off clears the mark" },
     Spec { name: "seed", usage: "", help: "fills the roadmap with the improvement plan of the agent itself" },
     Spec {
         name: "install",
-        usage: "[dir]",
-        help: "installs this build (rc and rc-gui) into a directory on the path; the running instances keep going",
+        usage: "[dir] [desktop]",
+        help: "installs this build (rc and rc-gui) into a directory on the path; desktop adds a shortcut to the window when there is none",
+    },
+    Spec {
+        name: "note",
+        usage: "<text>",
+        help: "an observation of yours for the next runs: what slowed one, a quirk, a direction; the workers read the latest",
+    },
+    Spec {
+        name: "filter",
+        usage: "[state...]",
+        help: "hides the tasks in those states from the tree, and the structure left empty; no state shows everything again",
+    },
+    Spec {
+        name: "log",
+        usage: "[id]",
+        help: "saves the full stream of the last run, or of the last run of card id, from the activity log and the harness's events to var/runs/<id>-<time>.log",
     },
     Spec { name: "clear", usage: "", help: "clears the log view" },
     Spec { name: "debug", usage: "", help: "toggles the trace lines in the log; the file copy always runs" },
@@ -74,6 +112,11 @@ pub enum Outcome {
     ToggleDebug,
     /// The console turns the complexity budgets on or off: `budgets` set it.
     Budgets(bool),
+    /// The lines fold under their first one, a header, until the person opens them: `context`
+    /// printed a whole file.
+    Fold,
+    /// The tree hides the tasks in these states: `filter` named them; empty shows everything.
+    Filter(Vec<TaskState>),
 }
 
 /// Command names that start with `prefix`.
@@ -81,13 +124,90 @@ pub fn complete(prefix: &str) -> Vec<&'static str> {
     COMMANDS.iter().map(|c| c.name).filter(|n| n.starts_with(prefix)).collect()
 }
 
+/// What Tab makes of a line.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Completion {
+    /// Nothing matches what is typed.
+    None,
+    /// One match: the line to put in place of the typed one, ending in a space.
+    Line(String),
+    /// Several matches, to show under the prompt.
+    Choices(Vec<String>),
+}
+
+/// Completes the word under the cursor of a console line: a command name on the first word; a
+/// card id on the first argument of a command that takes one, from the id typed so far or from
+/// the words of a title (`run key` finds the one card whose title contains "key"); a state on
+/// the second argument of `set`. The leading `/` or `.` stays as typed.
+pub fn complete_line(line: &str, nodes: &[Node]) -> Completion {
+    let (mark, text) = match line.strip_prefix('/') {
+        Some(rest) => ("/", rest),
+        None => match line.strip_prefix('.') {
+            Some(rest) => (".", rest),
+            None => ("", line),
+        },
+    };
+    let Some((name, rest)) = text.split_once(char::is_whitespace) else {
+        return match complete(text).as_slice() {
+            [] => Completion::None,
+            [one] => Completion::Line(format!("{mark}{one} ")),
+            many => Completion::Choices(many.iter().map(|&n| n.to_owned()).collect()),
+        };
+    };
+    let Some(spec) = COMMANDS.iter().find(|c| c.name == name) else {
+        return Completion::None;
+    };
+    if !(spec.usage.starts_with("<id>") || spec.usage.starts_with("[id]")) {
+        return Completion::None;
+    }
+    let rest = rest.trim_start();
+    let first = rest.split_whitespace().next().unwrap_or_default();
+    if first.parse::<i64>().is_ok() && rest.len() > first.len() {
+        // the id is in place; only `set` has a word to complete after it
+        if name != "set" {
+            return Completion::None;
+        }
+        let typed = rest[first.len()..].trim_start();
+        let states: Vec<&str> = TaskState::ALL.iter().map(|s| s.serde_name()).filter(|s| s.starts_with(typed)).collect();
+        return match states.as_slice() {
+            [] => Completion::None,
+            [one] => Completion::Line(format!("{mark}{name} {first} {one} ")),
+            many => Completion::Choices(many.iter().map(|&s| s.to_owned()).collect()),
+        };
+    }
+    let query = rest.trim_end();
+    if query.is_empty() {
+        return Completion::None;
+    }
+    let lower = query.to_lowercase();
+    let found: Vec<&Node> =
+        nodes.iter().filter(|n| n.id.to_string().starts_with(query) || n.title.to_lowercase().contains(&lower)).collect();
+    match found.as_slice() {
+        [] => Completion::None,
+        [one] => Completion::Line(format!("{mark}{name} {} ", one.id)),
+        many => Completion::Choices(many.iter().map(|n| format!("#{} {}", n.id, n.title)).collect()),
+    }
+}
+
 /// Runs one line against the store; the lines to show, or an error to show. `worker` holds the
 /// badge model and the provider, which `ping`, `run` and the reassessments talk to.
 pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(Vec<String>, Outcome)> {
-    let line = line.trim().trim_start_matches(['/', '.']);
+    let raw = line.trim();
+    let mut out = Vec::new();
+    if raw.is_empty() {
+        return Ok((out, Outcome::Continue));
+    }
+    // a command starts with a slash; anything else typed is a note for the next runs, the
+    // person's own look back, kept with the workers' ("stop after this task" once closed the
+    // window as a command)
+    let Some(line) = raw.strip_prefix('/').or_else(|| raw.strip_prefix('.')) else {
+        crate::retro::record_pair(&agent::workspace_of(store), raw)?;
+        out.push("noted; the next runs read it · a command starts with /".to_owned());
+        return Ok((out, Outcome::Continue));
+    };
+    let line = line.trim_start();
     let (name, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let args = rest.trim();
-    let mut out = Vec::new();
     match name.to_ascii_lowercase().as_str() {
         "" => {}
         "help" | "?" => {
@@ -145,6 +265,34 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             anyhow::ensure!(kind == NodeKind::Project || parent.is_some(), "a node below a project needs parent <id>");
             let id = store.insert(parent, kind, title, None, None, 3).await?;
             out.push(format!("#{id} {title}"));
+        }
+        "edit" => {
+            const USAGE: &str = "usage: edit <id> <title|objective|acceptance|complexity|files|session> <text>";
+            let (id_text, rest) = args.split_once(char::is_whitespace).context(USAGE)?;
+            let id = id_text.parse::<i64>().context("the id is a node id")?;
+            let (field, text) = rest.trim().split_once(char::is_whitespace).unwrap_or((rest.trim(), ""));
+            let text = text.trim();
+            let files: Vec<String>;
+            let mut edit = Edit::default();
+            match field.to_ascii_lowercase().as_str() {
+                "title" => edit.title = Some(text),
+                "objective" => edit.objective = Some(text),
+                "acceptance" => edit.acceptance = Some(text),
+                "complexity" => edit.complexity = Some(text.parse().context("complexity is 1 to 5")?),
+                "files" => {
+                    // a path is stored with forward slashes, so the file reads the same on every platform
+                    files = text.split_whitespace().map(|p| p.replace('\\', "/")).collect();
+                    edit.files = Some(&files);
+                }
+                "session" => {
+                    anyhow::ensure!(text == "clear", "usage: edit <id> session clear");
+                    edit.clear_session = true;
+                }
+                _ => anyhow::bail!("{USAGE}"),
+            }
+            anyhow::ensure!(field == "session" || field == "files" || !text.is_empty(), "{USAGE}");
+            store.edit(id, &edit).await?;
+            out.push(if edit.clear_session { format!("#{id} forgets its session") } else { format!("#{id} {field} rewritten") });
         }
         "depend" => {
             let mut ids = args.split_whitespace().map(str::parse::<i64>);
@@ -252,30 +400,81 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             let id = args.parse::<i64>().context(format!("usage: {name} <id>"))?;
             return Ok((agent::reassess(store, id, worker, name == "reassess-tree").await?, Outcome::Continue));
         }
+        "proposals" => {
+            let id = args.parse::<i64>().context("usage: proposals <id>")?;
+            let proposals = agent::proposals_of(store, id);
+            if proposals.is_empty() {
+                out.push(format!("no proposals wait on #{id}; a reassess-tree of a milestone makes them"));
+            } else {
+                out.extend(agent::proposal_lines(id, &proposals));
+            }
+        }
+        "accept" | "decline" => {
+            let usage = format!("usage: {name} <id> <n>");
+            let (id_text, n_text) = args.split_once(char::is_whitespace).context(usage.clone())?;
+            let id = id_text.parse::<i64>().context(usage.clone())?;
+            let n = n_text.trim().parse::<usize>().context(usage)?;
+            let lines =
+                if name == "accept" { agent::accept_proposal(store, id, n).await? } else { agent::decline_proposal(store, id, n).await? };
+            return Ok((lines, Outcome::Continue));
+        }
         "final" => {
             let (id_text, flag) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
             let id = id_text.parse::<i64>().context("usage: final <id> [off]")?;
+            // the declined proposals on the line stay either way
+            let node = store.read(id).await?;
             match flag.trim() {
                 "" => {
-                    store.set_assessed(id, Some(ra_roadmap::model::FINAL)).await?;
+                    store.set_assessed(id, agent::assessed_line(&node, Some(ra_roadmap::model::FINAL)).as_deref()).await?;
                     out.push(format!("#{id} is final: no reassessment rewrites it"));
                 }
                 "off" => {
                     // clearing the mark drops the fingerprint too, so the next reassessment calls
-                    store.set_assessed(id, None).await?;
+                    store.set_assessed(id, agent::assessed_line(&node, None).as_deref()).await?;
                     out.push(format!("#{id} is no longer final"));
                 }
                 _ => anyhow::bail!("usage: final <id> [off]"),
             }
         }
         "install" => {
-            let dir = (!args.is_empty()).then(|| std::path::PathBuf::from(args));
+            // `install [dir] [desktop]`: the word desktop adds the shortcut, anything else is the directory
+            let words: Vec<&str> = args.split_whitespace().collect();
+            let desktop = words.iter().any(|w| w.eq_ignore_ascii_case("desktop"));
+            let dir = words.iter().find(|w| !w.eq_ignore_ascii_case("desktop")).map(std::path::PathBuf::from);
             out.extend(crate::install::install(dir.as_deref())?);
+            if desktop {
+                let dir = dir.unwrap_or_else(crate::install::default_dir);
+                out.push(crate::install::desktop_shortcut(&dir, &agent::workspace_of(store)));
+            }
+        }
+        "note" => {
+            crate::retro::record_pair(&agent::workspace_of(store), args)?;
+            out.push("noted; the next runs read it with the workers' own look-backs".to_owned());
+        }
+        "log" => {
+            let id = if args.is_empty() { None } else { Some(args.parse::<i64>().context("usage: log [id]")?) };
+            let saved = save_run_log(&agent::workspace_of(store), id)?;
+            out.push(format!(
+                "#{} · {} lines{} · {}",
+                saved.id,
+                saved.lines,
+                if saved.events { "" } else { " · no harness events: the stream kept is a newer run's" },
+                saved.path.display()
+            ));
         }
         "clear" | "cls" => return Ok((out, Outcome::Clear)),
         "debug" => {
             anyhow::ensure!(args.is_empty(), "usage: debug");
             return Ok((out, Outcome::ToggleDebug));
+        }
+        "filter" => {
+            let states = args.split_whitespace().map(str::parse::<TaskState>).collect::<Result<Vec<_>, _>>()?;
+            out.push(if states.is_empty() {
+                "filter cleared: the tree shows every card".to_owned()
+            } else {
+                format!("the tree hides {}", states.iter().map(|s| s.serde_name()).collect::<Vec<_>>().join(", "))
+            });
+            return Ok((out, Outcome::Filter(states)));
         }
         "model" => {
             anyhow::ensure!(!args.is_empty(), "usage: model <id>, such as claude-opus-5-5, local/qwen3 or z-ai/glm-5.3-flash");
@@ -302,10 +501,157 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
                 _ => anyhow::bail!("usage: budgets [on|off]"),
             };
         }
-        "quit" | "exit" | "shutdown" | "stop" => return Ok((out, Outcome::Quit)),
-        other => anyhow::bail!("no command {other}; help lists them"),
+        "context" => {
+            // the header names what follows and how long it is; the body is the text, line by line
+            let (what, text) = if let Ok(id) = args.parse::<i64>() {
+                (format!("context #{id}"), agent::context_preview(store, id).await?)
+            } else {
+                anyhow::ensure!(args.is_empty(), "usage: context [id]");
+                let text = agent::project_context(store);
+                anyhow::ensure!(!text.is_empty(), "no {} beside the roadmap yet; a run drafts it", agent::PROJECT_FILE);
+                (agent::PROJECT_FILE.to_owned(), text)
+            };
+            let body: Vec<String> = text.trim_end().lines().map(str::to_owned).collect();
+            out.push(format!("{what} · {} lines", body.len()));
+            out.extend(body);
+            return Ok((out, Outcome::Fold));
+        }
+        "usage" => {
+            let nodes = store.all().await?;
+            let root = if let Ok(id) = args.parse::<i64>() {
+                anyhow::ensure!(nodes.iter().any(|n| n.id == id), "no node {id}");
+                id
+            } else {
+                anyhow::ensure!(args.is_empty(), "usage: usage [id]");
+                nodes.first().context("the roadmap is empty")?.id
+            };
+            let by_node = worker.by_node().await.context("no usage ledger is open")?;
+            let rows = usage_by_card(&nodes, root, &by_node);
+            if rows.is_empty() {
+                out.push("the ledger is empty: no completion has run yet".into());
+            }
+            // one line per card, so the log gives each its own lane color
+            for (node, t) in rows {
+                let cost = t.cost_usd.map_or_else(|| "—".to_owned(), |c| format!("${c:.4}"));
+                out.push(match node {
+                    Some(node) => format!(
+                        "{}#{} {} · {} calls · {} turns · {} in · {} out · {} cached · {cost}",
+                        "  ".repeat(tree::depth(&nodes, node.id)),
+                        node.id,
+                        node.title,
+                        t.calls,
+                        t.turns,
+                        t.prompt_tokens,
+                        t.completion_tokens,
+                        t.cached_tokens
+                    ),
+                    None => format!(
+                        "outside any card · {} calls · {} turns · {} in · {} out · {} cached · {cost}",
+                        t.calls, t.turns, t.prompt_tokens, t.completion_tokens, t.cached_tokens
+                    ),
+                });
+            }
+        }
+        // the whole line, or nothing: `stop after this task` once closed the window
+        "quit" | "exit" | "shutdown" if args.is_empty() => return Ok((out, Outcome::Quit)),
+        "quit" | "exit" | "shutdown" => anyhow::bail!("`{name}` takes no words; `stop` asks the walk to stop after the current task"),
+        "stop" => {
+            out.push(agent::stop_walk(&agent::workspace_of(store)));
+        }
+        other => anyhow::bail!("no command /{other}; /help lists them"),
     }
     Ok((out, Outcome::Continue))
+}
+
+/// One run cut out of the activity log: from its start marker to its end marker, or to the end
+/// of the log when it is still going.
+#[derive(Debug, PartialEq, Eq)]
+struct RunBlock {
+    /// The card the run was of.
+    id: i64,
+    /// The index of the start marker in the log, so the newest run is known from any other.
+    start: usize,
+    /// The progress lines, markers included.
+    lines: Vec<String>,
+}
+
+/// The last run in the activity text, or the last run of card `id`; none when no such run started.
+fn last_run_of(activity: &str, id: Option<i64>) -> Option<RunBlock> {
+    let lines: Vec<&str> = activity.lines().collect();
+    let card_of = |line: &str| -> Option<i64> {
+        let rest = line.strip_prefix(crate::logs::RUN_START)?.strip_prefix('#')?;
+        rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    };
+    let start = lines.iter().rposition(|line| card_of(line).is_some_and(|card| id.is_none_or(|id| id == card)))?;
+    let end = lines[start..].iter().position(|line| line.starts_with(crate::logs::RUN_END)).map_or(lines.len(), |i| start + i + 1);
+    Some(RunBlock { id: card_of(lines[start])?, start, lines: lines[start..end].iter().map(|l| (*l).to_owned()).collect() })
+}
+
+/// What `log` wrote: the card, the file, how many progress lines, and whether the harness's
+/// events went with them.
+struct SavedLog {
+    id: i64,
+    path: std::path::PathBuf,
+    lines: usize,
+    events: bool,
+}
+
+/// Writes the last run under `root`, or the last run of card `id`, to `var/runs/<id>-<time>.log`:
+/// its progress lines from the activity log, then the harness's event stream when that stream
+/// is this run's; the stream kept is only the newest run's.
+fn save_run_log(root: &std::path::Path, id: Option<i64>) -> anyhow::Result<SavedLog> {
+    let activity = std::fs::read_to_string(root.join(crate::ui::ACTIVITY_FILE)).unwrap_or_default();
+    let run = last_run_of(&activity, id).with_context(|| match id {
+        Some(id) => format!("no run of #{id} in {}; the console's own runs are not in it", crate::ui::ACTIVITY_FILE),
+        None => format!("no run in {}; the console's own runs are not in it", crate::ui::ACTIVITY_FILE),
+    })?;
+    let newest = last_run_of(&activity, None).is_some_and(|n| n.start == run.start);
+    let stream =
+        if newest { std::fs::read_to_string(root.join(ra_providers::claude_code::STREAM_FILE)).unwrap_or_default() } else { String::new() };
+    let mut text = run.lines.join("\n");
+    text.push('\n');
+    if !stream.is_empty() {
+        text.push_str("\n--- harness events ---\n");
+        text.push_str(&stream);
+    }
+    let dir = root.join("var/runs");
+    std::fs::create_dir_all(&dir)?;
+    let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let path = dir.join(format!("{}-{when}.log", run.id));
+    std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(SavedLog { id: run.id, path, lines: run.lines.len(), events: !stream.is_empty() })
+}
+
+/// The ledger by card under `root`: every node of its subtree whose own subtree has calls, in
+/// tree order, with the sums of that subtree (a milestone is its cards, the project the total),
+/// as the window's ledger tab reads it. The project also takes the calls booked to a node the
+/// roadmap lost; the calls that served no node close the list when `root` is the project.
+fn usage_by_card<'a>(nodes: &'a [Node], root: i64, by_node: &[(Option<i64>, Totals)]) -> Vec<(Option<&'a Node>, Totals)> {
+    let own = |id: i64| by_node.iter().find(|(n, _)| *n == Some(id)).map(|(_, t)| *t);
+    let mut rows: Vec<(Option<&Node>, Totals)> = Vec::new();
+    for node in tree::subtree(nodes, root) {
+        let mut sum = Totals::default();
+        for member in tree::subtree(nodes, node.id) {
+            if let Some(t) = own(member.id) {
+                sum.merge(&t);
+            }
+        }
+        if node.kind == NodeKind::Project {
+            for (id, t) in by_node {
+                if id.is_some_and(|id| !nodes.iter().any(|n| n.id == id)) {
+                    sum.merge(t);
+                }
+            }
+        }
+        if sum.calls > 0 {
+            rows.push((Some(node), sum));
+        }
+    }
+    let at_root = nodes.iter().any(|n| n.id == root && n.kind == NodeKind::Project);
+    if at_root && let Some((_, t)) = by_node.iter().find(|(n, _)| n.is_none()) {
+        rows.push((None, *t));
+    }
+    rows
 }
 
 /// Plants the improvement roadmap of the agent itself under the first project, as milestone,

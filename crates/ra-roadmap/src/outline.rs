@@ -16,7 +16,9 @@
 //! ```
 //!
 //! `{cN}` is the complexity, 3 unless said; `[done]` marks an item accepted already. A field
-//! line belongs to the item above it. Lines that are none of these are prose and stay out.
+//! line belongs to the item above it; `accept:` reads as `acceptance:`. An indented line with
+//! no field name is the objective of the item above it, so a plain outline needs no field names
+//! at all. Lines that are none of these are prose and stay out.
 
 use anyhow::Context;
 
@@ -55,6 +57,42 @@ impl Outline {
             }
         }
         parts.join(", ")
+    }
+
+    /// The items as an import would nest them, one line each, indented by depth, with the
+    /// objective and the acceptance beneath: what `rc import --dry` prints.
+    pub fn preview(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        // the depth of the last milestone, section and task, as the import nests
+        let (mut section, mut task) = (None, None);
+        for item in &self.items {
+            let depth = match item.kind {
+                NodeKind::Project | NodeKind::Milestone => 0,
+                NodeKind::Section => 1,
+                NodeKind::Task => section.map_or(1, |d| d + 1),
+                NodeKind::Subtask => task.or(section).map_or(1, |d| d + 1),
+            };
+            match item.kind {
+                NodeKind::Project | NodeKind::Milestone => (section, task) = (None, None),
+                NodeKind::Section => (section, task) = (Some(depth), None),
+                NodeKind::Task => task = Some(depth),
+                NodeKind::Subtask => {}
+            }
+            let pad = "  ".repeat(depth);
+            let kind = if item.kind == NodeKind::Project { NodeKind::Milestone } else { item.kind };
+            let done = if item.done { " [accepted]" } else { "" };
+            lines.push(format!("{pad}{kind} {} {{c{}}}{done}", item.title, item.complexity));
+            if let Some(objective) = &item.objective {
+                lines.push(format!("{pad}    objective: {objective}"));
+            }
+            if let Some(acceptance) = &item.acceptance {
+                lines.push(format!("{pad}    acceptance: {acceptance}"));
+            }
+            if !item.files.is_empty() {
+                lines.push(format!("{pad}    files: {}", item.files.join(" ")));
+            }
+        }
+        lines
     }
 }
 
@@ -95,14 +133,28 @@ pub fn parse(text: &str) -> anyhow::Result<Outline> {
             continue;
         }
         if let Some((field, value)) = trimmed.split_once(':')
-            && matches!(field.trim().to_ascii_lowercase().as_str(), "objective" | "acceptance" | "files")
+            && matches!(field.trim().to_ascii_lowercase().as_str(), "objective" | "acceptance" | "accept" | "files")
         {
             let item = outline.items.last_mut().with_context(|| format!("line {number}: a field with no item above it"))?;
             let value = value.trim();
             match field.trim().to_ascii_lowercase().as_str() {
                 "objective" => item.objective = Some(value.to_owned()),
-                "acceptance" => item.acceptance = Some(value.to_owned()),
+                "acceptance" | "accept" => item.acceptance = Some(value.to_owned()),
                 _ => item.files = value.split_whitespace().map(|f| f.trim_matches('`').to_owned()).collect(),
+            }
+            continue;
+        }
+        // an indented line under an item is its objective, several lines joining as one; a line
+        // at the margin is prose
+        if indent > 0
+            && let Some(item) = outline.items.last_mut()
+        {
+            match &mut item.objective {
+                Some(objective) => {
+                    objective.push(' ');
+                    objective.push_str(trimmed);
+                }
+                None => item.objective = Some(trimmed.to_owned()),
             }
         }
     }

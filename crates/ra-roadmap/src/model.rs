@@ -290,9 +290,86 @@ pub struct Node {
     /// The notes of the last execution: findings, blockers, results.
     pub notes: Option<String>,
     /// What the last reassessment saw: the word [`FINAL`], which no reassessment rewrites, or a
-    /// 16-hex-digit fingerprint of the inputs it judged, so an unchanged node costs no call.
+    /// 16-hex-digit fingerprint of the inputs it judged, so an unchanged node costs no call. The
+    /// words after it, each `-` and a 16-hex-digit hash of a title, are the cards the person
+    /// declined when a reassessment proposed them, so they do not return.
     #[serde(default)]
     pub assessed: Option<String>,
+    /// The person's priority on the card, 1..=5, apart from its complexity: the walk takes a
+    /// higher one first. `None` leaves the order to the file and the gambits.
+    #[serde(default)]
+    pub priority: Option<u8>,
+}
+
+/// The range a priority and a gambit's weight share.
+pub const WEIGHT_RANGE: std::ops::RangeInclusive<u8> = 1..=5;
+
+/// The state of a gambit: active ones steer, a parked one waits, a done one stays in the file as
+/// a record of the direction taken.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GambitState {
+    #[default]
+    Active,
+    Parked,
+    Done,
+}
+
+impl GambitState {
+    /// Every state, in the order of a gambit's life.
+    pub const ALL: [Self; 3] = [Self::Active, Self::Parked, Self::Done];
+
+    /// The name the store persists.
+    #[must_use]
+    pub fn serde_name(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Parked => "parked",
+            Self::Done => "done",
+        }
+    }
+}
+
+impl std::fmt::Display for GambitState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.serde_name())
+    }
+}
+
+impl std::str::FromStr for GambitState {
+    type Err = anyhow::Error;
+
+    /// The state of its name; the error lists the names.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|state| state.serde_name() == text.trim().to_ascii_lowercase())
+            .ok_or_else(|| anyhow::anyhow!("unknown gambit state {}; the state is {}", text.trim(), name_list(&Self::ALL)))
+    }
+}
+
+/// A gambit: one line of the person's standing direction, with the weight it carries in the
+/// walk and the words a card matches on. The file writes it as `- g1 ‹gambit› text {w3} [active]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gambit {
+    /// The number after the `g`; the gambits count apart from the nodes.
+    pub id: u32,
+    pub text: String,
+    /// The weight 1..=5: how far the gambit moves a card that matches its focus.
+    pub weight: u8,
+    pub state: GambitState,
+    /// The words a card matches on, in its title, its milestone's title or its files; empty
+    /// matches every card.
+    #[serde(default)]
+    pub focus: Vec<String>,
+}
+
+/// What a `rhipper.md` holds: the gambits first, then the tree.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Roadmap {
+    #[serde(default)]
+    pub gambits: Vec<Gambit>,
+    pub nodes: Vec<Node>,
 }
 
 /// The `assessed` mark of a node no reassessment rewrites.
@@ -301,6 +378,6 @@ pub const FINAL: &str = "final";
 impl Node {
     /// Whether the node is marked final: reassessment leaves it alone.
     pub fn is_final(&self) -> bool {
-        self.assessed.as_deref() == Some(FINAL)
+        self.assessed.as_deref().is_some_and(|a| a.split_whitespace().next() == Some(FINAL))
     }
 }

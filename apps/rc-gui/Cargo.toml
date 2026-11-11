@@ -21,9 +21,12 @@ egui = "0.37"
 egui_extras = { version = "0.37", features = ["svg"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ra-console.workspace = true
+ra-context.workspace = true
 ra-gotchas.workspace = true
 ra-providers.workspace = true
 ra-roadmap.workspace = true
 ra-usage.workspace = true
+serde.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true

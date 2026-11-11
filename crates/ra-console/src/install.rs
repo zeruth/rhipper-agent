@@ -130,6 +130,37 @@ fn on_path(dir: &Path) -> String {
     }
 }
 
+/// Puts a shortcut to the installed window on the desktop when there is none: `Rhipper
+/// Agent.lnk`, opening `project` as the working directory, so the window starts on this
+/// project. Says what it did, or why not.
+pub fn desktop_shortcut(dir: &Path, project: &Path) -> String {
+    if !cfg!(windows) {
+        return "a desktop shortcut is a Windows thing; put a launcher of your own on the path".to_owned();
+    }
+    let target = dir.join(format!("rc-gui{}", std::env::consts::EXE_SUFFIX));
+    let project =
+        std::fs::canonicalize(project).map_or_else(|_| project.display().to_string(), |p| p.display().to_string().replace("\\\\?\\", ""));
+    // the desktop as Windows resolves it (a OneDrive desktop is not under the profile), and the
+    // shortcut through the shell object: no crate, one PowerShell start, only when it is missing
+    let script = format!(
+        "$desktop = [Environment]::GetFolderPath('Desktop'); $path = Join-Path $desktop 'Rhipper Agent.lnk'; if (Test-Path $path) {{ 'present ' + $path }} else {{ $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path); $s.TargetPath = '{0}'; $s.WorkingDirectory = '{1}'; $s.IconLocation = '{0},0'; $s.Description = 'Rhipper Agent, the workspace'; $s.Save(); 'added ' + $path }}",
+        target.display(),
+        project
+    );
+    match std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output() {
+        Ok(out) if out.status.success() => {
+            let said = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            match said.split_once(' ') {
+                Some(("added", path)) => format!("desktop shortcut added: {path} → {} in {project}", target.display()),
+                Some(("present", path)) => format!("desktop shortcut already there: {path}"),
+                _ => format!("desktop shortcut: {said}"),
+            }
+        }
+        Ok(out) => format!("no desktop shortcut: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        Err(e) => format!("no desktop shortcut: {e}"),
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }

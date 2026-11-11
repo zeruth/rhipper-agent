@@ -30,6 +30,36 @@ fn serve_capturing(status_line: &'static str, body: &'static str) -> (String, st
     (format!("http://127.0.0.1:{port}"), receiver)
 }
 
+/// A server that answers by path: `routes` pairs a path with the body it returns, every other
+/// path gets a 404 with an OpenAI-shaped error. It serves until the test ends.
+fn serve_routes(routes: Vec<(&'static str, &'static str)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut socket in listener.incoming().flatten() {
+            let mut buffer = [0u8; 4096];
+            let read = socket.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            let path = request.split_whitespace().nth(1).unwrap_or("");
+            let (status_line, body) = routes
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map_or(("HTTP/1.1 404 Not Found", r#"{"error":{"message":"model 'local/x' not found"}}"#), |(_, body)| {
+                    ("HTTP/1.1 200 OK", *body)
+                });
+            let response = format!(
+                "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+        }
+    });
+    format!("http://127.0.0.1:{port}/v1")
+}
+
+/// The model list a llama.cpp or Ollama server answers on `GET /v1/models`.
+const TWO_MODELS: &str = r#"{"object":"list","data":[{"id":"qwen3-8b","object":"model"},{"id":"llama-3.2-3b","object":"model"}]}"#;
+
 /// A URL on 127.0.0.1 with nothing listening: the port of a listener that was just dropped.
 fn closed_port() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -159,6 +189,45 @@ async fn nothing_listening_is_unreachable_and_names_the_url() {
     let error = provider.complete(request()).await.unwrap_err();
     assert!(matches!(error, ProviderError::Unavailable(_)), "{error}");
     assert!(format!("{error}").contains(&format!("{base}/chat/completions")), "{error}");
+}
+
+#[tokio::test]
+async fn a_local_server_lists_its_models() {
+    let base = serve_routes(vec![("/v1/models", TWO_MODELS)]);
+    let models = OpenRouter::at(&base, "").unwrap().models().await.unwrap();
+    assert_eq!(models, ["qwen3-8b", "llama-3.2-3b"]);
+}
+
+#[tokio::test]
+async fn an_unknown_model_on_a_local_server_names_what_it_offers() {
+    let base = serve_routes(vec![("/v1/models", TWO_MODELS)]);
+    let provider = OpenRouter::at(&base, "").unwrap();
+    let mut request = request();
+    request.model = "local/x".to_owned();
+    let error = provider.complete(request).await.unwrap_err();
+    assert!(matches!(error, ProviderError::UnknownModel(_)), "{error}");
+    let text = format!("{error}");
+    assert!(text.contains("not found"), "{text}");
+    assert!(text.contains(&format!("the server at {base} offers: qwen3-8b, llama-3.2-3b")), "{text}");
+}
+
+#[tokio::test]
+async fn an_unknown_model_on_openrouter_lists_nothing() {
+    // the public list runs to hundreds of ids; only a local server's is named
+    let base = serve_routes(vec![("/v1/models", TWO_MODELS)]);
+    let error = OpenRouter::at(&base, "sk-or-test").unwrap().complete(request()).await.unwrap_err();
+    assert!(matches!(error, ProviderError::UnknownModel(_)), "{error}");
+    assert!(!format!("{error}").contains("offers"), "{error}");
+}
+
+#[tokio::test]
+async fn the_probe_goes_green_with_a_server_up_and_red_with_none() {
+    let probe = LocalProbe::default();
+    assert_eq!(probe.up(), None, "unprobed at first");
+    probe.clone().probe(&serve_routes(vec![("/v1/models", TWO_MODELS)])).await;
+    assert_eq!(probe.up(), Some(true));
+    probe.clone().probe(&closed_port()).await;
+    assert_eq!(probe.up(), Some(false));
 }
 
 #[test]

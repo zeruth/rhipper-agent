@@ -24,8 +24,22 @@ commit, accept, and keep the window good. The agent in turn reads what you tell 
 | Ledger, plan limits | `var/usage.db`, `var/limits.json` |
 | Installed binaries | `%LOCALAPPDATA%\Programs\rhipper\{rc,rc-gui}.exe` (on PATH); desktop shortcut `Rhipper Agent.lnk` |
 
-Everything under `var/` is per project; two projects run two windows at once. One window or
-console per project: a newcomer in the same directory replaces the other.
+Everything under `var/` is per project. **One window on the machine hosts every project as a
+tab** (Chrome-style strip at the top: name, a dot that burns while a run goes, ×, `+` for a
+path; Ctrl+Tab / Ctrl+1..9 switch). The window holds `%LOCALAPPDATA%\rhipper\agent\gui.lock`;
+its list of open projects is `open.txt` beside it, and a start with no arguments brings them
+back; `open\*.txt` beside them is the mailbox `rc open` drops a path into.
+
+**Open a project from a session**: `rc open <dir>` (or `rc open .`). It hands the directory to
+the running window, which opens it as a tab (or brings the tab to the front), or starts the
+installed `rc-gui` from `%LOCALAPPDATA%\Programs\rhipper` when none is running — on last
+session's tabs plus this one. Never start `rc-gui.exe` yourself for this and never look for a
+second window: there is one. The **dashboard** tab at the left of the strip shows every
+project's running card (or next ready cards) and its latest run, on one page.
+
+Within a project, one instance at a time: a console or a window's tab claims
+`var/console.pid`; `rc stop` in the project directory asks only that one to leave (a window
+closes the tab, not itself).
 
 ## The link: arm it first
 
@@ -54,13 +68,19 @@ ended (then do the pass), a note the person left. `rc pair` prints the last twen
    `#[must_use]`, `format!` appends, collapsible ifs): fix them yourself, it is cheaper than a
    second run.
 4. **Test**: `cargo test --workspace -q`.
-5. **Build + install + relaunch**: `cargo build -q -p rc -p rc-gui; .\target\debug\rc.exe install`
-   then close **this project's** window with `rc stop` run in the project directory (it asks
-   the window named in `var/console.pid` to quit; never `Get-Process rc-gui | CloseMainWindow`,
-   which closes every project's window on the machine, other sessions' included) and start
-   `%LOCALAPPDATA%\Programs\rhipper\rc-gui.exe` with the project as working directory. The
-   installed binaries never lock `target/`; installing over a running window is fine, and the
-   other projects' windows keep running the old build until their own relaunch.
+5. **Build + install (+ restart)**: `cargo build -q -p rc -p rc-gui; .\target\debug\rc.exe install`.
+   A change to `rc` alone is live at once: runs are child processes of the installed `rc`. A
+   change to the **window's own code** (`apps/rc-gui`, or `ra-console` code the window links)
+   shows after `rc restart`: the one window quits whole and comes back on the new build with
+   the same tabs, the same one in front. It is every session's window, so tell the others first
+   (`ListAgents` + `SendMessage`, "restarting the window in a minute for <change>; your runs
+   continue, your tab comes back") and wait a moment for an objection. Never `Get-Process
+   rc-gui | CloseMainWindow`, `Stop-Process` or `rc stop` in every project to do this: `rc stop`
+   is for leaving one project (its tab comes back next start all the same; the × on the tab
+   is what forgets it). **When**: `rc install` any time a card lands (the next run is on it);
+   `rc restart` only on a **milestone commit** — a phase's cards done and committed together —
+   or when the person asks. Not per card: the window is every session's and a restart
+   interrupts whoever is looking at it.
 6. **Commit** with a message that says the card, the model, the cost line, what the worker did
    and what you fixed (the git log is the review record), with `git commit -F <scratchpad file>`.
 7. **Accept**: `rc set <id> accepted`. Accept a milestone when its cards are.
@@ -129,7 +149,7 @@ you change anything there:
 
 1. **Look**: in the agent repo, `git status --short` (uncommitted work is someone's), the last
    `◆start`/`◆end` in `var/activity.log` (a start without an end is a live worker run),
-   `var/console.pid` (a window or console is open there).
+   `var/console.pid` (the project is a tab of the window, or a console is open there).
 2. **Ask**: `ListAgents`, then `SendMessage` to any session whose working directory is the agent
    repo: what you want to change, which files. Wait for the answer. If no session is listed and
    nothing is live, you are alone; say so in a note (`rc note "<session> taking <files> for
@@ -141,11 +161,27 @@ you change anything there:
 4. **If you edit**: stay on files no live run names (`var/context/<id>.md` of the running card
    lists them), keep the cycle (test, build, `rc install`, commit with the message that says
    why), and tell the session you spoke to when you are done. Never `git stash`, reset or amend
-   another session's work. `rc install` is how every project gets the new build; the running
-   windows keep going and pick it up on their next launch.
+   another session's work. `rc install` is how every project gets the new build: the next
+   `rc run` is on it; the window picks it up when it is restarted (see step 5 of the cycle).
 5. **The reply side**: if a session asks you about the agent repo, answer with what is live,
    what is uncommitted and whether the files they name are safe; agree a handoff or ask them
    to add a card instead.
+
+## A project's own commands and environment
+
+The worker's shell allowlist is the build, the read-only git and the read-only listing commands.
+A project that needs more puts it in its `rhipper.toml` (beside `rhipper.md`, the same file as
+the `[[route]]` rules):
+
+```toml
+[worker]
+allow = ["rhtest", "Bash(ninja *)"]   # a bare name allows `name …` in both shells; a Claude Code rule is taken as is
+[worker.env]
+CARGO_BUILD_JOBS = "6"               # the harness runs with these on top of the agent's own
+```
+
+The extra commands are exempt from the `shell-outside-allowlist` gotcha (the other gotchas still
+apply). The next `rc run` reads it; no restart.
 
 ## Reading the roadmap fast
 

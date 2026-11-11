@@ -3239,9 +3239,11 @@ dependencies = [
  "ra-tools",
  "ra-usage",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3491,11 +3493,14 @@ dependencies = [
  "egui_extras",
  "image",
  "ra-console",
+ "ra-context",
  "ra-gotchas",
  "ra-providers",
  "ra-roadmap",
  "ra-usage",
+ "serde",
  "tokio",
+ "toml",
  "tracing",
 ]
 

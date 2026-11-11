@@ -4,7 +4,8 @@
 
 use egui::epaint::RectShape;
 use egui::{Color32, CornerRadius, Frame, InnerResponse, Margin, Painter, Rect, RichText, Stroke, Ui};
-use ra_roadmap::model::{Node, NodeKind};
+use ra_roadmap::history::{self, Change};
+use ra_roadmap::model::{Node, NodeKind, TaskState};
 
 use crate::theme;
 
@@ -25,8 +26,8 @@ pub(crate) fn sheen(painter: &Painter, rect: Rect, strength: u8) {
     use egui::epaint::{Mesh, Vertex, WHITE_UV};
     let band =
         Rect::from_min_max(rect.left_top() + egui::vec2(10.0, 1.0), egui::pos2(rect.right() - 10.0, rect.top() + rect.height() * 0.45));
-    let top = alpha(Color32::WHITE, strength);
-    let bottom = alpha(Color32::WHITE, 0);
+    let top = alpha(theme::light(), strength);
+    let bottom = alpha(theme::light(), 0);
     let mut mesh = Mesh::default();
     let i = mesh.vertices.len() as u32;
     mesh.vertices.push(Vertex { pos: band.left_top(), uv: WHITE_UV, color: top });
@@ -42,7 +43,7 @@ pub(crate) fn sheen(painter: &Painter, rect: Rect, strength: u8) {
 /// `contents` inside. `lit` makes the glow strong, for the selected or the hovered card.
 pub(crate) fn card<R>(ui: &mut Ui, color: Color32, lit: bool, contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
     let frame = Frame::new()
-        .fill(theme::PANEL)
+        .fill(theme::panel())
         .stroke(Stroke::new(1.0, alpha(color, if lit { 220 } else { 110 })))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(12, 10));
@@ -67,7 +68,7 @@ pub(crate) fn bubble<R>(ui: &mut Ui, color: Color32, lit: bool, contents: impl F
     // dark, with a breath of the lane in it; the outline carries the lane bright, so the depth
     // reads from the colors the way the console's frames do
     let frame = Frame::new()
-        .fill(theme::mix(theme::BG, color, 0.07))
+        .fill(theme::mix(theme::bg(), color, 0.07))
         .stroke(Stroke::new(1.0, alpha(color, if lit { 245 } else { 175 })))
         .corner_radius(CornerRadius::same(9))
         .inner_margin(Margin::symmetric(8, 6))
@@ -107,6 +108,46 @@ pub(crate) fn badge(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
         .response
 }
 
+/// A jewel: a fixed-width tag that is bright in `color` at its left and fades to nothing by its
+/// right edge, the label set in the bright part. Every jewel in a column has the same width,
+/// so the text after them lines up whatever the label's length; the fade is the padding.
+pub(crate) fn jewel(ui: &mut Ui, text: &str, color: Color32, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
+    let painter = ui.painter();
+    fade(painter, rect, color, 120, false);
+    // a bright edge at the left, the facet the light catches
+    painter.rect_filled(Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())), CornerRadius::same(1), alpha(color, 230));
+    painter.text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(11.5),
+        theme::mix(theme::text(), color, 0.35),
+    );
+}
+
+/// A horizontal fade across `rect`: `strength` of `color` at one edge, nothing at the other;
+/// bright at the right with `from_right`, at the left otherwise. The gradient of a jewel, and
+/// of a roadmap row, where the light sits by the state.
+pub(crate) fn fade(painter: &Painter, rect: Rect, color: Color32, strength: u8, from_right: bool) {
+    painter.add(fade_shape(rect, color, strength, from_right));
+}
+
+/// The fade as a shape, for a slot taken before the thing it goes under is drawn.
+pub(crate) fn fade_shape(rect: Rect, color: Color32, strength: u8, from_right: bool) -> egui::Shape {
+    use egui::epaint::{Mesh, Vertex, WHITE_UV};
+    let (bright, gone) = (alpha(color, strength), alpha(color, 0));
+    let (left, right) = if from_right { (gone, bright) } else { (bright, gone) };
+    let mut mesh = Mesh::default();
+    mesh.vertices.push(Vertex { pos: rect.left_top(), uv: WHITE_UV, color: left });
+    mesh.vertices.push(Vertex { pos: rect.right_top(), uv: WHITE_UV, color: right });
+    mesh.vertices.push(Vertex { pos: rect.right_bottom(), uv: WHITE_UV, color: right });
+    mesh.vertices.push(Vertex { pos: rect.left_bottom(), uv: WHITE_UV, color: left });
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    egui::Shape::mesh(mesh)
+}
+
 /// A badge with a mark in front of the text.
 pub(crate) fn badge_marked(ui: &mut Ui, mark: &str, text: &str, color: Color32) -> egui::Response {
     Frame::new()
@@ -118,10 +159,34 @@ pub(crate) fn badge_marked(ui: &mut Ui, mark: &str, text: &str, color: Color32) 
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 ui.label(RichText::new(mark).color(color).small());
-                ui.label(RichText::new(text).color(theme::TEXT).small());
+                ui.label(RichText::new(text).color(theme::text()).small());
             });
         })
         .response
+}
+
+/// A toast: a card the width of a note, the run's name in `color` over its outcome, that
+/// answers a click on its whole face. A failed run's is lit and its outcome reads as an error;
+/// an outcome that counts gotchas reads as a warning.
+pub(crate) fn toast(ui: &mut Ui, name: &str, outcome: &str, color: Color32, failed: bool) -> egui::Response {
+    let tone = if failed {
+        theme::error_text()
+    } else if outcome.contains("gotcha") {
+        theme::warn_text()
+    } else {
+        theme::text()
+    };
+    let response = card(ui, color, failed, |ui| {
+        ui.set_width(320.0);
+        ui.label(RichText::new(name).color(color).strong());
+        ui.label(RichText::new(outcome).color(tone).small());
+    })
+    .response
+    .interact(egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
 }
 
 /// A pill bar: a badge-sized pill filled to `fill` (0 to 1) in `color`, with `text` across it.
@@ -140,8 +205,35 @@ pub(crate) fn pill_bar(ui: &mut Ui, text: &str, fill: f32, color: Color32, pulse
         painter.rect_filled(filled, radius, alpha(color, 110 + pulse / 2));
         sheen(painter, filled, 36);
     }
-    painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(11.0), theme::TEXT);
+    painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(11.0), theme::text());
     response
+}
+
+/// A sparkline of the week: one dot per day, oldest left, joined where days neighbour, over a
+/// faint baseline; a day without a reading leaves a gap. The values run 0 to 1.
+pub(crate) fn sparkline(ui: &mut Ui, days: &[Option<f64>; 7], color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(126.0, 28.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let plot = rect.shrink2(egui::vec2(4.0, 4.0));
+    painter.hline(plot.x_range(), plot.bottom(), Stroke::new(1.0, alpha(color, 60)));
+    let step = plot.width() / 6.0;
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let point = |slot: usize, value: f64| {
+        egui::pos2(plot.left() + step * slot as f32, plot.bottom() - plot.height() * (value as f32).clamp(0.0, 1.0))
+    };
+    let mut previous: Option<egui::Pos2> = None;
+    for (slot, day) in days.iter().enumerate() {
+        let Some(value) = day else {
+            previous = None;
+            continue;
+        };
+        let at = point(slot, *value);
+        if let Some(from) = previous {
+            painter.line_segment([from, at], Stroke::new(1.5, alpha(color, 200)));
+        }
+        painter.circle_filled(at, 2.0, color);
+        previous = Some(at);
+    }
 }
 
 /// A filter chip: a badge that is lit while `on` and dim while off, and reports a click.
@@ -152,7 +244,7 @@ pub(crate) fn chip(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
         .corner_radius(CornerRadius::same(9))
         .inner_margin(Margin::symmetric(8, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).color(if on { color } else { alpha(theme::DIM, 170) }).small().strong());
+            ui.label(RichText::new(text).color(if on { color } else { alpha(theme::dim(), 170) }).small().strong());
         })
         .response
         .interact(egui::Sense::click());
@@ -167,7 +259,7 @@ pub(crate) fn tab(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(12, 4))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).color(if on { color } else { alpha(theme::DIM, 190) }).small().strong());
+            ui.label(RichText::new(text).color(if on { color } else { alpha(theme::dim(), 190) }).small().strong());
         })
         .response
         .interact(egui::Sense::click());
@@ -177,12 +269,12 @@ pub(crate) fn tab(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
 /// The priority of a card as five dots, `complexity` of them lit, warm to hot.
 pub(crate) fn priority(ui: &mut Ui, complexity: u8) -> egui::Response {
     let lit = usize::from(complexity.clamp(1, 5));
-    let hot = theme::mix(theme::WARN_TEXT, theme::ACCENT, (lit as f32 - 1.0) / 4.0);
+    let hot = theme::mix(theme::warn_text(), theme::accent(), (lit as f32 - 1.0) / 4.0);
     let response = ui
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for i in 0..5 {
-                let color = if i < lit { hot } else { alpha(theme::DIM, 90) };
+                let color = if i < lit { hot } else { alpha(theme::dim(), 90) };
                 ui.label(RichText::new("●").color(color).small());
             }
         })
@@ -225,8 +317,9 @@ pub(crate) fn kind_mark(kind: NodeKind) -> &'static str {
 
 /// The rich tooltip of a roadmap card: the title in its lane color, the state and the priority,
 /// the objective, the acceptance, the model, the files and the first line of the notes, each in
-/// its own color, so the card reads at a glance without a click.
-pub(crate) fn tooltip(ui: &mut Ui, node: &Node, lane: Color32) {
+/// its own color, so the card reads at a glance without a click. With its last state change,
+/// who made it and how long the card has sat in its state since, counted from `now`.
+pub(crate) fn tooltip(ui: &mut Ui, node: &Node, lane: Color32, last: Option<&Change>, now: u64) {
     ui.set_max_width(480.0);
     ui.spacing_mut().item_spacing.y = 6.0;
     // the glow fits what the tooltip comes to, not the room it was given: a slot is taken now
@@ -239,45 +332,105 @@ pub(crate) fn tooltip(ui: &mut Ui, node: &Node, lane: Color32) {
     });
     ui.horizontal_wrapped(|ui| {
         badge(ui, &node.state.to_string(), theme::state_color(node.state));
-        ui.label(RichText::new(format!("#{} · {}", node.id, node.kind)).color(theme::DIM).small());
+        ui.label(RichText::new(format!("#{} · {}", node.id, node.kind)).color(theme::dim()).small());
         priority(ui, node.complexity);
         if node.is_final() {
-            badge(ui, "final", theme::WARN);
+            badge(ui, "final", theme::warn());
         }
     });
+    // a change recorded for another state than the card's came before a hand edit of the
+    // file: the age still counts from it, since nothing later is known
+    if let Some(last) = last {
+        let since = history::age(now.saturating_sub(last.at));
+        let text = if last.to == node.state {
+            format!("{} → {} by {} · in {} for {since}", last.from, last.to, last.by, last.to)
+        } else {
+            format!("{} → {} by {} · {since} ago, edited since", last.from, last.to, last.by)
+        };
+        ui.label(RichText::new(text).color(theme::dim()).small());
+    }
     if let Some(objective) = &node.objective {
-        section(ui, "OBJECTIVE", theme::WARN_TEXT);
-        ui.label(RichText::new(objective).color(theme::TEXT));
+        section(ui, "OBJECTIVE", theme::warn_text());
+        ui.label(RichText::new(objective).color(theme::text()));
     }
     if let Some(acceptance) = &node.acceptance {
-        section(ui, "ACCEPTANCE", theme::ONLINE);
-        ui.label(RichText::new(acceptance).color(theme::mix(theme::TEXT, theme::ONLINE, 0.25)));
+        section(ui, "ACCEPTANCE", theme::online());
+        ui.label(RichText::new(acceptance).color(theme::mix(theme::text(), theme::online(), 0.25)));
     }
     let model = node.assignee.as_ref().map_or("badge model", |a| a.model.as_str());
     ui.horizontal_wrapped(|ui| {
-        badge_marked(ui, "◉", model, theme::TRACE);
+        badge_marked(ui, "◉", model, theme::trace());
         if !node.files.is_empty() {
-            badge_marked(ui, "▤", &format!("{} files", node.files.len()), theme::DEBUG);
+            badge_marked(ui, "▤", &format!("{} files", node.files.len()), theme::debug());
         }
         if node.session.is_some() {
-            badge_marked(ui, "↻", "resumes", theme::ONLINE);
+            badge_marked(ui, "↻", "resumes", theme::online());
         }
         if !node.depends_on.is_empty() {
             badge_marked(
                 ui,
                 "⇠",
                 &format!("waits on {}", node.depends_on.iter().map(|d| format!("#{d}")).collect::<Vec<_>>().join(" ")),
-                theme::DIM,
+                theme::dim(),
             );
         }
     });
     if let Some(first) = node.notes.as_deref().and_then(|n| n.lines().find(|l| !l.trim().is_empty())) {
-        section(ui, "NOTES", theme::DIM);
-        ui.label(RichText::new(first.chars().take(240).collect::<String>()).color(theme::DIM).italics());
+        section(ui, "NOTES", theme::dim());
+        ui.label(RichText::new(first.chars().take(240).collect::<String>()).color(theme::dim()).italics());
     }
     // the glow under it, and a bold outline in the lane on top: the tooltip stands over the
     // rows behind it
     let rect = ui.min_rect().expand(6.0);
     painter.set(slot, RectShape::filled(rect.expand(7.0), CornerRadius::same(12), alpha(lane, 60)).with_blur_width(28.0));
     painter.rect_stroke(rect, CornerRadius::same(9), Stroke::new(2.0, alpha(lane, 255)), egui::StrokeKind::Outside);
+}
+
+/// What a row's menu was asked for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowPick {
+    State(TaskState),
+    Run,
+    Reassess,
+    /// Pin the card final, or unpin it when it is.
+    PinFinal,
+    CopyId,
+}
+
+/// The menu a right click opens on a roadmap row: the twelve states, each in its color and the
+/// card's own marked, then the actions the card view offers. The pick closes the menu.
+pub(crate) fn row_menu(ui: &mut Ui, node: &Node) -> Option<RowPick> {
+    ui.set_min_width(160.0);
+    ui.label(RichText::new(format!("#{} · {}", node.id, node.kind)).color(theme::dim()).small());
+    let mut pick = None;
+    for state in TaskState::ALL {
+        let color = theme::state_color(state);
+        let mark = if state == node.state { "●" } else { "○" };
+        let text = RichText::new(format!("{mark}  {state}")).color(if state == node.state {
+            color
+        } else {
+            theme::mix(theme::text(), color, 0.6)
+        });
+        if ui.button(text).clicked() {
+            pick = Some(RowPick::State(state));
+        }
+    }
+    ui.separator();
+    if node.kind != NodeKind::Project && ui.button(RichText::new("▶  run").color(theme::accent())).clicked() {
+        pick = Some(RowPick::Run);
+    }
+    if ui.button(RichText::new("↻  reassess").color(theme::warn_text())).clicked() {
+        pick = Some(RowPick::Reassess);
+    }
+    let pin = if node.is_final() { "⊘  unpin" } else { "⊙  pin final" };
+    if ui.button(RichText::new(pin).color(theme::warn())).clicked() {
+        pick = Some(RowPick::PinFinal);
+    }
+    if ui.button(RichText::new("⎘  copy id").color(theme::dim())).clicked() {
+        pick = Some(RowPick::CopyId);
+    }
+    if pick.is_some() {
+        ui.close();
+    }
+    pick
 }

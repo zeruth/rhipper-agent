@@ -18,6 +18,11 @@ use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvi
 
 /// Where the plan's limits are kept, beside the roadmap.
 pub const LIMITS_FILE: &str = "var/limits.json";
+/// Where every `rate_limit_event` is appended, for the week's history.
+pub const LIMITS_LOG: &str = "var/limits.log";
+/// Where the event stream of the latest workspace run is kept, one JSON line per event, for
+/// the console's `log` to save with the run. A new run replaces it.
+pub const STREAM_FILE: &str = "var/runs/last.jsonl";
 
 /// The built-in tools a worker gets: the files, the search, both shells, the web and the plan.
 /// Not the subagents: one card is one worker's work, and a subagent only multiplies the context
@@ -46,6 +51,8 @@ pub struct ClaudeCode {
     hooks: Option<PathBuf>,
     /// The gotchas the stream is read against, when there is a catalogue.
     catalogue: Option<Catalogue>,
+    /// The environment the harness runs with, on top of this process's own.
+    env: Vec<(String, String)>,
 }
 
 impl Default for ClaudeCode {
@@ -105,7 +112,26 @@ impl ClaudeCode {
             effort: "medium".to_owned(),
             hooks: None,
             catalogue: None,
+            env: Vec::new(),
         }
+    }
+
+    /// More permission rules for the worker, a project's own commands, on top of the defaults.
+    #[must_use]
+    pub fn with_allowed(mut self, rules: impl IntoIterator<Item = String>) -> Self {
+        for rule in rules {
+            if !self.allowed_shell.contains(&rule) {
+                self.allowed_shell.push(rule);
+            }
+        }
+        self
+    }
+
+    /// Environment the harness runs with, a project's `[worker.env]`.
+    #[must_use]
+    pub fn with_env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.env.extend(env);
+        self
     }
 
     /// The effort level: `low`, `medium`, `high`, `xhigh` or `max`.
@@ -203,6 +229,7 @@ impl ClaudeCode {
         }
         // a nested session refuses to start; the console may itself run under Claude Code
         command.env_remove("CLAUDECODE");
+        command.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         let mut child = command.spawn().map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!("{} is not installed or not on the path", self.binary.display()))
@@ -232,9 +259,11 @@ impl ClaudeCode {
         let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         // a console holds the binary while var/console.pid is in the workspace
         let conditions = Conditions { console_running: request.workspace.as_deref().is_some_and(|w| w.join("var/console.pid").exists()) };
+        let mut stream = Stream::open(request.workspace.as_deref());
         if let Some(pipe) = child.stdout.take() {
             let mut lines = tokio::io::BufReader::new(pipe).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                stream.note(&line);
                 for step in progress_of(&line, request.workspace.as_deref()) {
                     tracing::info!(target: "ra::progress", "{step}");
                 }
@@ -265,7 +294,11 @@ impl ClaudeCode {
                 }
                 // the plan's windows, kept for the console and the window to show
                 if let Some(newer) = crate::limits::Limits::from_event(&line) {
-                    let path = request.workspace.clone().unwrap_or_default().join(LIMITS_FILE);
+                    let root = request.workspace.clone().unwrap_or_default();
+                    if let Err(e) = newer.append(&root.join(LIMITS_LOG)) {
+                        tracing::warn!("cannot write the limits log: {e:#}");
+                    }
+                    let path = root.join(LIMITS_FILE);
                     let mut limits = crate::limits::Limits::load(&path);
                     limits.merge(newer);
                     if let Err(e) = limits.save(&path) {
@@ -294,6 +327,39 @@ impl ClaudeCode {
                 let reason = if reason.is_empty() { "no output" } else { reason };
                 Err(ProviderError::Other(format!("claude exited with {status} and no result: {}", snippet(reason))))
             }
+        }
+    }
+}
+
+/// The event stream of a run, written to [`STREAM_FILE`] as it comes, so a run that ends badly
+/// still leaves what the harness said. A chat completion, without a workspace, leaves none.
+struct Stream(Option<std::fs::File>);
+
+impl Stream {
+    /// Opens the stream file under `workspace`, in place of the one before.
+    fn open(workspace: Option<&Path>) -> Self {
+        let file = workspace.and_then(|root| {
+            let path = root.join(STREAM_FILE);
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            match std::fs::File::create(&path) {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    tracing::warn!("cannot keep the run's stream at {}: {e}", path.display());
+                    None
+                }
+            }
+        });
+        Self(file)
+    }
+
+    /// Appends one event line.
+    fn note(&mut self, line: &str) {
+        if let Some(file) = &mut self.0
+            && !line.trim().is_empty()
+        {
+            let _ = std::io::Write::write_all(file, format!("{line}\n").as_bytes());
         }
     }
 }

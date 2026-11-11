@@ -5,7 +5,8 @@
 //!
 //! The worker's notes are a report and then the checks it ran: a `check failed:` line, the
 //! command, and the raw output of the command. The parser knows that shape, lights the check
-//! line in the outcome's color and shows the raw output as a code block.
+//! line in the outcome's color, names the failed tests on it, and folds the raw output under
+//! it as a code block; the rest of the notes stay open.
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Align, Color32, CornerRadius, FontId, Frame, Label, Layout, Margin, RichText, Stroke, TextStyle, TextWrapMode, Ui};
@@ -49,10 +50,11 @@ enum Block {
     Quote(Vec<Inline>),
     /// A horizontal rule.
     Rule,
-    /// A fenced code block, or the raw output after a failed check.
+    /// A fenced code block.
     Code { lang: Option<String>, lines: Vec<String> },
-    /// A `check failed:` or `check passed:` line, with what follows the colon.
-    Check { passed: bool, text: String },
+    /// A `check failed:` or `check passed:` line, with what follows the colon; a failed check
+    /// keeps the raw output that follows it and the names of the tests that failed in it.
+    Check { passed: bool, text: String, output: Vec<String>, failed: Vec<String> },
 }
 
 /// What a line is before it joins a block.
@@ -220,14 +222,10 @@ fn parse(text: &str) -> Vec<Block> {
             Kind::ListItem => blocks.push(Block::List(list(&lines, &mut i))),
             Kind::Check => {
                 let (passed, text) = check(trimmed).unwrap_or((false, trimmed));
-                blocks.push(Block::Check { passed, text: text.to_owned() });
                 i += 1;
-                if !passed {
-                    let raw = raw_output(&lines, &mut i);
-                    if !raw.is_empty() {
-                        blocks.push(Block::Code { lang: None, lines: raw });
-                    }
-                }
+                let output = if passed { Vec::new() } else { raw_output(&lines, &mut i) };
+                let failed = failed_tests(&output);
+                blocks.push(Block::Check { passed, text: text.to_owned(), output, failed });
             }
             Kind::Text => {
                 let mut text = String::new();
@@ -294,6 +292,18 @@ fn raw_output(lines: &[&str], i: &mut usize) -> Vec<String> {
         }
     }
     raw
+}
+
+/// The names of the tests that failed in a check's output: the `test path::name ... FAILED`
+/// lines the runner prints, the last segment of each path.
+fn failed_tests(output: &[String]) -> Vec<String> {
+    output
+        .iter()
+        .filter_map(|line| {
+            let path = line.trim().strip_prefix("test ")?.strip_suffix("... FAILED")?.trim();
+            Some(path.rsplit("::").next().unwrap_or(path).to_owned())
+        })
+        .collect()
 }
 
 /// Splits a line of prose into its inline runs.
@@ -384,7 +394,7 @@ impl Prose {
         let font = TextStyle::Body.resolve(ui.style());
         let mut mono = TextStyle::Monospace.resolve(ui.style());
         mono.size = font.size - 1.0;
-        Self { font, mono, color: theme::TEXT, italics: false }
+        Self { font, mono, color: theme::text(), italics: false }
     }
 
     /// The format of one inline run.
@@ -394,12 +404,12 @@ impl Prose {
             Inline::Text(_) | Inline::Link(_) => {}
             Inline::Code(_) => {
                 format.font_id = self.mono.clone();
-                format.color = theme::mix(self.color, theme::WARN_TEXT, 0.35);
-                format.background = theme::PANEL_RAISED;
+                format.color = theme::mix(self.color, theme::warn_text(), 0.35);
+                format.background = theme::panel_raised();
                 format.expand_bg = 2.0;
             }
             Inline::Bold(_) => {
-                format.color = theme::mix(self.color, Color32::WHITE, 0.5);
+                format.color = theme::mix(self.color, theme::light(), 0.5);
                 format.coords.push(b"wght", 700.0);
             }
             Inline::Italic(_) => format.italics = true,
@@ -440,7 +450,7 @@ fn spans_ui(ui: &mut Ui, spans: &[Inline], prose: &Prose) {
                 if !trimmed.is_empty() {
                     ui.add(Label::new(job(&trimmed, prose)).wrap_mode(TextWrapMode::Wrap));
                 }
-                ui.hyperlink_to(RichText::new(url).font(prose.font.clone()).color(theme::ACCENT), url);
+                ui.hyperlink_to(RichText::new(url).font(prose.font.clone()).color(theme::accent()), url);
             } else {
                 run.push(span.clone());
             }
@@ -562,7 +572,7 @@ fn block_ui(ui: &mut Ui, block: &Block, index: usize, accent: Color32, prose: &P
         }
         Block::Quote(spans) => {
             let mut quote = prose.clone();
-            quote.color = theme::mix(theme::TEXT, theme::DIM, 0.5);
+            quote.color = theme::mix(theme::text(), theme::dim(), 0.5);
             quote.italics = true;
             let response = ui.horizontal(|ui| {
                 ui.add_space(12.0);
@@ -573,21 +583,122 @@ fn block_ui(ui: &mut Ui, block: &Block, index: usize, accent: Color32, prose: &P
             });
             let rect = response.response.rect;
             let x = rect.left() + 3.0;
-            ui.painter().line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], Stroke::new(2.0, theme::RULE));
+            ui.painter().line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], Stroke::new(2.0, theme::rule()));
         }
         Block::Rule => {
             ui.separator();
         }
         Block::Code { lang, lines } => code_ui(ui, lang.as_deref(), lines, index, prose),
-        Block::Check { passed, text } => {
-            let color = if *passed { theme::ONLINE } else { theme::ERROR_TEXT };
+        Block::Check { passed, text, output, failed } => {
+            let color = if *passed { theme::online() } else { theme::error_text() };
             let mut job = LayoutJob::default();
             let mut head = TextFormat::simple(prose.font.clone(), color);
             head.coords.push(b"wght", 700.0);
             job.append(if *passed { "check passed:" } else { "check failed:" }, 0.0, head);
-            job.append(text, 6.0, TextFormat::simple(prose.mono.clone(), theme::TEXT));
-            ui.add(Label::new(job).wrap_mode(TextWrapMode::Wrap));
+            job.append(text, 6.0, TextFormat::simple(prose.mono.clone(), theme::text()));
+            // the failed tests on the header line, so the output can stay folded
+            if !failed.is_empty() {
+                job.append("·", 6.0, TextFormat::simple(prose.font.clone(), theme::dim()));
+                job.append(&failed.join(", "), 6.0, TextFormat::simple(prose.mono.clone(), color));
+            }
+            if output.is_empty() {
+                ui.add(Label::new(job).wrap_mode(TextWrapMode::Wrap));
+            } else {
+                egui::CollapsingHeader::new(job).id_salt(("notes-check", index)).default_open(false).show(ui, |ui| {
+                    code_ui(ui, None, output, index, prose);
+                });
+            }
         }
+    }
+}
+
+/// Draws the diff of one file folded under its name: a line in the color of what it does,
+/// added green, removed red, a hunk header in the debug tint, the file headers dim, the rest
+/// as they are. Returns whether the name was clicked, to open the file beside the card; a
+/// file without lines says so instead of folding nothing.
+pub(crate) fn render_diff(ui: &mut Ui, file: &str, lines: &[String], index: usize) -> bool {
+    let prose = Prose::body(ui);
+    let (added, removed) = lines.iter().fold((0usize, 0usize), |(a, r), line| match diff_tint(line) {
+        DiffLine::Added => (a + 1, r),
+        DiffLine::Removed => (a, r + 1),
+        _ => (a, r),
+    });
+    let mut clicked = false;
+    let header = egui::CollapsingHeader::new(RichText::new(file).strong().color(theme::text()))
+        .id_salt(("diff-file", index))
+        .default_open(true)
+        .show(ui, |ui| {
+            if lines.is_empty() {
+                ui.label(
+                    RichText::new("no change git can show: committed since, or a file git does not know yet").color(theme::dim()).small(),
+                );
+                return;
+            }
+            let mut job = LayoutJob::default();
+            for (n, line) in lines.iter().enumerate() {
+                if n > 0 {
+                    job.append("\n", 0.0, TextFormat::simple(prose.mono.clone(), theme::text()));
+                }
+                let color = match diff_tint(line) {
+                    DiffLine::Added => theme::online(),
+                    DiffLine::Removed => theme::error_text(),
+                    DiffLine::Hunk => theme::debug(),
+                    DiffLine::Header => theme::dim(),
+                    DiffLine::Plain => theme::text(),
+                };
+                job.append(line, 0.0, TextFormat::simple(prose.mono.clone(), color));
+            }
+            Frame::new()
+                .fill(theme::panel())
+                .stroke(Stroke::new(1.0, theme::rule()))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width() - 20.0);
+                    egui::ScrollArea::horizontal().id_salt(("diff-code", index)).auto_shrink([false, true]).show(ui, |ui| {
+                        ui.add(Label::new(job).wrap_mode(TextWrapMode::Extend));
+                    });
+                });
+        });
+    // the counts sit on the header's row, at the right; a double click on the header opens
+    // the file, so a single click keeps folding
+    if header.header_response.double_clicked() {
+        clicked = true;
+    }
+    let counts = header.header_response.rect;
+    let text = format!("+{added} −{removed}");
+    let galley = ui.painter().layout_no_wrap(text, prose.mono.clone(), theme::dim());
+    let pos = egui::pos2(ui.max_rect().right() - galley.size().x - 8.0, counts.center().y - galley.size().y / 2.0);
+    ui.painter().galley(pos, galley, theme::dim());
+    header.header_response.on_hover_text("double-click to open the file beside the card");
+    clicked
+}
+
+/// What a line of a unified diff does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiffLine {
+    Added,
+    Removed,
+    Hunk,
+    Header,
+    Plain,
+}
+
+/// The kind of a line of `git diff`: the file headers before the first hunk count as headers,
+/// not as removed and added lines.
+fn diff_tint(line: &str) -> DiffLine {
+    const HEADERS: [&str; 8] =
+        ["+++ ", "--- ", "diff --git", "index ", "new file mode", "deleted file mode", "similarity index", "rename "];
+    if HEADERS.iter().any(|h| line.starts_with(h)) {
+        DiffLine::Header
+    } else if line.starts_with("@@") {
+        DiffLine::Hunk
+    } else if line.starts_with('+') {
+        DiffLine::Added
+    } else if line.starts_with('-') {
+        DiffLine::Removed
+    } else {
+        DiffLine::Plain
     }
 }
 
@@ -596,22 +707,22 @@ fn block_ui(ui: &mut Ui, block: &Block, index: usize, accent: Color32, prose: &P
 fn code_ui(ui: &mut Ui, lang: Option<&str>, lines: &[String], index: usize, prose: &Prose) {
     let width = ui.available_width();
     Frame::new()
-        .fill(theme::PANEL)
-        .stroke(Stroke::new(1.0, theme::RULE))
+        .fill(theme::panel())
+        .stroke(Stroke::new(1.0, theme::rule()))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.set_width(width - 20.0);
             if let Some(lang) = lang {
                 ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                    ui.label(RichText::new(lang).small().color(theme::DIM));
+                    ui.label(RichText::new(lang).small().color(theme::dim()));
                 });
             }
             let mut job = LayoutJob::default();
             let language = Language::of(lang);
             for (n, line) in lines.iter().enumerate() {
                 if n > 0 {
-                    job.append("\n", 0.0, TextFormat::simple(prose.mono.clone(), theme::TEXT));
+                    job.append("\n", 0.0, TextFormat::simple(prose.mono.clone(), theme::text()));
                 }
                 // a line of a tool's output that says how things went is lit whole: an error
                 // or a failed test in red, a warning in amber, a pass in green, a location dim
@@ -635,19 +746,19 @@ fn outcome_tint(line: &str) -> Option<Color32> {
     let trimmed = line.trim_start();
     let lower = trimmed.to_ascii_lowercase();
     if trimmed.starts_with("-->") || trimmed.starts_with("= note") || trimmed.starts_with("= help") {
-        return Some(theme::DIM);
+        return Some(theme::dim());
     }
     if lower.starts_with("error") || lower.contains("panicked at") || lower.contains(" failed") || lower.starts_with("failures:") {
-        return Some(theme::ERROR_TEXT);
+        return Some(theme::error_text());
     }
     if lower.starts_with("warning") || trimmed.starts_with('⚠') {
-        return Some(theme::WARN_TEXT);
+        return Some(theme::warn_text());
     }
     if lower.starts_with("test result: ok") || lower.ends_with(" ok") || trimmed.starts_with('✓') || lower.starts_with("check passed") {
-        return Some(theme::ONLINE);
+        return Some(theme::online());
     }
     if trimmed.starts_with('✗') || lower.starts_with("check failed") {
-        return Some(theme::ERROR_TEXT);
+        return Some(theme::error_text());
     }
     None
 }
@@ -656,9 +767,9 @@ fn outcome_tint(line: &str) -> Option<Color32> {
 // syntax coloring
 
 /// The little a code block knows about its language: the comment opener, the keywords, and
-/// whether a key before `=` or `:` is a keyword too.
+/// whether a key before `=` or `:` is a keyword too. The code pane colors a whole file with it.
 #[derive(Clone, Copy)]
-struct Language {
+pub(crate) struct Language {
     comment: Option<&'static str>,
     keywords: &'static [&'static str],
     keyed: Option<char>,
@@ -715,8 +826,8 @@ const CFAMILY: &[&str] = &[
 const VALUES: &[&str] = &["true", "false", "null"];
 
 impl Language {
-    /// The language of a tag, the plain one when the tag is unknown or missing.
-    fn of(tag: Option<&str>) -> Self {
+    /// The language of a tag or a file extension, the plain one when it is unknown or missing.
+    pub(crate) fn of(tag: Option<&str>) -> Self {
         let plain = Self { comment: None, keywords: &[], keyed: None, single_quotes: false, char_literals: false };
         let quoted = |comment, keywords, keyed| Self { comment: Some(comment), keywords, keyed, single_quotes: true, char_literals: false };
         match tag.map(str::to_ascii_lowercase).as_deref() {
@@ -732,31 +843,31 @@ impl Language {
     }
 
     /// Cuts one line into colored pieces, in order, covering the whole line.
-    fn tokens<'a>(&self, line: &'a str) -> Vec<(&'a str, Color32)> {
+    pub(crate) fn tokens<'a>(&self, line: &'a str) -> Vec<(&'a str, Color32)> {
         let mut out: Vec<(&'a str, Color32)> = Vec::new();
         let bytes = line.as_bytes();
         let mut i = 0;
         let mut plain_from = 0;
         // a toml table header is a key by itself
         if self.keyed == Some('=') && line.trim_start().starts_with('[') {
-            return vec![(line, theme::TRACE)];
+            return vec![(line, theme::trace())];
         }
         while i < bytes.len() {
             let c = bytes[i];
             let token: Option<(usize, Color32)> = if self.comment.is_some_and(|opener| line[i..].starts_with(opener)) {
-                Some((bytes.len(), theme::DIM))
+                Some((bytes.len(), theme::dim()))
             } else if c == b'"' || (c == b'\'' && self.single_quotes) {
-                Some((string_end(bytes, i), theme::WARN_TEXT))
+                Some((string_end(bytes, i), theme::warn_text()))
             } else if c == b'\'' && self.char_literals {
                 // a char literal closes within a few bytes; a lifetime does not close at all
                 let end = string_end(bytes, i);
-                (end - i <= 4 && bytes.get(end - 1) == Some(&b'\'')).then_some((end, theme::WARN_TEXT))
+                (end - i <= 4 && bytes.get(end - 1) == Some(&b'\'')).then_some((end, theme::warn_text()))
             } else if c.is_ascii_digit() && (i == 0 || !is_word(bytes[i - 1])) {
                 let mut end = i;
                 while end < bytes.len() && (is_word(bytes[end]) || bytes[end] == b'.') {
                     end += 1;
                 }
-                Some((end, theme::WARN_TEXT))
+                Some((end, theme::warn_text()))
             } else if c.is_ascii_alphabetic() || c == b'_' {
                 let mut end = i;
                 while end < bytes.len() && is_word(bytes[end]) {
@@ -765,11 +876,11 @@ impl Language {
                 let word = &line[i..end];
                 let is_key = self.keyed.is_some_and(|sep| line[..i].trim().is_empty() && line[end..].trim_start().starts_with(sep));
                 let color = if is_key || self.keywords.contains(&word) {
-                    theme::TRACE
+                    theme::trace()
                 } else if c.is_ascii_uppercase() {
-                    theme::DEBUG
+                    theme::debug()
                 } else {
-                    theme::TEXT
+                    theme::text()
                 };
                 Some((end, color))
             } else {
@@ -778,7 +889,7 @@ impl Language {
             match token {
                 Some((end, color)) => {
                     if plain_from < i {
-                        out.push((&line[plain_from..i], theme::TEXT));
+                        out.push((&line[plain_from..i], theme::text()));
                     }
                     out.push((&line[i..end], color));
                     i = end;
@@ -788,7 +899,7 @@ impl Language {
             }
         }
         if plain_from < bytes.len() {
-            out.push((&line[plain_from..], theme::TEXT));
+            out.push((&line[plain_from..], theme::text()));
         }
         out
     }
@@ -822,6 +933,17 @@ mod tests {
 
     fn text(s: &str) -> Inline {
         Inline::Text(s.to_owned())
+    }
+
+    #[test]
+    fn a_diff_line_is_told_by_its_first_characters() {
+        assert_eq!(diff_tint("diff --git a/x.rs b/x.rs"), DiffLine::Header);
+        assert_eq!(diff_tint("--- a/x.rs"), DiffLine::Header);
+        assert_eq!(diff_tint("+++ b/x.rs"), DiffLine::Header);
+        assert_eq!(diff_tint("@@ -1,2 +1,3 @@ fn main"), DiffLine::Hunk);
+        assert_eq!(diff_tint("+let a = 1;"), DiffLine::Added);
+        assert_eq!(diff_tint("-let a = 0;"), DiffLine::Removed);
+        assert_eq!(diff_tint(" let b = 2;"), DiffLine::Plain);
     }
 
     #[test]
@@ -906,26 +1028,38 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_check_lights_its_line_and_boxes_the_raw_output() {
+    fn a_failed_check_keeps_its_raw_output_under_its_line() {
         let notes = "Fixed the parser.\n\ncheck failed: cargo test -p x\nerror[E0308]: mismatched types\n  --> src/lib.rs:4:5\n\ntest result: FAILED. 1 failed\n\nThe fix is in the second commit.\ncheck passed: cargo fmt --check";
         let blocks = parse(notes);
         assert_eq!(blocks[0], Block::Paragraph(vec![text("Fixed the parser.")]));
-        assert_eq!(blocks[1], Block::Check { passed: false, text: "cargo test -p x".to_owned() });
         assert_eq!(
-            blocks[2],
-            Block::Code {
-                lang: None,
-                lines: vec![
+            blocks[1],
+            Block::Check {
+                passed: false,
+                text: "cargo test -p x".to_owned(),
+                output: vec![
                     "error[E0308]: mismatched types".to_owned(),
                     "  --> src/lib.rs:4:5".to_owned(),
                     String::new(),
                     "test result: FAILED. 1 failed".to_owned(),
                 ],
+                failed: Vec::new(),
             }
         );
-        assert_eq!(blocks[3], Block::Paragraph(vec![text("The fix is in the second commit.")]));
-        assert_eq!(blocks[4], Block::Check { passed: true, text: "cargo fmt --check".to_owned() });
-        assert_eq!(blocks.len(), 5);
+        assert_eq!(blocks[2], Block::Paragraph(vec![text("The fix is in the second commit.")]));
+        assert_eq!(blocks[3], Block::Check { passed: true, text: "cargo fmt --check".to_owned(), output: Vec::new(), failed: Vec::new() });
+        assert_eq!(blocks.len(), 4);
+    }
+
+    #[test]
+    fn a_failed_check_names_the_tests_that_failed() {
+        let notes = "check failed: cargo test --workspace -q\ntest store::tests::a_run_records_its_handoff ... FAILED\ntest agent::tests::a_check_names_its_failures ... FAILED\nthread 'x' panicked at src/a.rs:1:1\n\ntest result: FAILED. 2 failed\n\nThe report.";
+        let blocks = parse(notes);
+        let Block::Check { passed, failed, output, .. } = &blocks[0] else { panic!("not a check: {blocks:?}") };
+        assert!(!passed);
+        assert_eq!(failed, &["a_run_records_its_handoff".to_owned(), "a_check_names_its_failures".to_owned()]);
+        assert_eq!(output.len(), 5);
+        assert_eq!(blocks[1], Block::Paragraph(vec![text("The report.")]));
     }
 
     #[test]
@@ -942,26 +1076,26 @@ mod tests {
         let tokens = rust.tokens("let Name = \"hi\"; // 42");
         let rebuilt: String = tokens.iter().map(|(t, _)| *t).collect();
         assert_eq!(rebuilt, "let Name = \"hi\"; // 42");
-        assert_eq!(tokens[0], ("let", theme::TRACE));
-        assert_eq!(tokens[2], ("Name", theme::DEBUG));
-        assert!(tokens.contains(&("\"hi\"", theme::WARN_TEXT)));
-        assert_eq!(tokens.last().copied(), Some(("// 42", theme::DIM)));
+        assert_eq!(tokens[0], ("let", theme::trace()));
+        assert_eq!(tokens[2], ("Name", theme::debug()));
+        assert!(tokens.contains(&("\"hi\"", theme::warn_text())));
+        assert_eq!(tokens.last().copied(), Some(("// 42", theme::dim())));
 
         let toml = Language::of(Some("toml"));
-        assert_eq!(toml.tokens("[package]"), vec![("[package]", theme::TRACE)]);
-        assert_eq!(toml.tokens("name = \"x\"")[0], ("name", theme::TRACE));
+        assert_eq!(toml.tokens("[package]"), vec![("[package]", theme::trace())]);
+        assert_eq!(toml.tokens("name = \"x\"")[0], ("name", theme::trace()));
 
         let plain = Language::of(None);
         assert_eq!(
             plain.tokens("error: 3 tests FAILED"),
             vec![
-                ("error", theme::TEXT),
-                (": ", theme::TEXT),
-                ("3", theme::WARN_TEXT),
-                (" ", theme::TEXT),
-                ("tests", theme::TEXT),
-                (" ", theme::TEXT),
-                ("FAILED", theme::DEBUG),
+                ("error", theme::text()),
+                (": ", theme::text()),
+                ("3", theme::warn_text()),
+                (" ", theme::text()),
+                ("tests", theme::text()),
+                (" ", theme::text()),
+                ("FAILED", theme::debug()),
             ]
         );
     }

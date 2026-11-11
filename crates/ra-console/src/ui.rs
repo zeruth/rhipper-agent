@@ -61,6 +61,14 @@ struct App {
     tree_scroll: usize,
     /// The ids of the nodes whose children are folded away.
     folded: Vec<i64>,
+    /// The states `filter` hides from the tree; empty shows every card.
+    hidden: Vec<ra_roadmap::model::TaskState>,
+    /// What the search line above the tree holds; a row stays while its title or id contains
+    /// it, with its ancestors. Empty shows every row.
+    search: String,
+    /// Whether the keys go to the search line rather than the prompt; `/` on an empty prompt
+    /// opens it, Enter and Escape hand the keys back.
+    searching: bool,
     seen: u64,
     quit_armed: Option<Instant>,
     started: Instant,
@@ -93,6 +101,11 @@ struct App {
     all_time: Option<ra_usage::Totals>,
     /// The plan's windows as the harness last reported them, re-read every few seconds.
     limits: ra_providers::limits::Limits,
+    /// Whether the local server is up, probed once a minute in the background; the status line
+    /// shows it as a dot.
+    local: ra_providers::openrouter::LocalProbe,
+    /// What the dot showed last, so a probe that changed it redraws the frame.
+    local_seen: Option<bool>,
 }
 
 /// Runs the console until it is told to quit. `worker` carries the badge model, the provider and
@@ -117,6 +130,9 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
         scroll: 0,
         tree_scroll: 0,
         folded: Vec::new(),
+        hidden: Vec::new(),
+        search: String::new(),
+        searching: false,
         seen: 0,
         quit_armed: None,
         started: Instant::now(),
@@ -127,6 +143,8 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
         activity_offset: std::fs::metadata(ACTIVITY_FILE).map_or(0, |m| m.len()),
         all_time: worker.all_time().await,
         limits: ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE)),
+        local: ra_providers::openrouter::LocalProbe::default(),
+        local_seen: None,
         worker,
         selected: None,
         hover: None,
@@ -136,10 +154,15 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
         log_card: 12,
         job: None,
     };
-    sink.push(Kind::Banner, format!("Rhipper Agent {} — Tyler Bochard. Type help for commands.", crate::VERSION));
+    sink.push(
+        Kind::Banner,
+        format!("Rhipper Agent {} — /help lists the commands; a line without / is a note for the next runs.", crate::VERSION),
+    );
     // the slow calls report their completion here, so the status above the prompt can stop
     let (job_tx, mut job_done) = mpsc::unbounded_channel::<()>();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    // the first probe of the local server goes out now; the ticks repeat it every minute
+    tokio::spawn(app.local.clone().probe_local());
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     let mut dirty = true;
     // the screen rows of the tree pane, so the wheel and the clicks route to it
@@ -152,7 +175,7 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
     let mut tree_rows: Vec<roadmap_pane::Hit> = Vec::new();
     // the panes and the run under every visible log row, as the last draw laid them out
     let mut panes = Panes::default();
-    let mut log_rows: Vec<Option<u64>> = Vec::new();
+    let mut log_rows: Vec<Option<LogHit>> = Vec::new();
     let result = loop {
         let version = sink.version();
         if version != app.seen {
@@ -187,7 +210,16 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                 let Some(input) = input else { break Ok(()) };
                 dirty = true;
                 let action = match input {
-                    Input::Click(x, y) => on_click(&mut app, x, y, tree_area, &tree_rows),
+                    Input::Click(x, y) => {
+                        // a run bubble's header folds or unfolds it; the tree picks its card
+                        match log_hit(panes, &log_rows, y) {
+                            Some(LogHit { run, header: true }) => {
+                                sink.toggle_fold(run);
+                                Action::None
+                            }
+                            _ => on_click(&mut app, x, y, tree_area, &tree_rows),
+                        }
+                    }
                     Input::Hover(x, y) => {
                         let over_tree = tree_area.is_some_and(|area| contains_row(area, y));
                         let next = over_tree.then_some((x, y));
@@ -199,9 +231,8 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                     }
                     Input::Wheel(rows, y) => {
                         // over a run bubble, the wheel sizes that bubble and nothing else
-                        let run = panes.log_text.filter(|area| contains_row(*area, y)).and_then(|area| log_rows.get(usize::from(y - area.y)).copied().flatten());
-                        match run {
-                            Some(id) => sink.resize_run(id, rows),
+                        match log_hit(panes, &log_rows, y) {
+                            Some(LogHit { run, .. }) => sink.resize_run(run, rows),
                             None => on_wheel(&mut app, rows, y, panes, frame_height),
                         }
                         Action::None
@@ -210,6 +241,12 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                 };
                 match action {
                     Action::None => {}
+                    Action::Fold => {
+                        // the entry opens at the bottom of the log, where it was printed
+                        if sink.toggle_newest_fold().is_some() {
+                            app.scroll = 0;
+                        }
+                    }
                     Action::Quit => break Ok(()),
                     Action::Run(line) => {
                         if execute_line(line, &store, &sink, &mut app, &job_tx).await {
@@ -227,7 +264,7 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
             }
             _ = tick.tick() => {
                 // another console, or the launch script, asked this one to leave
-                if crate::instance::quit_requested() {
+                if crate::instance::quit_requested(std::path::Path::new(".")) {
                     break Ok(());
                 }
                 app.ticks = app.ticks.wrapping_add(1);
@@ -238,6 +275,14 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                         app.limits = limits;
                         dirty = true;
                     }
+                }
+                // the local server, once a minute, with a model list and no model call
+                if u128::from(app.ticks) % (ra_providers::openrouter::PROBE_EVERY.as_millis() / 100) == 0 {
+                    tokio::spawn(app.local.clone().probe_local());
+                }
+                if app.local.up() != app.local_seen {
+                    app.local_seen = app.local.up();
+                    dirty = true;
                 }
                 // the marquee walks a step every fourth tick, a pace the eye follows
                 if app.ticks % 4 == 0 && app.worker.model.chars().count() + 3 > 14 {
@@ -327,6 +372,8 @@ enum Action {
     None,
     Run(String),
     Quit,
+    /// Enter on the empty prompt: the newest folded entry of the log opens, or folds again.
+    Fold,
 }
 
 /// The file the processes without a console write their progress lines to.
@@ -336,15 +383,21 @@ pub const ACTIVITY_FILE: &str = "var/activity.log";
 /// that shrank was rotated and reads from its start. Returns whether any line came in. The GUI
 /// tails the same file.
 pub fn tail_activity(offset: &mut u64, sink: &Sink) -> bool {
+    tail_activity_at(std::path::Path::new(ACTIVITY_FILE), offset, sink)
+}
+
+/// [`tail_activity`] over the activity file at `path`: a window with a project per tab tails
+/// each project's own.
+pub fn tail_activity_at(path: &std::path::Path, offset: &mut u64, sink: &Sink) -> bool {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(len) = std::fs::metadata(ACTIVITY_FILE).map(|m| m.len()) else { return false };
+    let Ok(len) = std::fs::metadata(path).map(|m| m.len()) else { return false };
     if len < *offset {
         *offset = 0;
     }
     if len == *offset {
         return false;
     }
-    let Ok(mut file) = std::fs::File::open(ACTIVITY_FILE) else { return false };
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
     let mut bytes = Vec::new();
     if file.seek(SeekFrom::Start(*offset)).is_err() || file.read_to_end(&mut bytes).is_err() {
         return false;
@@ -363,6 +416,12 @@ fn contains_row(area: Rect, y: u16) -> bool {
     (area.y..area.y + area.height).contains(&y)
 }
 
+/// The run bubble under screen row `y` of the log, if any.
+fn log_hit(panes: Panes, log_rows: &[Option<LogHit>], y: u16) -> Option<LogHit> {
+    let area = panes.log_text.filter(|area| contains_row(*area, y))?;
+    log_rows.get(usize::from(y - area.y)).copied().flatten()
+}
+
 /// A click inside the tree pane. A button column answers with its command line; any other row
 /// picks the card it names, and a second click on a picked card folds its children or lets it go.
 /// A click anywhere else does nothing.
@@ -373,9 +432,9 @@ fn on_click(app: &mut App, x: u16, y: u16, tree_area: Option<Rect>, tree_rows: &
     let button = hit.buttons.iter().find(|(start, end, _)| column >= usize::from(*start) && column < usize::from(*end));
     if let Some(&(_, _, button)) = button {
         return Action::Run(match button {
-            roadmap_pane::Button::Run => format!("run {}", hit.id),
-            roadmap_pane::Button::Reassess => format!("reassess {}", hit.id),
-            roadmap_pane::Button::ReassessTree => format!("reassess-tree {}", hit.id),
+            roadmap_pane::Button::Run => format!("/run {}", hit.id),
+            roadmap_pane::Button::Reassess => format!("/reassess {}", hit.id),
+            roadmap_pane::Button::ReassessTree => format!("/reassess-tree {}", hit.id),
         });
     }
     let id = hit.id;
@@ -418,7 +477,12 @@ fn on_key(app: &mut App, key: KeyEvent) -> Action {
     if !(ctrl && key.code == KeyCode::Char('c')) {
         app.quit_armed = None;
     }
+    if app.searching {
+        on_search_key(app, key);
+        return Action::None;
+    }
     match key.code {
+        KeyCode::Char('/') if app.input.is_empty() => app.searching = true,
         KeyCode::Char('c') if ctrl => {
             if !app.input.is_empty() {
                 app.input.clear();
@@ -459,6 +523,9 @@ fn on_key(app: &mut App, key: KeyEvent) -> Action {
         KeyCode::Esc => {
             if app.input.is_empty() {
                 app.scroll = 0;
+                // a search left narrowing the tree goes with the second Escape
+                app.search.clear();
+                app.tree_scroll = 0;
             }
             app.input.clear();
             app.cursor = 0;
@@ -487,16 +554,13 @@ fn on_key(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Tab => {
             let text: String = app.input.iter().collect();
-            if !text.contains(char::is_whitespace) {
-                let choices = commands::complete(text.trim_start_matches(['/', '.']));
-                match choices.as_slice() {
-                    [] => {}
-                    [one] => {
-                        app.input = format!("{one} ").chars().collect();
-                        app.cursor = app.input.len();
-                    }
-                    many => app.hint = Some(many.join("  ")),
+            match commands::complete_line(&text, app.roadmap.as_deref().unwrap_or_default()) {
+                commands::Completion::None => {}
+                commands::Completion::Line(line) => {
+                    app.input = line.chars().collect();
+                    app.cursor = app.input.len();
                 }
+                commands::Completion::Choices(many) => app.hint = Some(many.join("  ")),
             }
         }
         KeyCode::Enter => {
@@ -506,7 +570,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Action {
             app.browsing = None;
             let line = line.trim().to_owned();
             if line.is_empty() {
-                return Action::None;
+                return Action::Fold;
             }
             if app.history.last() != Some(&line) {
                 app.history.push(line.clone());
@@ -520,6 +584,85 @@ fn on_key(app: &mut App, key: KeyEvent) -> Action {
 
 fn shift_held(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// A key while the search line has the focus: the text narrows the tree as it is typed, Escape
+/// clears it and closes the line, Enter picks the first match and hands the keys back to the
+/// prompt with the search still narrowing. A `/` on an empty search is a command being typed:
+/// the line closes and the prompt takes the slash, so `//help` still runs.
+fn on_search_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.search.clear();
+            app.searching = false;
+            app.tree_scroll = 0;
+        }
+        KeyCode::Enter => {
+            if let Some(nodes) = &app.roadmap
+                && let Some(id) = first_match(nodes, &app.search)
+            {
+                app.selected = Some(id);
+            }
+            app.searching = false;
+        }
+        KeyCode::Char('/') if app.search.is_empty() => {
+            app.searching = false;
+            app.input.push('/');
+            app.cursor = 1;
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.search.clear();
+            app.tree_scroll = 0;
+        }
+        KeyCode::Char(c) => {
+            app.search.push(c);
+            app.tree_scroll = 0;
+        }
+        KeyCode::Backspace => {
+            app.search.pop();
+            app.tree_scroll = 0;
+        }
+        _ => {}
+    }
+}
+
+/// Whether a node is a hit of `needle` (lowercase, trimmed): its title contains it, or its id
+/// contains the digits, a `#` in front allowed the way ids are written.
+fn search_hit(node: &ra_roadmap::model::Node, needle: &str) -> bool {
+    let id_part = needle.trim_start_matches('#');
+    node.title.to_lowercase().contains(needle) || (!id_part.is_empty() && node.id.to_string().contains(id_part))
+}
+
+/// The rows a search keeps, in roadmap order: every hit of `needle` and every ancestor of one,
+/// so a hit keeps its place in the tree, as the window narrows its column. An empty search
+/// keeps every row.
+fn search_rows(nodes: &[ra_roadmap::model::Node], needle: &str) -> Vec<ra_roadmap::model::Node> {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return nodes.to_vec();
+    }
+    let parents: std::collections::HashMap<i64, Option<i64>> = nodes.iter().map(|n| (n.id, n.parent)).collect();
+    let mut kept: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for node in nodes.iter().filter(|n| search_hit(n, &needle)) {
+        let mut current = Some(node.id);
+        while let Some(id) = current {
+            if !kept.insert(id) {
+                break;
+            }
+            current = parents.get(&id).copied().flatten();
+        }
+    }
+    nodes.iter().filter(|n| kept.contains(&n.id)).cloned().collect()
+}
+
+/// The first hit of `needle` in roadmap order, the one Enter picks; an ancestor kept for a hit
+/// does not count.
+fn first_match(nodes: &[ra_roadmap::model::Node], needle: &str) -> Option<i64> {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    nodes.iter().find(|n| search_hit(n, &needle)).map(|n| n.id)
 }
 
 /// Runs one command line through the dispatcher. A slow call (a run, a reassess, a ping) goes to a
@@ -557,11 +700,15 @@ async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, j
     sink.push(Kind::Input, line.clone());
     match commands::run(&line, store, &app.worker).await {
         Ok((out, outcome)) => {
-            for l in out {
-                sink.push(Kind::Output, l);
+            if matches!(outcome, Outcome::Fold) {
+                sink.push_folded(&out);
+            } else {
+                for l in out {
+                    sink.push(Kind::Output, l);
+                }
             }
             let quit = match outcome {
-                Outcome::Continue => false,
+                Outcome::Continue | Outcome::Fold => false,
                 Outcome::Clear => {
                     sink.clear();
                     false
@@ -580,6 +727,11 @@ async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, j
                     sink.push(Kind::Output, format!("trace lines {}", if app.show_debug { "on" } else { "off" }));
                     false
                 }
+                Outcome::Filter(states) => {
+                    app.hidden = states;
+                    app.tree_scroll = 0;
+                    false
+                }
             };
             app.scroll = 0;
             quit
@@ -590,6 +742,14 @@ async fn execute_line(line: String, store: &Store, sink: &Sink, app: &mut App, j
             false
         }
     }
+}
+
+/// The run under a log row, as the last draw laid it out; `header` marks the bubble's top
+/// border, the row a click folds it by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct LogHit {
+    run: u64,
+    header: bool,
 }
 
 /// The screen areas the wheel and the clicks route against.
@@ -610,7 +770,7 @@ fn draw(
     app: &App,
     sink: &Sink,
     row_ids: &mut Vec<roadmap_pane::Hit>,
-    log_rows: &mut Vec<Option<u64>>,
+    log_rows: &mut Vec<Option<LogHit>>,
 ) -> (usize, usize, Panes) {
     let [header, usage, tree, log_card, footer] = pane_layout(app.log_card).areas(f.area());
     // every cell, so even gaps the widgets never touch paint the theme
@@ -619,9 +779,20 @@ fn draw(
     f.render_widget(Paragraph::new(status_line(app)).style(Style::new().bg(theme::PANEL)), header);
     draw_usage(f, usage, app);
     let mut tree_max = 0usize;
+    // the search line sits above the tree while it is open or still narrowing
+    let tree = if app.searching || !app.search.is_empty() {
+        let [line, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(tree);
+        draw_search(f, app, line);
+        rest
+    } else {
+        tree
+    };
     if let Some(nodes) = &app.roadmap {
         // the hover row goes in raw; the pane resolves the card on the layout it draws this frame
-        let (tree_max_scroll, ids) = roadmap_pane::draw(f, nodes, &app.folded, app.selected, app.hover, app.tree_scroll, tree);
+        let shown = search_rows(&roadmap_pane::visible(nodes, &app.hidden), &app.search);
+        // a search opens everything, so a hit under a folded card shows
+        let folded: &[i64] = if app.search.trim().is_empty() { &app.folded } else { &[] };
+        let (tree_max_scroll, ids) = roadmap_pane::draw(f, &shown, folded, app.selected, app.hover, app.tree_scroll, tree);
         *row_ids = ids;
         tree_max = tree_max_scroll;
     }
@@ -799,7 +970,16 @@ fn status_line(app: &App) -> Line<'static> {
         Span::styled(format!(" {}", crate::VERSION), dim),
         sep(),
         Span::styled(format!("up {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60), dim),
+        sep(),
     ];
+    // the local server as a dot: green up, red down, dim until the first probe answers
+    let (dot, color) = match app.local.up() {
+        Some(true) => ("●", theme::ONLINE),
+        Some(false) => ("●", theme::ERROR_TEXT),
+        None => ("○", theme::DIM),
+    };
+    spans.push(Span::styled(format!("{dot} "), Style::new().fg(color)));
+    spans.push(Span::styled("local", dim));
     // the plan's windows, colored by how full they are
     if app.limits.fresh() {
         for (name, window) in &app.limits.windows {
@@ -817,17 +997,23 @@ fn status_line(app: &App) -> Line<'static> {
             spans.push(Span::styled(format!(" · resets in {}", ra_providers::limits::until(window.resets_at)), dim));
         }
     }
+    if !app.hidden.is_empty() {
+        let names: Vec<&str> = app.hidden.iter().map(|s| s.serde_name()).collect();
+        spans.push(sep());
+        spans.push(Span::styled("filter hides ", dim));
+        spans.push(Span::styled(names.join(", "), Style::new().fg(theme::WARN_TEXT).bold()));
+    }
     Line::from(spans)
 }
 
 /// Draws the log at the app's scroll; returns how far back it can scroll, and fills `row_runs`
 /// with the run under every visible row, top to bottom, so the wheel finds the bubble it is over.
-fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect, row_runs: &mut Vec<Option<u64>>) -> usize {
+fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect, row_runs: &mut Vec<Option<LogHit>>) -> usize {
     let (height, width) = (area.height as usize, area.width as usize);
     let want = height + app.scroll;
     let (mut visible, mut tags, all) = sink.with_lines(|lines| {
         let mut taken: Vec<Line<'static>> = Vec::new();
-        let mut tags: Vec<Option<u64>> = Vec::new();
+        let mut tags: Vec<Option<LogHit>> = Vec::new();
         let mut all = true;
         for (i, line) in lines.iter().rev().enumerate() {
             // the trace lines stay out of the log until debug turns them on
@@ -841,7 +1027,10 @@ fn draw_log(f: &mut Frame, app: &App, sink: &Sink, area: Rect, row_runs: &mut Ve
                 _ => rows_of(line, width, lane_index),
             };
             r.reverse();
-            tags.extend(std::iter::repeat_n(line.run, r.len()));
+            // the bubble's first row is its header; reversed, it comes last
+            let count = r.len();
+            let bubble = line.kind == Kind::Run;
+            tags.extend((0..count).map(|k| line.run.map(|run| LogHit { run, header: bubble && k + 1 == count })));
             taken.extend(r);
             if taken.len() >= want && i + 1 < lines.len() {
                 all = false;
@@ -873,7 +1062,8 @@ const HUM_BAND: usize = 10;
 
 /// A worker run as a bubble: the title and the clock (or the outcome) in the top border, the
 /// latest steps inside at the run's height, and, while the run is live, a soft band of light
-/// that flows along the top border to the right and along the bottom to the left.
+/// that flows along the top border to the right and along the bottom to the left. Folded, the
+/// bubble is its top border alone.
 fn run_rows(title: &str, run: &crate::logs::Run, width: usize, lane_index: usize, ticks: u32) -> Vec<Line<'static>> {
     let room = width.saturating_sub(4).max(8);
     let span = room + 4;
@@ -947,6 +1137,10 @@ fn run_rows(title: &str, run: &crate::logs::Run, width: usize, lane_index: usize
             .collect::<Vec<_>>(),
     );
     let mut rows = vec![top_line];
+    // a folded run is its header alone, by a click or by the clock
+    if run.folded() {
+        return rows;
+    }
     // the body: a live run keeps its height, a finished one shrinks to its steps
     let height = usize::from(run.height);
     let body = if run.live() { height } else { height.min(run.steps.len().max(1)) };
@@ -1010,7 +1204,7 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 fn rows_of(line: &crate::logs::Line, width: usize, lane_index: usize) -> Vec<Line<'static>> {
     let (border, text) = match line.kind {
         Kind::Input => (theme::ACCENT, theme::TEXT),
-        Kind::Output | Kind::Diff => {
+        Kind::Output | Kind::Diff | Kind::Folded => {
             let lane = theme::lane(1 + lane_index % (theme::LANE_COUNT - 1));
             (lane, lane)
         }
@@ -1041,6 +1235,18 @@ fn rows_of(line: &crate::logs::Line, width: usize, lane_index: usize) -> Vec<Lin
                 (src.to_owned(), style)
             })
             .collect(),
+        // a folded entry is its header and the key that opens it; open, the header leads the body
+        Kind::Folded => {
+            let (header, body) = line.text.split_once('\n').unwrap_or((&line.text, ""));
+            let header_style = Style::new().fg(theme::TEXT).bg(theme::PANEL).bold();
+            if line.folded {
+                vec![(format!("▸ {header} · Enter unfolds"), header_style)]
+            } else {
+                std::iter::once((format!("▾ {header}"), header_style))
+                    .chain(body.split('\n').map(|src| (src.to_owned(), text_style)))
+                    .collect()
+            }
+        }
         _ => vec![(line.text.clone(), text_style)],
     };
     let mut rows = vec![Line::from(vec![
@@ -1069,6 +1275,12 @@ fn rows_of(line: &crate::logs::Line, width: usize, lane_index: usize) -> Vec<Lin
 
 /// Wraps `text` into rows of at most `room` characters, on spaces where it can.
 fn wrap(text: &str, room: usize) -> Vec<String> {
+    // the indentation stays, on every row of the line: an outline reads by it
+    let indent = (text.len() - text.trim_start_matches(' ').len()).min(room.saturating_sub(1));
+    if indent > 0 {
+        let lead = " ".repeat(indent);
+        return wrap(&text[indent..], room - indent).into_iter().map(|row| format!("{lead}{row}")).collect();
+    }
     let mut rows = Vec::new();
     let mut current = String::new();
     for word in text.split(' ') {
@@ -1107,7 +1319,7 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::styled(PROMPT, Style::new().fg(theme::ACCENT).bold())];
     if app.input.is_empty() {
         spans.push(Span::styled(" ", caret));
-        spans.push(Span::styled("type a command (help lists them)", Style::new().fg(theme::DIM).italic()));
+        spans.push(Span::styled("/help lists the commands · a line without / is a note", Style::new().fg(theme::DIM).italic()));
     } else {
         let before: String = shown[..at.min(shown.len())].iter().collect();
         let under = shown.get(at).map_or(" ".to_owned(), char::to_string);
@@ -1117,6 +1329,28 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(after, Style::new().fg(theme::TEXT)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The search line above the tree: the slash, the text, a caret while it has the focus, and the
+/// count of hits; a hint on what the keys do while it is open.
+fn draw_search(f: &mut Frame, app: &App, area: Rect) {
+    let dim = Style::new().fg(theme::DIM).italic();
+    let mut spans =
+        vec![Span::styled(" / ", Style::new().fg(theme::ACCENT).bold()), Span::styled(app.search.clone(), Style::new().fg(theme::TEXT))];
+    if app.searching {
+        spans.push(Span::styled(" ", Style::new().fg(theme::BG).bg(theme::TEXT)));
+    }
+    if app.search.trim().is_empty() {
+        spans.push(Span::styled(" search by title or id · Esc closes", dim));
+    } else {
+        let hits = app.roadmap.as_ref().map_or(0, |nodes| {
+            let needle = app.search.trim().to_lowercase();
+            nodes.iter().filter(|n| search_hit(n, &needle)).count()
+        });
+        let keys = if app.searching { " · Enter picks the first · Esc clears" } else { " · Esc clears" };
+        spans.push(Span::styled(format!("  {hits} hit{}{keys}", if hits == 1 { "" } else { "s" }), dim));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::new().bg(theme::PANEL)), area);
 }
 
 fn footer_line(app: &App, width: u16) -> Line<'static> {
@@ -1133,6 +1367,7 @@ fn footer_line(app: &App, width: u16) -> Line<'static> {
         ("help", "commands"),
         ("↑↓", "history"),
         ("Tab", "complete"),
+        ("/", "search tree"),
         ("wheel", "tree · log size"),
         ("click", "pick node"),
         ("Ctrl+C×2", "stop"),

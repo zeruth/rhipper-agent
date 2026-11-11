@@ -23,11 +23,21 @@ fn node(id: i64, parent: Option<i64>) -> Node {
         estimate: None,
         notes: None,
         assessed: None,
+        priority: None,
     }
 }
 
 fn ids(nodes: &[&Node]) -> Vec<i64> {
     nodes.iter().map(|n| n.id).collect()
+}
+
+#[test]
+fn is_within_follows_the_parents_up() {
+    let nodes = vec![node(1, None), node(2, Some(1)), node(3, Some(2)), node(5, Some(1))];
+    assert!(is_within(&nodes, 3, 1));
+    assert!(is_within(&nodes, 3, 3));
+    assert!(!is_within(&nodes, 5, 2));
+    assert!(!is_within(&nodes, 9, 1));
 }
 
 #[test]
@@ -106,4 +116,89 @@ fn next_names_the_first_ready_card() {
     ];
     assert_eq!(next_ready(&nodes).map(|n| n.id), Some(4));
     assert!(next_ready(&nodes[..3]).is_none());
+}
+
+/// A card with everything a card needs: the lint has nothing to say about it.
+fn whole(id: i64, state: TaskState, depends_on: &[i64]) -> Node {
+    Node {
+        title: format!("card {id}"),
+        objective: Some("does a thing".to_owned()),
+        acceptance: Some("the thing is done".to_owned()),
+        files: vec!["src/lib.rs".to_owned()],
+        ..task(id, state, depends_on)
+    }
+}
+
+#[test]
+fn the_lint_trips_each_rule_once() {
+    let mut root = node(1, None);
+    root.kind = NodeKind::Section;
+    root.title = "the section".to_owned();
+    // #2 is clean; #3 has a template objective; #4 no acceptance; #5 no files; #6 waits on a
+    // missing card; #7 and #8 wait on each other; #9 has complexity 0
+    let nodes = vec![
+        root,
+        whole(2, TaskState::Defined, &[]),
+        Node { objective: Some("<the objective, one line>".to_owned()), ..whole(3, TaskState::Defined, &[]) },
+        Node { acceptance: None, ..whole(4, TaskState::Defined, &[]) },
+        Node { files: Vec::new(), ..whole(5, TaskState::Defined, &[]) },
+        whole(6, TaskState::Defined, &[99]),
+        whole(7, TaskState::Defined, &[8]),
+        whole(8, TaskState::Defined, &[7]),
+        Node { complexity: 0, ..whole(9, TaskState::Defined, &[]) },
+    ];
+    let lines = lint(&nodes);
+    assert_eq!(lines.len(), 7, "{lines:#?}");
+    assert!(lines[0].starts_with("#3:") && lines[0].contains("objective"), "{}", lines[0]);
+    assert!(lines[1].starts_with("#4:") && lines[1].contains("acceptance"), "{}", lines[1]);
+    assert!(lines[2].starts_with("#5:") && lines[2].contains("files"), "{}", lines[2]);
+    assert!(lines[3].starts_with("#6:") && lines[3].contains("#99"), "{}", lines[3]);
+    assert!(lines[4].starts_with("#7:") && lines[4].contains("waits-on"), "{}", lines[4]);
+    assert!(lines[5].starts_with("#8:") && lines[5].contains("waits-on"), "{}", lines[5]);
+    assert!(lines[6].starts_with("#9:") && lines[6].contains("complexity 0"), "{}", lines[6]);
+}
+
+#[test]
+fn a_card_without_files_takes_the_nearest_ancestors_and_the_lint_accepts_them() {
+    let mut root = node(1, None);
+    root.kind = NodeKind::Milestone;
+    root.title = "the milestone".to_owned();
+    root.files = vec!["crates/a/".to_owned()];
+    let mut section = node(2, Some(1));
+    section.kind = NodeKind::Section;
+    section.title = "the section".to_owned();
+    section.files = vec!["crates/a/src/lib.rs".to_owned()];
+    let own = Node { parent: Some(2), ..whole(3, TaskState::Defined, &[]) };
+    let bare = Node { parent: Some(2), files: Vec::new(), ..whole(4, TaskState::Defined, &[]) };
+    let nodes = vec![root, section, own, bare];
+    assert_eq!(files_of(&nodes, &nodes[2]), (&["src/lib.rs".to_owned()][..], None));
+    let (files, from) = files_of(&nodes, &nodes[3]);
+    assert_eq!(files, &["crates/a/src/lib.rs".to_owned()][..]);
+    assert_eq!(from.map(|n| n.id), Some(2));
+    assert!(lint(&nodes).is_empty(), "{:#?}", lint(&nodes));
+}
+
+#[test]
+fn a_clean_roadmap_lints_to_nothing_and_a_done_card_is_left_alone() {
+    let mut root = node(1, None);
+    root.kind = NodeKind::Section;
+    root.title = "the section".to_owned();
+    // a section carries no acceptance or files, and an accepted card is not asked for them
+    let nodes = vec![
+        root,
+        whole(2, TaskState::Defined, &[]),
+        Node { acceptance: None, files: Vec::new(), ..whole(3, TaskState::Accepted, &[]) },
+        task(4, TaskState::Cancelled, &[]),
+    ];
+    assert!(lint(&nodes).is_empty(), "{:#?}", lint(&nodes));
+}
+
+#[test]
+fn placeholder_text_is_a_bracketed_hint_or_a_bare_tbd() {
+    assert!(is_placeholder("<the acceptance>"));
+    assert!(is_placeholder("TBD"));
+    assert!(is_placeholder("todo."));
+    assert!(is_placeholder("  "));
+    assert!(!is_placeholder("the tests pass"));
+    assert!(!is_placeholder("<rc> prints the ids"));
 }
