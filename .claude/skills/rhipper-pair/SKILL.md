@@ -7,9 +7,24 @@ description: Pair with Rhipper Agent as the external architect session — run i
 
 Rhipper Agent is a roadmap-driven orchestrator: `rhipper.md` holds the cards, a worker (Claude
 Code headless, `claude -p`, on the person's Max plan) implements one card per run, and the
-orchestrator does the local work around it (context, lint, tests, handoffs). You are the
-*external* session: you read the roadmap, start runs, review what lands, fix the small things,
-commit, accept, and keep the window good. The agent in turn reads what you tell it.
+orchestrator does the local work around it (context, checks, lint, the reviewer, handoffs). You
+are the *external* session, usually over **every project on the machine at once**: you read
+the roadmaps, start the walks, read the verdicts, accept, commit, re-queue, steer with gambits
+and priorities, fix the small things in the agent, and keep the window good. The agent in turn
+reads what you tell it. The README is the full picture; this is the playbook.
+
+Standing rules from the person (2026-11-11):
+- The person reads verdicts, not diffs. Report in a few lines what landed and what came back.
+- Efficiency and local execution everywhere: tokens down, cheap roles local, nothing in the
+  loop that a model call is not needed for. "A gotcha is anything standing in the way."
+- **Leave the agent's own roadmap alone** once it is clear, with one exception: a serious
+  token or performance saving found in a run or a review goes on it as a card at once and runs.
+- One job per project (`rc walk`, never `--parallel`).
+- No physical UI tests to debug the window (no screenshots, no mouse driving): read the code,
+  instrument, fix. A screenshot is for showing the person, not for finding a bug.
+- Never `git add -A` in a project while one of its runs is live: commit the session's own
+  files by name, and a card's files after its run ends (a sweep put #169's work under a
+  dashboard commit and the reviewer saw an empty diff).
 
 ## Where things are
 
@@ -43,44 +58,49 @@ closes the tab, not itself).
 
 ## The link: arm it first
 
-The agent writes `var/pair.log` in the project — one line per event: `start #id title · model`,
-`end ✓|✗ #id … · cost · ↯ bullets`, `walk ran N card(s) · why it stopped`, `note …`. It cannot
-push into a session, so the session subscribes. **First thing in a Rhipper project, arm a
-Monitor on it** and re-arm it on every expiry while runs are going:
+The agent writes `var/pair.log` in the project — one line per event: `start #id title · model
+· check: …`, `end ✓|✗|↻ #id … · turns · tokens · cost · the cap or the check`, `review ✓|✗ #id
+… · N point(s)`, `walk ran N card(s) · why it stopped`, `note …`, `window up|down`. It cannot
+push into a session, so the session subscribes. **First thing, arm ONE Monitor over every
+project's feed** (the person: "stop setting per task monitors, set per project monitors long
+term") and re-arm it only when it expires:
 
 ```
-Monitor(command: "rc pair --follow --since <last seen>", description: "the agent's pair feed (<project>)", timeout_ms: 1800000)
+Monitor(command: "tail -n 0 -F C:/…/rhipper-agent/var/pair.log C:/…/rhipper-asm/var/pair.log C:/…/runelite/var/pair.log",
+        description: "the three projects' pair feeds", timeout_ms: 1800000)
 ```
 
-Each line comes stamped, `<unix time>\t<text>`; keep the last stamp you saw and pass it as
-`--since` when you re-arm, so what landed while the Monitor was down is replayed first (the
-first arm takes the current time). `rc pair --since <ts>` alone prints that catch-up and exits.
-`rc pair --follow` follows the file by name and survives its rotation; on a build before
-0.1.475, `tail -n 0 -F var/pair.log` does the same without the catch-up.
-
-Every line arrives as a notification: a card started, a card ended (then review it), the walk
-ended (then do the pass), a note the person left, `window up/down` and `run orphaned #id` when
-the window restarts. `rc pair` prints the last twenty. Do not tail `var/activity.log` for
-this; that is the step-by-step stream the window draws. Managing several projects: one
-Monitor per project, each in its own directory.
+`tail -F` over several files prefixes each burst with `==> <file> <==`, which names the
+project. Never one Monitor per card or per wait, never a `run_in_background` poll. `rc pair
+--since <ts>` prints what landed while the Monitor was down; `rc pair` the last twenty. Do not
+tail `var/activity.log` for this; that is the step-by-step stream the window draws.
 
 ## The cycle (what this session does for every card)
 
-1. **Run**: `rc run <id>` (foreground ~3–10 min; run it in the background and wait for the
-   notification), or **`rc walk`** to walk every ready card in order. `rc walk` does not run
-   the walk in your shell: the window that has the project starts it as a process of its own
-   (detached, hours long, survives a window restart and your session's tool limits), and the
-   tab shows it. `rc walk --stop` ends it after its current card; a second `rc walk` while one
-   runs says so and does nothing. Never `Start-Process rc run --all` yourself. No flags
-   needed: nothing caps a run by default; debug mode is on.
-2. **Read the result**: the run's lines (✓/✗, the check, `lint: N warning(s)`, `↯` look-back
-   bullets), then `git diff --stat` and the diff of the files the handoff names.
-3. **Lint**: a card comes back `needs_revision` when clippy warns on lines the run changed. The
-   warnings are first in `var/context/<id>.md`. They are usually small (`# Errors` docs,
-   `#[must_use]`, `format!` appends, collapsible ifs): fix them yourself, it is cheaper than a
-   second run.
-4. **Test**: `cargo test --workspace -q`.
-5. **Build + install (+ restart)**: `cargo build -q -p rc -p rc-gui; .\target\debug\rc.exe install`.
+1. **Walk**: **`rc walk`** in the project walks every ready card in order (by priority, then
+   the gambits, then the file). `rc walk` does not run the walk in your shell: the window that
+   has the project starts it as a process of its own (detached, hours long, survives a window
+   restart and your session's tool limits), and the tab shows it. `rc walk --stop` ends it
+   after its current card; a second `rc walk` while one runs says so and does nothing. Never
+   `Start-Process rc run --all` yourself. **A walk keeps the rc it started with**: after an
+   install that matters, `rc walk --stop`, wait for the card's end line, `rc walk` again.
+   `rc run <id>` runs one card in the foreground (background it and wait for the event).
+2. **Read the end line and the review line**: `end ✓ … · review ✓` is done; `review ✗ … N
+   point(s)` came back; `end ↻ … continues` hit a cap and the walk continues it by itself;
+   `end ✗ … check failed` has the output at the head of the notes. `rc show <id>` prints the
+   verdict and the points. Judge the reviewer, not the diff: a substantive rejection on a
+   placeholder handoff ("the suite is still running") is right; a rejection for files it
+   could not see (the reviewer diffs the card's files, the handoff's and the untracked among
+   them) is wrong, and a `rc review <id>` after the fix judges again for cents.
+3. **Accept or re-queue**: `rc set <id> accepted`, or `rc set <id> defined` to send it round
+   again. A re-queued card is still a rerun: the review block at the head of its notes rides
+   in the prompt and the run resumes the session it came back from. A card whose acceptance
+   names something the person forbade (an APK build, a device) gets its acceptance rewritten
+   with `rc edit <id> --acceptance "…"`, not a run that cannot pass.
+4. **Lint**: a lint-only failure takes the cheap fix pass by itself. What is left is small
+   (`# Errors` docs, `#[must_use]`, collapsible ifs): fix it yourself rather than pay a run.
+5. **Test** the agent after its own cards: `cargo test --workspace -q`.
+6. **Build + install (+ restart)**: `cargo build -q -p rc -p rc-gui; .\target\debug\rc.exe install`.
    A change to `rc` alone is live at once: runs are child processes of the installed `rc`. A
    change to the **window's own code** (`apps/rc-gui`, or `ra-console` code the window links)
    shows after `rc restart`: the one window quits whole and comes back on the new build with
@@ -96,13 +116,34 @@ Monitor per project, each in its own directory.
    `window: restart on the milestone commit` (it touched `apps/rc-gui` or `crates/ra-console`),
    `rc: install any time, no restart` (it touched `apps/rc` or another crate), or nothing (no
    Rust code). Follow that line.
-6. **Commit** with a message that says the card, the model, the cost line, what the worker did
-   and what you fixed (the git log is the review record), with `git commit -F <scratchpad file>`.
-7. **Accept**: `rc set <id> accepted`. Accept a milestone when its cards are.
+7. **Commit per card** with a message that says the card, what the worker did and what you
+   fixed (the git log is the review record), `git commit -F <scratchpad file>`, **adding the
+   card's files by name** (the handoff's `changed:` line and the card's `files:`), never
+   `-A` while a run is live. Files another card still holds dirty stay out; say so in the
+   message when a shared hunk rides along. Accept a milestone when its cards are.
 
-During a walk (`--all`) do not edit files the worker may be on: review and commit per card
-after the walk ends. Running `cargo test --workspace` while the worker's check runs can make
-*your* red test the card's failure; re-check such verdicts.
+During a walk do not edit files the live run names (`var/context/<id>.md` lists them).
+Running `cargo test --workspace` while the worker's check runs can make *your* red test the
+card's failure; re-check such verdicts.
+
+## Steering: gambits, priorities, plans
+
+- `rc gambits` lists the standing direction; `rc gambit add "…" --weight 1..5 --focus words`
+  adds one; `rc gambit park|activate|done|weight|focus` change it. Focus words match a card's
+  title, milestone and files as substrings: a word like `c` or `64` matches everything through
+  file paths, so pick words that name the work (`emit`, `oracle`, `port`, `x64`). `rc next
+  --why` shows the queue with the gambits that scored each card.
+- `rc priority <id> 1..5` puts a card ahead of the gambits; `--clear` leaves it to them.
+- A card: `rc add task "…" --parent <milestone> --objective … --acceptance … --files … --complexity N`.
+  Backticked commands in the acceptance are the check. Cite evidence (an end line, a retro
+  line, a cost) in the objective when the card is a saving.
+- `rc plan` plans the next cards from the runs' own evidence under the last open milestone;
+  `rc plan <id>` splits a milestone with the architect model and asks before adding.
+- Economics (the person, 2026-11-11): no turn cap; every run resumes its session, reruns
+  included; `[worker] context = 160000` ends a run on a handoff once a turn passes it, after
+  the first twelve turns; a run whose last session hit it reading in goes uncapped. A turn's
+  cost scales with the context it carries (148k a turn cost four times 41k). Read the `avg …
+  tokens a turn, largest …` of the end lines; a serious waste is a card for the agent.
 
 ## Talking to the agent
 
@@ -113,16 +154,22 @@ after the walk ends. Running `cargo test --workspace` while the worker's check r
 - Commands start with `/`: `/help`, `/run 7`, `/show`, `/set 7 accepted`, `/remove 7 [tree]`,
   `/effort 7 high`, `/assign 7 claude-opus-5-5`, `/install [dir] [desktop]`, `/stop` (the walk
   stops after the current task), `/quit`.
-- **Debug mode** (status-bar badge, `RHIPPER_DEBUG=off`, `rc run --no-debug`): the worker ends
-  its report with `## Faster next time`, at most three one-line bullets, `[machine]` when the
-  cause is this machine. They are parsed, kept, shown as `↯` lines, and the latest five go to
-  the next runs' machine notes. Act on them: a bullet that names a project fact belongs in
-  `rhipper.context.md`; a recurring machine problem belongs in the gotcha catalogue.
+- **Debug mode** (on by default; the `⚙ debug` badge toggles it everywhere, `RHIPPER_DEBUG=off`,
+  `rc run --no-debug`): the worker ends its report with `## Faster next time`, at most three
+  one-line bullets naming what cost the run turns or time and the one change that would have
+  avoided it, `[machine]` when the cause is this machine. They are parsed out of the report,
+  kept in `var/retro.log`, shown as `↯` lines, and the latest five go to the next runs'
+  machine notes; `rc plan` reads them as evidence. Act on them: a bullet that names a project
+  fact belongs in `rhipper.context.md`; a recurring machine problem belongs in the gotcha
+  catalogue; a stale one (a complaint about a check since fixed) can mislead a worker for a
+  run, so correct it with a note.
 - **Gotchas**: a `[[gotcha]]` has `where` (command / result / edit / text / answer), a regex
   `pattern`, a `message`, and a `remedy` (hint = deny with the message, rewrite, allow). The
-  pre/post tool hooks (`rc hook pre|post`) and the stream reader apply them. Add one when the
-  journal's `unmatched-denied` shows the same refused command twice. Edit the seed and copy it to
-  `var/gotchas.toml`.
+  pre/post tool hooks (`rc hook pre|post`) and the stream reader apply them. Every refused
+  command counts (the `refused` seed). Add one when `rc gotchas` shows the same refused command
+  twice: a project-only one in the project's `var/gotchas.toml` (runelite's `no-apk-build`), a
+  general one in the seed `crates/ra-gotchas/gotchas.toml`, which merges into every project's
+  catalogue on the next run start.
 - **MCP**: `.mcp.json` serves `show/add/details/set/depend/run/reassess/model/ping/usage` to a
   Claude Code session in this repo. Workers themselves run with `--strict-mcp-config`.
 
@@ -135,9 +182,13 @@ CARD / CONTEXT / LEDGER tabs. Bottom right: the console (one Markdown bubble per
 bubbles for notes, run cards with jewel-tagged steps that pin to the bottom while live) and the
 command line. The separators drag.
 
-To look at it, capture **by window handle**, never the screen:
-`scripts/shot-window.ps1 -Process rc-gui -Out <png>` then `scripts/crop.ps1 -In -Out -X -Y -W -H`,
-and Read the png. Vocabulary lives in `apps/rc-gui/src/cards.rs` (card, bubble, badge, jewel,
+To show it to the person, capture **by window handle**, never the screen:
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\shot-window.ps1 -Process rc-gui -Out <png>`
+(DPI-aware PrintWindow, the frame without its shadow), and Read the png. Not for debugging:
+a layout bug is found in the code (egui 0.37: a Frame's outer size is content + inner margin
++ 2×stroke + outer margin; a resizable Panel in a Ui stores its content's width, so content
+sized "available − margins" without the stroke grows 2 px a frame; measure with
+`ui.min_rect()` and feed last frame's overshoot back, as the dashboard does). Vocabulary lives in `apps/rc-gui/src/cards.rs` (card, bubble, badge, jewel,
 fade, divider, pill_bar, tooltip); the roadmap column is `draw_bubble`/`header_row` in
 `apps/rc-gui/src/main.rs`; the console is `apps/rc-gui/src/console.rs`; Markdown in
 `apps/rc-gui/src/markdown.rs`. egui gotchas met here: a single-line `TextEdit` gives up focus on
@@ -208,7 +259,13 @@ names its own command or turns it off:
 [worker]
 check = ".\\gw.ps1 :android-awt:compileDebugJavaWithJavac"   # the default check of a card that names none
 lint = ""                                                      # no lint here; a command runs it instead of clippy
+check_timeout = 1800                                           # a suite that needs half an hour
+context = 160000                                               # the context cap; absent, none; no `turns` anywhere
 ```
+
+A check command written `.\gw.ps1` kept its backslash since a4835e1; before that it reached
+PowerShell as `-File .gw.ps1` and sent three runelite cards back with their work complete
+(`exit code -196608` in the notes was that).
 
 `rc run <id> --dry` prints the resolved `check: … · lint: …`; the same line follows the
 `◆start` marker in `var/activity.log` and ends the `start #id` event of `var/pair.log`.
