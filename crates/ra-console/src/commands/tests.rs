@@ -312,6 +312,30 @@ async fn checked_run(passing: bool) -> (Vec<String>, ra_roadmap::model::Node) {
 }
 
 #[tokio::test]
+async fn a_dry_run_prints_the_prompt_and_leaves_the_card_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task Probe parent 1", &store, &worker()).await.unwrap();
+    store.set_session(2, Some("sess-1")).await.unwrap();
+    let before = store.read(2).await.unwrap();
+    // the harness route: the provider builds the command line and no process starts
+    let (out, _) = run("run 2 dry", &store, &Worker::new("claude-sonnet-5-5")).await.unwrap();
+    let text = out.join("\n");
+    assert!(out[0].contains("claude-sonnet-5-5"), "{text}");
+    assert!(out.iter().any(|l| l.contains("effort medium") && l.contains("Bash(cargo *)")), "{text}");
+    assert!(out.iter().any(|l| l == "  --resume") && out.iter().any(|l| l == "  sess-1"), "{text}");
+    assert!(text.contains("--- system ---") && text.contains("--- user ---") && text.contains("Probe"), "{text}");
+    let after = store.read(2).await.unwrap();
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.session.as_deref(), Some("sess-1"));
+    assert_eq!(after.notes, before.notes);
+    // a bare model: the toolbox is what it would get
+    let (out, _) = run("run 2 dry", &store, &worker()).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("tools: read_file write_file")), "{}", out.join("\n"));
+    assert_eq!(store.read(2).await.unwrap().state, before.state);
+}
+
+#[tokio::test]
 async fn a_failing_check_leaves_the_node_needing_revision() {
     let (out, node) = checked_run(false).await;
     assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);

@@ -38,6 +38,10 @@ const GOTCHAS_LOG: &str = "var/gotchas.log";
 /// How many of the refused commands the ledger tab lists, the same as `rc gotchas`.
 const UNMATCHED_SHOWN: usize = 20;
 
+/// The Claude models a card can be assigned from the card view, strongest first.
+const MODELS: [(&str, &str); 3] =
+    [("claude-fable-5-1", "Fable 5.1"), ("claude-opus-5-5", "Opus 5.5"), ("claude-haiku-4-5-20251001", "Haiku 4.5")];
+
 /// The three tabs of the card area.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -157,8 +161,6 @@ struct App {
     week_target: f32,
     week_moved: Option<Instant>,
     show_debug: bool,
-    /// The model typed into the card view, to assign to the selected card.
-    assign_model: String,
     /// What went wrong at start, shown on the splash instead of the workspace.
     fault: Option<String>,
     /// The choice a directory without a roadmap gets, until it has one.
@@ -254,7 +256,6 @@ impl App {
             week_target: 0.0,
             week_moved: None,
             show_debug: false,
-            assign_model: String::new(),
             fault,
             setup,
         };
@@ -470,8 +471,6 @@ impl App {
     /// Picks a card; the model field of the card view follows.
     fn select(&mut self, id: Option<i64>) {
         self.selected = id;
-        let node = id.and_then(|id| self.roadmap.iter().find(|n| n.id == id));
-        self.assign_model = node.and_then(|n| n.assignee.as_ref()).map(|a| a.model.clone()).unwrap_or_default();
     }
 
     /// The keys of the roadmap column: Up and Down move the selection along the rows shown,
@@ -928,7 +927,7 @@ impl App {
         }
         let context = &self.context;
         egui::ScrollArea::vertical().id_salt("context").auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_max_width(980.0);
+            ui.set_width(ui.available_width());
             cards::card(ui, theme::DIM, false, |ui| {
                 ui.set_width(ui.available_width());
                 egui::CollapsingHeader::new(RichText::new("PROJECT CONTEXT").small().strong().color(theme::DIM))
@@ -978,7 +977,7 @@ impl App {
     fn ledger_view(&self, ui: &mut egui::Ui) {
         let ledger = &self.ledger;
         egui::ScrollArea::vertical().id_salt("ledger").auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_max_width(980.0);
+            ui.set_width(ui.available_width());
             cards::card(ui, theme::ACCENT, false, |ui| {
                 ui.set_width(ui.available_width());
                 cards::section(ui, "USAGE BY CARD", theme::ACCENT);
@@ -1115,7 +1114,7 @@ impl App {
         let mut command: Option<String> = None;
         let nodes = self.roadmap.clone();
         egui::ScrollArea::vertical().id_salt("card").auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_max_width(980.0);
+            ui.set_width(ui.available_width());
             // the hero: the breadcrumb, the title in its lane, the badges
             let crumbs: Vec<String> = {
                 let mut out = Vec::new();
@@ -1224,18 +1223,27 @@ impl App {
                 ui.set_width(ui.available_width());
                 cards::section(ui, "MODEL", theme::TRACE);
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.assign_model)
-                            .hint_text("the badge model, unless set here")
-                            .desired_width(260.0)
-                            .font(TextStyle::Monospace),
+                    // the Claude models, strongest first, and the badge's; a pick assigns at once.
+                    // Most cards leave this to the agent's routing
+                    let current = node.assignee.as_ref().map_or("", |a| a.model.as_str());
+                    let shown = MODELS.iter().find(|(id, _)| *id == current).map_or_else(
+                        || if current.is_empty() { "the badge model".to_owned() } else { current.to_owned() },
+                        |(_, name)| (*name).to_owned(),
                     );
-                    if action(ui, "assign", theme::TRACE) {
-                        let model =
-                            if self.assign_model.trim().is_empty() { "none".to_owned() } else { self.assign_model.trim().to_owned() };
-                        command = Some(format!("assign {} {model}", node.id));
-                    }
-                    ui.label(RichText::new("a claude-* id runs on Claude Code · vendor/model on OpenRouter").color(theme::DIM).small());
+                    egui::ComboBox::from_id_salt(("model", node.id)).selected_text(RichText::new(shown).color(theme::TRACE)).width(220.0).show_ui(
+                        ui,
+                        |ui| {
+                            if ui.selectable_label(current.is_empty(), "the badge model").clicked() && !current.is_empty() {
+                                command = Some(format!("assign {} none", node.id));
+                            }
+                            for (id, name) in MODELS {
+                                if ui.selectable_label(current == id, name).on_hover_text(id).clicked() && current != id {
+                                    command = Some(format!("assign {} {id}", node.id));
+                                }
+                            }
+                        },
+                    );
+                    ui.label(RichText::new("strongest first · a claude-* id runs on Claude Code").color(theme::DIM).small());
                 });
                 if let Some(session) = &node.session {
                     ui.label(RichText::new(format!("session {session}")).color(theme::DIM).small().monospace());
@@ -1514,7 +1522,7 @@ fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node]
         .stroke(Stroke::new(1.0, if selected { cards::alpha(lane, 200) } else { Color32::TRANSPARENT }))
         .corner_radius(CornerRadius::same(7))
         .inner_margin(Margin::symmetric(6, 3));
-    let response = frame
+    let inner = frame
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1568,10 +1576,9 @@ fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node]
                     }
                 });
             });
-        })
-        .response
-        .interact(egui::Sense::click());
-    ui.ctx().memory_mut(|m| m.data.insert_temp(row_id, ()));
+        });
+    // the row's own id, so the next frame reads this frame's hover for the fill
+    let response = ui.interact(inner.response.rect, row_id, egui::Sense::click());
     let response = response.on_hover_ui(|ui| cards::tooltip(ui, node, lane));
     if walk.scroll_to == Some(node.id) {
         response.scroll_to_me(None);

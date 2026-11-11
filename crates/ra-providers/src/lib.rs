@@ -164,4 +164,10 @@ pub trait ModelProvider: Send + Sync {
     fn has_own_tools(&self) -> bool {
         false
     }
+
+    /// The command line a harness would run for `request`, binary first, for a dry run to show;
+    /// `None` from a provider that makes a request rather than running a command.
+    fn command_line(&self, _request: &CompletionRequest) -> Option<Vec<String>> {
+        None
+    }
 }

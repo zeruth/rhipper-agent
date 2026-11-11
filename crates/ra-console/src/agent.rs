@@ -232,7 +232,10 @@ impl Worker {
                 // the gotchas guard every harness run: the hooks call this very binary, and the
                 // catalogue lives beside the roadmap; without either, the harness runs unguarded
                 let mut harness = ra_providers::claude_code::ClaudeCode::new();
-                match (std::env::current_exe(), Catalogue::load(Path::new(GOTCHAS_FILE))) {
+                // the project's catalogue when it has one; the seed otherwise, written by the
+                // hook in the run's own directory, not here (a test runs where no var/ belongs)
+                let catalogue = if Path::new(GOTCHAS_FILE).exists() { Catalogue::load(Path::new(GOTCHAS_FILE)) } else { Ok(Catalogue::seed()) };
+                match (std::env::current_exe(), catalogue) {
                     (Ok(rc), Ok(catalogue)) => harness = harness.with_gotchas(rc, catalogue),
                     (_, Err(e)) => tracing::warn!("the gotchas are off: {e:#}"),
                     (Err(e), _) => tracing::warn!("the gotchas are off: no path to this binary: {e}"),
@@ -310,43 +313,19 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     let provider = worker.provider()?;
     store.set_state(id, TaskState::InProgress).await?;
 
-    // the worker acts in the directory of the roadmap file: the project it describes
-    let workspace =
-        store.path().parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
+    let Prepared { workspace, root, mut task, project, budget, cap } = prepare(store, &node, worker, true).await?;
     let workspace_dir = workspace.clone();
-    let root = workspace_dir.clone().unwrap_or_else(|| PathBuf::from("."));
-    // the context of the task: the brief of the card, the outlines of its files, and the
-    // handoffs of its earlier runs, so the worker reads regions and continues rather than
-    // exploring again; the project context rides along as a system message
-    let mut task = ra_context::TaskContext::open(&root, id);
-    task.brief = context_of(store, &node).await?;
-    task.outlines = ra_context::outline_files(&root, &node.files);
-    let context = task.prompt();
-    let project = ra_context::Project::ensure(&root).unwrap_or_default();
     // what is dirty before the run, so the handoff names only what the run changed
     let dirty_before = git_status(&root).await;
-    // an explicit budget, else the complexity's while budgets are on, else none at all
-    let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
-    // an explicit turn cap, else the complexity's: it stays on with budgets off
-    let cap = worker.turns.unwrap_or_else(|| ra_providers::turns_for(node.complexity));
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
     let session = if provider.has_own_tools() {
         // a harness acts in the workspace by itself: one call carries the whole task, and the
-        // harness holds it to the budget. The machine notes name what tripped the last runs.
-        let mut messages = vec![Message::system(SYSTEM)];
-        if !project.is_empty() {
-            messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
-        }
-        let notes = machine_notes(&root);
-        if !notes.is_empty() {
-            messages.push(Message::system(notes));
-        }
-        messages.push(Message::user(context));
+        // harness holds it to the budget
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
-                messages,
+                messages: harness_messages(&task, &project, &root),
                 temperature: Some(0.4),
                 max_tokens: Some(4096),
                 tools: Vec::new(),
@@ -371,9 +350,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             Err(error) => Err(error),
         }
     } else {
-        // a bare model reads the project context at the head of its task
-        let context = if project.is_empty() { context } else { format!("The project:\n{project}\n\n{context}") };
-        tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref(), budget, cap).await
+        tool_loop(provider.as_ref(), worker, id, bare_context(&task, &project), workspace.as_deref(), budget, cap).await
     };
     // the handoff of this run, for the next one of the card; the done cards' files go
     let handoff = |outcome: &str, check: &str, report: &str, changed: Vec<String>| ra_context::Handoff {
@@ -484,6 +461,150 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         lines.push(format!("  ⚠ {} gotcha(s): {} · rc gotchas lists them", gotcha_hits.len(), ids.join(", ")));
     }
     Ok((lines, session.usage.cost_usd, gotcha_hits.len()))
+}
+
+/// What a run of a node has in hand before it calls the model: the workspace, the task context,
+/// the project context, the budget and the turn cap. A run sends it; a dry run prints it.
+struct Prepared {
+    /// The directory the worker acts in; `None` when neither the roadmap nor the process names one.
+    workspace: Option<PathBuf>,
+    /// The workspace, or `.` without one: where the context files and the outlines are read.
+    root: PathBuf,
+    task: ra_context::TaskContext,
+    /// The project context; empty while there is none.
+    project: String,
+    budget: Option<f64>,
+    cap: u32,
+}
+
+/// Builds what a run of `node` sends. The context of the task is the brief of the card, the
+/// outlines of its files, and the handoffs of its earlier runs, so the worker reads regions and
+/// continues rather than exploring again. With `draft`, a missing project context file is
+/// written first, as a run does; a dry run reads what is there.
+async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> anyhow::Result<Prepared> {
+    // the worker acts in the directory of the roadmap file: the project it describes
+    let workspace =
+        store.path().parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
+    let root = workspace.clone().unwrap_or_else(|| PathBuf::from("."));
+    let mut task = ra_context::TaskContext::open(&root, node.id);
+    task.brief = context_of(store, node).await?;
+    task.outlines = ra_context::outline_files(&root, &node.files);
+    let project =
+        if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
+    // an explicit budget, else the complexity's while budgets are on, else none at all
+    let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
+    // an explicit turn cap, else the complexity's: it stays on with budgets off
+    let cap = worker.turns.unwrap_or_else(|| ra_providers::turns_for(node.complexity));
+    Ok(Prepared { workspace, root, task, project, budget, cap })
+}
+
+/// The messages of a harness run: the worker's role, the project context and the machine notes
+/// as system messages, the task as the user turn. The machine notes name what tripped the last
+/// runs, so the worker does not find out the hard way again.
+fn harness_messages(task: &ra_context::TaskContext, project: &str, root: &Path) -> Vec<Message> {
+    let mut messages = vec![Message::system(SYSTEM)];
+    if !project.is_empty() {
+        messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
+    }
+    let notes = machine_notes(root);
+    if !notes.is_empty() {
+        messages.push(Message::system(notes));
+    }
+    messages.push(Message::user(task.prompt()));
+    messages
+}
+
+/// The task of a bare model, which reads the project context at the head of it.
+fn bare_context(task: &ra_context::TaskContext, project: &str) -> String {
+    let context = task.prompt();
+    if project.is_empty() { context } else { format!("The project:\n{project}\n\n{context}") }
+}
+
+/// Everything a run of `id` would send, printed instead of sent: the system messages, the task
+/// context, and the command line of the harness or the tools of a bare model. No model is
+/// called, and the card keeps its state, its session and its notes. For `rc run --dry` and the
+/// console's `run <id> dry`.
+///
+/// # Errors
+/// When the card is not there or is the project, or the route has no provider.
+pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
+    let node = store.read(id).await?;
+    anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; run a task");
+    let provider = worker.provider()?;
+    let Prepared { workspace, root, task, project, budget, cap } = prepare(store, &node, worker, false).await?;
+    let harness = provider.has_own_tools();
+    let messages = if harness {
+        harness_messages(&task, &project, &root)
+    } else {
+        vec![Message::system(SYSTEM), Message::user(bare_context(&task, &project))]
+    };
+    let request = CompletionRequest {
+        model: worker.model.clone(),
+        messages,
+        temperature: Some(if harness { 0.4 } else { 0.2 }),
+        max_tokens: Some(4096),
+        tools: if harness { Vec::new() } else { ra_tools::Toolbox::specs() },
+        workspace,
+        budget_usd: budget,
+        resume: node.session.clone(),
+        max_turns: Some(cap),
+    };
+    let mut lines = vec![
+        format!(
+            "dry run of #{id} {} on {} via {}: nothing is called, the card is as it was",
+            node.title,
+            worker.model,
+            worker.route().name()
+        ),
+        format!(
+            "  budget {} · turn cap {cap} · resume {} · check: {}",
+            budget.map_or_else(|| "none".to_owned(), |b| format!("${b:.2}")),
+            node.session.as_deref().unwrap_or("none"),
+            check_command(node.acceptance.as_deref())
+        ),
+    ];
+    let command = provider.command_line(&request);
+    if let Some(command) = &command {
+        // the effort and the allowed tools, named before the argument list buries them
+        let effort = argument(command, "--effort").unwrap_or("the harness default");
+        let allowed = arguments(command, "--allowedTools");
+        lines.push(format!("  effort {effort} · allowed tools: {}", if allowed.is_empty() { "none".to_owned() } else { allowed.join(" ") }));
+    } else {
+        let names: Vec<String> = request.tools.iter().map(|t| t.name.clone()).collect();
+        lines.push(format!("  effort: none, a bare model · tools: {} · temperature 0.2", names.join(" ")));
+    }
+    for message in &request.messages {
+        lines.push(format!("--- {} ---", message.role));
+        lines.extend(message.content.lines().map(str::to_owned));
+    }
+    if let Some(command) = command {
+        lines.push("--- command ---".to_owned());
+        let mut previous = "";
+        for arg in &command {
+            // the system prompt is the messages above; the line names its size, not its text
+            lines.push(if previous == "--system-prompt" {
+                format!("  <the system messages, {} chars>", arg.len())
+            } else {
+                format!("  {arg}")
+            });
+            previous = arg;
+        }
+        lines.push("  (the task goes on stdin)".to_owned());
+    }
+    Ok(lines)
+}
+
+/// The value after `flag` in a command line.
+fn argument<'a>(command: &'a [String], flag: &str) -> Option<&'a str> {
+    command.iter().position(|a| a == flag).and_then(|at| command.get(at + 1)).map(String::as_str)
+}
+
+/// The values after `flag` in a command line, up to the next flag.
+fn arguments<'a>(command: &'a [String], flag: &str) -> Vec<&'a str> {
+    match command.iter().position(|a| a == flag) {
+        Some(at) => command[at + 1..].iter().map(String::as_str).take_while(|a| !a.starts_with("--")).collect(),
+        None => Vec::new(),
+    }
 }
 
 /// What the lint of a run's changed files came to.

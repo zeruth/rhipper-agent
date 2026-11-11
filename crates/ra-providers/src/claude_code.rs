@@ -352,6 +352,12 @@ impl ModelProvider for ClaudeCode {
     fn has_own_tools(&self) -> bool {
         true
     }
+
+    fn command_line(&self, request: &CompletionRequest) -> Option<Vec<String>> {
+        let mut line = vec![self.binary.display().to_string()];
+        line.extend(self.args(request));
+        Some(line)
+    }
 }
 
 /// The system messages of a request, joined into the one system prompt the command line takes.

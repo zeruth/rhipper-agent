@@ -229,8 +229,10 @@ pub(crate) fn kind_mark(kind: NodeKind) -> &'static str {
 pub(crate) fn tooltip(ui: &mut Ui, node: &Node, lane: Color32) {
     ui.set_max_width(480.0);
     ui.spacing_mut().item_spacing.y = 6.0;
-    let rect = ui.max_rect();
-    glow(ui.painter(), rect, lane, 40, 14.0);
+    // the glow fits what the tooltip comes to, not the room it was given: a slot is taken now
+    // and filled once the content has its rect
+    let painter = ui.painter().clone();
+    let slot = painter.add(egui::Shape::Noop);
     ui.horizontal(|ui| {
         ui.label(RichText::new(kind_mark(node.kind)).color(lane).size(16.0));
         ui.label(RichText::new(&node.title).color(lane).size(16.0).strong());
@@ -273,4 +275,6 @@ pub(crate) fn tooltip(ui: &mut Ui, node: &Node, lane: Color32) {
         section(ui, "NOTES", theme::DIM);
         ui.label(RichText::new(first.chars().take(240).collect::<String>()).color(theme::DIM).italics());
     }
+    let rect = ui.min_rect().expand(6.0);
+    painter.set(slot, RectShape::filled(rect.expand(7.0), CornerRadius::same(12), alpha(lane, 40)).with_blur_width(28.0));
 }

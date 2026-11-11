@@ -90,6 +90,10 @@ enum Command {
         /// (c1 15, c2 25, c3 40, c4 60, c5 90), budgets on or off.
         #[arg(long)]
         turns: Option<u32>,
+        /// Prints what the run would send (the system messages, the task context, the harness
+        /// command line) and calls no model; the card keeps its state and its session.
+        #[arg(long)]
+        dry: bool,
     },
     /// Starts the console over the orchestrator.
     Console {
@@ -181,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             usage().await
         }
-        Command::Run { id, model, budget, no_budget, turns } => {
+        Command::Run { id, model, budget, no_budget, turns, dry } => {
             plain_tracing()?;
             if let Some(budget) = budget {
                 anyhow::ensure!(budget.is_finite() && budget > 0.0, "the budget is a positive number of dollars");
@@ -196,7 +200,12 @@ async fn main() -> anyhow::Result<()> {
             if no_budget {
                 worker = worker.with_budgets(false);
             }
-            for line in ra_console::agent::run(&store, id, &worker).await? {
+            let lines = if dry {
+                ra_console::agent::dry_run(&store, id, &worker).await?
+            } else {
+                ra_console::agent::run(&store, id, &worker).await?
+            };
+            for line in lines {
                 println!("{line}");
             }
             Ok(())

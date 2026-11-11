@@ -29,7 +29,11 @@ pub const COMMANDS: &[Spec] = &[
         help: "the workspace-relative paths a task touches, read first by its worker; no path clears them",
     },
     Spec { name: "set", usage: "<id> <state>", help: "sets the state: the twelve lifecycle names; cancelled removes the card" },
-    Spec { name: "remove", usage: "<id> [tree]", help: "removes a card and every waits-on reference to it; tree takes what is under it too" },
+    Spec {
+        name: "remove",
+        usage: "<id> [tree]",
+        help: "removes a card and every waits-on reference to it; tree takes what is under it too",
+    },
     Spec {
         name: "model",
         usage: "<id>",
@@ -39,7 +43,11 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "budgets", usage: "[on|off]", help: "whether a run is capped by its card's complexity; off on a subscription" },
     Spec { name: "key", usage: "[<paste> | clear]", help: "stores, shows the state of, or clears the OpenRouter key" },
     Spec { name: "ping", usage: "", help: "one round trip to the badge model" },
-    Spec { name: "run", usage: "<id>", help: "executes one roadmap task on the badge model" },
+    Spec {
+        name: "run",
+        usage: "<id> [dry]",
+        help: "executes one roadmap task on the badge model; dry prints what it would send and calls nothing",
+    },
     Spec { name: "reassess", usage: "<id>", help: "the model revises the objective and acceptance of one node" },
     Spec { name: "reassess-tree", usage: "<id>", help: "reassess for the node and its whole subtree" },
     Spec { name: "final", usage: "<id> [off]", help: "marks a node final, so no reassessment rewrites it; off clears the mark" },
@@ -205,13 +213,20 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             return Ok((agent::ping(worker).await?, Outcome::Continue));
         }
         "run" => {
-            let id = args.parse::<i64>().context("usage: run <id>")?;
+            let (id_text, flag) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+            let id = id_text.parse::<i64>().context("usage: run <id> [dry]")?;
+            let dry = match flag.trim() {
+                "" => false,
+                "dry" => true,
+                _ => anyhow::bail!("usage: run <id> [dry]"),
+            };
             // a node with a model of its own runs on it; the badge is the default
             let mut runner = worker.clone();
             if let Some(assignment) = store.read(id).await?.assignee {
                 runner.model = assignment.model;
             }
-            return Ok((agent::run(store, id, &runner).await?, Outcome::Continue));
+            let lines = if dry { agent::dry_run(store, id, &runner).await? } else { agent::run(store, id, &runner).await? };
+            return Ok((lines, Outcome::Continue));
         }
         "assign" => {
             let (id_text, model) = args.split_once(char::is_whitespace).context("usage: assign <id> <model|none>")?;
