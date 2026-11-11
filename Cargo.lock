@@ -3232,6 +3232,7 @@ dependencies = [
  "anyhow",
  "keyring",
  "parking_lot",
+ "ra-context",
  "ra-gotchas",
  "ra-providers",
  "ra-roadmap",
@@ -3243,6 +3244,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ra-context"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -3460,6 +3470,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ra-console",
+ "ra-context",
  "ra-gotchas",
  "ra-providers",
  "ra-roadmap",

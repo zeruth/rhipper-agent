@@ -90,6 +90,26 @@ pub(crate) fn badge_marked(ui: &mut Ui, mark: &str, text: &str, color: Color32) 
         .response
 }
 
+/// A pill bar: a badge-sized pill filled to `fill` (0 to 1) in `color`, with `text` across it.
+/// `pulse` is the strength of the glow behind the fill: a rest value most of the time, a
+/// brighter one right after the value moved, so a change is seen.
+pub(crate) fn pill_bar(ui: &mut Ui, text: &str, fill: f32, color: Color32, pulse: u8) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(132.0, 20.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let radius = CornerRadius::same(10);
+    painter.rect(rect, radius, alpha(color, 16), Stroke::new(1.0, alpha(color, 150)), egui::StrokeKind::Inside);
+    let fill = fill.clamp(0.0, 1.0);
+    if fill > 0.0 {
+        // the fill never narrows below its own rounding, so a few percent still reads as a pill
+        let filled = Rect::from_min_size(rect.min, egui::vec2((rect.width() * fill).max(20.0), rect.height()));
+        glow(painter, filled, color, pulse, 6.0);
+        painter.rect_filled(filled, radius, alpha(color, 110 + pulse / 2));
+        sheen(painter, filled, 36);
+    }
+    painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(11.0), theme::TEXT);
+    response
+}
+
 /// A filter chip: a badge that is lit while `on` and dim while off, and reports a click.
 pub(crate) fn chip(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
     let response = Frame::new()

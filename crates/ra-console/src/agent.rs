@@ -2,7 +2,7 @@
 //! one roadmap task to the badge model and records what came back. The functions talk to a
 //! [`ModelProvider`] through a [`Worker`], never to a vendor.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -263,11 +263,21 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     let provider = worker.provider()?;
     store.set_state(id, TaskState::InProgress).await?;
 
-    let context = context_of(store, &node).await?;
     // the worker acts in the directory of the roadmap file: the project it describes
     let workspace =
         store.path().parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
     let workspace_dir = workspace.clone();
+    let root = workspace_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+    // the context of the task: the brief of the card, the outlines of its files, and the
+    // handoffs of its earlier runs, so the worker reads regions and continues rather than
+    // exploring again; the project context rides along as a system message
+    let mut task = ra_context::TaskContext::open(&root, id);
+    task.brief = context_of(store, &node).await?;
+    task.outlines = ra_context::outline_files(&root, &node.files);
+    let context = task.prompt();
+    let project = ra_context::Project::ensure(&root).unwrap_or_default();
+    // what is dirty before the run, so the handoff names only what the run changed
+    let dirty_before = git_status(&root).await;
     // an explicit budget, else the complexity's while budgets are on, else none at all
     let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
     // the gotchas the run hits, for the journal and the summary
@@ -276,7 +286,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         // a harness acts in the workspace by itself: one call carries the whole task, and the
         // harness holds it to the budget. The machine notes name what tripped the last runs.
         let mut messages = vec![Message::system(SYSTEM)];
-        let notes = machine_notes(workspace.as_deref().unwrap_or(Path::new(".")));
+        if !project.is_empty() {
+            messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
+        }
+        let notes = machine_notes(&root);
         if !notes.is_empty() {
             messages.push(Message::system(notes));
         }
@@ -308,7 +321,18 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             Err(error) => Err(error),
         }
     } else {
+        // a bare model reads the project context at the head of its task
+        let context = if project.is_empty() { context } else { format!("The project:\n{project}\n\n{context}") };
         tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref(), budget).await
+    };
+    // the handoff of this run, for the next one of the card; the done cards' files go
+    let handoff = |outcome: &str, check: &str, report: &str, changed: Vec<String>| ra_context::Handoff {
+        when: unix_now(),
+        model: worker.model.clone(),
+        outcome: outcome.to_owned(),
+        check: check.to_owned(),
+        changed,
+        report: report.to_owned(),
     };
     let session = match session {
         Ok(session) => session,
@@ -318,6 +342,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
                 store.set_notes(id, &over.to_string()).await?;
             }
             store.set_state(id, TaskState::Failed).await?;
+            let changed = ra_context::changed_between(&dirty_before, &git_status(&root).await);
+            task.record(handoff("failed", "no check: the run failed", &format!("{error:#}"), changed));
+            save_context(store, &root, &task).await;
             return Err(error);
         }
     };
@@ -344,6 +371,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     } else {
         store.set_state(id, TaskState::NeedsRevision).await?;
     }
+    let changed = ra_context::changed_between(&dirty_before, &git_status(&root).await);
+    task.record(handoff(if passed { "implemented" } else { "needs revision" }, check_line.trim(), &session.text, changed));
+    save_context(store, &root, &task).await;
     let mut lines = vec![
         format!(
             "{} #{} {} {} on {} · {} turn(s), {} tool call(s) · in {} out {} · {}",
@@ -367,6 +397,41 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         lines.push(format!("  ⚠ {} gotcha(s): {} · rc gotchas lists them", gotcha_hits.len(), ids.join(", ")));
     }
     Ok((lines, session.usage.cost_usd, gotcha_hits.len()))
+}
+
+/// Writes a task's context file and removes the files of the cards that are done. A failure
+/// here is a log line, not a failed run: the context is a saving, not the work.
+async fn save_context(store: &Store, root: &Path, task: &ra_context::TaskContext) {
+    if let Err(e) = task.save(root) {
+        tracing::warn!("the context of #{} was not saved: {e:#}", task.id);
+    }
+    if let Ok(nodes) = store.all().await {
+        let open: Vec<i64> = nodes.iter().filter(|n| !matches!(n.state, TaskState::Accepted | TaskState::Cancelled)).map(|n| n.id).collect();
+        ra_context::TaskContext::prune(root, &open);
+    }
+}
+
+/// The context a run of `id` would send, without running: the brief, the outlines and the
+/// handoffs so far. For `rc context <id>` and the window.
+pub async fn context_preview(store: &Store, id: i64) -> anyhow::Result<String> {
+    let node = store.read(id).await?;
+    let root = store.path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let mut task = ra_context::TaskContext::open(&root, id);
+    task.brief = context_of(store, &node).await?;
+    task.outlines = ra_context::outline_files(&root, &node.files);
+    Ok(task.prompt())
+}
+
+/// `git status --porcelain` of `root`, or nothing where git has nothing to say.
+async fn git_status(root: &Path) -> String {
+    match tokio::process::Command::new("git").args(["status", "--porcelain"]).current_dir(root).output().await {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => String::new(),
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// The check of a node: the first backticked command in its acceptance that starts with cargo,
@@ -726,9 +791,9 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
     if let Some(acceptance) = &node.acceptance {
         text.push_str(&format!("Acceptance criteria: {acceptance}\n"));
     }
-    // the files the task names: the worker reads these first instead of exploring
+    // the files the task names: where the change lands; the task context outlines them
     if !node.files.is_empty() {
-        text.push_str("Files: read these first, they are where the change lands:\n");
+        text.push_str("Files of the card, where the change lands:\n");
         for file in &node.files {
             text.push_str(&format!("  {file}\n"));
         }

@@ -104,6 +104,14 @@ enum Command {
     },
     /// The gotchas that fired, by id, and the refused commands no gotcha names yet.
     Gotchas,
+    /// The context a run carries: the project's (rhipper.context.md), or a task's with the outlines of its files and its handoffs.
+    Context {
+        /// The task; left out, the project context.
+        id: Option<i64>,
+        /// Drafts rhipper.context.md from the workspace when there is none; an existing file is kept.
+        #[arg(long)]
+        init: bool,
+    },
 }
 
 #[tokio::main]
@@ -171,7 +179,32 @@ async fn main() -> anyhow::Result<()> {
         // a hook answers fast and stays silent on anything it cannot judge; no trace file either
         Command::Hook { event } => hook(&event),
         Command::Gotchas => gotchas(),
+        Command::Context { id, init } => {
+            plain_tracing()?;
+            context(id, init).await
+        }
     }
+}
+
+/// Prints the project context, drafting it with `--init`, or a task's context as a run would
+/// send it.
+async fn context(id: Option<i64>, init: bool) -> anyhow::Result<()> {
+    let root = Path::new(".");
+    match id {
+        Some(id) => {
+            let store = open_store().await?;
+            print!("{}", ra_console::agent::context_preview(&store, id).await?);
+        }
+        None => match ra_context::Project::load(root) {
+            Some(text) => print!("{text}"),
+            None if init => {
+                print!("{}", ra_context::Project::ensure(root)?);
+                eprintln!("\n{} written; edit it by hand, every run reads it", ra_context::PROJECT_FILE);
+            }
+            None => println!("no {}; `rc context --init` drafts one from the workspace", ra_context::PROJECT_FILE),
+        },
+    }
+    Ok(())
 }
 
 /// Answers one Claude Code tool hook from the gotchas. `pre` prints a deny with the reason, or

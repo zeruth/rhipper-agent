@@ -11,6 +11,7 @@ license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 ra-console = { path = "crates/ra-console" }
+ra-context = { path = "crates/ra-context" }
 ra-providers = { path = "crates/ra-providers" }
 ra-gotchas = { path = "crates/ra-gotchas" }
 ra-roadmap = { path = "crates/ra-roadmap" }

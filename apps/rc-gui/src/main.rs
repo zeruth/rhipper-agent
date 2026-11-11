@@ -118,6 +118,9 @@ struct App {
     /// The plan's windows as the harness last reported them, and when they were last read.
     limits: ra_providers::limits::Limits,
     limits_read: Instant,
+    /// The week's utilization the pill bar last aimed at, and when it last moved, for the glow.
+    week_target: f32,
+    week_moved: Option<Instant>,
     show_debug: bool,
     /// The model typed into the card view, to assign to the selected card.
     assign_model: String,
@@ -200,6 +203,8 @@ impl App {
             tab: Tab::Card,
             limits: ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE)),
             limits_read: Instant::now(),
+            week_target: 0.0,
+            week_moved: None,
             show_debug: false,
             assign_model: String::new(),
             fault,
@@ -274,6 +279,13 @@ impl App {
         if self.limits_read.elapsed() >= Duration::from_secs(5) {
             self.limits = ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE));
             self.limits_read = Instant::now();
+            // the week's pill aims at the new value and glows for a moment when it moved
+            #[allow(clippy::cast_possible_truncation)]
+            let target = self.limits.windows.get("seven_day").map_or(0.0, |w| w.utilization as f32);
+            if (target - self.week_target).abs() > 0.0005 {
+                self.week_target = target;
+                self.week_moved = Some(Instant::now());
+            }
         }
     }
 
@@ -524,23 +536,31 @@ impl App {
                     cards::badge_marked(ui, "◌", "no ledger", theme::DIM);
                 }
             }
-            // the plan's windows, colored by how full they are
-            if self.limits.fresh() {
-                for (name, window) in &self.limits.windows {
-                    let label = ra_providers::limits::label(name);
-                    let color = if window.utilization >= 0.8 {
-                        theme::ERROR_TEXT
-                    } else if window.utilization >= 0.5 {
-                        theme::WARN_TEXT
-                    } else {
-                        theme::ONLINE
-                    };
-                    cards::badge_marked(ui, "◔", &format!("{label} {:.0}%", window.utilization * 100.0), color).on_hover_text(format!(
-                        "the plan's {label} window: {:.0}% used, resets in {}\nfrom the harness's last run",
-                        window.utilization * 100.0,
-                        ra_providers::limits::until(window.resets_at)
-                    ));
+            // the week of the plan as a pill filled to its percent, colored by how full it is;
+            // the fill eases to a new value and glows brighter for a moment when it moves
+            if self.limits.fresh()
+                && let Some(week) = self.limits.windows.get("seven_day")
+            {
+                let target = self.week_target;
+                let shown = ui.ctx().animate_value_with_time(egui::Id::unique("week-pill"), target, 0.9);
+                let fade = self.week_moved.map_or(0.0, |t| (1.0 - t.elapsed().as_secs_f32() / 1.6).clamp(0.0, 1.0));
+                if fade > 0.0 {
+                    ui.ctx().request_repaint();
                 }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let pulse = (40.0 + 190.0 * fade) as u8;
+                let color = if target >= 0.8 {
+                    theme::ERROR_TEXT
+                } else if target >= 0.5 {
+                    theme::WARN_TEXT
+                } else {
+                    theme::ONLINE
+                };
+                cards::pill_bar(ui, &format!("week {:.0}%", shown * 100.0), shown, color, pulse).on_hover_text(format!(
+                    "the plan's week: {:.0}% used, resets in {}\nfrom the harness's last run",
+                    week.utilization * 100.0,
+                    ra_providers::limits::until(week.resets_at)
+                ));
             }
             let secs = self.started.elapsed().as_secs();
             ui.label(RichText::new(format!("up {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)).color(theme::DIM).small());

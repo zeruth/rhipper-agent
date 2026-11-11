@@ -1,0 +1,464 @@
+//! The context of a run: what every task needs to know about the project, and what one task
+//! has learned across its runs. Nothing here costs a model call; the point is that a worker
+//! spends its tokens on the change, not on finding out where the change lives.
+//!
+//! Two kinds of file. [`PROJECT_FILE`] beside the roadmap is the project context: the layout,
+//! the build and the checks, the conventions. It is drafted once from the workspace, edited by
+//! hand after, and sent with every run. `var/context/<id>.md` is a task's context: the brief of
+//! the card, an [`outline`] of each file the card names (the items and their lines, so the
+//! worker reads regions rather than whole files), and a [`Handoff`] from each run, so the next
+//! run of the card starts where the last one stopped. A task's file lives until the card is
+//! done; [`TaskContext::prune`] removes the rest.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+
+/// The project context, beside the roadmap file.
+pub const PROJECT_FILE: &str = "rhipper.context.md";
+
+/// Where the tasks' files live, under the workspace.
+pub const CONTEXT_DIR: &str = "var/context";
+
+/// How many items an outline names before it counts the rest.
+const OUTLINE_ROOM: usize = 60;
+
+/// How many handoffs a prompt carries, newest last; the file keeps [`HANDOFFS_KEPT`].
+const HANDOFFS_SHOWN: usize = 3;
+
+/// How many handoffs a task's file keeps.
+const HANDOFFS_KEPT: usize = 10;
+
+/// How many lines of a report a handoff keeps.
+const REPORT_LINES: usize = 40;
+
+/// The project context: the text of [`PROJECT_FILE`], or a draft of it from the workspace.
+pub struct Project;
+
+impl Project {
+    /// The project context, when the file exists and says something.
+    pub fn load(workspace: &Path) -> Option<String> {
+        std::fs::read_to_string(workspace.join(PROJECT_FILE)).ok().filter(|t| !t.trim().is_empty())
+    }
+
+    /// The project context, drafting and writing the file first when there is none.
+    ///
+    /// # Errors
+    /// When the file cannot be written.
+    pub fn ensure(workspace: &Path) -> anyhow::Result<String> {
+        if let Some(text) = Self::load(workspace) {
+            return Ok(text);
+        }
+        let draft = Self::draft(workspace);
+        std::fs::write(workspace.join(PROJECT_FILE), &draft).with_context(|| format!("cannot write {PROJECT_FILE}"))?;
+        Ok(draft)
+    }
+
+    /// A draft of the project context from the workspace itself: the name, the first paragraph
+    /// of the README, the crates of a Cargo workspace with their descriptions, the checks and
+    /// the conventions the manifest shows. Short on purpose: it rides on every run.
+    pub fn draft(workspace: &Path) -> String {
+        let manifest = read_toml(&workspace.join("Cargo.toml"));
+        let (title, lead) = readme_lead(workspace).unwrap_or_default();
+        // the package's name, else the README's title, else the directory's own name
+        let name = manifest
+            .as_ref()
+            .and_then(|m| m.get("package")?.get("name")?.as_str().map(str::to_owned))
+            .or(title)
+            .or_else(|| std::fs::canonicalize(workspace).ok()?.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "the project".to_owned());
+        let mut text = format!("# {name}\n\n");
+        if let Some(lead) = lead {
+            text.push_str(&lead);
+            text.push_str("\n\n");
+        }
+        let members = members_of(workspace, manifest.as_ref());
+        if !members.is_empty() {
+            text.push_str("## Layout\n\n");
+            for (path, description) in &members {
+                text.push_str(&format!("- `{path}` — {description}\n"));
+            }
+            text.push('\n');
+        }
+        if manifest.is_some() {
+            text.push_str("## Build and checks\n\n");
+            text.push_str("- `cargo test --workspace -q` is the check of a card unless its acceptance names another cargo command in backticks.\n");
+            if manifest.as_ref().and_then(|m| m.get("workspace")?.get("lints")?.get("clippy")).is_some() {
+                text.push_str("- `cargo clippy --workspace` warns with the pedantic set; a change adds no warnings of its own.\n");
+            }
+            if let Some(edition) = manifest.as_ref().and_then(|m| {
+                m.get("workspace").and_then(|w| w.get("package")).or_else(|| m.get("package"))?.get("edition")?.as_str().map(str::to_owned)
+            }) {
+                text.push_str(&format!("- Rust edition {edition}.\n"));
+            }
+            text.push('\n');
+        }
+        text.push_str("## Conventions\n\n");
+        text.push_str("- Match the surrounding code: its comment density, naming and idiom. Doc comments say what and why, not how.\n");
+        text.push_str("- Read the files the card names first, by the regions the outline points at; search before exploring.\n");
+        text.push_str("- Run the check the card names before reporting, and report what changed and what was verified, briefly.\n\n");
+        text.push_str(&format!("_Drafted by `rc context --init` from the workspace. Edit it by hand: every run reads {PROJECT_FILE}._\n"));
+        text
+    }
+}
+
+/// The root manifest as TOML, when it reads and parses.
+fn read_toml(path: &Path) -> Option<toml::Value> {
+    std::fs::read_to_string(path).ok()?.parse::<toml::Value>().ok()
+}
+
+/// The README's title and its first paragraph after it (up to six lines); `None` without a
+/// README, and a title or a lead of `None` when the file has none.
+fn readme_lead(workspace: &Path) -> Option<(Option<String>, Option<String>)> {
+    let text = ["README.md", "README", "readme.md"].iter().find_map(|n| std::fs::read_to_string(workspace.join(n)).ok())?;
+    let mut title = None;
+    let mut lines = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(heading) = line.strip_prefix("# ") {
+            title.get_or_insert_with(|| heading.trim().to_owned());
+            continue;
+        }
+        if line.starts_with('#') || (line.is_empty() && lines.is_empty()) {
+            continue;
+        }
+        if line.is_empty() || lines.len() == 6 {
+            break;
+        }
+        lines.push(line.to_owned());
+    }
+    Some((title, (!lines.is_empty()).then(|| lines.join(" "))))
+}
+
+/// The members of a Cargo workspace as `(path, description)`, in manifest order; a member
+/// without a description gives the first `//!` line of its root source. A single package
+/// stands alone.
+fn members_of(workspace: &Path, manifest: Option<&toml::Value>) -> Vec<(String, String)> {
+    let Some(manifest) = manifest else { return Vec::new() };
+    let globs: Vec<String> = manifest
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(toml::Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for glob in &globs {
+        match glob.strip_suffix("/*") {
+            Some(parent) => {
+                if let Ok(entries) = std::fs::read_dir(workspace.join(parent)) {
+                    let mut found: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.join("Cargo.toml").exists()).collect();
+                    found.sort();
+                    dirs.extend(found);
+                }
+            }
+            None => dirs.push(workspace.join(glob)),
+        }
+    }
+    if dirs.is_empty() && manifest.get("package").is_some() {
+        dirs.push(workspace.to_path_buf());
+    }
+    dirs.into_iter()
+        .filter_map(|dir| {
+            let package = read_toml(&dir.join("Cargo.toml"))?;
+            let name = package.get("package")?.get("name")?.as_str()?.to_owned();
+            let description = package
+                .get("package")
+                .and_then(|p| p.get("description"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| doc_line(&dir.join("src/lib.rs")))
+                .or_else(|| doc_line(&dir.join("src/main.rs")))
+                .unwrap_or_else(|| name.clone());
+            let shown = dir.strip_prefix(workspace).map_or(name, |p| p.to_string_lossy().replace('\\', "/"));
+            Some((shown, description))
+        })
+        .collect()
+}
+
+/// The first `//!` line of a source file, without the marker.
+fn doc_line(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().find_map(|l| l.strip_prefix("//!").map(|d| d.trim().trim_end_matches('.').to_owned())).filter(|d| !d.is_empty())
+}
+
+/// The outline of one file: its line count, its first doc line, and the items it declares with
+/// their line numbers, so a reader opens the region it needs and not the file. Rust files give
+/// their functions, types, traits, impls and modules at the top level and one level in; Markdown
+/// its headings; TOML its tables; anything else the definitions at the start of a line.
+pub fn outline(path: &Path, text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let mut items: Vec<String> = Vec::new();
+    let mut hidden = 0usize;
+    // the tests module of a Rust file is not where a change lands; its functions stay out
+    let mut in_tests = false;
+    for (number, line) in lines.iter().enumerate() {
+        if extension == "rs" {
+            if !in_tests && line.starts_with("mod tests") && line.trim_end().ends_with('{') {
+                in_tests = true;
+                continue;
+            }
+            if in_tests {
+                in_tests = line.trim_end() != "}";
+                continue;
+            }
+        }
+        let item = match extension {
+            "rs" => rust_item(line),
+            "md" => line.starts_with('#').then(|| line.trim().to_owned()),
+            "toml" => line.starts_with('[').then(|| line.trim().to_owned()),
+            _ => generic_item(line),
+        };
+        let Some(item) = item else { continue };
+        if items.len() == OUTLINE_ROOM {
+            hidden += 1;
+            continue;
+        }
+        items.push(format!("  {:>5}  {}", number + 1, clip(&item, 110)));
+    }
+    let mut out = format!("{} ({} lines)", path.display().to_string().replace('\\', "/"), lines.len());
+    if extension == "rs"
+        && let Some(doc) = lines.iter().find_map(|l| l.strip_prefix("//!").map(str::trim)).filter(|d| !d.is_empty())
+    {
+        out.push_str(&format!(" — {}", clip(doc, 140)));
+    }
+    out.push('\n');
+    for item in &items {
+        out.push_str(item);
+        out.push('\n');
+    }
+    if hidden > 0 {
+        out.push_str(&format!("         … and {hidden} more\n"));
+    }
+    out
+}
+
+/// A Rust item at the top level or one level in: the declaration without its body.
+fn rust_item(line: &str) -> Option<String> {
+    let indent = line.len() - line.trim_start().len();
+    if indent > 4 {
+        return None;
+    }
+    let mut rest = line.trim_start();
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = match after.strip_prefix('(') {
+            Some(scoped) => scoped.split_once(')')?.1,
+            None => after,
+        }
+        .trim_start();
+    }
+    const KEYWORDS: [&str; 15] =
+        ["fn", "async fn", "const fn", "unsafe fn", "struct", "enum", "union", "trait", "impl", "mod", "const", "static", "type", "macro_rules!", "unsafe impl"];
+    let is_item = KEYWORDS.iter().any(|k| {
+        rest.strip_prefix(k).is_some_and(|after| after.starts_with([' ', '<', '!']) || (k.ends_with('!') && after.starts_with(' ')))
+    });
+    if !is_item || rest.starts_with("mod tests") {
+        return None;
+    }
+    // a declaration ends before its body, empty or not, or its `;`
+    let shown = line.trim();
+    let shown = shown.strip_suffix("{}").or_else(|| shown.strip_suffix("{ }")).unwrap_or(shown);
+    Some(shown.trim_end_matches(['{', ';', ' ']).trim_end_matches(" where").to_owned())
+}
+
+/// A definition at the start of a line in a language the outline does not know.
+fn generic_item(line: &str) -> Option<String> {
+    const STARTS: [&str; 9] = ["function ", "def ", "class ", "export function ", "export class ", "export const ", "fn ", "func ", "sub "];
+    STARTS.iter().any(|s| line.starts_with(s)).then(|| line.trim().trim_end_matches(['{', ':', ' ']).to_owned())
+}
+
+/// The outlines of the files a card names, under one heading; a file that is not there is
+/// named as missing, so the card's list shows its mistake.
+pub fn outline_files(workspace: &Path, files: &[String]) -> String {
+    let mut out = String::new();
+    for file in files {
+        match std::fs::read_to_string(workspace.join(file)) {
+            Ok(text) => out.push_str(&outline(Path::new(file), &text)),
+            Err(_) => out.push_str(&format!("{file} (not in the workspace yet)\n")),
+        }
+    }
+    out
+}
+
+/// What one run of a task left behind, for the next run to start from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handoff {
+    /// When the run ended, as seconds since the Unix epoch.
+    pub when: u64,
+    pub model: String,
+    /// `implemented`, `needs revision` or `failed`.
+    pub outcome: String,
+    /// The check line: the command and whether it passed.
+    pub check: String,
+    /// The workspace-relative paths the run changed.
+    pub changed: Vec<String>,
+    /// The worker's report, clipped to its first lines.
+    pub report: String,
+}
+
+/// A task's context: the brief, the outlines and the handoffs, in `var/context/<id>.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskContext {
+    pub id: i64,
+    /// The card and its surroundings, as the run builds them.
+    pub brief: String,
+    /// The outlines of the files the card names, built afresh each run.
+    pub outlines: String,
+    /// The handoffs of the earlier runs, oldest first.
+    pub handoffs: Vec<Handoff>,
+}
+
+impl TaskContext {
+    /// The file of task `id` under `workspace`.
+    pub fn path(workspace: &Path, id: i64) -> PathBuf {
+        workspace.join(CONTEXT_DIR).join(format!("{id}.md"))
+    }
+
+    /// The context of task `id`: the handoffs of its file when there is one, nothing else yet;
+    /// the run sets the brief and the outlines.
+    pub fn open(workspace: &Path, id: i64) -> Self {
+        let handoffs = std::fs::read_to_string(Self::path(workspace, id)).map(|text| parse_handoffs(&text)).unwrap_or_default();
+        Self { id, brief: String::new(), outlines: String::new(), handoffs }
+    }
+
+    /// The text a run sends the worker: the brief, the outlines, and the last handoffs.
+    pub fn prompt(&self) -> String {
+        let mut text = self.brief.clone();
+        if !self.outlines.is_empty() {
+            text.push_str("\nFiles: read the regions the outline points at, not whole files.\n");
+            text.push_str(&self.outlines);
+        }
+        let shown = &self.handoffs[self.handoffs.len().saturating_sub(HANDOFFS_SHOWN)..];
+        if !shown.is_empty() {
+            text.push_str("\nEarlier runs of this task, oldest first; continue from the last one:\n");
+            for handoff in shown {
+                text.push_str(&handoff.render());
+            }
+        }
+        text
+    }
+
+    /// Adds the handoff of a run, keeping the newest [`HANDOFFS_KEPT`].
+    pub fn record(&mut self, handoff: Handoff) {
+        self.handoffs.push(handoff);
+        let excess = self.handoffs.len().saturating_sub(HANDOFFS_KEPT);
+        self.handoffs.drain(..excess);
+    }
+
+    /// Writes the file.
+    ///
+    /// # Errors
+    /// When the directory or the file cannot be written.
+    pub fn save(&self, workspace: &Path) -> anyhow::Result<()> {
+        let path = Self::path(workspace, self.id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut text = format!("# Task #{} context\n\n## Brief\n\n{}\n", self.id, self.brief.trim_end());
+        if !self.outlines.is_empty() {
+            text.push_str(&format!("\n## Files\n\n{}", self.outlines));
+        }
+        for handoff in &self.handoffs {
+            text.push('\n');
+            text.push_str(&handoff.render());
+        }
+        std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))
+    }
+
+    /// Removes the files of every task not in `keep`: the done cards. Returns how many went.
+    pub fn prune(workspace: &Path, keep: &[i64]) -> usize {
+        let Ok(entries) = std::fs::read_dir(workspace.join(CONTEXT_DIR)) else { return 0 };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let id = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<i64>().ok());
+            if let Some(id) = id
+                && !keep.contains(&id)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        removed
+    }
+}
+
+impl Handoff {
+    /// The handoff as a block of the file and of the prompt.
+    fn render(&self) -> String {
+        let mut text = format!("## Handoff {} · {} · {}\n", self.when, self.model, self.outcome);
+        text.push_str(&format!("check: {}\n", self.check.trim()));
+        if !self.changed.is_empty() {
+            text.push_str(&format!("changed: {}\n", self.changed.join(" ")));
+        }
+        let report: Vec<&str> = self.report.lines().filter(|l| !l.starts_with("## Handoff ")).collect();
+        let shown = &report[..report.len().min(REPORT_LINES)];
+        if !shown.is_empty() {
+            text.push_str(&shown.join("\n"));
+            text.push('\n');
+        }
+        if report.len() > shown.len() {
+            text.push_str(&format!("… {} more lines in the notes of the card\n", report.len() - shown.len()));
+        }
+        text
+    }
+}
+
+/// The handoffs of a task's file, oldest first; a file without any gives none.
+fn parse_handoffs(text: &str) -> Vec<Handoff> {
+    let mut handoffs: Vec<Handoff> = Vec::new();
+    for line in text.lines() {
+        if let Some(header) = line.strip_prefix("## Handoff ") {
+            let mut parts = header.split(" · ");
+            let when = parts.next().and_then(|w| w.trim().parse().ok()).unwrap_or(0);
+            let model = parts.next().unwrap_or("").trim().to_owned();
+            let outcome = parts.next().unwrap_or("").trim().to_owned();
+            handoffs.push(Handoff { when, model, outcome, check: String::new(), changed: Vec::new(), report: String::new() });
+            continue;
+        }
+        let Some(current) = handoffs.last_mut() else { continue };
+        if line.starts_with("## ") {
+            // another section after the handoffs; nothing of the format writes one, but a hand
+            // edit may
+            continue;
+        }
+        if current.check.is_empty() && current.report.is_empty() && let Some(check) = line.strip_prefix("check: ") {
+            current.check = check.to_owned();
+        } else if current.changed.is_empty() && current.report.is_empty() && let Some(changed) = line.strip_prefix("changed: ") {
+            current.changed = changed.split_whitespace().map(str::to_owned).collect();
+        } else if line.starts_with("… ") && line.ends_with("in the notes of the card") {
+            // the count of the clipped lines is not part of the report
+        } else {
+            if !current.report.is_empty() {
+                current.report.push('\n');
+            }
+            current.report.push_str(line);
+        }
+    }
+    for handoff in &mut handoffs {
+        handoff.report = handoff.report.trim().to_owned();
+    }
+    handoffs
+}
+
+/// The paths whose line of `git status --porcelain` differs between `before` and `after`: what
+/// a run changed, whatever was already dirty.
+pub fn changed_between(before: &str, after: &str) -> Vec<String> {
+    let before: std::collections::HashSet<&str> = before.lines().collect();
+    let mut changed: Vec<String> = after
+        .lines()
+        .filter(|l| !before.contains(l))
+        .filter_map(|l| l.get(3..))
+        .map(|p| p.rsplit(" -> ").next().unwrap_or(p).trim_matches('"').to_owned())
+        .collect();
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
+/// A text clipped to `room` characters with an ellipsis.
+fn clip(text: &str, room: usize) -> String {
+    if text.chars().count() <= room { text.to_owned() } else { format!("{}…", text.chars().take(room - 1).collect::<String>()) }
+}
+
+#[cfg(test)]
+mod tests;
