@@ -9,6 +9,7 @@ pub mod install;
 pub mod instance;
 pub mod logs;
 pub mod mcp;
+pub mod retro;
 pub mod roadmap_pane;
 pub mod secret;
 pub mod setup;

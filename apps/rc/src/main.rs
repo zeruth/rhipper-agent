@@ -86,6 +86,10 @@ enum Command {
         /// The most turns the run may take; none unless given.
         #[arg(long)]
         turns: Option<u32>,
+        /// Out of debug mode: the worker is not asked what would have made the run faster. RHIPPER_DEBUG=off
+        /// does the same everywhere.
+        #[arg(long)]
+        no_debug: bool,
         /// The effort the run asks of the model: low, medium or high; left out, the card's own,
         /// medium when it names none.
         #[arg(long)]
@@ -185,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             usage().await
         }
-        Command::Run { id, model, budget, turns, effort, dry } => {
+        Command::Run { id, model, budget, turns, no_debug, effort, dry } => {
             plain_tracing()?;
             if let Some(budget) = budget {
                 anyhow::ensure!(budget.is_finite() && budget > 0.0, "the budget is a positive number of dollars");
@@ -196,7 +200,10 @@ async fn main() -> anyhow::Result<()> {
                 Some(model) => model,
                 None => store.read(id).await?.assignee.map_or_else(|| ra_console::ui::DEFAULT_MODEL.to_owned(), |a| a.model),
             };
-            let worker = Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns).with_effort(effort);
+            let mut worker = Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns).with_effort(effort);
+            if no_debug {
+                worker = worker.with_debug(false);
+            }
             let lines = if dry {
                 ra_console::agent::dry_run(&store, id, &worker).await?
             } else {
@@ -281,7 +288,13 @@ fn hook(event: &str) -> anyhow::Result<()> {
     let cwd =
         call.get("cwd").and_then(serde_json::Value::as_str).map_or_else(|| std::env::current_dir().unwrap_or_default(), PathBuf::from);
     let Ok(catalogue) = ra_gotchas::Catalogue::load(&cwd.join("var/gotchas.toml")) else { return Ok(()) };
-    let conditions = ra_gotchas::Conditions { console_running: cwd.join("var/console.pid").exists() };
+    // a running console or window holds its binary only while it runs from target/; an
+    // installed one leaves the build free, so the lock itself is asked, not the pid file
+    let locked = |name: &str| {
+        let path = cwd.join("target").join("debug").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        path.exists() && std::fs::OpenOptions::new().append(true).open(&path).is_err()
+    };
+    let conditions = ra_gotchas::Conditions { console_running: locked("rc") || locked("rc-gui") };
     let answer = match event {
         "pre" => {
             let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str).unwrap_or("");

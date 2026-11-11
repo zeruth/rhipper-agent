@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::markdown::{self, render};
-use crate::model::{Assignment, Effort, Node, NodeKind, TaskState};
+use crate::model::{Assignment, Effort, Estimate, Node, NodeKind, TaskState};
 use crate::tree;
 
 /// The store over one `rhipper.md`.
@@ -39,6 +39,7 @@ impl Store {
                 assignee: None,
                 complexity: 3,
                 effort: Effort::default(),
+                estimate: None,
                 notes: None,
                 assessed: None,
             };
@@ -113,6 +114,7 @@ impl Store {
             assignee: None,
             complexity,
             effort: Effort::default(),
+            estimate: None,
             notes: None,
             assessed: None,
         };
@@ -243,6 +245,16 @@ impl Store {
     pub async fn set_effort(&self, id: i64, effort: Effort) -> anyhow::Result<()> {
         let mut nodes = self.all().await?;
         node_mut(&mut nodes, id)?.effort = effort;
+        self.write(nodes).await
+    }
+
+    /// Sets a node's own estimate of what a run spends; `None` goes back to the complexity's.
+    ///
+    /// # Errors
+    /// When the node is not there or the file cannot be written.
+    pub async fn set_estimate(&self, id: i64, estimate: Option<Estimate>) -> anyhow::Result<()> {
+        let mut nodes = self.all().await?;
+        node_mut(&mut nodes, id)?.estimate = estimate;
         self.write(nodes).await
     }
 

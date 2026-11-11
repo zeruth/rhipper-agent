@@ -20,6 +20,7 @@ fn node(id: i64, parent: Option<i64>) -> Node {
         assignee: None,
         complexity: 3,
         effort: crate::model::Effort::default(),
+        estimate: None,
         notes: None,
         assessed: None,
     }

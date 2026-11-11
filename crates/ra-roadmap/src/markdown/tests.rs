@@ -20,9 +20,30 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
         assignee: None,
         complexity: 3,
         effort: Effort::default(),
+        estimate: None,
         notes: None,
         assessed: None,
     }
+}
+
+#[test]
+fn round_trips_the_estimate_line_and_leaves_the_default_out() {
+    use crate::model::Estimate;
+    let mut sized = node(8, None, NodeKind::Task, "Sized task");
+    sized.estimate = Some(Estimate { tokens: 40_000, turns: 12 });
+    let routine = node(9, None, NodeKind::Task, "Routine task");
+    let text = render(&[sized, routine]);
+    assert!(text.contains("    estimate: 40k tokens, 12 turns"), "{text}");
+    assert_eq!(text.matches("estimate:").count(), 1, "no estimate writes no line:\n{text}");
+    let parsed = parse(&text).unwrap();
+    assert_eq!(parsed[0].estimate, Some(Estimate { tokens: 40_000, turns: 12 }));
+    assert_eq!(parsed[1].estimate, None);
+    assert_eq!(render(&parsed), text);
+    // the bare counts read too, and a line without the turns does not
+    let short = parse("- 1 ‹task› T\n    estimate: 2500 3").unwrap();
+    assert_eq!(short[0].estimate, Some(Estimate { tokens: 2500, turns: 3 }));
+    let error = parse("- 1 ‹task› T\n    estimate: 40k").unwrap_err();
+    assert!(format!("{error:#}").contains("the tokens then the turns"), "{error:#}");
 }
 
 #[test]

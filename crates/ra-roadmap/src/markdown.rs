@@ -17,6 +17,7 @@
 //!         files: crates/ra-roadmap/src/store.rs crates/ra-console/src/agent.rs
 //!         waits-on: 2 7
 //!         effort: high
+//!         estimate: 40k tokens, 12 turns
 //!         notes: ...
 //!         assessed: 9f3a0c41d27b6e58
 //! ```
@@ -26,6 +27,9 @@
 //!
 //! `effort:` is `low`, `medium` or `high`, what a run asks of the model; a card without the line
 //! runs at medium, so the line is written only for another level.
+//!
+//! `estimate:` is what a run of the card is expected to spend, the tokens then the turns; a card
+//! without the line takes the estimate of its complexity.
 //!
 //! `assessed:` holds what the last reassessment saw: a fingerprint of its inputs, or the word
 //! `final`, which no reassessment rewrites.
@@ -132,6 +136,9 @@ fn detail_lines(node: &Node, level: usize) -> Vec<String> {
     if node.effort != Effort::default() {
         lines.push(format!("{indent}effort: {}", node.effort));
     }
+    if let Some(estimate) = node.estimate {
+        lines.push(format!("{indent}estimate: {estimate}"));
+    }
     lines
 }
 
@@ -179,6 +186,7 @@ pub fn parse(text: &str) -> anyhow::Result<Vec<Node>> {
                     .with_context(|| format!("line {number}: the session time is a number"))?;
             }
             "effort" => node.effort = value.parse().with_context(|| format!("line {number}"))?,
+            "estimate" => node.estimate = Some(value.parse().with_context(|| format!("line {number}"))?),
             "waits-on" => {
                 node.depends_on = value
                     .split_whitespace()
@@ -249,6 +257,7 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         assignee,
         complexity,
         effort: Effort::default(),
+        estimate: None,
         notes: None,
         assessed: None,
     })

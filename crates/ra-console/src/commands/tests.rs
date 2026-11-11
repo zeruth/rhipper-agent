@@ -345,6 +345,30 @@ async fn a_dry_run_prints_the_prompt_and_leaves_the_card_as_it_was() {
 }
 
 #[tokio::test]
+async fn in_debug_mode_the_run_keeps_the_worker_s_look_back_for_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task Probe parent 1", &store, &worker()).await.unwrap();
+    let report = "done\n\n## Faster next time\n- [machine] cargo test relinks rc.exe while the window runs: test with -p\n- the card named no files; a files line would have saved the search\n";
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(report, vec![])]));
+    assert!(runner.debug, "debug mode is on unless turned off");
+    let (out, _) = run("run 2", &store, &runner).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("↯ [machine] cargo test relinks")), "{out:?}");
+    let kept = crate::retro::recent(dir.path(), 10);
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[0].node, Some(2));
+    // the next run reads them as machine notes
+    assert!(crate::retro::machine_lines(dir.path()).contains("a files line"));
+    // out of debug mode nothing is asked and nothing kept
+    run("add task Quiet parent 1", &store, &worker()).await.unwrap();
+    let quiet = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(report, vec![])])).with_debug(false);
+    let (out, _) = run("run 3", &store, &quiet).await.unwrap();
+    assert!(!out.iter().any(|l| l.contains('↯')), "{out:?}");
+    assert_eq!(crate::retro::recent(dir.path(), 10).len(), 2);
+}
+
+#[tokio::test]
 async fn a_failing_check_leaves_the_node_needing_revision() {
     let (out, node) = checked_run(false).await;
     assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
@@ -516,6 +540,55 @@ async fn run_on_a_bare_model_fails_the_node_when_the_provider_does() {
 fn the_complexity_sets_the_budget() {
     use crate::agent::budget_for;
     assert_eq!([1, 2, 3, 4, 5].map(budget_for), [0.25, 0.50, 1.00, 2.00, 5.00]);
+}
+
+#[test]
+fn the_complexity_sets_the_estimate_unless_the_card_names_one() {
+    use crate::agent::{estimate_for, estimate_of};
+    use ra_roadmap::model::Estimate;
+    assert_eq!([1, 2, 3, 4, 5].map(|c| estimate_for(c).tokens), [20_000, 50_000, 120_000, 250_000, 500_000]);
+    assert_eq!([1, 2, 3, 4, 5].map(|c| estimate_for(c).turns), [4, 8, 15, 25, 40]);
+    assert_eq!(estimate_for(0), estimate_for(1));
+    assert_eq!(estimate_for(9), estimate_for(5));
+    let mut node = ra_roadmap::markdown::parse("- 1 ‹task› T {c2}").unwrap().remove(0);
+    assert_eq!(estimate_of(&node), estimate_for(2));
+    node.estimate = Some(Estimate { tokens: 500, turns: 1 });
+    assert_eq!(estimate_of(&node), Estimate { tokens: 500, turns: 1 });
+}
+
+/// A run of a c3 card whose scripted provider reports `tokens` read in one turn; the lines and
+/// the handoff of the run.
+async fn sized_run(tokens: u64, estimate: Option<ra_roadmap::model::Estimate>) -> (Vec<String>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task Probe parent 1", &store, &worker()).await.unwrap();
+    store.set_estimate(2, estimate).await.unwrap();
+    let mut answer = says("done", vec![]);
+    answer.usage.prompt_tokens = tokens;
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![answer]));
+    let (out, _) = run("run 2", &store, &worker).await.unwrap();
+    let context = std::fs::read_to_string(dir.path().join("var/context/2.md")).unwrap();
+    let handoff = context.split("## Handoff ").nth(1).unwrap().to_owned();
+    (out, handoff)
+}
+
+#[tokio::test]
+async fn a_run_that_reports_more_than_its_estimate_says_so() {
+    let (out, handoff) = sized_run(400_000, None).await;
+    assert!(out[0].contains("over the estimate of 120k tokens, 15 turns"), "{out:?}");
+    assert!(handoff.contains("over the estimate"), "{handoff}");
+}
+
+#[tokio::test]
+async fn a_run_under_its_estimate_says_so_and_the_card_can_size_itself() {
+    let (out, handoff) = sized_run(100, None).await;
+    assert!(out[0].contains("under the estimate of 120k tokens, 15 turns"), "{out:?}");
+    assert!(handoff.contains("under the estimate"), "{handoff}");
+    // the card's own line is the measure: 110 tokens against 50 is over
+    let estimate = ra_roadmap::model::Estimate { tokens: 50, turns: 1 };
+    let (out, _) = sized_run(100, Some(estimate)).await;
+    assert!(out[0].contains("over the estimate of 50 tokens, 1 turns"), "{out:?}");
 }
 
 /// The script behind a harness: it brings its own tools, as Claude Code does.

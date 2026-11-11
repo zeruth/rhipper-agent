@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use parking_lot::Mutex;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError, TurnUsage, Usage};
-use ra_roadmap::model::{Effort, Node, NodeKind, TaskState};
+use ra_roadmap::model::{Effort, Estimate, Node, NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 use ra_usage::{Entry, Totals, UsageStore};
@@ -84,6 +84,9 @@ pub struct Worker {
     /// The effort of a run, from `--effort`; `None` takes the card's own, medium when it names
     /// none.
     pub effort: Option<Effort>,
+    /// Debug mode, on unless `RHIPPER_DEBUG=off`: a run asks the worker to end its report with
+    /// what would have made it faster, keeps the answer, and hands the latest to the next runs.
+    pub debug: bool,
     /// What answers the commands of a run instead of the shell; the tests script the check and
     /// the lint with it.
     script: Option<ra_tools::Script>,
@@ -102,8 +105,16 @@ impl Worker {
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes")),
             turns: None,
             effort: None,
+            debug: !std::env::var("RHIPPER_DEBUG").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
             script: None,
         }
+    }
+
+    /// The same worker, in or out of debug mode.
+    #[must_use]
+    pub fn with_debug(mut self, on: bool) -> Self {
+        self.debug = on;
+        self
     }
 
     /// The same worker, with every run capped at `turns` turns instead of the complexity's.
@@ -362,7 +373,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
-                messages: harness_messages(&task, &project, &root),
+                messages: harness_messages(&task, &project, &root, worker.debug),
                 temperature: Some(0.4),
                 max_tokens: Some(4096),
                 tools: Vec::new(),
@@ -388,7 +399,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             Err(error) => Err(error),
         }
     } else {
-        tool_loop(provider.as_ref(), worker, id, bare_context(&task, &project), workspace.as_deref(), budget, cap).await
+        tool_loop(provider.as_ref(), worker, id, bare_context(&task, &project, worker.debug), workspace.as_deref(), budget, cap).await
     };
     // the handoff of this run, for the next one of the card; the done cards' files go
     let handoff = |outcome: &str, check: &str, report: &str, changed: Vec<String>| ra_context::Handoff {
@@ -472,6 +483,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         }
         store.set_state(id, TaskState::NeedsRevision).await?;
     }
+    // the run against its estimate, on the check line so the handoff carries it: the next run
+    // reads what the last one spent against what the card was sized at
+    let verdict = estimate_verdict(estimate_of(&node), &session.usage, session.turns);
+    check_line = format!("{check_line} · {verdict}");
     task.record(handoff(if passed { "implemented" } else { "needs revision" }, check_line.trim(), &report, changed));
     save_context(store, &root, &task).await;
     let turns = match session.cap {
@@ -480,7 +495,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     };
     let mut lines = vec![
         format!(
-            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · in {} out {}{} · {}",
+            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · in {} out {}{} · {} · {verdict}",
             if passed { "✓" } else { "✗" },
             id,
             node.title,
@@ -496,6 +511,16 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     ];
     lines.extend(fresh);
     lines.extend(lint_lines);
+    // in debug mode the worker's own look back: kept for the next runs, and named here
+    if worker.debug {
+        let notes = crate::retro::parse(&session.text);
+        if let Err(e) = crate::retro::record(&root, Some(id), &notes) {
+            tracing::warn!("the look back of #{id} was not kept: {e:#}");
+        }
+        for note in &notes {
+            lines.push(format!("  ↯ {}{}", if note.machine { "[machine] " } else { "" }, note.text));
+        }
+    }
     lines.push("  the full answer is in the notes of the card in rhipper.md".to_owned());
     if !gotcha_hits.is_empty() {
         let mut ids: Vec<&str> = gotcha_hits.iter().map(|h| h.id.as_str()).collect();
@@ -547,7 +572,7 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
 /// The messages of a harness run: the worker's role, the project context and the machine notes
 /// as system messages, the task as the user turn. The machine notes name what tripped the last
 /// runs, so the worker does not find out the hard way again.
-fn harness_messages(task: &ra_context::TaskContext, project: &str, root: &Path) -> Vec<Message> {
+fn harness_messages(task: &ra_context::TaskContext, project: &str, root: &Path, debug: bool) -> Vec<Message> {
     let mut messages = vec![Message::system(SYSTEM)];
     if !project.is_empty() {
         messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
@@ -556,14 +581,23 @@ fn harness_messages(task: &ra_context::TaskContext, project: &str, root: &Path) 
     if !notes.is_empty() {
         messages.push(Message::system(notes));
     }
+    if debug {
+        messages.push(Message::system(crate::retro::PROMPT));
+    }
     messages.push(Message::user(task.prompt()));
     messages
 }
 
-/// The task of a bare model, which reads the project context at the head of it.
-fn bare_context(task: &ra_context::TaskContext, project: &str) -> String {
+/// The task of a bare model, which reads the project context at the head of it and, in debug
+/// mode, the ask for its look back at the end.
+fn bare_context(task: &ra_context::TaskContext, project: &str, debug: bool) -> String {
     let context = task.prompt();
-    if project.is_empty() { context } else { format!("The project:\n{project}\n\n{context}") }
+    let mut text = if project.is_empty() { context } else { format!("The project:\n{project}\n\n{context}") };
+    if debug {
+        text.push_str("\n\n");
+        text.push_str(crate::retro::PROMPT);
+    }
+    text
 }
 
 /// Everything a run of `id` would send, printed instead of sent: the system messages, the task
@@ -580,9 +614,9 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let Prepared { workspace, root, task, project, budget, cap, effort } = prepare(store, &node, worker, false).await?;
     let harness = provider.has_own_tools();
     let messages = if harness {
-        harness_messages(&task, &project, &root)
+        harness_messages(&task, &project, &root, worker.debug)
     } else {
-        vec![Message::system(SYSTEM), Message::user(bare_context(&task, &project))]
+        vec![Message::system(SYSTEM), Message::user(bare_context(&task, &project, worker.debug))]
     };
     let request = CompletionRequest {
         model: worker.model.clone(),
@@ -808,8 +842,13 @@ fn check_failure(output: &str) -> CheckFailure {
 /// The machine notes of a run: what the gotchas say about the last hits in the journal, for the
 /// system prompt, so the worker does not find out the hard way again. Empty when nothing fired.
 fn machine_notes(workspace: &Path) -> String {
-    let Ok(catalogue) = Catalogue::load(&workspace.join(GOTCHAS_FILE)) else { return String::new() };
-    catalogue.notes(&Journal::at(&workspace.join(GOTCHAS_LOG)).recent(RECENT_HITS))
+    let gotchas = match Catalogue::load(&workspace.join(GOTCHAS_FILE)) {
+        Ok(catalogue) => catalogue.notes(&Journal::at(&workspace.join(GOTCHAS_LOG)).recent(RECENT_HITS)),
+        Err(_) => String::new(),
+    };
+    // what the earlier runs said themselves, in debug mode, rides along
+    let retro = crate::retro::machine_lines(workspace);
+    [gotchas, retro].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n")
 }
 
 /// What one worker session came to: the final answer, the usage summed over its turns, and how
@@ -856,6 +895,35 @@ pub fn budget_for(complexity: u8) -> f64 {
         4 => 2.00,
         _ => 5.00,
     }
+}
+
+/// The estimate of a run on a node of `complexity`, when the card names none: what a lean run
+/// reads and writes over its turns. c1 20k tokens in 4 turns, c2 50k in 8, c3 120k in 15, c4
+/// 250k in 25, c5 500k in 40. An out-of-range complexity takes the nearest end.
+#[must_use]
+pub fn estimate_for(complexity: u8) -> Estimate {
+    let (tokens, turns) = match complexity {
+        0 | 1 => (20_000, 4),
+        2 => (50_000, 8),
+        3 => (120_000, 15),
+        4 => (250_000, 25),
+        _ => (500_000, 40),
+    };
+    Estimate { tokens, turns }
+}
+
+/// The estimate a run of `node` is held against: the card's own `estimate:` line, else the
+/// complexity's.
+#[must_use]
+pub fn estimate_of(node: &Node) -> Estimate {
+    node.estimate.unwrap_or_else(|| estimate_for(node.complexity))
+}
+
+/// The verdict of a run against its estimate, for the run line and the handoff: `over the
+/// estimate of 120k tokens, 15 turns` or `under the estimate of …`.
+fn estimate_verdict(estimate: Estimate, usage: &Usage, turns: u64) -> String {
+    let side = if estimate.is_over(usage.prompt_tokens + usage.completion_tokens, turns) { "over" } else { "under" };
+    format!("{side} the estimate of {estimate}")
 }
 
 /// A run stopped because its summed cost crossed its budget. Its text is the note on the node.

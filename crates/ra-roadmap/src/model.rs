@@ -187,6 +187,55 @@ impl std::str::FromStr for Effort {
     }
 }
 
+/// What a run of a card is expected to spend: the tokens read and written over the run, and the
+/// turns it takes. The runner derives one from the complexity; a card's `estimate:` line
+/// overrides it, so a run says over or under and the ledger shows the subtrees that ran far over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Estimate {
+    pub tokens: u64,
+    pub turns: u64,
+}
+
+impl Estimate {
+    /// Whether `tokens` or `turns` passed the estimate.
+    #[must_use]
+    pub fn is_over(self, tokens: u64, turns: u64) -> bool {
+        tokens > self.tokens || turns > self.turns
+    }
+}
+
+impl std::fmt::Display for Estimate {
+    /// The form the store persists, `40k tokens, 12 turns`; a count under a thousand is written
+    /// whole.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.tokens >= 1000 && self.tokens.is_multiple_of(1000) {
+            write!(f, "{}k tokens, {} turns", self.tokens / 1000, self.turns)
+        } else {
+            write!(f, "{} tokens, {} turns", self.tokens, self.turns)
+        }
+    }
+}
+
+impl std::str::FromStr for Estimate {
+    type Err = anyhow::Error;
+
+    /// The estimate of its line: two counts, the tokens then the turns, with `k` allowed on the
+    /// tokens; the words between them are free, so `40k tokens, 12 turns` and `40000 12` both read.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut counts = text.split(|c: char| c.is_whitespace() || c == ',').filter(|w| w.starts_with(|c: char| c.is_ascii_digit()));
+        let (Some(tokens), Some(turns)) = (counts.next(), counts.next()) else {
+            anyhow::bail!("the estimate is the tokens then the turns, as `40k tokens, 12 turns`");
+        };
+        let tokens = match tokens.strip_suffix(['k', 'K']) {
+            Some(thousands) => thousands.parse::<u64>().map(|n| n * 1000),
+            None => tokens.parse::<u64>(),
+        }
+        .map_err(|_| anyhow::anyhow!("the tokens of an estimate are a count, as 40000 or 40k"))?;
+        let turns = turns.parse::<u64>().map_err(|_| anyhow::anyhow!("the turns of an estimate are a count"))?;
+        Ok(Self { tokens, turns })
+    }
+}
+
 /// Who executes a task, as a model id plus the role it plays. The router resolves it; the roadmap
 /// only records the assignment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +284,9 @@ pub struct Node {
     /// The effort a run asks of the model; medium when the card names none.
     #[serde(default)]
     pub effort: Effort,
+    /// The card's own estimate of what a run spends; `None` takes the complexity's.
+    #[serde(default)]
+    pub estimate: Option<Estimate>,
     /// The notes of the last execution: findings, blockers, results.
     pub notes: Option<String>,
     /// What the last reassessment saw: the word [`FINAL`], which no reassessment rewrites, or a

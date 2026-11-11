@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use egui::{Align, Color32, CornerRadius, FontId, Frame, Key, Layout, Margin, Modifiers, RichText, Stroke, TextStyle};
-use ra_console::agent::Worker;
+use ra_console::agent::{Worker, estimate_of};
 use ra_console::commands::{self, Outcome};
 use ra_console::logs::{Kind, Sink};
 use ra_gotchas::{Catalogue, Journal};
@@ -99,6 +99,8 @@ struct Ledger {
     gotchas: Vec<(String, usize, Option<String>)>,
     /// The refused commands no gotcha names, oldest first.
     unmatched: Vec<String>,
+    /// What the runs said would have made them faster, newest first.
+    retro: Vec<ra_console::retro::Note>,
     /// How many entries the catalogue holds; what the empty view says.
     catalogue: usize,
     read_at: Option<Instant>,
@@ -416,6 +418,7 @@ impl App {
             calls: calls.unwrap_or_default(),
             gotchas,
             unmatched: journal.unmatched(),
+            retro: ra_console::retro::recent(Path::new("."), 20),
             catalogue: catalogue.map_or(0, |c| c.entries.len()),
             read_at: Some(Instant::now()),
         };
@@ -695,7 +698,7 @@ impl App {
         root.ctx().request_repaint_after(Duration::from_millis(16));
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new(" ✦ Rhipper").color(theme::ACCENT).strong().size(15.0));
             ui.label(RichText::new("Agent").strong().size(15.0));
@@ -703,6 +706,16 @@ impl App {
             ui.add_space(10.0);
             cards::badge_marked(ui, "◉", &self.worker.model, theme::ACCENT)
                 .on_hover_text("the model of the next run; `model <id>` swaps it");
+            // debug mode: a run ends with the worker's own look back, kept for the next runs
+            let debug = self.worker.debug;
+            let (mark, color, hint) = if debug {
+                ("⚙", theme::DEBUG, "debug mode: a run ends with what would have made it faster, kept for the next runs · click to turn off")
+            } else {
+                ("○", theme::DIM, "debug mode off: runs are not asked what would have made them faster · click to turn on")
+            };
+            if cards::badge_marked(ui, mark, "debug", color).interact(egui::Sense::click()).on_hover_text(hint).clicked() {
+                self.worker.debug = !debug;
+            }
             match current_task(&self.roadmap) {
                 Some(node) => {
                     cards::badge_marked(ui, "◇", &format!("#{} {}", node.id, node.title), theme::TRACE)
@@ -1044,7 +1057,14 @@ impl App {
                             let (label, color) = match node {
                                 Some(node) => {
                                     let depth = depths.get(&node.id).copied().unwrap_or(0);
-                                    let color = if node.kind == NodeKind::Project { theme::ACCENT } else { theme::lane(depth) };
+                                    // red when the subtree spent twice what its cards were sized at
+                                    let color = if ran_far_over(&self.roadmap, node, t) {
+                                        theme::ERROR_TEXT
+                                    } else if node.kind == NodeKind::Project {
+                                        theme::ACCENT
+                                    } else {
+                                        theme::lane(depth)
+                                    };
                                     (format!("{}#{} {}", "  ".repeat(depth), node.id, node.title), color)
                                 }
                                 None => ("outside the roadmap (pings, chats)".to_owned(), theme::DIM),
@@ -1147,6 +1167,30 @@ impl App {
                 }
             });
             ui.add_space(6.0);
+            if !ledger.retro.is_empty() {
+                cards::card(ui, theme::DEBUG, false, |ui| {
+                    ui.set_width(ui.available_width());
+                    cards::section(ui, "FASTER NEXT TIME", theme::DEBUG);
+                    ui.label(
+                        RichText::new("what the runs said themselves, newest first · the latest go to the next runs as machine notes")
+                            .color(theme::DIM)
+                            .small(),
+                    );
+                    for note in &ledger.retro {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if let Some(node) = note.node {
+                                ui.label(RichText::new(format!("#{node}")).color(theme::DIM).small());
+                            }
+                            if note.machine {
+                                cards::badge(ui, "machine", theme::WARN_TEXT);
+                            }
+                            ui.add(egui::Label::new(RichText::new(&note.text).color(theme::TEXT)).wrap());
+                        });
+                    }
+                });
+                ui.add_space(6.0);
+            }
             if !ledger.unmatched.is_empty() {
                 cards::card(ui, theme::ERROR_TEXT, false, |ui| {
                     ui.set_width(ui.available_width());
@@ -1227,7 +1271,12 @@ impl App {
                     }
                     // the card's own model, else the session's: the one on the status bar
                     let (model, from) = node.assignee.as_ref().map_or_else(
-                        || (short(&self.worker.model).to_owned(), "the session's model, from the status bar; this card names none of its own"),
+                        || {
+                            (
+                                short(&self.worker.model).to_owned(),
+                                "the session's model, from the status bar; this card names none of its own",
+                            )
+                        },
                         |a| (a.model.clone(), "the model this card names; a run uses it over the session's"),
                     );
                     cards::badge_marked(ui, "◉", &model, theme::TRACE).on_hover_text(from);
@@ -1238,6 +1287,9 @@ impl App {
                     if effort.clicked() {
                         command = Some(format!("effort {} {}", node.id, node.effort.next()));
                     }
+                    let sized_by = if node.estimate.is_some() { "the card's own line" } else { "the complexity" };
+                    cards::badge_marked(ui, "≈", &estimate_of(&node).to_string(), theme::DIM)
+                        .on_hover_text(format!("the estimate of a run, from {sized_by}; the run line says over or under"));
                     if node.is_final() {
                         cards::badge(ui, "final", theme::WARN).on_hover_text("never reassessed");
                     }
@@ -1762,6 +1814,17 @@ fn usage_by_card<'a>(nodes: &'a [Node], by_node: &[(Option<i64>, Totals)]) -> Ve
         rows.push((None, *t));
     }
     rows
+}
+
+/// Whether the subtree of `node` spent more than twice its estimate, in tokens or in turns. The
+/// estimate of a subtree is the sum of its tasks', a card's own line or its complexity's; a node
+/// without a task under it is held to its own.
+fn ran_far_over(nodes: &[Node], node: &Node, spent: &Totals) -> bool {
+    let tasks: Vec<&Node> = tree::subtree(nodes, node.id).into_iter().filter(|n| n.kind == NodeKind::Task).collect();
+    let estimates = if tasks.is_empty() { vec![estimate_of(node)] } else { tasks.into_iter().map(estimate_of).collect() };
+    let tokens: u64 = estimates.iter().map(|e| e.tokens).sum();
+    let turns: u64 = estimates.iter().map(|e| e.turns).sum();
+    spent.prompt_tokens + spent.completion_tokens > 2 * tokens || spent.turns > 2 * turns
 }
 
 fn usage_row(ui: &mut egui::Ui, model: &str, t: &Totals, color: Color32) {
