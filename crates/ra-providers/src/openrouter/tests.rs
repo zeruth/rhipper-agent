@@ -88,15 +88,15 @@ async fn a_tool_call_answer_without_arguments_defaults_to_an_empty_object() {
 
 #[tokio::test]
 async fn a_tool_result_message_round_trips() {
-    let base = serve(
-        "HTTP/1.1 200 OK",
-        r#"{"choices":[{"message":{"content":"the file holds 3 lines","role":"assistant"}}]}"#,
-    );
+    let base = serve("HTTP/1.1 200 OK", r#"{"choices":[{"message":{"content":"the file holds 3 lines","role":"assistant"}}]}"#);
     let provider = OpenRouter::at(&base, "test").unwrap();
     let mut request = request();
     request.messages = vec![
         Message::user("read src/main.rs"),
-        Message::assistant_calls("", vec![ToolCall { id: "call_1".into(), name: "read_file".into(), arguments: r#"{"path":"src/main.rs"}"#.into() }]),
+        Message::assistant_calls(
+            "",
+            vec![ToolCall { id: "call_1".into(), name: "read_file".into(), arguments: r#"{"path":"src/main.rs"}"#.into() }],
+        ),
         Message::tool("call_1", "fn main() {}"),
     ];
     let answer = provider.complete(request).await.unwrap();
@@ -116,5 +116,11 @@ async fn a_tool_call_answer_with_no_text_is_not_a_refusal() {
 }
 
 fn request() -> CompletionRequest {
-    CompletionRequest { model: model().to_owned(), messages: vec![Message::user("hello")], temperature: Some(0.0), max_tokens: Some(16), tools: Vec::new() }
+    CompletionRequest {
+        model: model().to_owned(),
+        messages: vec![Message::user("hello")],
+        temperature: Some(0.0),
+        max_tokens: Some(16),
+        tools: Vec::new(),
+    }
 }

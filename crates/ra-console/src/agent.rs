@@ -82,9 +82,20 @@ pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> a
     // one pass over the tree before any call, so the recursion cannot stall midway
     let order = if recursive { subtree_preorder(&nodes, id) } else { vec![id] };
     let mut revised: Vec<String> = Vec::new();
+    let mut verified: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut receipts: Vec<String> = Vec::new();
     for current in order {
+        let Some(node) = nodes.iter().find(|n| n.id == current) else {
+            warnings.push(format!("⚠ #{}: no such node", current));
+            continue;
+        };
+        // a node whose work is done is verified, not recreated: no model call, no chance to drift
+        if matches!(node.state, TaskState::Implemented | TaskState::Accepted) {
+            receipts.push(format!("#{} {} [{}] verified: no revision needed", node.id, node.title, node.state.serde_name()));
+            verified.push(format!("#{}", current));
+            continue;
+        }
         match reassess_one(store, &provider, model, current, &nodes).await {
             Ok(receipt) => {
                 revised.push(format!("#{}", current));
@@ -93,7 +104,13 @@ pub async fn reassess(store: &Store, id: i64, model: &str, recursive: bool) -> a
             Err(e) => warnings.push(format!("⚠ #{}: {e:#}", current)),
         }
     }
-    let mut out = vec![format!("✓ {} node(s) reassessed on {}: {}", revised.len(), short(model), revised.join(" "))];
+    let mut out = vec![format!(
+        "✓ {} node(s) reassessed on {} ({} verified): {}",
+        revised.len() + verified.len(),
+        short(model),
+        verified.len(),
+        revised.join(" ")
+    )];
     out.extend(receipts);
     out.extend(warnings);
     Ok(out)
@@ -157,7 +174,9 @@ async fn reassess_one(
     ask.push_str(
         "\nRevise the objective and the acceptance so they name only the work still ahead: leave out what the \
          children and the notes show as done, and make every acceptance criterion concrete and checkable without \
-         interpretation. Reply with exactly three lines and nothing else:\n\
+         interpretation. Name the exact command or observable behavior that proves each criterion. Never write \
+         placeholder text in angle brackets: write the actual revised words. Reply with exactly three lines and \
+         nothing else:\n\
          overview: <one sentence on what you changed and why>\n\
          objective: <the revised objective, one line>\nacceptance: <the revised acceptance, one line>",
     );
@@ -181,18 +200,20 @@ async fn reassess_one(
                 overview = Some(rest.trim().to_owned());
             }
         } else if let Some(rest) = line.strip_prefix("objective:") {
-            if !rest.trim().is_empty() {
-                objective = Some(rest.trim().to_owned());
+            let rest = rest.trim();
+            if !rest.is_empty() && !is_placeholder(rest) {
+                objective = Some(rest.to_owned());
             }
         } else if let Some(rest) = line.strip_prefix("acceptance:") {
-            if !rest.trim().is_empty() {
-                acceptance = Some(rest.trim().to_owned());
+            let rest = rest.trim();
+            if !rest.is_empty() && !is_placeholder(rest) {
+                acceptance = Some(rest.trim_start().to_owned());
             }
         }
     }
     anyhow::ensure!(
         objective.is_some() || acceptance.is_some(),
-        "the reassessment held no objective or acceptance line; the answer started with: {}",
+        "the reassessment held no real objective or acceptance; the answer started with: {}",
         answer.text.lines().next().unwrap_or("")
     );
     store.set_details(id, objective.as_deref(), acceptance.as_deref()).await?;
@@ -224,6 +245,12 @@ async fn reassess_one(
     }
     receipt.push_str(&format!("\n{changed} field(s) changed"));
     Ok(receipt)
+}
+
+/// Whether a revised field is template text the model echoed back, such as `<the revised
+/// objective, one line>`: it opens and closes with angle brackets, so it names no real work.
+fn is_placeholder(value: &str) -> bool {
+    value.starts_with('<') && value.ends_with('>')
 }
 
 /// The first line of a note, for a prompt that stays short.

@@ -254,11 +254,7 @@ fn to_wire(message: &Message) -> WireMessage<'_> {
 }
 
 fn to_wire_call(call: &ToolCall) -> WireToolCall<'_> {
-    WireToolCall {
-        id: &call.id,
-        kind: "function",
-        function: WireFunction { name: &call.name, arguments: &call.arguments },
-    }
+    WireToolCall { id: &call.id, kind: "function", function: WireFunction { name: &call.name, arguments: &call.arguments } }
 }
 
 fn to_wire_tool(spec: &ToolSpec) -> WireTool<'_> {
