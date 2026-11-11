@@ -36,6 +36,10 @@ pub struct Card<'a> {
     pub waits_on: &'a [i64],
     /// The model of the card's implementer; `None` leaves the card to the default route.
     pub model: Option<&'a str>,
+    /// The evidence line a planned card cites, `source:line`.
+    pub evidence: Option<&'a str>,
+    /// What a planned card claims to save.
+    pub saving: Option<&'a str>,
 }
 
 impl Card<'_> {
@@ -96,6 +100,8 @@ impl Store {
                 notes: None,
                 assessed: None,
                 priority: None,
+                evidence: None,
+                saving: None,
             };
             std::fs::write(path, render(std::slice::from_ref(&root))).with_context(|| format!("cannot write {}", path.display()))?;
         }
@@ -215,6 +221,8 @@ impl Store {
             notes: None,
             assessed: None,
             priority: None,
+            evidence: card.evidence.map(str::to_owned),
+            saving: card.saving.map(str::to_owned),
         };
         nodes.insert(position, node);
         self.write(roadmap).await?;

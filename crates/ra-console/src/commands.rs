@@ -854,8 +854,9 @@ async fn seed(store: &Store) -> anyhow::Result<Vec<i64>> {
     Ok(ids)
 }
 
+pub mod plan;
 pub mod review;
 pub mod run;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

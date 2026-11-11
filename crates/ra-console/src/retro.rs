@@ -10,6 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::plan::evidence::Line;
+
 /// Where the bullets are kept, under the workspace: `time<TAB>node<TAB>machine<TAB>text`.
 pub const RETRO_FILE: &str = "var/retro.log";
 
@@ -147,6 +149,27 @@ pub fn record_with(root: &Path, shared: &Path, node: Option<i64>, notes: &[Note]
     Ok(())
 }
 
+/// The tag of the line a walk writes when it reads a planned card's claimed saving back.
+pub const SAVING: &str = "[saving]";
+
+/// Keeps the walk's verdict on a planned card's claim, `[saving] #id held: …` or `missed`,
+/// under the card, so the next plan reads it as evidence; the line as written.
+///
+/// # Errors
+/// When the file cannot be written.
+pub fn record_saving(root: &Path, node: i64, held: bool, why: &str) -> anyhow::Result<String> {
+    let text = format!("{SAVING} #{node} {}: {why}", if held { "held" } else { "missed" });
+    record(root, Some(node), &[Note { when: 0, node: Some(node), machine: false, pair: false, text: text.clone() }])?;
+    Ok(text)
+}
+
+/// Whether the log already holds the walk's verdict on the card's claim: a claim is read back
+/// once.
+#[must_use]
+pub fn saving_read(root: &Path, node: i64) -> bool {
+    parse_log(&root.join(RETRO_FILE)).iter().any(|(_, _, note)| note.node == Some(node) && note.text.starts_with(SAVING))
+}
+
 /// Appends `lines` to `path`, making its directory; nothing is touched when there are none.
 fn append(path: &Path, lines: impl Iterator<Item = String>) -> anyhow::Result<()> {
     use std::io::Write;
@@ -186,7 +209,7 @@ fn project_name(root: &Path) -> String {
 /// The latest `limit` bullets, newest first; none without a file.
 #[must_use]
 pub fn recent(root: &Path, limit: usize) -> Vec<Note> {
-    let mut notes: Vec<Note> = parse_log(&root.join(RETRO_FILE)).into_iter().map(|(_, note)| note).collect();
+    let mut notes: Vec<Note> = parse_log(&root.join(RETRO_FILE)).into_iter().map(|(_, _, note)| note).collect();
     notes.reverse();
     notes.truncate(limit);
     notes
@@ -197,18 +220,20 @@ pub fn recent(root: &Path, limit: usize) -> Vec<Note> {
 #[must_use]
 pub fn shared_recent(root: &Path, shared: &Path, limit: usize) -> Vec<(String, Note)> {
     let this = project_name(root);
-    let mut notes: Vec<(String, Note)> = parse_log(shared).into_iter().filter(|(project, _)| *project != this).collect();
+    let mut notes: Vec<(String, Note)> =
+        parse_log(shared).into_iter().filter(|(_, project, _)| *project != this).map(|(_, project, note)| (project, note)).collect();
     notes.reverse();
     notes.truncate(limit);
     notes
 }
 
-/// The lines of a log, oldest first, each with its second column (the node of a project's log,
-/// the project of the shared one).
-fn parse_log(path: &Path) -> Vec<(String, Note)> {
+/// The lines of a log, oldest first, each with its line number (from 1) and its second column
+/// (the node of a project's log, the project of the shared one).
+fn parse_log(path: &Path) -> Vec<(usize, String, Note)> {
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
     text.lines()
-        .filter_map(|line| {
+        .enumerate()
+        .filter_map(|(index, line)| {
             let mut cols = line.split('\t');
             let (when, second, kind, text) = (cols.next()?, cols.next()?, cols.next()?, cols.next()?);
             let note = Note {
@@ -218,9 +243,52 @@ fn parse_log(path: &Path) -> Vec<(String, Note)> {
                 pair: matches!(kind, "2" | "3"),
                 text: text.to_owned(),
             };
-            Some((second.to_owned(), note))
+            Some((index + 1, second.to_owned(), note))
         })
         .collect()
+}
+
+/// How many of the latest lines of each log the planner reads as evidence.
+pub const EVIDENCE_LINES: usize = 10;
+
+/// The look-backs as the planner's evidence: the latest lines of the project's log, then the
+/// latest shared notes of the other projects, each oldest first and cited by file and line
+/// number (`retro.log:12`, `notes.log:3`), so a planned card names the line it comes from and
+/// a reader can open it. None without a log.
+#[must_use]
+pub fn evidence(root: &Path) -> Vec<Line> {
+    evidence_with(root, &shared_file())
+}
+
+/// `evidence` with the shared store named, for the tests.
+#[must_use]
+pub fn evidence_with(root: &Path, shared: &Path) -> Vec<Line> {
+    let this = project_name(root);
+    let own = parse_log(&root.join(RETRO_FILE)).into_iter().map(|(line, _, note)| {
+        let who = match (note.pair, note.node) {
+            (true, _) => "the person".to_owned(),
+            (false, Some(node)) => format!("card #{node}"),
+            (false, None) => "a run".to_owned(),
+        };
+        Line { source: format!("retro.log:{line}"), text: format!("{who}: {}", tagged(&note)) }
+    });
+    let shared = parse_log(shared)
+        .into_iter()
+        .filter(|(_, project, _)| *project != this)
+        .map(|(line, project, note)| Line { source: format!("notes.log:{line}"), text: format!("({project}) {}", tagged(&note)) });
+    tail(own.collect()).into_iter().chain(tail(shared.collect())).collect()
+}
+
+/// A note's text with its `[machine]` tag back on, so the planner tells a machine lesson.
+fn tagged(note: &Note) -> String {
+    if note.machine { format!("[machine] {}", note.text) } else { note.text.clone() }
+}
+
+/// The last `EVIDENCE_LINES` of `all`, in their order.
+fn tail<T>(mut all: Vec<T>) -> Vec<T> {
+    let skip = all.len().saturating_sub(EVIDENCE_LINES);
+    all.drain(..skip);
+    all
 }
 
 /// The latest bullets as a block for the system prompt of the next run, each once, and under
@@ -235,6 +303,10 @@ pub fn machine_lines(root: &Path) -> String {
 pub fn machine_lines_with(root: &Path, shared: &Path) -> String {
     let mut seen: Vec<String> = Vec::new();
     for note in recent(root, SHOWN * 2) {
+        // the walk's verdicts on the plan's claims are the planner's to read, not a worker's
+        if note.text.starts_with(SAVING) {
+            continue;
+        }
         // the person's notes are told from the workers' own
         let line = if note.pair { format!("(the person) {}", note.text) } else { note.text };
         if seen.len() == SHOWN || seen.contains(&line) {

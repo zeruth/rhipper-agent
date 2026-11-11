@@ -315,6 +315,25 @@ async fn insert_card_writes_a_complete_card_in_one_go() {
 }
 
 #[tokio::test]
+async fn a_planned_card_keeps_its_evidence_and_saving_through_a_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rhipper.md");
+    let id = {
+        let store = Store::open(&path, "Test").await.unwrap();
+        let root = store.all().await.unwrap().remove(0).id;
+        let card = Card { evidence: Some("var/retro.log:41"), saving: Some("two turns a run"), ..Card::new() };
+        store.insert_card(Some(root), NodeKind::Task, "Planned", &card).await.unwrap()
+    };
+    let store = Store::open(&path, "Test").await.unwrap();
+    let node = store.read(id).await.unwrap();
+    assert_eq!(node.evidence.as_deref(), Some("var/retro.log:41"));
+    assert_eq!(node.saving.as_deref(), Some("two turns a run"));
+    // a card written by hand carries neither line
+    let root = store.read(1).await.unwrap();
+    assert_eq!((root.evidence, root.saving), (None, None));
+}
+
+#[tokio::test]
 async fn read_names_a_missing_node() {
     let (_dir, store) = store().await;
     let error = store.read(99).await.unwrap_err();

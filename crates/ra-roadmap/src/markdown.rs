@@ -26,6 +26,8 @@
 //!         priority: 5
 //!         notes: ...
 //!         assessed: 9f3a0c41d27b6e58
+//!         evidence: var/retro.log:41
+//!         saving: two turns a run
 //! ```
 //!
 //! The gambits come first, since the walk reads the file in order until the gambits decide it:
@@ -48,6 +50,9 @@
 //! `assessed:` holds what the last reassessment saw: a fingerprint of its inputs, or the word
 //! `final`, which no reassessment rewrites; after it, `-` and a hash per proposed card the person
 //! declined.
+//!
+//! `evidence:` is the line a planned card came from, `source:line`, and `saving:` what it claims
+//! to save; a card the person wrote has neither.
 
 use std::fmt::Write as _;
 
@@ -179,6 +184,8 @@ fn detail_lines(node: &Node, level: usize) -> Vec<String> {
         ("acceptance", node.acceptance.as_deref()),
         ("notes", node.notes.as_deref()),
         ("assessed", node.assessed.as_deref()),
+        ("evidence", node.evidence.as_deref()),
+        ("saving", node.saving.as_deref()),
     ] {
         if let Some(value) = value.filter(|v| !v.trim().is_empty()) {
             lines.push(format!("{indent}{field}: {}", escape(value)));
@@ -278,6 +285,8 @@ pub fn parse_file(text: &str) -> anyhow::Result<Roadmap> {
             "acceptance" => node.acceptance = Some(value),
             "notes" => node.notes = Some(value),
             "assessed" => node.assessed = Some(value),
+            "evidence" => node.evidence = Some(value),
+            "saving" => node.saving = Some(value),
             "files" => node.files = value.split_whitespace().map(str::to_owned).collect(),
             "session" => {
                 let mut words = value.split_whitespace();
@@ -390,6 +399,8 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         notes: None,
         assessed: None,
         priority: None,
+        evidence: None,
+        saving: None,
     })
 }
 

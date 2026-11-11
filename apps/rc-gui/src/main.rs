@@ -2919,6 +2919,7 @@ impl Workspace {
             files: &files,
             waits_on: &waits_on,
             model: None,
+            ..ra_roadmap::store::Card::new()
         };
         let parent = form.parent;
         match self.rt.block_on(self.store.insert_card(Some(parent), NodeKind::Task, &title, &card)) {

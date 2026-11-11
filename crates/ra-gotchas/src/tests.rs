@@ -167,6 +167,36 @@ fn the_journal_lists_the_refused_commands_no_gotcha_names_oldest_first() {
 }
 
 #[test]
+fn the_summary_counts_the_days_hits_by_gotcha_and_tallies_each_unmatched_command_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gotchas.log");
+    assert_eq!(journal::summary(&path), journal::Summary::default(), "no journal yet, nothing to say");
+    let journal = Journal::at(&path);
+    let hit = |id: &str, excerpt: &str| Hit { id: id.into(), message: "m".into(), excerpt: excerpt.into() };
+    journal.record(Some(3), Where::Command, &hit("mojibake", "Ã©")).unwrap();
+    journal.record(Some(3), Where::Command, &hit("shell-outside-allowlist", "sed -n 1p x")).unwrap();
+    journal.record(Some(4), Where::Result, &hit("mojibake", "Ã¨")).unwrap();
+    journal.record(Some(4), Where::Command, &hit(UNMATCHED, "Get-ChildItem -Recurse")).unwrap();
+    journal.record(None, Where::Command, &hit(UNMATCHED, "Select-String foo")).unwrap();
+    journal.record(None, Where::Command, &hit(UNMATCHED, "Get-ChildItem -Recurse")).unwrap();
+    let summary = journal::summary(&path);
+    assert_eq!(summary.counts, [("mojibake".to_owned(), 2), ("shell-outside-allowlist".to_owned(), 1)]);
+    assert_eq!(summary.unmatched, [("Get-ChildItem -Recurse".to_owned(), 2), ("Select-String foo".to_owned(), 1)]);
+    assert_eq!(
+        summary.lines(),
+        [
+            "gotcha mojibake fired 2 times in the last day",
+            "gotcha shell-outside-allowlist fired once in the last day",
+            "refused command `Get-ChildItem -Recurse` matched no gotcha, 2 times in the last day",
+            "refused command `Select-String foo` matched no gotcha, once in the last day",
+        ]
+    );
+    // a hit older than the window is not counted
+    let later = journal::unix_now() + 10;
+    assert_eq!(journal::summary_since(&path, later), journal::Summary::default());
+}
+
+#[test]
 fn a_load_writes_the_seed_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("var/gotchas.toml");

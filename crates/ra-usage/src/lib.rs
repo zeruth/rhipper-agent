@@ -7,7 +7,7 @@ use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 mod query;
-pub use query::CardCost;
+pub use query::{CardCost, LAST_DAY};
 
 /// The usage store over one `SQLite` database.
 #[derive(Clone, Debug)]
@@ -173,10 +173,22 @@ impl UsageStore {
     /// # Errors
     /// When the row cannot be written.
     pub async fn record(&self, entry: &Entry) -> anyhow::Result<()> {
+        self.record_ago(entry, std::time::Duration::ZERO).await
+    }
+
+    /// Records one completion as written `ago` before now: an import of an older ledger, and
+    /// the tests of the readings that compare one day with the one before it.
+    ///
+    /// # Errors
+    /// When the row cannot be written.
+    pub async fn record_ago(&self, entry: &Entry, ago: std::time::Duration) -> anyhow::Result<()> {
+        // SQLite does the date arithmetic, as the column's default does
+        let at = format!("-{} seconds", ago.as_secs());
         sqlx::query(
-            "insert into usage (model, role, node, prompt_tokens, completion_tokens, cached_tokens, cost_usd, turns, cost_computed) \
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into usage (at, model, role, node, prompt_tokens, completion_tokens, cached_tokens, cost_usd, turns, cost_computed) \
+             values (datetime('now', ?), ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(at)
         .bind(&entry.model)
         .bind(&entry.role)
         .bind(entry.node)
@@ -197,6 +209,21 @@ impl UsageStore {
     /// When the query fails.
     pub async fn totals(&self) -> anyhow::Result<Totals> {
         let row = sqlx::query(concat!("select ", sums!(), " from usage")).fetch_one(&self.pool).await?;
+        Ok(totals_of(&row))
+    }
+
+    /// The totals over the rows written between `older` and `newer` before now, the older
+    /// bound out and the newer in, so a `newer` of zero takes a row written this second: one
+    /// day against the day before it, as a saving is read back.
+    ///
+    /// # Errors
+    /// When the query fails.
+    pub async fn totals_between(&self, older: std::time::Duration, newer: std::time::Duration) -> anyhow::Result<Totals> {
+        let row = sqlx::query(concat!("select ", sums!(), " from usage where at > datetime('now', ?) and at <= datetime('now', ?)"))
+            .bind(format!("-{} seconds", older.as_secs()))
+            .bind(format!("-{} seconds", newer.as_secs()))
+            .fetch_one(&self.pool)
+            .await?;
         Ok(totals_of(&row))
     }
 

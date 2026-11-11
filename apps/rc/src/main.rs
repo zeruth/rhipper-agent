@@ -244,16 +244,24 @@ enum Command {
         /// The node id.
         id: i64,
     },
-    /// Asks the architect model to split a milestone or a section into cards with objective, acceptance,
-    /// complexity and files, shows them, and adds them on confirmation. The planner is the `planner` rule
-    /// of rhipper.toml that fits the node, else the default model; the prompt carries the project context
-    /// and the cards already under the node, so none repeats.
+    /// Without an id, plans the next cards from the evidence of the runs themselves: the ledger's costliest
+    /// cards, the cards run more than once, the look-backs, the gotcha journal and the other projects'
+    /// digests. Each card that cites a line and names a saving and a check lands under the last open
+    /// milestone with its evidence and saving, one run each under the turn cap; the next day's walk reads
+    /// the saving back into var/retro.log. With an id, asks the architect model to split that milestone or
+    /// section into cards, shows them, and adds them on confirmation.
     Plan {
-        /// The milestone or section id.
-        id: i64,
-        /// Adds the cards without asking.
+        /// The milestone or section to split; left out, the plan comes from the evidence.
+        id: Option<i64>,
+        /// Adds the cards of a split without asking.
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Shows the evidence plan and adds nothing.
+        #[arg(long, conflicts_with = "id")]
+        dry: bool,
+        /// The milestone or section the evidence plan's cards go under; the last open milestone without it.
+        #[arg(long, conflicts_with = "id")]
+        under: Option<i64>,
     },
     /// Prints the model a run of the card would take and why: the card's own, the `[[route]]` rule of
     /// rhipper.toml that fits its complexity and kind, or the default. No model call.
@@ -411,6 +419,7 @@ async fn run_main() -> anyhow::Result<()> {
                 files: &files,
                 waits_on: &waits_on,
                 model: model.as_deref(),
+                ..Card::new()
             };
             add(kind, &title, parent, &card).await
         }
@@ -594,11 +603,17 @@ async fn run_main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Plan { id, yes } => {
+        Command::Plan { id, yes, dry, under } => {
             plain_tracing()?;
             let store = open_store().await?;
             let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
-            plan(&store, id, &worker, yes).await
+            if let Some(id) = id {
+                return plan(&store, id, &worker, yes).await;
+            }
+            for line in ra_console::commands::plan::plan(&store, &worker, under, dry).await? {
+                println!("{line}");
+            }
+            Ok(())
         }
         Command::Route { id } => route(id).await,
         Command::Stop => {

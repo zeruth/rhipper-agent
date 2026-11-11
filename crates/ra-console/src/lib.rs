@@ -11,6 +11,7 @@ pub mod instance;
 pub mod logs;
 pub mod mcp;
 pub mod pair;
+pub mod plan;
 pub mod retro;
 pub mod roadmap_pane;
 pub mod roles;

@@ -6,6 +6,18 @@ use std::collections::HashMap;
 
 use crate::model::{Gambit, GambitState, Node, NodeKind, TaskState};
 
+/// Whether a node is a card, a task or a subtask: what a run takes, what the walks rank and
+/// what the lints hold to a card's rules.
+#[must_use]
+pub fn is_card(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Task | NodeKind::Subtask)
+}
+
+/// The cards of the list, in its order.
+pub fn cards(nodes: &[Node]) -> impl Iterator<Item = &Node> {
+    nodes.iter().filter(|node| is_card(node))
+}
+
 /// The subtree of `root` in preorder: the node, then each child's subtree, in the order of the
 /// list. Empty when no node has that id.
 pub fn subtree(nodes: &[Node], root: i64) -> Vec<&Node> {
@@ -184,7 +196,7 @@ pub fn lint(nodes: &[Node]) -> Vec<String> {
     let mut out = Vec::new();
     for node in nodes {
         let id = node.id;
-        let card = matches!(node.kind, NodeKind::Task | NodeKind::Subtask);
+        let card = is_card(node);
         let done = matches!(node.state, TaskState::Accepted | TaskState::Cancelled);
         if !done {
             for (field, text) in
@@ -273,7 +285,7 @@ fn cyclic_ids(nodes: &[Node], by_id: &HashMap<i64, &Node>) -> Vec<i64> {
 }
 
 fn effective_in(by_id: &HashMap<i64, &Node>, node: &Node) -> TaskState {
-    if node.state != TaskState::Defined || !matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
+    if node.state != TaskState::Defined || !is_card(node) {
         return node.state;
     }
     let mut ready = true;

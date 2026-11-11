@@ -131,8 +131,9 @@ pub struct Worker {
     workspace: Option<PathBuf>,
     /// The branch of that worktree, which the check line and the handoff name.
     branch: Option<String>,
-    /// The verdict a fix pass works from, when the worker is one: it leads the task instead of
-    /// the card being taken up afresh.
+    /// What a fix pass works from, when the worker is one: the instruction with the reviewer's
+    /// verdict or the lint's warnings, leading the task instead of the card being taken up
+    /// afresh.
     fix: Option<String>,
 }
 
@@ -348,6 +349,13 @@ impl Worker {
                 None
             }
         }
+    }
+
+    /// The ledger every completion is written to, when the worker has one: the planner reads
+    /// its costliest cards and the walk reads a day of it back against a planned saving.
+    #[must_use]
+    pub fn ledger(&self) -> Option<&UsageStore> {
+        self.ledger.as_ref()
     }
 
     /// The ledger's totals by roadmap node, `None` for the calls that served none; `None` as a
@@ -802,7 +810,12 @@ async fn ledger_check(root: &Path) -> Result<String, String> {
 /// Runs one roadmap task: builds the context from the node, its ancestors and its dependencies,
 /// sends it to the model, and writes the answer and the state back. A failed call leaves the node
 /// failed, not in progress. The run announces its start and its outcome on the progress channel,
-/// so the console draws its steps in a bubble of their own.
+/// so the console draws its steps in a bubble of their own. A run whose checks pass and whose
+/// lint alone fails takes the cheap fix pass of [`review`] with the warning lines as its task
+/// ([`lint_fix`]) before the reviewer, so the person does not clear a warning by hand.
+///
+/// # Errors
+/// When the card cannot be read or written, or the provider cannot be reached.
 pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
     run_picked(store, id, worker, false).await
 }
@@ -848,6 +861,13 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     // the cheap roles of this run, resolved once: the local server is pinged here, not per role
     let roles = worker.roles(&root).await;
     let mut outcome = run_task(store, node, worker, &roles).await;
+    // a lint-only failure never reaches the reviewer, so its fix pass starts here: the warnings
+    // are the task, the pass lints again, and a clean one goes on to the reviewer
+    if let Ok((lines, _, _)) = &mut outcome
+        && store.read(id).await.is_ok_and(|n| n.state == TaskState::NeedsRevision)
+    {
+        lint_fix(store, id, worker, &roles, lines).await;
+    }
     // the reviewer judges a run that passed its checks before the card is offered: implemented
     // means review-ready, and a card is review-ready only with a verdict attached
     if let Ok((lines, _, _)) = &mut outcome
@@ -926,9 +946,69 @@ pub fn verdict_of(answer: &str) -> Verdict {
 /// What a fix pass is told, ahead of the verdict and the card.
 const FIX_INSTRUCTION: &str = "A reviewer sent this card back for the points below, every one of them a lint warning, a format diff or a doc comment. Fix exactly those points in the files they name, run the card's checks, and report in a few lines what you changed; change nothing else, and do not take the card up afresh.";
 
+/// What the fix pass of a lint-only failure is told, ahead of the warnings and the card.
+const LINT_FIX_INSTRUCTION: &str = "The lint of this card's run left the warnings below in the lines it changed; the checks passed. Fix exactly those lines in the files the warnings name, run the card's checks, and report in a few lines what you changed; change nothing else, and do not take the card up afresh.";
+
 /// The outcome a review leaves on the handoff of a trivially rejected run; a second one on the
 /// same card halts the fix passes.
 const TRIVIAL_TAG: &str = "needs revision (trivial)";
+
+/// The model of a fix pass: the `fix` role of `rhipper.toml` on the cheap route, else the cheap
+/// route's own pick; `None` when the role is off, and in the tests, which neither ping the
+/// local server nor fall to haiku.
+async fn fix_model(root: &Path) -> Option<String> {
+    let named = crate::router::Router::load(root).ok().and_then(|router| router.role.fix);
+    match named.as_deref() {
+        Some(named) => ra_providers::route::cheap(Some(named), None),
+        None if cfg!(test) => None,
+        None => ra_providers::route::cheap_model(None).await,
+    }
+}
+
+/// The fix pass of a run whose checks passed and whose lint alone failed: the warning lines of
+/// its handoff are the task, on the cheap model, and the pass runs the checks and the lint
+/// again, so a clean lint leaves the card implemented for the reviewer and a second red one
+/// leaves it needs revision as the first did. The pass's lines join `lines`: after the run's
+/// when the lint stayed red, and before them, with `lint fixed on <model>` on the run line,
+/// when it came clean, so the end line is the pass's.
+async fn lint_fix(store: &Store, id: i64, worker: &Worker, roles: &Roles, lines: &mut Vec<String>) {
+    let root = workspace_of(store);
+    let task = ra_context::TaskContext::open(&root, id);
+    let warnings = task.last_warnings();
+    // a failed check is the person's to read; only the lint's warnings take the pass
+    if warnings.is_empty() {
+        return;
+    }
+    let Some(model) = fix_model(&root).await else {
+        lines.push("  the fix role is off: the lint warnings wait for the person".to_owned());
+        return;
+    };
+    let fix = format!("{LINT_FIX_INSTRUCTION}\n{}", warnings.join("\n\n"));
+    let fixer = Worker { model: resolve(&model), fix: Some(fix), ..worker.clone() };
+    let model = short(&fixer.model);
+    tracing::info!(target: crate::trace::PROGRESS, "#{id} · lint fix pass on {model}");
+    let outcome = match store.read(id).await {
+        Ok(node) => run_task(store, node, &fixer, roles).await,
+        Err(e) => Err(e),
+    };
+    match outcome {
+        Ok((mut passed, _, _)) if store.read(id).await.is_ok_and(|n| n.state == TaskState::Implemented) => {
+            if let Some(first) = passed.first_mut() {
+                let _ = write!(first, " · lint fixed on {model}");
+            }
+            let before = std::mem::replace(lines, passed);
+            lines.push(format!("  the run before the lint fix pass on {model}:"));
+            lines.extend(before);
+        }
+        Ok((passed, _, _)) => {
+            lines.push(format!("  lint fix pass on {model}"));
+            lines.extend(passed);
+        }
+        Err(e) => {
+            lines.push(format!("  the lint fix pass on {model} failed: {}; the card waits for the person", first_line(&format!("{e:#}"))));
+        }
+    }
+}
 
 /// Has a second model review a card: it reads the objective and the acceptance, the last
 /// handoff and the `git diff` of the card's files (and of the ones the handoff names), and
@@ -992,18 +1072,11 @@ async fn review_to(store: &Store, id: i64, worker: &Worker, accepted: TaskState)
         lines.push("  a second trivial rejection: no fix pass, the card waits for the person".to_owned());
         return Ok(lines);
     }
-    let named = crate::router::Router::load(&root).ok().and_then(|router| router.role.fix);
-    let model = match named.as_deref() {
-        Some(named) => ra_providers::route::cheap(Some(named), None),
-        // the tests neither ping the local server nor fall to haiku; a run does, once
-        None if cfg!(test) => None,
-        None => ra_providers::route::cheap_model(None).await,
-    };
-    let Some(model) = model else {
+    let Some(model) = fix_model(&root).await else {
         lines.push("  the fix role is off: the card waits for the person".to_owned());
         return Ok(lines);
     };
-    let fixer = Worker { model: resolve(&model), fix: Some(verdict), ..worker.clone() };
+    let fixer = Worker { model: resolve(&model), fix: Some(format!("{FIX_INSTRUCTION}\n{verdict}")), ..worker.clone() };
     tracing::info!(target: crate::trace::PROGRESS, "#{id} · fix pass on {}", short(&fixer.model));
     lines.push(format!("  fix pass on {}", short(&fixer.model)));
     let node = store.read(id).await?;
@@ -1170,6 +1243,29 @@ async fn review_brief(root: &Path, node: &Node) -> String {
         let _ = writeln!(text, "{cut}\n… clipped at {REVIEW_DIFF} characters");
     } else {
         text.push_str(&diff);
+    }
+    // a file the run created is not in a diff against HEAD until it is staged: the reviewer
+    // rejected a card whole for work it could not see (#143). The new files among the card's
+    // come in full, clipped the same way
+    let mut untracked = tokio::process::Command::new("git");
+    untracked.args(["ls-files", "--others", "--exclude-standard", "--"]).args(&files).current_dir(root);
+    if let Ok(out) = untracked.output().await
+        && out.status.success()
+    {
+        let listed = String::from_utf8_lossy(&out.stdout);
+        let mut budget = REVIEW_DIFF;
+        for path in listed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let Ok(content) = std::fs::read_to_string(root.join(path)) else { continue };
+            let _ = writeln!(text, "\n## new file {path} (not yet tracked)");
+            let shown: String = content.chars().take(budget).collect();
+            budget = budget.saturating_sub(shown.chars().count());
+            text.push_str(&shown);
+            if budget == 0 {
+                text.push_str("\n… the new files are clipped here\n");
+                break;
+            }
+            text.push('\n');
+        }
     }
     text
 }
@@ -1556,6 +1652,9 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     // the other projects see the walk from its start
     let root = workspace_of(store);
     write_digest(store, &root, Some(format!("walk · pid {} · started {}", std::process::id(), clock(unix_now()))), None, None).await;
+    // the planned cards done a day ago are read back first: the day since them against the
+    // day before, so the plan's claims are judged before the walk spends the next day
+    lines.extend(crate::commands::plan::read_back(store, &root, worker).await);
     loop {
         let roadmap = store.load().await?;
         // the walk's end, whichever way, goes to the paired session's feed and the digest
@@ -1943,9 +2042,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     store.set_state_by(id, TaskState::InProgress, Source::Run).await?;
 
     let Prepared { workspace, root, mut task, project, budget, caps, effort } = prepare(store, &node, worker, true).await?;
-    // a fix pass reads the verdict first: the points are the task, the card is the setting
-    if let Some(verdict) = &worker.fix {
-        task.brief = format!("{FIX_INSTRUCTION}\n{verdict}\n\n{}", task.brief);
+    // a fix pass reads its points first, the verdict's or the lint's: they are the task, the
+    // card is the setting
+    if let Some(fix) = &worker.fix {
+        task.brief = format!("{fix}\n\n{}", task.brief);
     }
     let workspace_dir = workspace.clone();
     // where the changes land: the worktree when the run has one, else the project
@@ -2106,7 +2206,17 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // two builds do not fight over the directory
     let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root).await } else { None };
     let checks = run_checks(&toolbox, &commands).await;
-    let changed = ra_context::changed_between(&dirty_before, &git_status(&acting).await);
+    let mut changed = ra_context::changed_between(&dirty_before, &git_status(&acting).await);
+    // a fix pass edits the files the run before it dirtied, which `git status` shows no
+    // differently: its change is the run's and its own together, so the lint reads the lines
+    // it was sent to fix and the handoff still names them
+    if worker.fix.is_some()
+        && let Some(last) = task.handoffs.last()
+    {
+        changed.extend(last.changed.iter().cloned());
+        changed.sort();
+        changed.dedup();
+    }
     // a failed check leads the notes and the handoff: the failed command with its tests and the
     // tail of its output first, then the commands that passed before it with their exit codes,
     // then the worker's answer, so the next run reads the failures before anything

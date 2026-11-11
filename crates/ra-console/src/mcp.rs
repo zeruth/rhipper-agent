@@ -221,6 +221,7 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
                 files: &files,
                 waits_on: &waits_on,
                 model: text("model"),
+                ..Card::new()
             };
             let id = store.insert_card(parent, kind, title, &card).await?;
             Ok(vec![format!("#{id} {title}")])

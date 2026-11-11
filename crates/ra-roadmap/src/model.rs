@@ -307,6 +307,14 @@ pub struct Node {
     /// higher one first. `None` leaves the order to the file and the gambits.
     #[serde(default)]
     pub priority: Option<u8>,
+    /// The evidence line a planned card came from, cited as `source:line`, so the person sees why
+    /// the planner wrote it; a card without evidence is not planned.
+    #[serde(default)]
+    pub evidence: Option<String>,
+    /// What the planned card claims to save: turns, tokens, a refused command, a person's
+    /// intervention.
+    #[serde(default)]
+    pub saving: Option<String>,
 }
 
 /// The range a priority and a gambit's weight share.

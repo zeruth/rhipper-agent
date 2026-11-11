@@ -24,6 +24,8 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
         notes: None,
         assessed: None,
         priority: None,
+        evidence: None,
+        saving: None,
     }
 }
 
@@ -139,6 +141,22 @@ fn round_trips_the_assessed_line() {
     assert_eq!(parsed[1].assessed.as_deref(), Some("final"));
     assert!(parsed[1].is_final());
     assert!(!parsed[0].is_final());
+    assert_eq!(render(&parsed), text);
+}
+
+#[test]
+fn round_trips_the_evidence_and_saving_lines_and_leaves_them_out_when_unset() {
+    let mut planned = node(4, None, NodeKind::Task, "Clip the outputs");
+    planned.evidence = Some("var/retro.log:41".into());
+    planned.saving = Some("two turns a run: no refused sed".into());
+    let nodes = vec![planned, node(5, None, NodeKind::Task, "Written by hand")];
+    let text = render(&nodes);
+    assert!(text.contains("    evidence: var/retro.log:41\n    saving: two turns a run: no refused sed"), "{text}");
+    assert_eq!(text.matches("evidence:").count(), 1, "{text}");
+    let parsed = parse(&text).unwrap();
+    assert_eq!(parsed[0].evidence.as_deref(), Some("var/retro.log:41"));
+    assert_eq!(parsed[0].saving.as_deref(), Some("two turns a run: no refused sed"));
+    assert_eq!((parsed[1].evidence.as_deref(), parsed[1].saving.as_deref()), (None, None));
     assert_eq!(render(&parsed), text);
 }
 

@@ -154,6 +154,36 @@ async fn a_card_costs_the_sum_of_its_runs_and_averages_its_tokens_a_turn() {
 }
 
 #[tokio::test]
+async fn the_costliest_cards_of_the_day_rank_by_cost_and_average_their_tokens_a_turn() {
+    let store = UsageStore::in_memory().await.unwrap();
+    // three cards: 5 costs the most over two runs, 6 the least, 7 reported no cost at all
+    store
+        .record(&Entry { turns: 4, prompt_tokens: 700, completion_tokens: 100, ..entry("claude-opus-5-5", Some(5), Some(0.30)) })
+        .await
+        .unwrap();
+    store
+        .record(&Entry { turns: 6, prompt_tokens: 1_000, completion_tokens: 200, ..entry("claude-opus-5-5", Some(5), Some(0.50)) })
+        .await
+        .unwrap();
+    store
+        .record(&Entry { turns: 2, prompt_tokens: 100, completion_tokens: 20, ..entry("z-ai/glm-5.3-flash", Some(6), Some(0.01)) })
+        .await
+        .unwrap();
+    store.record(&Entry { turns: 3, prompt_tokens: 300, completion_tokens: 30, ..entry("local/qwen", Some(7), None) }).await.unwrap();
+    store.record(&entry("claude-opus-5-5", None, Some(9.0))).await.unwrap();
+    // a run on card 8 from before the window, backdated as the ledger would have written it
+    store.record(&Entry { turns: 1, ..entry("claude-opus-5-5", Some(8), Some(5.0)) }).await.unwrap();
+    sqlx::query("update usage set at = datetime('now', '-2 days') where node = 8").execute(&store.pool).await.unwrap();
+    let cards = store.costliest_cards(LAST_DAY, 10).await.unwrap();
+    assert_eq!(
+        cards.iter().map(|c| (c.node, c.totals.cost_usd, c.totals.turns, c.tokens_per_turn())).collect::<Vec<_>>(),
+        [(5, Some(0.8), 10, 200), (6, Some(0.01), 2, 60), (7, None, 3, 110)]
+    );
+    // the limit keeps the top of the ranking
+    assert_eq!(store.costliest_cards(LAST_DAY, 1).await.unwrap().iter().map(|c| c.node).collect::<Vec<_>>(), [5]);
+}
+
+#[tokio::test]
 async fn a_card_the_ledger_has_not_seen_costs_nothing() {
     let store = UsageStore::in_memory().await.unwrap();
     let card = store.card_cost(9).await.unwrap();

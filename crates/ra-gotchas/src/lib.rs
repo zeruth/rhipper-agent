@@ -8,13 +8,16 @@
 //! what a result or an answer shows. The [`Journal`] keeps every hit, so `rc gotchas` can say
 //! which ones keep coming back and the next run can read [`Catalogue::notes`] about them.
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::Context;
 use regex::Regex;
 use serde::Deserialize;
+
+pub mod journal;
+
+pub use journal::Journal;
 
 /// The seed catalogue, written to `var/gotchas.toml` when there is none.
 pub const SEED: &str = include_str!("../gotchas.toml");
@@ -292,79 +295,6 @@ fn one() -> usize {
 
 fn clip(text: &str, room: usize) -> String {
     if text.chars().count() <= room { text.to_owned() } else { format!("{}…", text.chars().take(room - 1).collect::<String>()) }
-}
-
-/// The journal of hits: one line per hit in a file, `time<TAB>node<TAB>id<TAB>where<TAB>excerpt`.
-pub struct Journal<'a> {
-    path: &'a Path,
-}
-
-impl<'a> Journal<'a> {
-    pub fn at(path: &'a Path) -> Self {
-        Self { path }
-    }
-
-    /// Appends one hit.
-    ///
-    /// # Errors
-    /// When the file cannot be written.
-    pub fn record(&self, node: Option<i64>, place: Where, hit: &Hit) -> anyhow::Result<()> {
-        use std::io::Write;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(self.path)?;
-        let node = node.map_or(String::from("-"), |n| n.to_string());
-        let excerpt = hit.excerpt.replace(['\t', '\n'], " ");
-        writeln!(file, "{}\t{node}\t{}\t{:?}\t{excerpt}", unix_now(), hit.id, place)?;
-        Ok(())
-    }
-
-    /// The ids of every hit, oldest first; empty when there is no journal yet.
-    pub fn ids(&self) -> Vec<String> {
-        std::fs::read_to_string(self.path)
-            .map(|text| text.lines().filter_map(|l| l.split('\t').nth(2).map(str::to_owned)).collect())
-            .unwrap_or_default()
-    }
-
-    /// How often each gotcha fired, the most often first.
-    pub fn counts(&self) -> Vec<(String, usize)> {
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for id in self.ids() {
-            *counts.entry(id).or_default() += 1;
-        }
-        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        out
-    }
-
-    /// The commands the harness refused that no gotcha names, oldest first: the excerpts of the
-    /// [`UNMATCHED`] hits. Empty when there is no journal yet.
-    pub fn unmatched(&self) -> Vec<String> {
-        std::fs::read_to_string(self.path)
-            .map(|text| {
-                text.lines()
-                    .filter_map(|l| {
-                        let mut cols = l.split('\t');
-                        let (_, _, id, _, excerpt) = (cols.next()?, cols.next()?, cols.next()?, cols.next()?, cols.next()?);
-                        (id == UNMATCHED).then(|| excerpt.to_owned())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The ids of the last `limit` hits, newest first, for the machine notes of the next run.
-    pub fn recent(&self, limit: usize) -> Vec<String> {
-        let mut ids = self.ids();
-        ids.reverse();
-        ids.truncate(limit);
-        ids
-    }
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Serde for a regular expression in a TOML string.

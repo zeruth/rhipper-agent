@@ -388,14 +388,14 @@ async fn seed_fills_an_empty_roadmap_and_refuses_a_second_time() {
 }
 
 /// A provider that plays a script: each completion pops the next answer. It records the requests
-/// it saw, so a test can read what the loop sent.
-struct Scripted {
+/// it saw, so a test can read what the loop sent. The plan tests share it.
+pub(crate) struct Scripted {
     answers: parking_lot::Mutex<Vec<ra_providers::Completion>>,
-    seen: parking_lot::Mutex<Vec<ra_providers::CompletionRequest>>,
+    pub(crate) seen: parking_lot::Mutex<Vec<ra_providers::CompletionRequest>>,
 }
 
 impl Scripted {
-    fn new(answers: Vec<ra_providers::Completion>) -> std::sync::Arc<Self> {
+    pub(crate) fn new(answers: Vec<ra_providers::Completion>) -> std::sync::Arc<Self> {
         let mut answers = answers;
         answers.reverse();
         std::sync::Arc::new(Self { answers: parking_lot::Mutex::new(answers), seen: parking_lot::Mutex::new(Vec::new()) })
@@ -454,7 +454,7 @@ async fn gambit_commands_add_change_and_list_them_and_priority_marks_a_card() {
     assert_eq!(store.read(2).await.unwrap().priority, None);
 }
 
-fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Completion {
+pub(crate) fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Completion {
     let usage =
         ra_providers::Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 0, cost_usd: Some(0.01), cost_computed: false };
     ra_providers::Completion {
@@ -1641,6 +1641,95 @@ async fn a_warning_in_a_changed_file_sends_the_card_to_needs_revision() {
     assert!(!request.messages.iter().any(|m| m.content.contains("Fix these lines first")), "{:?}", request.messages);
     let prompt = &request.messages.last().unwrap().content;
     assert!(prompt.contains("### Warnings\nwarning: unused variable: `x`\n --> src/extra.rs:1:22"), "{prompt}");
+}
+
+/// [`linted_run`] in a project whose `[role]` table puts the fix pass on the scripted model: the
+/// first clippy warns in `src/extra.rs`, and the next one is clean when `clean_after`. The
+/// lines, the node after the run, the commands the scripts ran and the model's requests.
+async fn lint_fixed_run(
+    clean_after: bool,
+) -> (Vec<String>, ra_roadmap::model::Node, Vec<String>, std::sync::Arc<Scripted>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[role]\nfix = \"z-ai/glm-5.3-flash\"\n").unwrap();
+    assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status().unwrap().success());
+    assert!(std::process::Command::new("git").args(["add", "-A"]).current_dir(dir.path()).status().unwrap().success());
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let write = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"src/extra.rs","content":"pub fn extra() { let x = 1; }\n"}"#.into(),
+    };
+    let clippy = "    Checking probe v0.1.0\nwarning: unused variable: `x`\n --> src/extra.rs:1:22\n  |\n1 | pub fn extra() { let x = 1; }\n  |                      ^\n\nwarning: `probe` (lib) generated 1 warning\n";
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        let mut log = log.lock();
+        let lints = log.iter().filter(|c| c.starts_with("cargo clippy")).count();
+        log.push(command.to_owned());
+        let warns = command.starts_with("cargo clippy") && (lints == 0 || !clean_after);
+        Ok((0, if warns { clippy.to_owned() } else { "ok\n".to_owned() }))
+    });
+    let mut answers = vec![says("", vec![write]), says("added extra", vec![]), says("dropped the unused x", vec![])];
+    if clean_after {
+        answers.push(says("accepted", vec![]));
+    }
+    let model = Scripted::new(answers);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(model.clone()).with_script(script).with_debug(false);
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    let commands = seen.lock().clone();
+    (out, store.read(2).await.unwrap(), commands, model, dir)
+}
+
+#[tokio::test]
+async fn a_lint_only_failure_takes_the_cheap_fix_pass_and_goes_on_to_the_reviewer() {
+    let (out, node, commands, model, dir) = lint_fixed_run(true).await;
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented, "{out:?}");
+    // the end line is the pass's, with the note; the first run's lines follow, the verdict last
+    assert!(out[0].starts_with("✓ #2 Probe implemented on glm-5.3-flash"), "{out:?}");
+    assert!(out[0].ends_with(" · lint fixed on glm-5.3-flash"), "{out:?}");
+    let clean = out.iter().position(|l| l.contains("lint clean: cargo clippy -p probe")).expect("the pass's lint line");
+    let before = out.iter().position(|l| l == "  the run before the lint fix pass on glm-5.3-flash:").expect("the pass line");
+    let first = out.iter().position(|l| l.starts_with("✗ #2 Probe needs revision on glm-5.3-flash")).expect("the first run's line");
+    let verdict = out.iter().position(|l| l.starts_with("✓ #2 Probe accepted by glm-5.3-flash")).expect("the verdict");
+    assert!(clean < before && before < first && first < verdict, "{out:?}");
+    assert!(!out.iter().any(|l| l.contains("waits for the person")), "{out:?}");
+    // the pass ran the check and the lint again
+    assert_eq!(commands.iter().filter(|c| c.starts_with("cargo clippy")).count(), 2, "{commands:?}");
+    assert_eq!(commands.iter().filter(|c| c.starts_with("cargo test")).count(), 2, "{commands:?}");
+    // the warning lines led the pass's task; the reviewer came after
+    let seen = model.seen.lock();
+    assert_eq!(seen.len(), 4);
+    let prompt = &seen[2].messages.last().unwrap().content;
+    assert!(prompt.contains("The lint of this card's run left the warnings below"), "{prompt}");
+    assert!(prompt.contains("warning: unused variable: `x`\n --> src/extra.rs:1:22"), "{prompt}");
+    assert!(seen[3].tools.is_empty(), "the verdict is a review");
+    // the handoffs: the run with its warnings, the pass without, the verdict on the pass's
+    let handoffs = ra_context::TaskContext::open(dir.path(), 2).handoffs;
+    assert_eq!(handoffs.len(), 2);
+    assert_eq!(handoffs[0].outcome, "needs revision");
+    assert_eq!(handoffs[0].warnings.len(), 1);
+    assert_eq!(handoffs[1].outcome, "implemented");
+    assert!(handoffs[1].warnings.is_empty());
+    assert!(handoffs[1].verdict.as_deref().is_some_and(|v| v.starts_with("accepted")), "{:?}", handoffs[1].verdict);
+}
+
+#[tokio::test]
+async fn a_lint_still_red_after_the_fix_pass_leaves_the_card_needs_revision() {
+    let (out, node, commands, model, dir) = lint_fixed_run(false).await;
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision, "{out:?}");
+    assert!(out[0].starts_with("✗ #2 Probe needs revision on glm-5.3-flash"), "{out:?}");
+    assert!(out.iter().any(|l| l == "  lint fix pass on glm-5.3-flash"), "{out:?}");
+    assert!(!out.iter().any(|l| l.contains("lint fixed on")), "{out:?}");
+    assert_eq!(out.iter().filter(|l| l.contains("lint: 1 warning(s)")).count(), 2, "{out:?}");
+    // one pass, no reviewer, no third run
+    assert_eq!(commands.iter().filter(|c| c.starts_with("cargo clippy")).count(), 2, "{commands:?}");
+    assert_eq!(model.seen.lock().len(), 3);
+    let handoffs = ra_context::TaskContext::open(dir.path(), 2).handoffs;
+    assert_eq!(handoffs.len(), 2);
+    assert!(handoffs.iter().all(|h| h.outcome == "needs revision" && h.warnings.len() == 1));
+    assert!(node.notes.unwrap_or_default().starts_with("warning: unused variable: `x`"));
 }
 
 #[tokio::test]

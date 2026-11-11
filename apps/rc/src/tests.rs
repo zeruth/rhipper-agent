@@ -149,6 +149,28 @@ fn a_card_without_a_judged_run_shows_no_verdict() {
 }
 
 #[test]
+fn plan_without_an_id_is_the_evidence_plan_and_with_one_the_split_and_dry_takes_no_id() {
+    let Options { command: Command::Plan { id, yes, dry, under } } = Options::try_parse_from(["rc", "plan", "--dry"]).expect("parses")
+    else {
+        panic!("not a plan")
+    };
+    assert_eq!((id, yes, dry, under), (None, false, true, None));
+    let Options { command: Command::Plan { id, yes, dry, under } } =
+        Options::try_parse_from(["rc", "plan", "--under", "9"]).expect("parses")
+    else {
+        panic!("not a plan")
+    };
+    assert_eq!((id, yes, dry, under), (None, false, false, Some(9)));
+    let Options { command: Command::Plan { id, yes, dry, under } } = Options::try_parse_from(["rc", "plan", "4", "-y"]).expect("parses")
+    else {
+        panic!("not a plan")
+    };
+    assert_eq!((id, yes, dry, under), (Some(4), true, false, None));
+    // a dry run plans from the evidence; a split has nothing dry about it
+    assert!(Options::try_parse_from(["rc", "plan", "4", "--dry"]).is_err());
+}
+
+#[test]
 fn a_status_card_line_carries_the_cost_and_the_tokens_a_turn_and_is_blank_before_a_run() {
     let nodes = roadmap();
     let ran = CardCost {
