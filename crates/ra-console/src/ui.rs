@@ -84,10 +84,13 @@ struct App {
     log_card: u16,
     /// The slow call in flight, shown as the animated status above the prompt.
     job: Option<String>,
+    /// The ledger's all-time totals, refreshed when a job completes; `None` without a ledger.
+    all_time: Option<ra_usage::Totals>,
 }
 
-/// Runs the console until it is told to quit.
-pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
+/// Runs the console until it is told to quit. `worker` carries the badge model, the provider and
+/// the ledger the sessions write to.
+pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     // the wheel scrolls the panes (Shift+drag still selects text in most terminals)
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
@@ -110,7 +113,8 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
         started: Instant::now(),
         hint: None,
         roadmap: None,
-        worker: Worker::new(DEFAULT_MODEL),
+        all_time: worker.all_time().await,
+        worker,
         selected: None,
         hover: None,
         marquee: 0,
@@ -249,8 +253,10 @@ pub async fn run(store: Store, sink: Sink) -> anyhow::Result<()> {
                 }
             }
             Some(()) = job_done.recv() => {
-                // the background call finished; the status above the prompt goes away
+                // the background call finished; the status above the prompt goes away, and the
+                // ledger panel reads the row it wrote
                 app.job = None;
+                app.all_time = app.worker.all_time().await;
                 dirty = true;
             }
             _ = tick.tick() => {
@@ -571,11 +577,11 @@ fn pane_layout(log_card: u16) -> Layout {
 }
 
 /// The usage pane: four areas on one row. The badges name the model and the task of the next run;
-/// the tokens carry the counts; the ledger, the OpenRouter connection state, stands on the right
-/// until the provider integration fills it.
+/// the tokens carry the session's counts and cost; the ledger on the right carries the all-time
+/// cost from the usage store.
 fn draw_usage(f: &mut Frame, area: Rect, app: &App) {
     let [model, task, tokens, ledger] =
-        Layout::horizontal([Constraint::Length(18), Constraint::Min(14), Constraint::Length(20), Constraint::Length(17)]).areas(area);
+        Layout::horizontal([Constraint::Length(18), Constraint::Min(14), Constraint::Length(30), Constraint::Length(22)]).areas(area);
     // the model badge: the model the next worker session would run on, marqueeing when it overflows
     let inner = usage_panel(f, model);
     let model_text = app.worker.model.as_str();
@@ -600,26 +606,53 @@ fn draw_usage(f: &mut Frame, area: Rect, app: &App) {
         None => spans.push(Span::styled("no task queued", Style::new().fg(theme::DIM))),
     }
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
-    // the tokens: in, out and the session cost; the counts land with the OpenRouter run
+    // the tokens: the session's in, out and cost, as the worker tallied them
     let inner = usage_panel(f, tokens);
     let dim = Style::new().fg(theme::DIM);
+    let session = app.worker.tally();
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("⇅", Style::new().fg(theme::ACCENT)),
             Span::raw(" "),
             Span::styled("in ", dim),
-            Span::styled("—", Style::new().fg(theme::TEXT)),
+            Span::styled(compact(session.prompt_tokens), Style::new().fg(theme::TEXT)),
             Span::styled(" out ", dim),
-            Span::styled("—", Style::new().fg(theme::TEXT)),
+            Span::styled(compact(session.completion_tokens), Style::new().fg(theme::TEXT)),
             Span::raw(" "),
-            Span::styled("$", dim),
-            Span::styled("—", Style::new().fg(theme::WARN_TEXT)),
+            Span::styled(dollars(session.cost_usd), Style::new().fg(theme::WARN_TEXT)),
         ])),
         inner,
     );
-    // the ledger: the OpenRouter connection, its own panel on the right
+    // the ledger: the all-time cost from the usage store, its own panel on the right
     let inner = usage_panel(f, ledger);
-    f.render_widget(Paragraph::new(Line::from(vec![Span::styled("◌", dim), Span::raw(" "), Span::styled("not linked", dim)])), inner);
+    let line = match &app.all_time {
+        Some(all) => Line::from(vec![
+            Span::styled("◉ ", Style::new().fg(theme::ONLINE)),
+            Span::styled("ledger ", dim),
+            Span::styled(dollars(all.cost_usd), Style::new().fg(theme::TEXT)),
+            Span::styled(format!(" · {}", all.calls), dim),
+        ]),
+        None => Line::from(vec![Span::styled("◌", dim), Span::raw(" "), Span::styled("no ledger", dim)]),
+    };
+    f.render_widget(Paragraph::new(line), inner);
+}
+
+/// A token count that fits a badge: `950`, `12.3k`, `1.2M`.
+fn compact(count: u64) -> String {
+    match count {
+        0..=999 => count.to_string(),
+        1_000..=999_999 => format!("{:.1}k", count as f64 / 1_000.0),
+        _ => format!("{:.1}M", count as f64 / 1_000_000.0),
+    }
+}
+
+/// A cost for a badge: cents when it is small, a dash when no call reported one.
+fn dollars(cost: Option<f64>) -> String {
+    match cost {
+        None => "$—".to_owned(),
+        Some(c) if c < 0.01 && c > 0.0 => "<$0.01".to_owned(),
+        Some(c) => format!("${c:.2}"),
+    }
 }
 
 /// A window of `room` characters over `text`, offset by `step`, with a gap of three spaces when it

@@ -6,10 +6,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError};
+use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError, Usage};
 use ra_roadmap::model::{Node, NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
+use ra_usage::{Entry, Totals, UsageStore};
 
 use crate::secret;
 
@@ -28,21 +29,67 @@ impl Route {
     }
 }
 
-/// The console's handle on a worker session: the model of the badge and the provider behind it.
-/// The provider connects on first use and stays for the session; the clones in the background
-/// jobs share it. A model on another route reconnects, and [`Worker::forget`] drops the provider
-/// when the key changes.
+/// The console's handle on a worker session: the model of the badge, the provider behind it, and
+/// the ledger every completion lands in. The provider connects on first use and stays for the
+/// session; the clones in the background jobs share it and the session tally. A model on another
+/// route reconnects, and [`Worker::forget`] drops the provider when the key changes.
 #[derive(Clone)]
 pub struct Worker {
     /// The model the next session runs on, as the badge holds it.
     pub model: String,
     provider: Arc<Mutex<Option<(Route, Arc<dyn ModelProvider>)>>>,
+    /// The usage store; `None` keeps the tally in memory only.
+    ledger: Option<UsageStore>,
+    /// The session's running totals, shared by every clone.
+    tally: Arc<Mutex<Totals>>,
 }
 
 impl Worker {
-    /// A worker on `model`, not yet connected.
+    /// A worker on `model`, not yet connected and without a ledger.
     pub fn new(model: impl Into<String>) -> Self {
-        Self { model: model.into(), provider: Arc::new(Mutex::new(None)) }
+        Self { model: model.into(), provider: Arc::new(Mutex::new(None)), ledger: None, tally: Arc::new(Mutex::new(Totals::default())) }
+    }
+
+    /// The same worker, writing every completion to `ledger`.
+    pub fn with_ledger(mut self, ledger: UsageStore) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// The session's totals so far.
+    pub fn tally(&self) -> Totals {
+        *self.tally.lock()
+    }
+
+    /// The ledger's all-time totals; `None` without a ledger, or when it cannot be read.
+    pub async fn all_time(&self) -> Option<Totals> {
+        let ledger = self.ledger.as_ref()?;
+        match ledger.totals().await {
+            Ok(totals) => Some(totals),
+            Err(e) => {
+                tracing::warn!("cannot read the usage ledger: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Books one completion against the tally and the ledger. A ledger that cannot be written is
+    /// a warning, not a failed run: the answer already came back.
+    async fn record(&self, node: Option<i64>, usage: &Usage) {
+        let entry = Entry {
+            model: self.model.clone(),
+            node,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cached_tokens: usage.cached_tokens,
+            cost_usd: usage.cost_usd,
+        };
+        self.tally.lock().add(&entry);
+        if let Some(ledger) = &self.ledger {
+            if let Err(e) = ledger.record(&entry).await {
+                tracing::warn!("cannot write the usage ledger: {e:#}");
+            }
+        }
     }
 
     /// The route of the badge model.
@@ -89,9 +136,16 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
         })
         .await
         .map_err(map_error)?;
+    worker.record(None, &answer.usage).await;
     Ok(vec![
         format!("{} says: {}", short(&worker.model), answer.text.trim()),
-        format!("  tokens: in {} out {} cached {}", answer.usage.prompt_tokens, answer.usage.completion_tokens, answer.usage.cached_tokens),
+        format!(
+            "  tokens: in {} out {} cached {} · {}",
+            answer.usage.prompt_tokens,
+            answer.usage.completion_tokens,
+            answer.usage.cached_tokens,
+            cost_text(answer.usage.cost_usd)
+        ),
     ])
 }
 
@@ -127,15 +181,17 @@ pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<
         }
     };
 
+    worker.record(Some(id), &answer.usage).await;
     store.set_notes(id, &answer.text).await?;
     store.set_state(id, TaskState::Implemented).await?;
     Ok(vec![
         format!(
-            "✓ #{} implemented on {} · in {} out {}",
+            "✓ #{} implemented on {} · in {} out {} · {}",
             node.title,
             short(&worker.model),
             answer.usage.prompt_tokens,
-            answer.usage.completion_tokens
+            answer.usage.completion_tokens,
+            cost_text(answer.usage.cost_usd)
         ),
         "  the full answer is in the notes of the card in rhipper.md".to_owned(),
     ])
@@ -164,7 +220,7 @@ pub async fn reassess(store: &Store, id: i64, worker: &Worker, recursive: bool) 
             verified.push(format!("#{}", current));
             continue;
         }
-        match reassess_one(store, provider.as_ref(), &worker.model, current, &nodes).await {
+        match reassess_one(store, worker, provider.as_ref(), current, &nodes).await {
             Ok(receipt) => {
                 revised.push(format!("#{}", current));
                 receipts.push(receipt);
@@ -187,7 +243,7 @@ pub async fn reassess(store: &Store, id: i64, worker: &Worker, recursive: bool) 
 /// One reassessment: the model returns two lines, and the store takes them. The prompt carries the
 /// node's own notes and its children with their states, so the revision names only the work the
 /// subtree still owes.
-async fn reassess_one(store: &Store, provider: &dyn ModelProvider, model: &str, id: i64, nodes: &[Node]) -> anyhow::Result<String> {
+async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvider, id: i64, nodes: &[Node]) -> anyhow::Result<String> {
     let node = store.read(id).await?;
     let old_objective = node.objective.clone();
     let old_acceptance = node.acceptance.clone();
@@ -214,7 +270,7 @@ async fn reassess_one(store: &Store, provider: &dyn ModelProvider, model: &str, 
     );
     let answer = provider
         .complete(CompletionRequest {
-            model: model.to_owned(),
+            model: worker.model.clone(),
             messages: vec![Message::system(ARCHITECT), Message::user(ask)],
             temperature: Some(0.2),
             max_tokens: Some(512),
@@ -223,6 +279,7 @@ async fn reassess_one(store: &Store, provider: &dyn ModelProvider, model: &str, 
         })
         .await
         .map_err(map_error)?;
+    worker.record(Some(id), &answer.usage).await;
     let mut overview: Option<String> = None;
     let mut objective: Option<String> = None;
     let mut acceptance: Option<String> = None;
@@ -345,6 +402,11 @@ fn map_error(error: ProviderError) -> anyhow::Error {
         ProviderError::Unavailable(text) => anyhow::anyhow!("the provider is unreachable: {text}"),
         ProviderError::Other(text) => anyhow::anyhow!("the run failed: {text}"),
     }
+}
+
+/// A cost for a log line: the dollars, or a word when the provider reported none.
+fn cost_text(cost: Option<f64>) -> String {
+    cost.map_or_else(|| "cost unreported".to_owned(), |c| format!("${c:.4}"))
 }
 
 /// The model id without its vendor.

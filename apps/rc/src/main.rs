@@ -1,12 +1,14 @@
 //! Rhipper Agent: the roadmap-driven multi-model development orchestrator. The binary parses the
 //! command line and hands over to the subcommands; the work lives in the crates.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use ra_console::agent::Worker;
 use ra_roadmap::model::{NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
+use ra_usage::UsageStore;
 
 #[derive(Parser)]
 #[command(name = "rc", version, about = "Rhipper Agent: the roadmap-driven multi-model development orchestrator")]
@@ -60,6 +62,8 @@ enum Command {
         #[arg(long, default_value = ra_console::ui::DEFAULT_MODEL)]
         model: String,
     },
+    /// The usage ledger: the calls, the tokens and the cost of every model, all time.
+    Usage,
     /// Starts the console over the orchestrator.
     Console {
         /// The roadmap file.
@@ -90,13 +94,57 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Ping { model } => {
             plain_tracing()?;
-            for line in ra_console::agent::ping(&ra_console::agent::Worker::new(model)).await? {
+            let worker = Worker::new(model).with_ledger(open_ledger().await?);
+            for line in ra_console::agent::ping(&worker).await? {
                 println!("{line}");
             }
             Ok(())
         }
+        Command::Usage => {
+            plain_tracing()?;
+            usage().await
+        }
         Command::Console { roadmap } => console(roadmap).await,
     }
+}
+
+/// Opens the usage ledger under `var/`.
+async fn open_ledger() -> anyhow::Result<UsageStore> {
+    std::fs::create_dir_all("var")?;
+    UsageStore::open(Path::new("var/usage.db")).await
+}
+
+/// Prints the ledger by model, the costliest first, and the total.
+async fn usage() -> anyhow::Result<()> {
+    let ledger = open_ledger().await?;
+    let rows = ledger.by_model().await?;
+    if rows.is_empty() {
+        println!("the ledger is empty: no completion has run yet");
+        return Ok(());
+    }
+    let cost = |c: Option<f64>| c.map_or("—".to_owned(), |c| format!("${c:.4}"));
+    println!("{:<34} {:>6} {:>10} {:>10} {:>10} {:>10}", "model", "calls", "in", "out", "cached", "cost");
+    for (model, t) in &rows {
+        println!(
+            "{model:<34} {:>6} {:>10} {:>10} {:>10} {:>10}",
+            t.calls,
+            t.prompt_tokens,
+            t.completion_tokens,
+            t.cached_tokens,
+            cost(t.cost_usd)
+        );
+    }
+    let all = ledger.totals().await?;
+    println!(
+        "{:<34} {:>6} {:>10} {:>10} {:>10} {:>10}",
+        "total",
+        all.calls,
+        all.prompt_tokens,
+        all.completion_tokens,
+        all.cached_tokens,
+        cost(all.cost_usd)
+    );
+    Ok(())
 }
 
 /// The default roadmap file; the commands open it in the working directory.
@@ -192,5 +240,6 @@ async fn console(roadmap: PathBuf) -> anyhow::Result<()> {
     }
     let sink = ra_console::logs::Sink::new();
     ra_console::trace::init(log, Some(sink.clone()));
-    ra_console::ui::run(store, sink).await
+    let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
+    ra_console::ui::run(store, worker, sink).await
 }
