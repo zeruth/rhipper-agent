@@ -133,6 +133,19 @@ impl Worker {
         }
     }
 
+    /// The ledger's totals by model, the costliest first; `None` without a ledger, or when it
+    /// cannot be read.
+    pub async fn by_model(&self) -> Option<Vec<(String, Totals)>> {
+        let ledger = self.ledger.as_ref()?;
+        match ledger.by_model().await {
+            Ok(rows) => Some(rows),
+            Err(e) => {
+                tracing::warn!("cannot read the usage ledger: {e:#}");
+                None
+            }
+        }
+    }
+
     /// Books one completion against the tally and the ledger. A ledger that cannot be written is
     /// a warning, not a failed run: the answer already came back.
     async fn record(&self, node: Option<i64>, usage: &Usage) {

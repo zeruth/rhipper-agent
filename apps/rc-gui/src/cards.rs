@@ -105,6 +105,21 @@ pub(crate) fn chip(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
     response.on_hover_text(if on { "shown · click to hide" } else { "hidden · click to show" }).clicked()
 }
 
+/// A tab of the card area: lit while `on`, dim and clickable while not; reports a click.
+pub(crate) fn tab(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
+    let response = Frame::new()
+        .fill(alpha(color, if on { 40 } else { 0 }))
+        .stroke(Stroke::new(1.0, alpha(color, if on { 180 } else { 50 })))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 4))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).color(if on { color } else { alpha(theme::DIM, 190) }).small().strong());
+        })
+        .response
+        .interact(egui::Sense::click());
+    response.clicked()
+}
+
 /// The priority of a card as five dots, `complexity` of them lit, warm to hot.
 pub(crate) fn priority(ui: &mut Ui, complexity: u8) -> egui::Response {
     let lit = usize::from(complexity.clamp(1, 5));

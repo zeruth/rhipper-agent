@@ -479,7 +479,7 @@ fn gotchas_of_event(
                 }
                 if !command.is_empty() && catalogue.command(command, conditions) == Verdict::Pass {
                     hits.push(Hit {
-                        id: "unmatched-denied".to_owned(),
+                        id: ra_gotchas::UNMATCHED.to_owned(),
                         message: "the harness refused a command no gotcha names; see rc gotchas".to_owned(),
                         excerpt: snippet(command.lines().next().unwrap_or("")),
                     });

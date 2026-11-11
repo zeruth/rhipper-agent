@@ -3480,6 +3480,7 @@ dependencies = [
  "egui_extras",
  "image",
  "ra-console",
+ "ra-gotchas",
  "ra-providers",
  "ra-roadmap",
  "ra-usage",

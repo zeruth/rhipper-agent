@@ -18,6 +18,10 @@ use serde::Deserialize;
 /// The seed catalogue, written to `var/gotchas.toml` when there is none.
 pub const SEED: &str = include_str!("../gotchas.toml");
 
+/// The id the journal gives a command the harness refused that no gotcha names: not an entry of
+/// the catalogue, but a hit all the same, so the catalogue can grow from it.
+pub const UNMATCHED: &str = "unmatched-denied";
+
 /// Where a gotcha shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -252,6 +256,22 @@ impl<'a> Journal<'a> {
         let mut out: Vec<(String, usize)> = counts.into_iter().collect();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out
+    }
+
+    /// The commands the harness refused that no gotcha names, oldest first: the excerpts of the
+    /// [`UNMATCHED`] hits. Empty when there is no journal yet.
+    pub fn unmatched(&self) -> Vec<String> {
+        std::fs::read_to_string(self.path)
+            .map(|text| {
+                text.lines()
+                    .filter_map(|l| {
+                        let mut cols = l.split('\t');
+                        let (_, _, id, _, excerpt) = (cols.next()?, cols.next()?, cols.next()?, cols.next()?, cols.next()?);
+                        (id == UNMATCHED).then(|| excerpt.to_owned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The ids of the last `limit` hits, newest first, for the machine notes of the next run.

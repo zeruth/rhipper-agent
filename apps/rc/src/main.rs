@@ -243,15 +243,7 @@ fn gotchas() -> anyhow::Result<()> {
         let message = catalogue.get(id).map_or("a refused command no gotcha names; see below", |g| g.message.as_str());
         println!("{id:<26} {count:>5}  {message}");
     }
-    let unmatched: Vec<String> = std::fs::read_to_string("var/gotchas.log")
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| {
-            let mut cols = l.split('\t');
-            let (_, _, id, _, excerpt) = (cols.next()?, cols.next()?, cols.next()?, cols.next()?, cols.next()?);
-            (id == "unmatched-denied").then(|| excerpt.to_owned())
-        })
-        .collect();
+    let unmatched = journal.unmatched();
     if !unmatched.is_empty() {
         println!("\nrefused commands no gotcha names, newest last:");
         for command in unmatched.iter().rev().take(20).rev() {

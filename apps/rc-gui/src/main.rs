@@ -23,6 +23,7 @@ use egui::{Align, Color32, CornerRadius, FontId, Frame, Key, Layout, Margin, Ric
 use ra_console::agent::Worker;
 use ra_console::commands::{self, Outcome};
 use ra_console::logs::{Kind, Sink};
+use ra_gotchas::{Catalogue, Journal};
 use ra_roadmap::model::{Node, NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
@@ -31,6 +32,35 @@ use tokio::sync::mpsc;
 
 /// How long the splash stays at least.
 const SPLASH: Duration = Duration::from_millis(1800);
+/// The catalogue of the gotchas and the journal of the ones that fired, as `rc gotchas` reads them.
+const GOTCHAS_FILE: &str = "var/gotchas.toml";
+const GOTCHAS_LOG: &str = "var/gotchas.log";
+/// How many of the refused commands the ledger tab lists, the same as `rc gotchas`.
+const UNMATCHED_SHOWN: usize = 20;
+
+/// The two tabs of the card area.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Card,
+    Ledger,
+}
+
+/// What the ledger tab shows, read the way `rc usage` and `rc gotchas` read it: the usage by
+/// model and all time from `var/usage.db`, the gotchas by id with their counts, and the refused
+/// commands no gotcha names from `var/gotchas.log`. Read at start and again when a run ends.
+#[derive(Default)]
+struct Ledger {
+    by_model: Vec<(String, Totals)>,
+    all_time: Option<Totals>,
+    /// Each gotcha that fired: the id, how often, and its message from the catalogue, `None`
+    /// for an id the catalogue does not hold.
+    gotchas: Vec<(String, usize, Option<String>)>,
+    /// The refused commands no gotcha names, oldest first.
+    unmatched: Vec<String>,
+    /// How many entries the catalogue holds; what the empty view says.
+    catalogue: usize,
+    read_at: Option<Instant>,
+}
 
 fn main() -> eframe::Result<()> {
     let icon = image::load_from_memory(include_bytes!("../assets/icon.png")).ok().map(|img| {
@@ -76,7 +106,9 @@ struct App {
     job: Option<String>,
     job_tx: mpsc::UnboundedSender<()>,
     job_done: mpsc::UnboundedReceiver<()>,
-    all_time: Option<Totals>,
+    /// The numbers of the ledger tab and the status bar's ledger badge.
+    ledger: Ledger,
+    tab: Tab,
     /// The plan's windows as the harness last reported them, and when they were last read.
     limits: ra_providers::limits::Limits,
     limits_read: Instant,
@@ -130,13 +162,12 @@ impl App {
             Ok(ledger) => worker = worker.with_ledger(ledger),
             Err(e) => tracing::warn!("no ledger: {e:#}"),
         }
-        let all_time = rt.block_on(worker.all_time());
         sink.push(Kind::Banner, format!("Rhipper Agent {} — the workspace. Type help for commands.", ra_console::VERSION));
         if let Some(what) = replaced {
             sink.push(Kind::Log(tracing::Level::INFO), what);
         }
         let (job_tx, job_done) = mpsc::unbounded_channel();
-        Self {
+        let mut app = Self {
             rt,
             store,
             worker,
@@ -156,13 +187,46 @@ impl App {
             job: None,
             job_tx,
             job_done,
-            all_time,
+            ledger: Ledger::default(),
+            tab: Tab::Card,
             limits: ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE)),
             limits_read: Instant::now(),
             show_debug: false,
             assign_model: String::new(),
             fault,
-        }
+        };
+        app.refresh_ledger();
+        app
+    }
+
+    /// Reads the ledger and the gotchas again: the same queries as `rc usage` and the same
+    /// journal as `rc gotchas`, so the tab shows their numbers.
+    fn refresh_ledger(&mut self) {
+        let (all_time, by_model) = self.rt.block_on(async { (self.worker.all_time().await, self.worker.by_model().await) });
+        let catalogue = match Catalogue::load(Path::new(GOTCHAS_FILE)) {
+            Ok(catalogue) => Some(catalogue),
+            Err(e) => {
+                tracing::warn!("cannot read the gotchas catalogue: {e:#}");
+                None
+            }
+        };
+        let journal = Journal::at(Path::new(GOTCHAS_LOG));
+        let gotchas = journal
+            .counts()
+            .into_iter()
+            .map(|(id, count)| {
+                let message = catalogue.as_ref().and_then(|c| c.get(&id)).map(|g| g.message.clone());
+                (id, count, message)
+            })
+            .collect();
+        self.ledger = Ledger {
+            by_model: by_model.unwrap_or_default(),
+            all_time,
+            gotchas,
+            unmatched: journal.unmatched(),
+            catalogue: catalogue.map_or(0, |c| c.entries.len()),
+            read_at: Some(Instant::now()),
+        };
     }
 
     /// The housekeeping of a frame: the activity of other processes, the roadmap file, the jobs,
@@ -187,11 +251,15 @@ impl App {
             if working.is_some() && working != self.followed {
                 self.select(working);
             }
+            // a run of any instance just started or ended: the ledger and the journal may have moved
+            if working != self.followed {
+                self.refresh_ledger();
+            }
             self.followed = working;
         }
         while self.job_done.try_recv().is_ok() {
             self.job = None;
-            self.all_time = self.rt.block_on(self.worker.all_time());
+            self.refresh_ledger();
         }
         // the plan's windows, every five seconds: a run of any instance may have moved them
         if self.limits_read.elapsed() >= Duration::from_secs(5) {
@@ -342,50 +410,51 @@ impl App {
                 let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][((t * 10.0) as usize) % 10];
                 cards::badge_marked(ui, spinner, job, theme::WARN_TEXT);
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let secs = self.started.elapsed().as_secs();
-                ui.label(RichText::new(format!("up {:02}:{:02}:{:02} ", secs / 3600, secs / 60 % 60, secs % 60)).color(theme::DIM).small());
-                // the plan's windows, colored by how full they are
-                if self.limits.fresh() {
-                    for (name, window) in self.limits.windows.iter().rev() {
-                        let label = ra_providers::limits::label(name);
-                        let color = if window.utilization >= 0.8 {
-                            theme::ERROR_TEXT
-                        } else if window.utilization >= 0.5 {
-                            theme::WARN_TEXT
-                        } else {
-                            theme::ONLINE
-                        };
-                        cards::badge_marked(ui, "◔", &format!("{label} {:.0}%", window.utilization * 100.0), color).on_hover_text(format!(
-                            "the plan's {label} window: {:.0}% used, resets in {}\nfrom the harness's last run",
-                            window.utilization * 100.0,
-                            ra_providers::limits::until(window.resets_at)
-                        ));
-                    }
+            // the counts, left to right after a gap: a right-aligned group pushed its first
+            // badges past the edge as it grew
+            ui.add_space(18.0);
+            let session = self.worker.tally();
+            cards::badge_marked(
+                ui,
+                "⇅",
+                &format!(
+                    "in {} · out {} · {}",
+                    compact(session.prompt_tokens),
+                    compact(session.completion_tokens),
+                    dollars(session.cost_usd)
+                ),
+                theme::WARN_TEXT,
+            )
+            .on_hover_text("this session's tokens and cost");
+            match &self.ledger.all_time {
+                Some(all) => {
+                    cards::badge_marked(ui, "◉", &format!("ledger {} · {} calls", dollars(all.cost_usd), all.calls), theme::ONLINE)
+                        .on_hover_text("all time, from var/usage.db");
                 }
-                match &self.all_time {
-                    Some(all) => {
-                        cards::badge_marked(ui, "◉", &format!("ledger {} · {} calls", dollars(all.cost_usd), all.calls), theme::ONLINE)
-                            .on_hover_text("all time, from var/usage.db");
-                    }
-                    None => {
-                        cards::badge_marked(ui, "◌", "no ledger", theme::DIM);
-                    }
+                None => {
+                    cards::badge_marked(ui, "◌", "no ledger", theme::DIM);
                 }
-                let session = self.worker.tally();
-                cards::badge_marked(
-                    ui,
-                    "⇅",
-                    &format!(
-                        "in {} · out {} · {}",
-                        compact(session.prompt_tokens),
-                        compact(session.completion_tokens),
-                        dollars(session.cost_usd)
-                    ),
-                    theme::WARN_TEXT,
-                )
-                .on_hover_text("this session's tokens and cost");
-            });
+            }
+            // the plan's windows, colored by how full they are
+            if self.limits.fresh() {
+                for (name, window) in &self.limits.windows {
+                    let label = ra_providers::limits::label(name);
+                    let color = if window.utilization >= 0.8 {
+                        theme::ERROR_TEXT
+                    } else if window.utilization >= 0.5 {
+                        theme::WARN_TEXT
+                    } else {
+                        theme::ONLINE
+                    };
+                    cards::badge_marked(ui, "◔", &format!("{label} {:.0}%", window.utilization * 100.0), color).on_hover_text(format!(
+                        "the plan's {label} window: {:.0}% used, resets in {}\nfrom the harness's last run",
+                        window.utilization * 100.0,
+                        ra_providers::limits::until(window.resets_at)
+                    ));
+                }
+            }
+            let secs = self.started.elapsed().as_secs();
+            ui.label(RichText::new(format!("up {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)).color(theme::DIM).small());
         });
     }
 
@@ -528,6 +597,128 @@ impl App {
         if let Some(line) = command {
             self.submit(ui.ctx(), line);
         }
+    }
+
+    /// The middle of the workspace: the tab row, then the selected card or the ledger.
+    fn center(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if cards::tab(ui, "CARD", theme::ACCENT, self.tab == Tab::Card) {
+                self.tab = Tab::Card;
+            }
+            if cards::tab(ui, "LEDGER", theme::ONLINE, self.tab == Tab::Ledger) {
+                self.tab = Tab::Ledger;
+            }
+            if self.tab == Tab::Ledger {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .small_button(RichText::new("↻").color(theme::ONLINE))
+                        .on_hover_text("read the ledger and the journal again")
+                        .clicked()
+                    {
+                        self.refresh_ledger();
+                    }
+                    if let Some(at) = self.ledger.read_at {
+                        let secs = at.elapsed().as_secs();
+                        let when = if secs < 5 { "just now".to_owned() } else { format!("{secs}s ago") };
+                        ui.label(RichText::new(format!("read {when} · refreshed when a run ends")).color(theme::DIM).small());
+                    }
+                });
+            }
+        });
+        ui.add_space(6.0);
+        match self.tab {
+            Tab::Card => self.card_view(ui),
+            Tab::Ledger => self.ledger_view(ui),
+        }
+    }
+
+    /// The ledger tab: the usage by model with the total, the gotchas by how often they fired,
+    /// and the refused commands no gotcha names, the same numbers as `rc usage` and `rc gotchas`.
+    fn ledger_view(&self, ui: &mut egui::Ui) {
+        let ledger = &self.ledger;
+        egui::ScrollArea::vertical().id_salt("ledger").auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(980.0);
+            cards::card(ui, theme::ONLINE, false, |ui| {
+                ui.set_width(ui.available_width());
+                cards::section(ui, "USAGE BY MODEL", theme::ONLINE);
+                ui.label(
+                    RichText::new("all time, from var/usage.db, the costliest first · what `rc usage` prints").color(theme::DIM).small(),
+                );
+                if ledger.by_model.is_empty() {
+                    ui.label(RichText::new("the ledger is empty: no completion has run yet").color(theme::DIM));
+                } else {
+                    egui::Grid::new("usage").num_columns(6).spacing([22.0, 5.0]).striped(true).show(ui, |ui| {
+                        ui.label(RichText::new("model").small().strong().color(theme::DIM));
+                        for head in ["calls", "in", "out", "cached", "cost"] {
+                            cell_right(ui, RichText::new(head).small().strong().color(theme::DIM));
+                        }
+                        ui.end_row();
+                        for (model, t) in &ledger.by_model {
+                            usage_row(ui, model, t, theme::TEXT);
+                        }
+                        if let Some(all) = &ledger.all_time {
+                            usage_row(ui, "total", all, theme::ONLINE);
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
+            cards::card(ui, theme::WARN_TEXT, false, |ui| {
+                ui.set_width(ui.available_width());
+                cards::section(ui, "GOTCHAS", theme::WARN_TEXT);
+                ui.label(RichText::new("how often each fired, from var/gotchas.log · what `rc gotchas` prints").color(theme::DIM).small());
+                if ledger.gotchas.is_empty() {
+                    ui.label(
+                        RichText::new(format!(
+                            "no gotcha has fired yet; the catalogue holds {} entries in {GOTCHAS_FILE}",
+                            ledger.catalogue
+                        ))
+                        .color(theme::DIM),
+                    );
+                } else {
+                    egui::Grid::new("gotchas").num_columns(3).spacing([22.0, 5.0]).striped(true).show(ui, |ui| {
+                        ui.label(RichText::new("gotcha").small().strong().color(theme::DIM));
+                        cell_right(ui, RichText::new("hits").small().strong().color(theme::DIM));
+                        ui.label(RichText::new("message").small().strong().color(theme::DIM));
+                        ui.end_row();
+                        for (id, count, message) in &ledger.gotchas {
+                            let known = message.is_some();
+                            ui.label(RichText::new(id).monospace().color(if known { theme::TEXT } else { theme::ERROR_TEXT }));
+                            cell_right(ui, RichText::new(count.to_string()).color(theme::WARN_TEXT).strong());
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(message.as_deref().unwrap_or("a refused command no gotcha names; see below"))
+                                        .color(if known { theme::TEXT } else { theme::DIM }),
+                                )
+                                .wrap(),
+                            );
+                            ui.end_row();
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
+            if !ledger.unmatched.is_empty() {
+                cards::card(ui, theme::ERROR_TEXT, false, |ui| {
+                    ui.set_width(ui.available_width());
+                    cards::section(ui, "REFUSED COMMANDS NO GOTCHA NAMES", theme::ERROR_TEXT);
+                    let shown = ledger.unmatched.len().min(UNMATCHED_SHOWN);
+                    ui.label(
+                        RichText::new(format!(
+                            "newest last · {shown} of {} · each is a gotcha the catalogue could grow by",
+                            ledger.unmatched.len()
+                        ))
+                        .color(theme::DIM)
+                        .small(),
+                    );
+                    for command in ledger.unmatched.iter().rev().take(UNMATCHED_SHOWN).rev() {
+                        ui.label(RichText::new(command).monospace().color(theme::TEXT));
+                    }
+                });
+                ui.add_space(6.0);
+            }
+        });
     }
 
     /// The selected card, large, in the middle of the workspace.
@@ -779,7 +970,7 @@ impl eframe::App for App {
             .show(root, |ui| self.roadmap_panel(ui));
         egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(18, 12)))
-            .show(root, |ui| self.card_view(ui));
+            .show(root, |ui| self.center(ui));
         let live = self.sink.live_run().is_some() || self.job.is_some();
         ctx.request_repaint_after(Duration::from_millis(if live { 40 } else { 250 }));
     }
@@ -820,6 +1011,25 @@ fn text_card(ui: &mut egui::Ui, name: &str, value: Option<&str>, color: Color32)
         };
     });
     ui.add_space(6.0);
+}
+
+/// A cell of a grid with its text against the right edge, the way numbers line up.
+fn cell_right(ui: &mut egui::Ui, text: RichText) {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.label(text);
+    });
+}
+
+/// One row of the usage grid: the model, the calls, the tokens and the cost, the numbers as
+/// `rc usage` prints them.
+fn usage_row(ui: &mut egui::Ui, model: &str, t: &Totals, color: Color32) {
+    ui.label(RichText::new(model).monospace().color(color));
+    for n in [t.calls, t.prompt_tokens, t.completion_tokens, t.cached_tokens] {
+        cell_right(ui, RichText::new(n.to_string()).color(color));
+    }
+    let cost = t.cost_usd.map_or_else(|| "—".to_owned(), |c| format!("${c:.4}"));
+    cell_right(ui, RichText::new(cost).color(color));
+    ui.end_row();
 }
 
 /// An action button in `color`: tinted, with a stroke, bright on hover.

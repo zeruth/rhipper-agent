@@ -28,6 +28,15 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
         }
     }
     assert_eq!(catalogue.command("git status --short", Conditions::default()), Verdict::Pass);
+    // a pipe or a redirect after cargo is refused as a whole; the plain command passes
+    assert!(
+        matches!(catalogue.command("cargo test -p ra-gotchas 2>&1 | tail -15", Conditions::default()), Verdict::Deny { id, .. } if id == "shell-pipe")
+    );
+    assert!(
+        matches!(catalogue.command("cargo test -p x > out.txt 2>&1", Conditions::default()), Verdict::Deny { id, .. } if id == "shell-pipe")
+    );
+    assert_eq!(catalogue.command("cargo test -p ra-gotchas", Conditions::default()), Verdict::Pass);
+    assert!(matches!(catalogue.command("powershell.exe -NoProfile -File x.ps1", Conditions::default()), Verdict::Deny { .. }));
 }
 
 #[test]
@@ -86,6 +95,21 @@ fn the_journal_counts_and_the_notes_name_each_gotcha_once() {
     assert_eq!(catalogue.notes(&[]), "");
     // a tab in the excerpt does not break the columns
     assert!(std::fs::read_to_string(&path).unwrap().lines().all(|l| l.split('\t').count() == 5));
+}
+
+#[test]
+fn the_journal_lists_the_refused_commands_no_gotcha_names_oldest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gotchas.log");
+    let journal = Journal::at(&path);
+    assert!(journal.unmatched().is_empty(), "no journal yet, no commands");
+    let refused = |command: &str| Hit { id: UNMATCHED.into(), message: "refused".into(), excerpt: command.into() };
+    journal.record(Some(3), Where::Command, &refused("Get-ChildItem -Recurse")).unwrap();
+    journal.record(Some(3), Where::Command, &Hit { id: "mojibake".into(), message: "m".into(), excerpt: "Ã©".into() }).unwrap();
+    journal.record(None, Where::Command, &refused("Select-String foo")).unwrap();
+    assert_eq!(journal.unmatched(), ["Get-ChildItem -Recurse", "Select-String foo"]);
+    // the unmatched hits still count among the gotchas, under their own id
+    assert_eq!(journal.counts(), [(UNMATCHED.to_owned(), 2), ("mojibake".to_owned(), 1)]);
 }
 
 #[test]
