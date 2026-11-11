@@ -36,6 +36,15 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
     for command in ["powershell.exe -NoProfile -File x.ps1", "sh var/check.sh", "bash -c 'cargo test'"] {
         assert!(matches!(catalogue.command(command, Conditions::default()), Verdict::Deny { .. }), "{command}");
     }
+    // the git state is the person's, wherever in a chain the write sits
+    for command in ["git stash -q && cargo clippy", "git add -A", "cargo test && git commit -m x", "git branch -D card"] {
+        assert!(
+            matches!(catalogue.command(command, Conditions::default()), Verdict::Deny { id, .. } if id == "git-writes"),
+            "{command}"
+        );
+    }
+    assert_eq!(catalogue.command("git diff --stat", Conditions::default()), Verdict::Pass);
+    assert_eq!(catalogue.command("git branch --show-current", Conditions::default()), Verdict::Pass);
 }
 
 #[test]

@@ -6,6 +6,7 @@
 //! on, the way a person reads an error.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -22,10 +23,21 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 /// The directories a search and a listing skip.
 const SKIPPED_DIRS: [&str; 4] = [".git", "target", "node_modules", "var"];
 
+/// What answers a command in place of the shell: a test's script. It gets the command line and
+/// answers with the exit code and the output, or with why the command could not run.
+pub type Script = Arc<dyn Fn(&str) -> anyhow::Result<(i32, String)> + Send + Sync>;
+
 /// The tools over one workspace.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Toolbox {
     root: PathBuf,
+    script: Option<Script>,
+}
+
+impl std::fmt::Debug for Toolbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Toolbox").field("root", &self.root).field("scripted", &self.script.is_some()).finish()
+    }
 }
 
 impl Toolbox {
@@ -36,7 +48,14 @@ impl Toolbox {
     pub fn new(root: &Path) -> anyhow::Result<Self> {
         let root = root.canonicalize().with_context(|| format!("no workspace at {}", root.display()))?;
         anyhow::ensure!(root.is_dir(), "the workspace {} is not a directory", root.display());
-        Ok(Self { root })
+        Ok(Self { root, script: None })
+    }
+
+    /// The same toolbox, with `script` answering every command instead of the shell.
+    #[must_use]
+    pub fn with_script(mut self, script: Script) -> Self {
+        self.script = Some(script);
+        self
     }
 
     /// The workspace.
@@ -273,28 +292,102 @@ impl Toolbox {
         let program = parts.next().context("the command is empty")?;
         let args: Vec<&str> = parts.collect();
         anyhow::ensure!(allowed(program, &args), "{program} is not allowed; the commands are cargo, and git status, diff, log and show");
-        let child = tokio::process::Command::new(program).args(&args).current_dir(&self.root).stdin(std::process::Stdio::null()).output();
-        let output = tokio::time::timeout(COMMAND_TIMEOUT, child)
-            .await
-            .map_err(|_| anyhow::anyhow!("{program} ran past {} seconds and was stopped", COMMAND_TIMEOUT.as_secs()))?
-            .with_context(|| format!("cannot start {program}"))?;
-        let mut text = String::new();
-        text.push_str(&String::from_utf8_lossy(&output.stdout));
-        if !output.stderr.is_empty() {
-            if !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
+        let (code, mut text) = if let Some(script) = &self.script {
+            let (code, text) = script(command)?;
+            (Some(code), text)
+        } else {
+            let child =
+                tokio::process::Command::new(program).args(&args).current_dir(&self.root).stdin(std::process::Stdio::null()).output();
+            let output = tokio::time::timeout(COMMAND_TIMEOUT, child)
+                .await
+                .map_err(|_| anyhow::anyhow!("{program} ran past {} seconds and was stopped", COMMAND_TIMEOUT.as_secs()))?
+                .with_context(|| format!("cannot start {program}"))?;
+            let mut text = String::new();
+            text.push_str(&String::from_utf8_lossy(&output.stdout));
+            if !output.stderr.is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
             }
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
+            (output.status.code(), text)
+        };
         if !text.ends_with('\n') && !text.is_empty() {
             text.push('\n');
         }
-        text.push_str(&match output.status.code() {
+        text.push_str(&match code {
             Some(code) => format!("exit code {code}"),
             None => "stopped by a signal".to_owned(),
         });
         Ok(text)
     }
+}
+
+/// The name of the crate that owns `file`, a workspace-relative path: the `[package]` of the
+/// nearest `Cargo.toml` above it, up to `root`. None for a file outside any package.
+#[must_use]
+pub fn crate_of(root: &Path, file: &str) -> Option<String> {
+    let mut dir = Path::new(file).parent();
+    while let Some(d) = dir {
+        if let Ok(manifest) = std::fs::read_to_string(root.join(d).join("Cargo.toml"))
+            && let Some(name) = package_name(&manifest)
+        {
+            return Some(name);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The `name` under `[package]` of a manifest, read without a TOML parser: the key is a bare
+/// quoted string in every manifest cargo writes.
+fn package_name(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package && let Some(value) = line.strip_prefix("name") {
+            let value = value.trim_start().strip_prefix('=')?.trim();
+            return Some(value.trim_matches(|c| c == '"' || c == '\'').to_owned());
+        }
+    }
+    None
+}
+
+/// The diagnostics of a cargo output that point at one of `files`: each `warning:` or `error:`
+/// paragraph whose `-->` line names a file, whole, in the order they came. The summary lines
+/// (`generated 1 warning`) point at nothing and stay out.
+#[must_use]
+pub fn warnings_at(output: &str, files: &[String]) -> Vec<String> {
+    let normalized: Vec<String> = files.iter().map(|f| f.replace('\\', "/")).collect();
+    // a diagnostic opens on a column-0 `warning`/`error` line and runs over its indented lines
+    // and the numbered lines of its snippet to the next blank or other column-0 line; the cargo
+    // lines around it are indented and never open one
+    let mut blocks: Vec<String> = Vec::new();
+    let mut open = false;
+    for line in output.lines() {
+        let indented = line.starts_with(|c: char| c.is_whitespace() || c.is_ascii_digit());
+        if line.starts_with("warning") || line.starts_with("error") {
+            blocks.push(line.to_owned());
+            open = true;
+        } else if open
+            && indented
+            && let Some(block) = blocks.last_mut()
+        {
+            block.push('\n');
+            block.push_str(line);
+        } else {
+            open = false;
+        }
+    }
+    blocks.retain(|block| {
+        block.lines().filter_map(|l| l.trim_start().strip_prefix("--> ")).any(|at| {
+            let path = at.rsplit_once(':').map_or(at, |(p, _)| p);
+            let path = path.rsplit_once(':').map_or(path, |(p, _)| p).replace('\\', "/");
+            normalized.iter().any(|f| f == &path || path.ends_with(&format!("/{f}")) || f.ends_with(&format!("/{path}")))
+        })
+    });
+    blocks
 }
 
 /// Whether a command is on the allowlist: any cargo subcommand, and the git commands that only

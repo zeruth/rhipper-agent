@@ -77,6 +77,9 @@ pub struct Worker {
     /// `RHIPPER_BUDGETS=off` is in the environment, `--no-budget` was passed, or `budgets off`
     /// was typed: a subscription has no bill to guard.
     pub budgets: bool,
+    /// What answers the commands of a run instead of the shell; the tests script the check and
+    /// the lint with it.
+    script: Option<ra_tools::Script>,
 }
 
 impl Worker {
@@ -90,7 +93,24 @@ impl Worker {
             budget: None,
             budgets: !std::env::var("RHIPPER_BUDGETS")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
+            script: None,
         }
+    }
+
+    /// The same worker, with `script` answering every command a run makes instead of the shell.
+    #[must_use]
+    pub fn with_script(mut self, script: ra_tools::Script) -> Self {
+        self.script = Some(script);
+        self
+    }
+
+    /// The toolbox of a run over `root`, scripted when the worker is.
+    fn toolbox(&self, root: &Path) -> anyhow::Result<ra_tools::Toolbox> {
+        let toolbox = ra_tools::Toolbox::new(root)?;
+        Ok(match &self.script {
+            Some(script) => toolbox.with_script(script.clone()),
+            None => toolbox,
+        })
     }
 
     /// The same worker, with every run capped at `budget` dollars instead of the complexity's.
@@ -365,11 +385,13 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     };
     // a local check before the card counts as done: no model call, the acceptance names it
     let command = check_command(node.acceptance.as_deref());
-    let check = match ra_tools::Toolbox::new(workspace_dir.as_deref().unwrap_or(Path::new("."))) {
+    let toolbox = worker.toolbox(workspace_dir.as_deref().unwrap_or(Path::new(".")));
+    let check = match &toolbox {
         Ok(toolbox) => toolbox.check(&command).await,
-        Err(e) => Err(e),
+        Err(e) => Err(anyhow::anyhow!("{e:#}")),
     };
-    let (passed, check_line) = match check {
+    let changed = ra_context::changed_between(&dirty_before, &git_status(&root).await);
+    let (mut passed, mut check_line) = match check {
         Ok((true, _)) => (true, format!("  check passed: {command}")),
         Ok((false, output)) => {
             store.set_notes(id, &format!("{}\ncheck failed: {command}\n{}", session.text, last_lines(&output, 40))).await?;
@@ -380,14 +402,40 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             (false, format!("  check failed: {command} · {e:#}"))
         }
     };
+    // the lint of what the run changed, once the check passed: the orchestrator finds the
+    // warnings so the worker spends no turns on them. A lint that cannot run is a line, not a
+    // verdict; a warning in a changed file is.
+    let mut report = session.text.clone();
+    let mut lint_lines = Vec::new();
+    if passed && let Ok(toolbox) = &toolbox {
+        let lint = lint_changed(toolbox, &root, &changed).await;
+        for skipped in &lint.skipped {
+            lint_lines.push(format!("  lint skipped: {skipped}"));
+        }
+        if lint.warnings.is_empty() {
+            if !lint.crates.is_empty() {
+                lint_lines.push(format!("  lint clean: cargo clippy -p {}", lint.crates.join(" -p ")));
+            }
+        } else {
+            passed = false;
+            report = format!("{}\n\n{}", lint.warnings.join("\n\n"), session.text);
+            check_line = format!(
+                "  check passed: {command} · lint: {} warning(s) in the changed files from cargo clippy -p {} · the lines are in the notes",
+                lint.warnings.len(),
+                lint.crates.join(" -p ")
+            );
+        }
+    }
     if passed {
         store.set_notes(id, &session.text).await?;
         store.set_state(id, TaskState::Implemented).await?;
     } else {
+        if report != session.text {
+            store.set_notes(id, &report).await?;
+        }
         store.set_state(id, TaskState::NeedsRevision).await?;
     }
-    let changed = ra_context::changed_between(&dirty_before, &git_status(&root).await);
-    task.record(handoff(if passed { "implemented" } else { "needs revision" }, check_line.trim(), &session.text, changed));
+    task.record(handoff(if passed { "implemented" } else { "needs revision" }, check_line.trim(), &report, changed));
     save_context(store, &root, &task).await;
     let mut lines = vec![
         format!(
@@ -404,14 +452,47 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             cost_text(session.usage.cost_usd)
         ),
         check_line,
-        "  the full answer is in the notes of the card in rhipper.md".to_owned(),
     ];
+    lines.extend(lint_lines);
+    lines.push("  the full answer is in the notes of the card in rhipper.md".to_owned());
     if !gotcha_hits.is_empty() {
         let mut ids: Vec<&str> = gotcha_hits.iter().map(|h| h.id.as_str()).collect();
         ids.dedup();
         lines.push(format!("  ⚠ {} gotcha(s): {} · rc gotchas lists them", gotcha_hits.len(), ids.join(", ")));
     }
     Ok((lines, session.usage.cost_usd, gotcha_hits.len()))
+}
+
+/// What the lint of a run's changed files came to.
+#[derive(Default)]
+struct Lint {
+    /// The crates linted, one `cargo clippy -p` each, in order.
+    crates: Vec<String>,
+    /// The diagnostics pointing at a changed file, whole.
+    warnings: Vec<String>,
+    /// The lints that could not run, each with its reason.
+    skipped: Vec<String>,
+}
+
+/// Lints each crate that owns one of `changed` and keeps the diagnostics that point at those
+/// files. Clippy exits 0 on a warning, so the output decides, not the exit code.
+async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[String]) -> Lint {
+    let mut lint = Lint::default();
+    for file in changed {
+        if let Some(krate) = ra_tools::crate_of(root, file)
+            && !lint.crates.contains(&krate)
+        {
+            lint.crates.push(krate);
+        }
+    }
+    for krate in &lint.crates {
+        let command = format!("cargo clippy -p {krate}");
+        match toolbox.check(&command).await {
+            Ok((_, output)) => lint.warnings.extend(ra_tools::warnings_at(&output, changed)),
+            Err(e) => lint.skipped.push(format!("{command} · {e:#}")),
+        }
+    }
+    lint
 }
 
 /// Writes a task's context file and removes the files of the cards that are done. A failure
@@ -542,7 +623,7 @@ async fn tool_loop(
     budget: Option<f64>,
 ) -> anyhow::Result<Session> {
     let workspace = workspace.context("the worker has no workspace to act in")?;
-    let toolbox = ra_tools::Toolbox::new(workspace)?;
+    let toolbox = worker.toolbox(workspace)?;
     let mut messages = vec![Message::system(SYSTEM), Message::user(context)];
     let mut usage = Usage::default();
     let mut calls = 0usize;
@@ -802,7 +883,7 @@ fn first_line(text: &str) -> String {
 
 /// The system prompt of a worker session. A harness with tools implements in the workspace; a
 /// bare model answers with the plan and the changes.
-const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory, check it against the acceptance criteria, and answer with a short report of what you changed and what you verified. Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through tail. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
+const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory, check it against the acceptance criteria, and answer with a short report of what you changed and what you verified. Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through tail. After your report the orchestrator runs the check and lints the files you changed, and any warning comes back to you; do not hunt warnings yourself. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
 
 /// The system prompt of a reassessment.
 const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done. When the objective and the acceptance already name only the remaining work and are checkable, you answer with the same text rather than rewording it.";

@@ -327,6 +327,60 @@ async fn a_passing_check_leaves_the_node_implemented() {
     assert!(out.iter().any(|l| l.contains("check passed: cargo test --workspace -q")), "{out:?}");
 }
 
+/// A run over a git-tracked cargo project whose worker writes `src/extra.rs`; the check and the
+/// lint come from a script, with clippy warning at `at`. The node after the run, and the lines.
+async fn linted_run(at: &str) -> (Vec<String>, ra_roadmap::model::Node, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    // the project's own files are in the index before the run, so the handoff names only what
+    // the worker wrote
+    assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status().unwrap().success());
+    assert!(std::process::Command::new("git").args(["add", "-A"]).current_dir(dir.path()).status().unwrap().success());
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task Probe parent 1", &store, &worker()).await.unwrap();
+    let write = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"src/extra.rs","content":"pub fn extra() { let x = 1; }\n"}"#.into(),
+    };
+    let clippy = format!(
+        "    Checking probe v0.1.0\nwarning: unused variable: `x`\n --> {at}:1:22\n  |\n1 | pub fn extra() {{ let x = 1; }}\n  |                      ^\n\nwarning: `probe` (lib) generated 1 warning\n"
+    );
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        log.lock().push(command.to_owned());
+        Ok((0, if command.starts_with("cargo clippy") { clippy.clone() } else { "ok\n".to_owned() }))
+    });
+    let provider = Scripted::new(vec![says("", vec![write]), says("added extra", vec![])]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider).with_script(script);
+    let (out, _) = run("run 2", &store, &worker).await.unwrap();
+    assert_eq!(*seen.lock(), ["cargo test --workspace -q", "cargo clippy -p probe"], "the check, then the lint of the crate of the change");
+    (out, store.read(2).await.unwrap(), dir)
+}
+
+#[tokio::test]
+async fn a_warning_in_a_changed_file_sends_the_card_to_needs_revision() {
+    let (out, node, dir) = linted_run("src/extra.rs").await;
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
+    let notes = node.notes.unwrap_or_default();
+    assert!(notes.starts_with("warning: unused variable: `x`\n --> src/extra.rs:1:22"), "the warning comes first: {notes}");
+    assert!(notes.ends_with("\n\nadded extra"), "{notes}");
+    assert!(out.iter().any(|l| l.contains("lint: 1 warning(s)") && l.contains("cargo clippy -p probe")), "{out:?}");
+    let context = std::fs::read_to_string(dir.path().join("var/context/2.md")).unwrap();
+    let handoff = context.split("## Handoff ").nth(1).unwrap();
+    assert!(handoff.contains("needs revision") && handoff.contains("changed: src/extra.rs"), "{handoff}");
+    assert!(handoff.contains("warning: unused variable: `x`"), "the handoff carries the warning: {handoff}");
+}
+
+#[tokio::test]
+async fn a_warning_elsewhere_leaves_the_card_implemented() {
+    let (out, node, _dir) = linted_run("src/lib.rs").await;
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented);
+    assert_eq!(node.notes.as_deref(), Some("added extra"));
+    assert!(out.iter().any(|l| l.contains("lint clean: cargo clippy -p probe")), "{out:?}");
+}
+
 /// The answer of a reassessment that keeps the text: the three lines the prompt asks for.
 fn keeps(objective: &str, acceptance: &str) -> ra_providers::Completion {
     says(&format!("overview: already sharp\nobjective: {objective}\nacceptance: {acceptance}"), Vec::new())

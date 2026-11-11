@@ -103,3 +103,40 @@ fn the_specs_name_every_tool_once() {
     let names: Vec<String> = Toolbox::specs().into_iter().map(|s| s.name).collect();
     assert_eq!(names, ["read_file", "write_file", "edit_file", "list_dir", "search", "run"]);
 }
+
+const CLIPPY: &str = "    Checking probe v0.1.0\nwarning: unused variable: `x`\n --> crates/probe/src/lib.rs:2:9\n  |\n2 |     let x = 1;\n  |         ^\n\nwarning: this could be a `let` chain\n  --> crates/other/src/lib.rs:9:5\n\nwarning: `probe` (lib) generated 1 warning\n    Finished `dev` profile\n";
+
+#[test]
+fn warnings_at_keeps_the_diagnostics_of_the_named_files_whole() {
+    let hits = warnings_at(CLIPPY, &["crates/probe/src/lib.rs".to_owned()]);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].starts_with("warning: unused variable: `x`\n --> crates/probe/src/lib.rs:2:9"), "{}", hits[0]);
+    assert!(hits[0].ends_with('^'), "the paragraph is whole: {}", hits[0]);
+    assert!(warnings_at(CLIPPY, &["crates/probe/src/other.rs".to_owned()]).is_empty());
+    // a Windows path from git and a cargo path meet on their separators
+    assert_eq!(warnings_at(CLIPPY, &["crates\\other\\src\\lib.rs".to_owned()]).len(), 1);
+}
+
+#[test]
+fn crate_of_is_the_nearest_package_above_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = [\"crates/*\"]\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("crates/probe/src")).unwrap();
+    std::fs::write(
+        dir.path().join("crates/probe/Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n\n[dependencies]\nname = \"not me\"\n",
+    )
+    .unwrap();
+    assert_eq!(crate_of(dir.path(), "crates/probe/src/lib.rs").as_deref(), Some("probe"));
+    assert_eq!(crate_of(dir.path(), "README.md"), None, "the workspace root is no package");
+}
+
+#[tokio::test]
+async fn a_scripted_toolbox_answers_a_command_from_the_script() {
+    let (_dir, tools) = workspace().await;
+    let tools =
+        tools.with_script(Arc::new(|command: &str| Ok((if command == "cargo test" { 0 } else { 101 }, format!("ran {command}\n")))));
+    assert_eq!(tools.check("cargo test").await.unwrap(), (true, "ran cargo test\nexit code 0".to_owned()));
+    assert!(!tools.check("cargo clippy").await.unwrap().0, "exit code 101 is a failed check");
+    assert!(tools.check("rm -rf /").await.is_err(), "the allowlist comes before the script");
+}
