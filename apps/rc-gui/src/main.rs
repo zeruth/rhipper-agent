@@ -4183,15 +4183,10 @@ impl Workspace {
                             }
                         }
                     }
-                    // the queue takes the whole share, rows or not: the band under its last
-                    // row is the column's, so the run card beside it is as tall as the share
-                    let used = ui.min_rect().height();
-                    if columns > used {
-                        ui.allocate_space(egui::vec2(left, columns - used));
-                    }
                 });
-                // the run card is exactly the queue's height: the two columns grow together
-                // into the card's share of the window, and never past it
+                // the run card is exactly as tall as the queue's rows: the rows grow into the
+                // card's share of the window while they fit, and the run card follows them,
+                // never past the last row (the person: no band of nothing under the sixth)
                 let room = queue.response.rect.height();
                 ui.allocate_ui_with_layout(egui::vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(right);

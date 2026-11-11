@@ -113,8 +113,11 @@ pub(crate) fn badge(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
 /// A jewel: a fixed-width tag that is bright in `color` at its left and fades to nothing by its
 /// right edge, the label set in the bright part. Every jewel in a column has the same width,
 /// so the text after them lines up whatever the label's length; the fade is the padding.
+/// The height of a jewel, which sets the height of a step row on a run card.
+pub(crate) const JEWEL_HEIGHT: f32 = 18.0;
+
 pub(crate) fn jewel(ui: &mut Ui, text: &str, color: Color32, width: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, JEWEL_HEIGHT), egui::Sense::hover());
     let painter = ui.painter();
     fade(painter, rect, color, 120, false);
     // a bright edge at the left, the facet the light catches
