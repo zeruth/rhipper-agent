@@ -47,6 +47,30 @@ fn the_failed_tests_lead_the_notes_of_a_failed_check() {
     assert!(!failure.text.contains("a_passing_test_0 "));
 }
 
+/// A task with a session made an `age` of seconds before `now`, for the card as it stands.
+fn with_session(age: u64, now: u64) -> Node {
+    let mut node = ra_roadmap::markdown::parse("- 2 ‹task› T\n    objective: a goal\n    files: a.rs\n").unwrap().remove(0);
+    node.session = Some("sess-1".into());
+    node.session_of = Some(card_fingerprint(&node));
+    node.session_at = Some(now - age);
+    node
+}
+
+#[test]
+fn a_session_within_the_day_is_resumed_and_an_older_one_is_not() {
+    let now = 1_800_000_000;
+    assert_eq!(resume_of(&with_session(SESSION_LIFE - 60, now), now), Ok(Some("sess-1".to_owned())));
+    assert_eq!(resume_of(&with_session(SESSION_LIFE + 60, now), now), Err("the session is older than a day".to_owned()));
+    let mut changed = with_session(60, now);
+    changed.files.push("b.rs".into());
+    assert_eq!(resume_of(&changed, now), Err("the card changed since the session".to_owned()));
+    let mut bare = with_session(60, now);
+    bare.session_of = None;
+    assert_eq!(resume_of(&bare, now), Err("the session has no fingerprint".to_owned()));
+    bare.session = None;
+    assert_eq!(resume_of(&bare, now), Ok(None));
+}
+
 #[test]
 fn an_output_without_failed_tests_is_its_tail_alone() {
     let failure = check_failure("error[E0425]: cannot find value `x`\n --> src/lib.rs:1:1\nerror: could not compile");

@@ -32,6 +32,8 @@ impl Store {
                 acceptance: None,
                 files: Vec::new(),
                 session: None,
+                session_at: None,
+                session_of: None,
                 depends_on: Vec::new(),
                 state: TaskState::Defined,
                 assignee: None,
@@ -104,6 +106,8 @@ impl Store {
             acceptance: acceptance.map(str::to_owned),
             files: Vec::new(),
             session: None,
+            session_at: None,
+            session_of: None,
             depends_on: Vec::new(),
             state: TaskState::Defined,
             assignee: None,
@@ -261,13 +265,24 @@ impl Store {
         self.write(nodes).await
     }
 
-    /// Keeps the harness session of a node's last worker run, so the next run resumes it; `None`
-    /// forgets it. A session id is one word.
-    pub async fn set_session(&self, id: i64, session: Option<&str>) -> anyhow::Result<()> {
-        let session = session.map(str::trim).filter(|s| !s.is_empty());
-        anyhow::ensure!(session.is_none_or(|s| !s.contains(char::is_whitespace)), "a session id holds no whitespace");
+    /// Keeps the harness session of a node's last worker run, with the fingerprint of the card it
+    /// worked on and the time, so the next run resumes it while the card is the same and the
+    /// session young; `None` forgets it. A session id and a fingerprint are one word each.
+    ///
+    /// # Errors
+    /// When an id or a fingerprint holds whitespace, the node is not there, or the file cannot
+    /// be written.
+    pub async fn set_session(&self, id: i64, session: Option<(&str, &str)>, now: u64) -> anyhow::Result<()> {
+        let session = session.map(|(s, of)| (s.trim(), of.trim())).filter(|(s, _)| !s.is_empty());
+        anyhow::ensure!(
+            session.is_none_or(|(s, of)| !s.contains(char::is_whitespace) && !of.is_empty() && !of.contains(char::is_whitespace)),
+            "a session id and its fingerprint hold no whitespace"
+        );
         let mut nodes = self.all().await?;
-        node_mut(&mut nodes, id)?.session = session.map(str::to_owned);
+        let node = node_mut(&mut nodes, id)?;
+        node.session = session.map(|(s, _)| s.to_owned());
+        node.session_of = session.map(|(_, of)| of.to_owned());
+        node.session_at = session.map(|_| now);
         self.write(nodes).await
     }
 

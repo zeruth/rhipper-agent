@@ -333,6 +333,15 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     let dirty_before = git_status(&root).await;
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
+    // the session of the last run of this node, so the harness keeps its context, unless it is
+    // stale: then the brief and the handoffs carry it, and the run says so first
+    let (resume, fresh) = match resume_of(&node, unix_now()) {
+        Ok(resume) => (resume, None),
+        Err(reason) => (None, Some(format!("  fresh start: {reason}; the brief and the handoffs go instead"))),
+    };
+    if let Some(fresh) = &fresh {
+        tracing::info!(target: crate::trace::PROGRESS, "{}", fresh.trim_start());
+    }
     let session = if provider.has_own_tools() {
         // a harness acts in the workspace by itself: one call carries the whole task, and the
         // harness holds it to the budget
@@ -345,8 +354,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
                 tools: Vec::new(),
                 workspace,
                 budget_usd: budget,
-                // the session of the last run of this node, so the harness keeps its context
-                resume: node.session.clone(),
+                resume,
                 max_turns: cap,
                 effort: Some(effort.to_string()),
             })
@@ -357,8 +365,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
                 worker.record(Some(id), &answer.usage).await;
                 gotcha_hits.clone_from(&answer.gotchas);
                 if let Some(session) = answer.session_id.as_deref() {
-                    // kept on the node: the next run of it resumes this session
-                    store.set_session(id, Some(session)).await?;
+                    // kept on the node with the card's fingerprint: the next run of it resumes
+                    // this session while the card reads the same
+                    store.set_session(id, Some((session, &card_fingerprint(&node))), unix_now()).await?;
                 }
                 Ok(Session { text: answer.text, usage: answer.usage, calls: 0, turns: answer.turns, cap })
             }
@@ -470,6 +479,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         ),
         check_line,
     ];
+    lines.extend(fresh);
     lines.extend(lint_lines);
     lines.push("  the full answer is in the notes of the card in rhipper.md".to_owned());
     if !gotcha_hits.is_empty() {
@@ -567,7 +577,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
         tools: if harness { Vec::new() } else { ra_tools::Toolbox::specs() },
         workspace,
         budget_usd: budget,
-        resume: node.session.clone(),
+        resume: resume_of(&node, unix_now()).unwrap_or_default(),
         max_turns: cap,
         effort: Some(effort.to_string()),
     };
@@ -582,7 +592,11 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             "  budget {} · turn cap {} · resume {} · check: {}",
             budget.map_or_else(|| "none".to_owned(), |b| format!("${b:.2}")),
             cap.map_or_else(|| "none".to_owned(), |c| c.to_string()),
-            node.session.as_deref().unwrap_or("none"),
+            match resume_of(&node, unix_now()) {
+                Ok(Some(session)) => session,
+                Ok(None) => "none".to_owned(),
+                Err(reason) => format!("none, {reason}"),
+            },
             check_command(node.acceptance.as_deref())
         ),
     ];
@@ -726,7 +740,7 @@ async fn git_status(root: &Path) -> String {
     }
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
@@ -850,7 +864,9 @@ async fn tool_loop(
         if let Some(cap) = cap
             && turn > cap
         {
-            anyhow::bail!("the worker made {calls} tool call(s) in {cap} turns without finishing; raise the cap with --turns or split the task");
+            anyhow::bail!(
+                "the worker made {calls} tool call(s) in {cap} turns without finishing; raise the cap with --turns or split the task"
+            );
         }
         let answer = provider
             .complete(CompletionRequest {
@@ -1076,25 +1092,60 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
 /// first line of its notes, and each child's id, state and objective. Sixteen hex digits of a
 /// 64-bit FNV-1a hash, stable across builds, so a file written today matches tomorrow.
 pub fn fingerprint(node: &Node, nodes: &[Node]) -> String {
+    let mut fields = vec![
+        node.objective.clone().unwrap_or_default(),
+        node.acceptance.clone().unwrap_or_default(),
+        node.notes.as_deref().map(first_line).unwrap_or_default(),
+    ];
+    for kid in nodes.iter().filter(|n| n.parent == Some(node.id)) {
+        fields.push(kid.id.to_string());
+        fields.push(kid.state.serde_name().to_owned());
+        fields.push(kid.objective.clone().unwrap_or_default());
+    }
+    hash_fields(fields.iter().map(String::as_str))
+}
+
+/// The fingerprint of the card a worker run reads: its objective, its acceptance and its files.
+/// It sits beside the session the run made, so a later run tells the same card from a changed one.
+#[must_use]
+pub fn card_fingerprint(node: &Node) -> String {
+    hash_fields([node.objective.as_deref().unwrap_or(""), node.acceptance.as_deref().unwrap_or(""), &node.files.join(" ")])
+}
+
+/// Sixteen hex digits of a 64-bit FNV-1a hash over the fields, stable across builds, so a file
+/// written today matches tomorrow.
+fn hash_fields<'a>(fields: impl IntoIterator<Item = &'a str>) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0100_0000_01b3;
     let mut hash = OFFSET;
-    let mut feed = |text: &str| {
+    for text in fields {
         // a unit separator after each field, so moving text across fields changes the hash
         for byte in text.bytes().chain(std::iter::once(0x1f)) {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(PRIME);
         }
-    };
-    feed(node.objective.as_deref().unwrap_or(""));
-    feed(node.acceptance.as_deref().unwrap_or(""));
-    feed(&node.notes.as_deref().map(first_line).unwrap_or_default());
-    for kid in nodes.iter().filter(|n| n.parent == Some(node.id)) {
-        feed(&kid.id.to_string());
-        feed(kid.state.serde_name());
-        feed(kid.objective.as_deref().unwrap_or(""));
     }
     format!("{hash:016x}")
+}
+
+/// How long a session is resumed: past a day its context is older than the work around it.
+const SESSION_LIFE: u64 = 24 * 60 * 60;
+
+/// The session a run of `node` resumes at `now`: `Ok(None)` when the node has none, `Err` with
+/// the reason when it has one the run must not resume, since a session older than a day or made
+/// for other text of the card would lead the harness by what it no longer is.
+fn resume_of(node: &Node, now: u64) -> Result<Option<String>, String> {
+    let Some(session) = node.session.as_deref().filter(|s| !s.trim().is_empty()) else { return Ok(None) };
+    let (Some(of), Some(at)) = (node.session_of.as_deref(), node.session_at) else {
+        return Err("the session has no fingerprint".to_owned());
+    };
+    if of != card_fingerprint(node) {
+        return Err("the card changed since the session".to_owned());
+    }
+    if now.saturating_sub(at) > SESSION_LIFE {
+        return Err("the session is older than a day".to_owned());
+    }
+    Ok(Some(session.to_owned()))
 }
 
 /// Whether a revised field is template text the model echoed back, such as `<the revised

@@ -19,7 +19,7 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
     assert_eq!(catalogue.command("ls -la crates", Conditions::default()), Verdict::Pass);
     assert_eq!(catalogue.command("wc -l src/*.rs", Conditions::default()), Verdict::Pass);
     assert_eq!(catalogue.command("Get-ChildItem -Recurse crates", Conditions::default()), Verdict::Pass);
-    for command in ["cd foo", "Set-Location crates", "python x.py"] {
+    for command in ["cd foo", "Set-Location crates", "python x.py", "sed -i 's/a/b/' x.rs"] {
         match catalogue.command(command, Conditions::default()) {
             Verdict::Deny { id, reason } => {
                 assert_eq!(id, "shell-outside-allowlist", "{command}");

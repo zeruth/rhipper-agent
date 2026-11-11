@@ -316,7 +316,8 @@ async fn a_dry_run_prints_the_prompt_and_leaves_the_card_as_it_was() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("add task Probe parent 1", &store, &worker()).await.unwrap();
-    store.set_session(2, Some("sess-1")).await.unwrap();
+    let card = store.read(2).await.unwrap();
+    store.set_session(2, Some(("sess-1", &crate::agent::card_fingerprint(&card))), crate::agent::unix_now()).await.unwrap();
     let before = store.read(2).await.unwrap();
     // the harness route: the provider builds the command line and no process starts
     let (out, _) = run("run 2 dry", &store, &Worker::new("claude-sonnet-5-5")).await.unwrap();
@@ -537,6 +538,23 @@ async fn a_second_run_of_a_node_resumes_its_session() {
     let seen = script.seen.lock();
     assert_eq!(seen[0].resume, None, "a first run has nothing to resume");
     assert_eq!(seen[1].resume.as_deref(), Some("sess-1"), "the second run resumes the first");
+}
+
+#[tokio::test]
+async fn a_changed_objective_drops_the_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task T parent 1", &store, &worker()).await.unwrap();
+    let mut first = says("done", vec![]);
+    first.session_id = Some("sess-1".into());
+    let script = Scripted::new(vec![first, says("done again", vec![])]);
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
+    run("run 2", &store, &runner).await.unwrap();
+    store.set_details(2, Some("another goal"), None).await.unwrap();
+    let (out, _) = run("run 2", &store, &runner).await.unwrap();
+    let seen = script.seen.lock();
+    assert_eq!(seen[1].resume, None, "a changed card starts fresh");
+    assert!(out.iter().any(|l| l.contains("fresh start: the card changed since the session")), "{}", out.join("\n"));
 }
 
 #[tokio::test]

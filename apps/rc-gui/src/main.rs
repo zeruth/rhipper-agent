@@ -182,6 +182,11 @@ impl App {
             style.spacing.item_spacing = egui::vec2(8.0, 5.0);
             style.spacing.button_padding = egui::vec2(10.0, 4.0);
             style.spacing.tooltip_width = 500.0;
+            // a tooltip comes at once, moving or not, and stays a moment between neighbouring
+            // rows; the default waits half a second after the pointer stops
+            style.interaction.tooltip_delay = 0.08;
+            style.interaction.tooltip_grace_time = 0.35;
+            style.interaction.show_tooltips_only_when_still = false;
             style.visuals.popup_shadow =
                 egui::epaint::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(160) };
         });

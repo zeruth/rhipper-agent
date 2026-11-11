@@ -218,6 +218,14 @@ pub struct Node {
     /// context instead of reading the repository again.
     #[serde(default)]
     pub session: Option<String>,
+    /// When the run that made the session ended, in unix seconds: a session older than a day is
+    /// not resumed.
+    #[serde(default)]
+    pub session_at: Option<u64>,
+    /// The fingerprint of the card the session worked on, its objective, acceptance and files: a
+    /// card changed since then starts fresh.
+    #[serde(default)]
+    pub session_of: Option<String>,
     /// The nodes that must be accepted first.
     pub depends_on: Vec<i64>,
     pub state: TaskState,

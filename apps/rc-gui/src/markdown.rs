@@ -613,6 +613,12 @@ fn code_ui(ui: &mut Ui, lang: Option<&str>, lines: &[String], index: usize, pros
                 if n > 0 {
                     job.append("\n", 0.0, TextFormat::simple(prose.mono.clone(), theme::TEXT));
                 }
+                // a line of a tool's output that says how things went is lit whole: an error
+                // or a failed test in red, a warning in amber, a pass in green, a location dim
+                if let Some(color) = outcome_tint(line) {
+                    job.append(line, 0.0, TextFormat::simple(prose.mono.clone(), color));
+                    continue;
+                }
                 for (text, color) in language.tokens(line) {
                     job.append(text, 0.0, TextFormat::simple(prose.mono.clone(), color));
                 }
@@ -621,6 +627,29 @@ fn code_ui(ui: &mut Ui, lang: Option<&str>, lines: &[String], index: usize, pros
                 ui.add(Label::new(job).wrap_mode(TextWrapMode::Extend));
             });
         });
+}
+
+/// The color a line of a tool's output gets whole, by what it says: `None` for a line that is
+/// only code or text.
+fn outcome_tint(line: &str) -> Option<Color32> {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.starts_with("-->") || trimmed.starts_with("= note") || trimmed.starts_with("= help") {
+        return Some(theme::DIM);
+    }
+    if lower.starts_with("error") || lower.contains("panicked at") || lower.contains(" failed") || lower.starts_with("failures:") {
+        return Some(theme::ERROR_TEXT);
+    }
+    if lower.starts_with("warning") || trimmed.starts_with('⚠') {
+        return Some(theme::WARN_TEXT);
+    }
+    if lower.starts_with("test result: ok") || lower.ends_with(" ok") || trimmed.starts_with('✓') || lower.starts_with("check passed") {
+        return Some(theme::ONLINE);
+    }
+    if trimmed.starts_with('✗') || lower.starts_with("check failed") {
+        return Some(theme::ERROR_TEXT);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------------------------

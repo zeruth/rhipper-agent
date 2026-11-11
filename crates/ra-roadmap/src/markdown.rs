@@ -118,7 +118,12 @@ fn detail_lines(node: &Node, level: usize) -> Vec<String> {
         lines.push(format!("{indent}files: {}", node.files.join(" ")));
     }
     if let Some(session) = node.session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        lines.push(format!("{indent}session: {session}"));
+        // the fingerprint and the time follow the id, so a run tells a stale session from a live one
+        let line = match (node.session_of.as_deref(), node.session_at) {
+            (Some(of), Some(at)) => format!("{indent}session: {session} {of} {at}"),
+            _ => format!("{indent}session: {session}"),
+        };
+        lines.push(line);
     }
     if !node.depends_on.is_empty() {
         let ids: Vec<String> = node.depends_on.iter().map(|id| id.to_string()).collect();
@@ -163,7 +168,16 @@ pub fn parse(text: &str) -> anyhow::Result<Vec<Node>> {
             "notes" => node.notes = Some(value),
             "assessed" => node.assessed = Some(value),
             "files" => node.files = value.split_whitespace().map(str::to_owned).collect(),
-            "session" => node.session = Some(value),
+            "session" => {
+                let mut words = value.split_whitespace();
+                node.session = words.next().map(str::to_owned);
+                node.session_of = words.next().map(str::to_owned);
+                node.session_at = words
+                    .next()
+                    .map(str::parse::<u64>)
+                    .transpose()
+                    .with_context(|| format!("line {number}: the session time is a number"))?;
+            }
             "effort" => node.effort = value.parse().with_context(|| format!("line {number}"))?,
             "waits-on" => {
                 node.depends_on = value
@@ -228,6 +242,8 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         acceptance: None,
         files: Vec::new(),
         session: None,
+        session_at: None,
+        session_of: None,
         depends_on: Vec::new(),
         state,
         assignee,

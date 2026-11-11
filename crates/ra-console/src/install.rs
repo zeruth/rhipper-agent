@@ -21,32 +21,53 @@ pub fn default_dir() -> PathBuf {
     }
 }
 
-/// Installs the binaries beside the running one into `dir` (the default when `None`), puts the
-/// directory on the user's path when it is not, and says what it did, one line each.
+/// Installs the build into `dir` (the default when `None`), puts the directory on the user's
+/// path when it is not, and says what it did, one line each. The build is `target/debug` under
+/// the working directory when it holds the binaries, else the directory of the running binary;
+/// an installed binary asked to install from its own directory refuses, rather than setting
+/// itself aside and copying nothing (which once left no `rc` at all).
 ///
 /// # Errors
-/// When the directory cannot be made or a binary cannot be copied.
+/// When the directory cannot be made, the source is the destination, or a binary cannot be
+/// copied; a binary set aside for a copy that failed is put back.
 pub fn install(dir: Option<&Path>) -> anyhow::Result<Vec<String>> {
     let dir = dir.map_or_else(default_dir, Path::to_path_buf);
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot make {}", dir.display()))?;
-    let source = std::env::current_exe()?.parent().context("the running binary has no directory")?.to_path_buf();
     let suffix = std::env::consts::EXE_SUFFIX;
+    let beside = std::env::current_exe()?.parent().context("the running binary has no directory")?.to_path_buf();
+    let build = std::env::current_dir().ok().map(|d| d.join("target").join("debug")).filter(|d| d.join(format!("rc{suffix}")).is_file());
+    let source = build.unwrap_or(beside);
+    let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    anyhow::ensure!(
+        !same(&source, &dir),
+        "{} holds the installed binaries, not a build: run `rc install` from the project's directory after `cargo build -p rc -p rc-gui`, or `.\\target\\debug\\rc install`",
+        dir.display()
+    );
     let mut lines = Vec::new();
     sweep(&dir, &mut lines);
     for stem in BINARIES {
         let name = format!("{stem}{suffix}");
         let from = source.join(&name);
-        if !from.exists() {
-            lines.push(format!("{name}: not built beside {}; skipped", source.display()));
+        if !from.is_file() {
+            lines.push(format!("{name}: not built in {}; skipped", source.display()));
             continue;
         }
         let to = dir.join(&name);
-        if to.exists() {
-            // a running binary refuses to be overwritten, never to be moved
-            let aside = dir.join(format!("{stem}.old.{}{suffix}", unix_now()));
-            std::fs::rename(&to, &aside).with_context(|| format!("cannot set {} aside", to.display()))?;
+        // a running binary refuses to be overwritten, never to be moved: the old one goes aside
+        // and comes back if the copy fails
+        let aside = to.exists().then(|| dir.join(format!("{stem}.old.{}{suffix}", unix_now())));
+        if let Some(aside) = &aside {
+            std::fs::rename(&to, aside).with_context(|| format!("cannot set {} aside", to.display()))?;
         }
-        std::fs::copy(&from, &to).with_context(|| format!("cannot copy {} to {}", from.display(), to.display()))?;
+        if let Err(e) = std::fs::copy(&from, &to) {
+            if let Some(aside) = &aside {
+                let _ = std::fs::rename(aside, &to);
+            }
+            return Err(anyhow::anyhow!(e).context(format!("cannot copy {} to {}", from.display(), to.display())));
+        }
         lines.push(format!("{name} {} → {}", crate::VERSION, to.display()));
     }
     lines.push(on_path(&dir));

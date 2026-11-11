@@ -13,6 +13,8 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
         acceptance: None,
         files: Vec::new(),
         session: None,
+        session_at: None,
+        session_of: None,
         depends_on: Vec::new(),
         state: TaskState::Defined,
         assignee: None,
@@ -112,11 +114,23 @@ fn round_trips_the_files_line() {
 fn round_trips_the_session_line() {
     let mut task = node(7, None, NodeKind::Task, "Session task");
     task.session = Some("3f2a9c1e-0b7d-4e55-9a10-6c2d8e4f1b23".into());
+    task.session_of = Some("00ff00ff00ff00ff".into());
+    task.session_at = Some(1_700_000_000);
     let text = render(std::slice::from_ref(&task));
-    assert!(text.contains("    session: 3f2a9c1e-0b7d-4e55-9a10-6c2d8e4f1b23"), "{text}");
+    assert!(text.contains("    session: 3f2a9c1e-0b7d-4e55-9a10-6c2d8e4f1b23 00ff00ff00ff00ff 1700000000"), "{text}");
     let parsed = parse(&text).unwrap();
     assert_eq!(parsed[0].session, task.session);
+    assert_eq!(parsed[0].session_of, task.session_of);
+    assert_eq!(parsed[0].session_at, task.session_at);
     assert_eq!(render(&parsed), text);
+}
+
+#[test]
+fn a_session_line_without_a_fingerprint_still_reads() {
+    let parsed = parse("- 1 ‹task› Old\n    session: sess-1\n").unwrap();
+    assert_eq!(parsed[0].session.as_deref(), Some("sess-1"));
+    assert_eq!(parsed[0].session_of, None);
+    assert_eq!(parsed[0].session_at, None);
 }
 
 #[test]

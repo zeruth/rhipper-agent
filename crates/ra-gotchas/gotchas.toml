@@ -17,8 +17,8 @@
 [[gotcha]]
 id = "shell-outside-allowlist"
 where = "command"
-pattern = '^\s*(cd|Set-Location|Start-Process|powershell(\.exe)?|pwsh|cmd(\.exe)?|sh|bash|python|pip|npm|node)\b|^\s*git\s+-C\b'
-message = "the shells here run cargo, the read-only git commands and the read-only listing and reading commands, from the workspace directory; read files with Read, search with Grep and Glob, start from the files on the card, and pipe a long output through tail"
+pattern = '^\s*(cd|Set-Location|Start-Process|powershell(\.exe)?|pwsh|cmd(\.exe)?|sh|bash|python|pip|npm|node|sed|awk|perl)\b|^\s*git\s+-C\b'
+message = "the shells here run cargo, the read-only git commands and the read-only listing and reading commands, from the workspace directory; read files with Read, change them with Edit (never sed), search with Grep and Glob, start from the files on the card, and pipe a long output through tail"
 remedy = { kind = "hint" }
 
 [[gotcha]]

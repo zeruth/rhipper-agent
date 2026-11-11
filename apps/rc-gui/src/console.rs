@@ -203,26 +203,85 @@ fn run_steps(ui: &mut Ui, run: &Run) {
     if run.steps.is_empty() {
         ui.label(RichText::new(if run.live() { "starting…" } else { "no steps" }).font(font.clone()).color(theme::DIM).italics());
     }
-    let mark = if run.live() { theme::ACCENT } else { theme::DIM };
+    // a step that repeats the one before folds into it with a count at the end
+    let mut shown: Vec<(&str, usize)> = Vec::new();
     for step in run.steps.iter().skip(skip) {
-        let color = if step.starts_with("$ ") {
-            theme::WARN_TEXT
-        } else if step.starts_with("⚠ ") {
-            theme::ERROR_TEXT
-        } else if step.starts_with("… ") {
-            theme::TEXT
-        } else {
-            theme::DIM
-        };
+        match shown.last_mut() {
+            Some((last, count)) if *last == step.as_str() => *count += 1,
+            _ => shown.push((step.as_str(), 1)),
+        }
+    }
+    let drawn = shown.len();
+    for (step, count) in shown {
+        let (tool, rest, color) = step_tool(step);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("▸").color(mark).font(font.clone()));
-            clipped(ui, step, STEP_CLIP, &font, color);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            match tool {
+                Some(tool) => {
+                    crate::cards::badge(ui, tool, color);
+                }
+                None => {
+                    ui.label(RichText::new("·").color(theme::DIM).font(font.clone()));
+                }
+            }
+            clipped(ui, rest, STEP_CLIP, &font, if tool.is_some() { theme::TEXT } else { color });
+            if count > 1 {
+                ui.label(RichText::new(format!("×{count}")).font(font.clone()).color(theme::WARN_TEXT).strong());
+            }
         });
     }
     if run.live() {
-        for _ in run.steps.len().saturating_sub(skip)..body {
+        for _ in drawn..body {
             ui.label(RichText::new(" ").font(font.clone()));
         }
+    }
+}
+
+/// The tool a step belongs to, as a badge, with the rest of the step and the color of the
+/// badge: a shell command, a file tool, a search, a gotcha; a step that is the worker's own
+/// words gets no badge, a dot.
+fn step_tool(step: &str) -> (Option<&'static str>, &str, Color32) {
+    if let Some(rest) = step.strip_prefix("$ ") {
+        return (Some("sh"), rest, theme::WARN_TEXT);
+    }
+    if let Some(rest) = step.strip_prefix("⚠ ") {
+        return (Some("gotcha"), rest, theme::ERROR_TEXT);
+    }
+    if let Some(rest) = step.strip_prefix("… ") {
+        return (None, rest, theme::TEXT);
+    }
+    const TOOLS: [(&str, &str); 11] = [
+        ("Read", "read"),
+        ("Edit", "edit"),
+        ("MultiEdit", "edit"),
+        ("Write", "write"),
+        ("NotebookEdit", "edit"),
+        ("Grep", "grep"),
+        ("Glob", "glob"),
+        ("TodoWrite", "plan"),
+        ("WebFetch", "fetch"),
+        ("WebSearch", "search"),
+        ("Task", "agent"),
+    ];
+    for (name, badge) in TOOLS {
+        if step == name {
+            return (Some(badge), "", tool_color(badge));
+        }
+        if let Some(rest) = step.strip_prefix(name).and_then(|r| r.strip_prefix(' ')) {
+            return (Some(badge), rest, tool_color(badge));
+        }
+    }
+    (None, step, theme::DIM)
+}
+
+/// The color of a tool's badge: reads cool, writes warm, searches in between.
+fn tool_color(badge: &str) -> Color32 {
+    match badge {
+        "read" | "glob" => theme::DEBUG,
+        "edit" | "write" => theme::ACCENT,
+        "grep" | "search" | "fetch" => theme::TRACE,
+        "plan" => theme::ONLINE,
+        _ => theme::DIM,
     }
 }
 
