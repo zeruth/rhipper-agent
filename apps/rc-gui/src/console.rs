@@ -389,6 +389,21 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     }
 }
 
+/// The tools a step names and the badge each wears.
+const TOOLS: [(&str, &str); 11] = [
+    ("Read", "read"),
+    ("Edit", "edit"),
+    ("MultiEdit", "edit"),
+    ("Write", "write"),
+    ("NotebookEdit", "edit"),
+    ("Grep", "grep"),
+    ("Glob", "glob"),
+    ("TodoWrite", "plan"),
+    ("WebFetch", "fetch"),
+    ("WebSearch", "search"),
+    ("Task", "agent"),
+];
+
 /// The tool a step belongs to, as a badge, with the rest of the step and the color of the
 /// badge: a shell command, a file tool, a search, a gotcha; a step that is the worker's own
 /// words gets no badge, a dot.
@@ -402,19 +417,6 @@ fn step_tool(step: &str) -> (Option<&'static str>, &str, Color32) {
     if let Some(rest) = step.strip_prefix("… ") {
         return (None, rest, theme::text());
     }
-    const TOOLS: [(&str, &str); 11] = [
-        ("Read", "read"),
-        ("Edit", "edit"),
-        ("MultiEdit", "edit"),
-        ("Write", "write"),
-        ("NotebookEdit", "edit"),
-        ("Grep", "grep"),
-        ("Glob", "glob"),
-        ("TodoWrite", "plan"),
-        ("WebFetch", "fetch"),
-        ("WebSearch", "search"),
-        ("Task", "agent"),
-    ];
     for (name, badge) in TOOLS {
         if step == name {
             return (Some(badge), "", tool_color(badge));
