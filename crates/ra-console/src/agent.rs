@@ -732,6 +732,12 @@ fn begin_run(root: &Path, id: i64) {
 /// is the one in [`CARD_VAR`], else the newest context file under `var/context/`.
 #[must_use]
 pub fn read_hint(root: &Path, call: &serde_json::Value) -> Option<String> {
+    hint_of(root, call, card_of_run(root))
+}
+
+/// [`read_hint`] for a known card, so a test is not at the mercy of the [`CARD_VAR`] a run
+/// around it set; `None` for the card is no hint at all.
+fn hint_of(root: &Path, call: &serde_json::Value, card: Option<i64>) -> Option<String> {
     use serde_json::Value;
     if call.get("tool_name").and_then(Value::as_str) != Some("Read") {
         return None;
@@ -746,7 +752,7 @@ pub fn read_hint(root: &Path, call: &serde_json::Value) -> Option<String> {
     if text.lines().count() < LONG_READ {
         return None;
     }
-    let card = card_of_run(root)?;
+    let card = card?;
     let shown = path.strip_prefix(root).unwrap_or(&path).display().to_string().replace('\\', "/");
     if !first_hint(root, card, &shown) {
         return None;

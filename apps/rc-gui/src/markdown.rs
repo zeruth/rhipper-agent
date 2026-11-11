@@ -8,10 +8,15 @@
 //! line in the outcome's color, names the failed tests on it, and folds the raw output under
 //! it as a code block; the rest of the notes stay open.
 
-use egui::text::{LayoutJob, TextFormat};
-use egui::{Align, Color32, CornerRadius, FontId, Frame, Label, Layout, Margin, RichText, Stroke, TextStyle, TextWrapMode, Ui};
+use std::path::Path;
 
-use crate::theme;
+use egui::text::{LayoutJob, TextFormat};
+use egui::{
+    Align, Color32, CornerRadius, CursorIcon, FontId, Frame, Label, Layout, Margin, RichText, Sense, Shape, Stroke, TextStyle,
+    TextWrapMode, Ui,
+};
+
+use crate::{cards, theme};
 
 /// A run of inline text with one formatting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,10 +492,192 @@ pub(crate) fn render(ui: &mut Ui, text: &str, accent: Color32) {
 }
 
 /// Renders the text a run sends: the lines of the brief each their own paragraph, the indented
-/// rows of the outlines and the file lists as code, and the Markdown of the handoffs as it is.
-/// The prompt is written for a model, one fact a line; joined into paragraphs it would not read.
-pub(crate) fn render_prompt(ui: &mut Ui, text: &str, accent: Color32) {
-    render(ui, &prompt_markdown(text), accent);
+/// rows of the file lists as code, the outlines as links, and the Markdown of the handoffs as
+/// it is. The prompt is written for a model, one fact a line; joined into paragraphs it would
+/// not read. Returns the file and the line of the outline item that was clicked, for the code
+/// pane to open.
+pub(crate) fn render_prompt(ui: &mut Ui, text: &str, accent: Color32) -> Option<(String, usize)> {
+    let prose = Prose::body(ui);
+    let mut clicked = None;
+    for (index, segment) in segments(text).iter().enumerate() {
+        match segment {
+            Segment::Prose(prose_text) => render(ui, &prompt_markdown(prose_text), accent),
+            Segment::Outline(outline) => {
+                if let Some(line) = outline_ui(ui, outline, index, &prose) {
+                    clicked = Some((outline.file.clone(), line));
+                }
+            }
+        }
+    }
+    clicked
+}
+
+/// A stretch of the prompt: prose, or the outline of one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Segment {
+    Prose(String),
+    Outline(Outline),
+}
+
+/// The outline of one file as the prompt carries it: the header `path (N lines) — doc`, a row
+/// per item with its line number, a `*` ahead of an item a run of the card changed, and the
+/// count of the items the outline left out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Outline {
+    file: String,
+    /// What follows the path on the header line: the line count and the doc line.
+    head: String,
+    items: Vec<OutlineItem>,
+    /// The `… and N more` trailer, when the file has more items than the outline shows.
+    more: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutlineItem {
+    line: usize,
+    changed: bool,
+    text: String,
+}
+
+/// Cuts the outlines out of the prompt, each with the rows that follow its header; what is
+/// between them stays prose.
+fn segments(text: &str) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
+    let mut prose = String::new();
+    let mut outline: Option<Outline> = None;
+    for line in text.lines() {
+        if let Some(current) = &mut outline {
+            if let Some((number, changed, item)) = outline_row(line) {
+                current.items.push(OutlineItem { line: number, changed, text: item.to_owned() });
+                continue;
+            }
+            if current.more.is_none()
+                && let Some(more) = outline_more(line)
+            {
+                current.more = Some(more.to_owned());
+                continue;
+            }
+            out.push(Segment::Outline(outline.take().expect("an outline is open")));
+        }
+        if let Some((file, head)) = outline_header(line) {
+            if !prose.is_empty() {
+                out.push(Segment::Prose(std::mem::take(&mut prose)));
+            }
+            outline = Some(Outline { file: file.to_owned(), head: head.to_owned(), items: Vec::new(), more: None });
+            continue;
+        }
+        prose.push_str(line);
+        prose.push('\n');
+    }
+    if let Some(outline) = outline {
+        out.push(Segment::Outline(outline));
+    }
+    if !prose.is_empty() {
+        out.push(Segment::Prose(prose));
+    }
+    out
+}
+
+/// The path and the rest of an outline's header line, `src/lib.rs (120 lines) — The crate`.
+fn outline_header(line: &str) -> Option<(&str, &str)> {
+    if line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let (file, rest) = line.split_once(" (")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    (digits > 0
+        && !file.is_empty()
+        && !file.contains(' ')
+        && (rest[digits..].starts_with(" lines)") || rest[digits..].starts_with(" line)")))
+    .then(|| (file, &line[file.len() + 1..]))
+}
+
+/// The line number, the change mark and the text of an outline row, `*    42  fn run()`.
+fn outline_row(line: &str) -> Option<(usize, bool, &str)> {
+    let changed = match line.as_bytes().first()? {
+        b' ' => false,
+        b'*' => true,
+        _ => return None,
+    };
+    let rest = line[1..].trim_start_matches(' ');
+    if rest.len() == line.len() - 1 {
+        return None;
+    }
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let number = rest[..digits].parse().ok()?;
+    let text = rest[digits..].strip_prefix("  ")?;
+    Some((number, changed, text.trim_end()))
+}
+
+/// The trailer that counts the items an outline left out.
+fn outline_more(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    (line.starts_with(' ') && trimmed.starts_with("… and ") && trimmed.ends_with(" more")).then_some(trimmed)
+}
+
+/// Draws one outline as the code blocks are framed, every row a link: the number in the
+/// gutter, the item colored as code, lit as the pointer passes. Returns the line of the row
+/// that was clicked, line 1 for the header.
+fn outline_ui(ui: &mut Ui, outline: &Outline, index: usize, prose: &Prose) -> Option<usize> {
+    let mut clicked = None;
+    let language = Language::of(Path::new(&outline.file).extension().and_then(|e| e.to_str()));
+    let width = ui.available_width();
+    Frame::new()
+        .fill(theme::panel())
+        .stroke(Stroke::new(1.0, theme::rule()))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(width - 20.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let name =
+                    Label::new(RichText::new(&outline.file).monospace().strong().color(theme::text()).underline()).sense(Sense::click());
+                if ui.add(name).on_hover_cursor(CursorIcon::PointingHand).on_hover_text("open the file beside the card").clicked() {
+                    clicked = Some(1);
+                }
+                ui.label(RichText::new(&outline.head).small().color(theme::dim()));
+            });
+            if outline.items.is_empty() && outline.more.is_none() {
+                return;
+            }
+            ui.add_space(2.0);
+            egui::ScrollArea::horizontal().id_salt(("outline", index)).auto_shrink([false, true]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                for item in &outline.items {
+                    // the fill goes under the row, so a hovered row lights behind its text
+                    let fill = ui.painter().add(Shape::Noop);
+                    let mut job = LayoutJob::default();
+                    let mark = if item.changed { "*" } else { " " };
+                    job.append(
+                        &format!("{mark}{:>5}  ", item.line),
+                        0.0,
+                        TextFormat::simple(
+                            prose.mono.clone(),
+                            if item.changed { theme::warn_text() } else { cards::alpha(theme::dim(), 170) },
+                        ),
+                    );
+                    for (text, color) in language.tokens(&item.text) {
+                        job.append(text, 0.0, TextFormat::simple(prose.mono.clone(), color));
+                    }
+                    let response = ui
+                        .add(Label::new(job).wrap_mode(TextWrapMode::Extend).sense(Sense::click()))
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(format!("open {} at line {}", outline.file, item.line));
+                    if response.hovered() {
+                        let rect = response.rect.expand2(egui::vec2(4.0, 0.0));
+                        ui.painter().set(fill, Shape::rect_filled(rect, 3.0, theme::debug().gamma_multiply(0.18)));
+                    }
+                    if response.clicked() {
+                        clicked = Some(item.line);
+                    }
+                }
+                if let Some(more) = &outline.more {
+                    ui.label(RichText::new(format!("       {more}")).font(prose.mono.clone()).color(theme::dim()));
+                }
+            });
+        });
+    clicked
 }
 
 /// The prompt as Markdown: a blank after every plain line, a fence around every run of
@@ -980,6 +1167,33 @@ mod tests {
         assert!(matches!(&blocks[5], Block::Heading { level: 2, .. }));
         assert_eq!(blocks[6], Block::Paragraph(vec![text("check: ok")]));
         assert_eq!(blocks[7], Block::Code { lang: None, lines: vec!["raw".to_owned()] });
+    }
+
+    #[test]
+    fn the_outlines_of_a_prompt_are_cut_out_with_their_rows() {
+        let prompt = "Files: read the regions the outline points at.\nsrc/lib.rs (120 lines) — The crate\n      9  mod cards\n*    41  pub fn run(root: &Path) -> Self\n         … and 3 more\nsrc/new.rs (not in the workspace yet)\nUnder #1 Root: no objective\n";
+        let segments = segments(prompt);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], Segment::Prose("Files: read the regions the outline points at.\n".to_owned()));
+        let Segment::Outline(outline) = &segments[1] else { panic!("not an outline: {segments:?}") };
+        assert_eq!(outline.file, "src/lib.rs");
+        assert_eq!(outline.head, "(120 lines) — The crate");
+        assert_eq!(outline.items[0], OutlineItem { line: 9, changed: false, text: "mod cards".to_owned() });
+        assert_eq!(outline.items[1], OutlineItem { line: 41, changed: true, text: "pub fn run(root: &Path) -> Self".to_owned() });
+        assert_eq!(outline.more.as_deref(), Some("… and 3 more"));
+        // a missing file and the lines after are prose, not an outline
+        assert_eq!(segments[2], Segment::Prose("src/new.rs (not in the workspace yet)\nUnder #1 Root: no objective\n".to_owned()));
+    }
+
+    #[test]
+    fn an_outline_row_needs_the_gutter_and_a_line_number() {
+        assert_eq!(outline_row("     12  fn x()"), Some((12, false, "fn x()")));
+        assert_eq!(outline_row("*     3  struct S"), Some((3, true, "struct S")));
+        assert_eq!(outline_row("  src/a.rs"), None);
+        assert_eq!(outline_row("12  fn x()"), None);
+        assert_eq!(outline_header("a (b) c"), None);
+        assert_eq!(outline_header("Task #3 (the third)"), None);
+        assert_eq!(outline_header("README.md (1 line)"), Some(("README.md", "(1 line)")));
     }
 
     #[test]

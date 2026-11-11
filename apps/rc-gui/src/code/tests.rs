@@ -61,3 +61,17 @@ fn a_row_carries_its_number_and_the_colored_pieces() {
     assert!(job.sections.iter().any(|s| s.format.color == theme::warn_text()));
     assert_eq!(job.sections.last().map(|s| s.format.color), Some(theme::dim()));
 }
+
+#[test]
+fn a_pane_opened_at_a_line_jumps_there_and_lights_it() {
+    let file = Scratch::new("at.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
+    let pane = CodePane::open_at(&file.0, 2);
+    assert_eq!(pane.jump, Some(2));
+    assert!(pane.lit_fade(1) > 0.9);
+    assert_eq!(pane.lit_fade(0), 0.0);
+    let font = FontId::monospace(13.0);
+    assert_ne!(pane.row(1, 1, &font).sections[0].format.background, Color32::TRANSPARENT);
+    assert_eq!(pane.row(0, 1, &font).sections[0].format.background, Color32::TRANSPARENT);
+    assert_eq!(row_offset(1, 15.0), 0.0);
+    assert_eq!(row_offset(11, 15.0), 150.0);
+}

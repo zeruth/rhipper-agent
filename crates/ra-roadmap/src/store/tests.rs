@@ -255,8 +255,16 @@ async fn move_node_reparents_a_subtree_in_tree_order_and_refuses_a_cycle() {
     store.move_node(b, two, Some(a)).await.unwrap();
     let ids: Vec<i64> = store.all().await.unwrap().iter().map(|n| n.id).collect();
     assert_eq!(ids, [root, one, two, c, a, a1, b]);
+    // first among the children: right behind the parent's line, its subtree with it
+    store.move_first(a, two).await.unwrap();
+    let ids: Vec<i64> = store.all().await.unwrap().iter().map(|n| n.id).collect();
+    assert_eq!(ids, [root, one, two, a, a1, c, b]);
+    store.move_node(a, two, Some(c)).await.unwrap();
+    let ids: Vec<i64> = store.all().await.unwrap().iter().map(|n| n.id).collect();
+    assert_eq!(ids, [root, one, two, c, a, a1, b]);
     // never under itself or a descendant, never the project, and a sibling under another parent is refused
     assert!(store.move_node(a, a, None).await.is_err());
+    assert!(store.move_first(a, a1).await.is_err());
     assert!(store.move_node(two, a1, None).await.is_err());
     assert!(store.move_node(root, two, None).await.is_err());
     assert!(store.move_node(c, one, Some(a)).await.is_err());

@@ -277,18 +277,21 @@ fn a_whole_file_read_of_a_long_file_is_answered_with_the_outline_once_per_run() 
     std::fs::write(root.join(ra_context::CONTEXT_DIR).join("7.md"), "# Task #7 context\n\n## Brief\n\nchange `beta` in src/big.rs\n")
         .unwrap();
 
-    let hint = read_hint(root, &read_event(root, "src/big.rs", None, None)).expect("a whole-file read gets the hint");
+    // the card is named outright: the tests run under a worker whose RHIPPER_CARD is another
+    // card's, and other tests start runs of their own while this one goes
+    let hint = hint_of(root, &read_event(root, "src/big.rs", None, None), Some(7)).expect("a whole-file read gets the hint");
     assert!(hint.contains("rc context 7"), "{hint}");
     assert!(hint.contains("beta 201-400"), "{hint}");
     assert!(!hint.contains("alpha"), "only the function the card names: {hint}");
     // the same file again this run: the worker was told
-    assert_eq!(read_hint(root, &read_event(root, "src/big.rs", None, None)), None);
-    // a ranged read and a short file need no hint
+    assert_eq!(hint_of(root, &read_event(root, "src/big.rs", None, None), Some(7)), None);
+    // a ranged read, a short file and no card at all need no hint
     begin_run(root, 7);
-    assert_eq!(read_hint(root, &read_event(root, "src/big.rs", Some(200), Some(60))), None);
-    assert_eq!(read_hint(root, &read_event(root, "src/big.rs", None, Some(60))), None);
-    assert_eq!(read_hint(root, &read_event(root, "src/small.rs", None, None)), None);
+    assert_eq!(hint_of(root, &read_event(root, "src/big.rs", Some(200), Some(60)), Some(7)), None);
+    assert_eq!(hint_of(root, &read_event(root, "src/big.rs", None, Some(60)), Some(7)), None);
+    assert_eq!(hint_of(root, &read_event(root, "src/small.rs", None, None), Some(7)), None);
+    assert_eq!(hint_of(root, &read_event(root, "src/big.rs", None, None), None), None);
     // a new run forgets what the last one said
-    assert!(read_hint(root, &read_event(root, "src/big.rs", None, None)).is_some());
+    assert!(hint_of(root, &read_event(root, "src/big.rs", None, None), Some(7)).is_some());
     unsafe { std::env::remove_var(CARD_VAR) };
 }

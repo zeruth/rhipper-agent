@@ -362,19 +362,33 @@ impl Store {
     /// When a node is not there, the node is the project, `under` sits in the moved subtree,
     /// `after` is not a child of `under`, or the file cannot be written.
     pub async fn move_node(&self, id: i64, under: i64, after: Option<i64>) -> anyhow::Result<()> {
+        self.relocate(id, under, after.map_or(Slot::Last, Slot::After)).await
+    }
+
+    /// Moves a node with its subtree under `under` as its first child: where a drop above the
+    /// first row of a bubble lands, which no `after` can name.
+    ///
+    /// # Errors
+    /// As [`Store::move_node`].
+    pub async fn move_first(&self, id: i64, under: i64) -> anyhow::Result<()> {
+        self.relocate(id, under, Slot::First).await
+    }
+
+    async fn relocate(&self, id: i64, under: i64, slot: Slot) -> anyhow::Result<()> {
         let mut roadmap = self.load().await?;
         let nodes = &mut roadmap.nodes;
         let node = nodes.iter().find(|n| n.id == id).with_context(|| format!("no node {id}"))?;
         anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is the project; it stays");
         anyhow::ensure!(nodes.iter().any(|n| n.id == under), "no node {under}");
         anyhow::ensure!(!tree::is_within(nodes, under, id), "#{under} is #{id} or under it; a card does not move under itself");
-        if let Some(after) = after {
+        if let Slot::After(after) = slot {
             let sibling = nodes.iter().find(|n| n.id == after).with_context(|| format!("no node {after}"))?;
             anyhow::ensure!(sibling.parent == Some(under), "#{after} is not under #{under}");
             anyhow::ensure!(after != id, "#{id} cannot follow itself");
         }
-        // the subtree comes out whole, then goes back after the last descendant of the sibling it
-        // follows, or of the new parent when it goes last
+        // the subtree comes out whole, then goes back right behind the new parent's line when it
+        // goes first, else after the last descendant of the sibling it follows, or of the new
+        // parent when it goes last
         let moved: Vec<i64> = tree::subtree(nodes, id).iter().map(|n| n.id).collect();
         let mut lifted: Vec<Node> = Vec::with_capacity(moved.len());
         let mut rest = Vec::with_capacity(nodes.len());
@@ -383,9 +397,12 @@ impl Store {
         }
         *nodes = rest;
         lifted[0].parent = Some(under);
-        let anchor = after.unwrap_or(under);
-        let last = tree::subtree(nodes, anchor).last().map(|n| n.id);
-        let position = nodes.iter().position(|n| Some(n.id) == last).map_or(nodes.len(), |i| i + 1);
+        let behind = match slot {
+            Slot::First => Some(under),
+            Slot::Last => tree::subtree(nodes, under).last().map(|n| n.id),
+            Slot::After(after) => tree::subtree(nodes, after).last().map(|n| n.id),
+        };
+        let position = nodes.iter().position(|n| Some(n.id) == behind).map_or(nodes.len(), |i| i + 1);
         nodes.splice(position..position, lifted);
         self.write(roadmap).await
     }
@@ -604,6 +621,14 @@ impl Store {
 }
 
 /// Seconds since the epoch, for a history line.
+/// Where a moved subtree goes among the new parent's children.
+#[derive(Clone, Copy)]
+enum Slot {
+    First,
+    Last,
+    After(i64),
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }

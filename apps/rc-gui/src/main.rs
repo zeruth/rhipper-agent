@@ -1481,6 +1481,10 @@ struct Workspace {
     /// The row whose tooltip was open last, and when: the shade over the column stays a moment
     /// after the pointer leaves it, so a pass over the rules does not flash it.
     shade: Option<(Rect, Instant)>,
+    /// The row being dragged across the column, until the pointer lets go.
+    drag: Option<i64>,
+    /// The row that shakes because its drop was refused, and when the shake began.
+    shake: Option<(i64, Instant)>,
     /// The runs that ended and have not been clicked or timed out, oldest first.
     toasts: Vec<Toast>,
     /// The newest run of the log a toast announced; the runs after it are still going.
@@ -1619,6 +1623,8 @@ impl Workspace {
             setup,
             view: RoadmapView::Tree,
             shade: None,
+            drag: None,
+            shake: None,
             toasts: Vec::new(),
             announced: 0,
             console_height: layout.console,
@@ -2607,7 +2613,12 @@ impl Workspace {
             now: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
             costs: self.show_cost.then(|| self.costs.clone()),
             cost_width: self.cost_width.unwrap_or(0.0),
+            dragging: self.drag,
+            shaking: self.shake.map(|(id, at)| (id, at.elapsed().as_secs_f32())).filter(|(_, t)| *t < SHAKE_FOR),
         };
+        if walk.dragging.is_some() || walk.shaking.is_some() {
+            ui.ctx().request_repaint();
+        }
         let mut out = Walked::default();
         let view = self.view;
         let scroll = egui::ScrollArea::vertical().id_salt("roadmap").auto_shrink([false, false]).show(ui, |ui| {
@@ -2684,6 +2695,54 @@ impl Workspace {
         if let Some(parent) = out.add_under {
             self.new_card = Some(NewCard::under(parent));
             self.tab = Tab::Card;
+        }
+        // a drag holds its row until the pointer lets go; where it lets go decides the move
+        if let Some(id) = out.drag_started {
+            self.drag = Some(id);
+        }
+        if let Some(id) = self.drag {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let (released, down) = ui.input(|i| (i.pointer.any_released(), i.pointer.any_down()));
+            if released {
+                self.drag = None;
+                if let Some((target, slot)) = out.drop {
+                    self.move_card(id, target, slot);
+                }
+            } else if !down {
+                self.drag = None;
+            }
+        }
+    }
+
+    /// Writes a drop through the store: onto a row makes the card its last child, above or
+    /// below a row puts it beside that row under the row's parent. A refusal (its own subtree,
+    /// the project) shakes the dragged row and says why in the log.
+    fn move_card(&mut self, id: i64, target: i64, slot: DropSlot) {
+        let Some(onto) = self.roadmap.iter().find(|n| n.id == target) else { return };
+        let result = match (slot, onto.parent) {
+            (DropSlot::Onto, _) | (_, None) => self.rt.block_on(self.store.move_node(id, target, None)),
+            (DropSlot::After, Some(parent)) => self.rt.block_on(self.store.move_node(id, parent, Some(target))),
+            (DropSlot::Before, Some(parent)) => {
+                // the sibling the card follows is the one above the target, the card itself not counted
+                let before = self.roadmap.iter().filter(|n| n.parent == Some(parent) && n.id != id).take_while(|n| n.id != target).last();
+                match before {
+                    Some(sibling) => self.rt.block_on(self.store.move_node(id, parent, Some(sibling.id))),
+                    None => self.rt.block_on(self.store.move_first(id, parent)),
+                }
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.sink.push(
+                    Kind::Output,
+                    format!("#{id} moved under #{}", if slot == DropSlot::Onto { target } else { onto.parent.unwrap_or(target) }),
+                );
+                self.roadmap_seen = None;
+            }
+            Err(e) => {
+                self.sink.push(Kind::Error, format!("cannot move #{id}: {e:#}"));
+                self.shake = Some((id, Instant::now()));
+            }
         }
     }
 
@@ -2999,6 +3058,8 @@ impl Workspace {
             self.refresh_context();
         }
         let context = &self.context;
+        // an outline item clicked: the file and the line the code pane opens at
+        let mut open_at: Option<(String, usize)> = None;
         egui::ScrollArea::vertical().id_salt("context").auto_shrink([false, false]).show(ui, |ui| {
             ui.set_width(ui.available_width());
             cards::card(ui, theme::dim(), false, |ui| {
@@ -3038,11 +3099,18 @@ impl Workspace {
                     Some(fault) => {
                         ui.label(RichText::new(fault).color(theme::error_text()));
                     }
-                    None => markdown::render_prompt(ui, &context.text, theme::debug()),
+                    None => open_at = markdown::render_prompt(ui, &context.text, theme::debug()),
                 }
             });
             ui.add_space(6.0);
         });
+        if let Some((file, line)) = open_at {
+            let path = Path::new(&file);
+            match &mut self.code {
+                Some(pane) if pane.path() == path => pane.show_line(line),
+                _ => self.code = Some(code::CodePane::open_at(path, line)),
+            }
+        }
     }
 
     /// The ledger tab: the usage by model with the total, the gotchas by how often they fired,
@@ -3822,7 +3890,7 @@ impl Workspace {
                 .default_size(root.max_rect().width() * 0.42)
                 .frame(Frame::new().fill(theme::panel()).inner_margin(Margin::symmetric(12, 10)).stroke(Stroke::new(1.0, theme::rule())))
                 .show(root, |ui| {
-                    if let Some(pane) = &self.code {
+                    if let Some(pane) = &mut self.code {
                         close = pane.draw(ui);
                     }
                 });
@@ -3890,6 +3958,8 @@ impl Workspace {
             now: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
             costs: None,
             cost_width: 0.0,
+            dragging: None,
+            shaking: None,
         };
         let mut out = Walked::default();
         let mut open = false;
@@ -4036,6 +4106,22 @@ struct Walk {
     costs: Option<HashMap<i64, Totals>>,
     /// The width the cost column takes, the same on every row.
     cost_width: f32,
+    /// The row being dragged, so the others light as the pointer passes over them.
+    dragging: Option<i64>,
+    /// The row shaking off a refused drop, and how long it has been shaking.
+    shaking: Option<(i64, f32)>,
+}
+
+/// How long a refused drop shakes its row, in seconds.
+const SHAKE_FOR: f32 = 0.45;
+
+/// Where a drag over a row would drop: onto it (last child), or just above or below it (a
+/// sibling under its parent). The band near a row's top or bottom edge is between; the rest is onto.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropSlot {
+    Before,
+    Onto,
+    After,
 }
 
 /// What the walk brings back: the rows shown top to bottom (what the arrow keys walk), and
@@ -4052,6 +4138,10 @@ struct Walked {
     tooltip_row: Option<egui::Rect>,
     /// The milestone or section whose `+` was clicked: the new-card form opens under it.
     add_under: Option<i64>,
+    /// The row the pointer began dragging this frame.
+    drag_started: Option<i64>,
+    /// The row under the dragged pointer and where on it, this frame.
+    drop: Option<(i64, DropSlot)>,
 }
 
 impl Walk {
@@ -4135,18 +4225,30 @@ fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node]
     } else {
         Color32::TRANSPARENT
     };
-    let frame = Frame::new()
-        .fill(fill)
-        .stroke(Stroke::new(1.0, if selected { cards::alpha(lane, 200) } else { Color32::TRANSPARENT }))
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(Margin::symmetric(6, 3));
+    // a refused drop shakes the row: its content jitters sideways under a red edge for a moment
+    let shake = walk.shaking.filter(|(id, _)| *id == node.id).map(|(_, t)| 3.0 + 3.0 * (t * 60.0).sin());
+    let dragged = walk.dragging == Some(node.id);
+    let stroke = if shake.is_some() {
+        Stroke::new(1.0, theme::error_text())
+    } else if selected {
+        Stroke::new(1.0, cards::alpha(lane, 200))
+    } else {
+        Stroke::NONE
+    };
+    let frame = Frame::new().fill(fill).stroke(stroke).corner_radius(CornerRadius::same(7)).inner_margin(Margin::symmetric(6, 3));
     // the row's jewel: the state's color bright at the right, where its badge sits, fading
     // leftward under the title; the slot is filled once the row has its rect
     let painter = ui.painter().clone();
     let slot = painter.add(egui::Shape::Noop);
     let inner = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
+        if dragged {
+            ui.multiply_opacity(0.4);
+        }
         ui.horizontal(|ui| {
+            if let Some(dx) = shake {
+                ui.add_space(dx);
+            }
             let arrow = if !has_children {
                 "  "
             } else if walk.is_folded(node.id) {
@@ -4223,7 +4325,42 @@ fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node]
         cards::fade_shape(Rect::from_min_max(egui::pos2(row.left() + row.width() * 0.35, row.top()), row.max), glow_color, 46, true),
     );
     // the row's own id, so the next frame reads this frame's hover for the fill
-    let response = ui.interact(inner.response.rect, row_id, egui::Sense::click());
+    let response = ui.interact(inner.response.rect, row_id, egui::Sense::click_and_drag());
+    if response.drag_started() && node.kind != NodeKind::Project {
+        out.drag_started = Some(node.id);
+    }
+    // while another row is dragged, this one lights where the pointer would drop it: a filled
+    // frame to take it as a child, a line along its top or bottom edge to take it as a sibling;
+    // the project has no siblings, so it only takes children
+    if let Some(dragging) = walk.dragging
+        && dragging != node.id
+        && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
+        && row.contains(pointer)
+    {
+        let band = (row.height() * 0.25).min(8.0);
+        let slot = if node.kind == NodeKind::Project {
+            DropSlot::Onto
+        } else if pointer.y < row.top() + band {
+            DropSlot::Before
+        } else if pointer.y > row.bottom() - band {
+            DropSlot::After
+        } else {
+            DropSlot::Onto
+        };
+        let accent = theme::accent();
+        match slot {
+            DropSlot::Onto => {
+                painter.rect(row, CornerRadius::same(7), cards::alpha(accent, 40), Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+            }
+            DropSlot::Before => {
+                painter.hline(row.x_range(), row.top(), Stroke::new(2.0, accent));
+            }
+            DropSlot::After => {
+                painter.hline(row.x_range(), row.bottom(), Stroke::new(2.0, accent));
+            }
+        }
+        out.drop = Some((node.id, slot));
+    }
     if egui::Tooltip::was_tooltip_open_last_frame(ui.ctx(), response.id) {
         out.tooltip_row = Some(response.rect);
     }
