@@ -509,6 +509,13 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<String> {
     if let Some(acceptance) = &node.acceptance {
         text.push_str(&format!("Acceptance criteria: {acceptance}\n"));
     }
+    // the files the task names: the worker reads these first instead of exploring
+    if !node.files.is_empty() {
+        text.push_str("Files: read these first, they are where the change lands:\n");
+        for file in &node.files {
+            text.push_str(&format!("  {file}\n"));
+        }
+    }
     // the ancestors: the chain of parents above the task, nearest first
     let mut parent = node.parent.and_then(find);
     while let Some(ancestor) = parent {

@@ -23,6 +23,11 @@ pub const COMMANDS: &[Spec] = &[
         help: "adds a node under its parent; a project takes no parent",
     },
     Spec { name: "depend", usage: "<id> <id>...", help: "makes the first node wait for the others" },
+    Spec {
+        name: "files",
+        usage: "<id> [path...]",
+        help: "the workspace-relative paths a task touches, read first by its worker; no path clears them",
+    },
     Spec { name: "set", usage: "<id> <state>", help: "sets the state: the twelve lifecycle names" },
     Spec {
         name: "model",
@@ -99,6 +104,9 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
                 if let Some(objective) = &node.objective {
                     out.push(format!("    {objective}"));
                 }
+                if !node.files.is_empty() {
+                    out.push(format!("    files: {}", node.files.join(" ")));
+                }
             }
             if picked.is_empty() {
                 out.push("the roadmap is empty: add a project first".into());
@@ -130,6 +138,18 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             }
             anyhow::ensure!(count > 0, "usage: depend <id> <id>...");
             out.push(format!("#{id} now waits for {count} more"));
+        }
+        "files" => {
+            let mut words = args.split_whitespace();
+            let id = words.next().context("usage: files <id> [path...]")?.parse::<i64>().context("the id is a node id")?;
+            // a path is stored with forward slashes, so the file reads the same on every platform
+            let files: Vec<String> = words.map(|p| p.replace('\\', "/")).collect();
+            store.set_files(id, &files).await?;
+            out.push(if files.is_empty() {
+                format!("#{id} names no files")
+            } else {
+                format!("#{id} names {} files: {}", files.len(), files.join(" "))
+            });
         }
         "set" => {
             let (id_text, state_text) = args.split_once(char::is_whitespace).context("usage: set <id> <state>")?;

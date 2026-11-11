@@ -233,6 +233,9 @@ async fn show(id: Option<i64>) -> anyhow::Result<()> {
         if let Some(objective) = &node.objective {
             println!("{}    {}", indent, objective);
         }
+        if !node.files.is_empty() {
+            println!("{}    files: {}", indent, node.files.join(" "));
+        }
     }
     Ok(())
 }

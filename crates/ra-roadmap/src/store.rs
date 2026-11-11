@@ -30,6 +30,7 @@ impl Store {
                 title: title.to_owned(),
                 objective: None,
                 acceptance: None,
+                files: Vec::new(),
                 depends_on: Vec::new(),
                 state: TaskState::Defined,
                 assignee: None,
@@ -96,6 +97,7 @@ impl Store {
             title: title.to_owned(),
             objective: objective.map(str::to_owned),
             acceptance: acceptance.map(str::to_owned),
+            files: Vec::new(),
             depends_on: Vec::new(),
             state: TaskState::Defined,
             assignee: None,
@@ -137,6 +139,15 @@ impl Store {
     pub async fn set_notes(&self, id: i64, notes: &str) -> anyhow::Result<()> {
         let mut nodes = self.all().await?;
         node_mut(&mut nodes, id)?.notes = Some(notes.to_owned());
+        self.write(nodes).await
+    }
+
+    /// Replaces the files a node names, the workspace-relative paths its worker reads first; an
+    /// empty list clears them. A path holds no whitespace, since the file separates paths by spaces.
+    pub async fn set_files(&self, id: i64, files: &[String]) -> anyhow::Result<()> {
+        anyhow::ensure!(files.iter().all(|f| !f.is_empty() && !f.contains(char::is_whitespace)), "a path holds no whitespace");
+        let mut nodes = self.all().await?;
+        node_mut(&mut nodes, id)?.files = files.to_vec();
         self.write(nodes).await
     }
 

@@ -155,6 +155,10 @@ pub struct Node {
     pub objective: Option<String>,
     /// How acceptance is verified: the checks, the tests, the review requirements.
     pub acceptance: Option<String>,
+    /// The workspace-relative paths the task touches, so a worker reads them first instead of
+    /// exploring the repository.
+    #[serde(default)]
+    pub files: Vec<String>,
     /// The nodes that must be accepted first.
     pub depends_on: Vec<i64>,
     pub state: TaskState,

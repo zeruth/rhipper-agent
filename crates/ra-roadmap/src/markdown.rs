@@ -14,10 +14,14 @@
 //!     - 4 ‹task› Roadmap storage layer {c2} [accepted] [implementer:z-ai/glm-5.3-flash]
 //!         objective: ...
 //!         acceptance: ...
+//!         files: crates/ra-roadmap/src/store.rs crates/ra-console/src/agent.rs
 //!         waits-on: 2 7
 //!         notes: ...
 //!         assessed: 9f3a0c41d27b6e58
 //! ```
+//!
+//! `files:` lists the workspace-relative paths a task touches, space-separated, so a worker reads
+//! them first. A path holds no space.
 //!
 //! `assessed:` holds what the last reassessment saw: a fingerprint of its inputs, or the word
 //! `final`, which no reassessment rewrites.
@@ -106,6 +110,9 @@ fn detail_lines(node: &Node, level: usize) -> Vec<String> {
             lines.push(format!("{indent}{field}: {}", escape(value)));
         }
     }
+    if !node.files.is_empty() {
+        lines.push(format!("{indent}files: {}", node.files.join(" ")));
+    }
     if !node.depends_on.is_empty() {
         let ids: Vec<String> = node.depends_on.iter().map(|id| id.to_string()).collect();
         lines.push(format!("{indent}waits-on: {}", ids.join(" ")));
@@ -145,6 +152,7 @@ pub fn parse(text: &str) -> anyhow::Result<Vec<Node>> {
             "acceptance" => node.acceptance = Some(value),
             "notes" => node.notes = Some(value),
             "assessed" => node.assessed = Some(value),
+            "files" => node.files = value.split_whitespace().map(str::to_owned).collect(),
             "waits-on" => {
                 node.depends_on = value
                     .split_whitespace()
@@ -206,6 +214,7 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         title,
         objective: None,
         acceptance: None,
+        files: Vec::new(),
         depends_on: Vec::new(),
         state,
         assignee,

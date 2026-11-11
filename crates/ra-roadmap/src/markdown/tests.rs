@@ -11,6 +11,7 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
         title: title.to_owned(),
         objective: None,
         acceptance: None,
+        files: Vec::new(),
         depends_on: Vec::new(),
         state: TaskState::Defined,
         assignee: None,
@@ -75,6 +76,17 @@ fn carries_the_detail_fields() {
     assert_eq!(back.state, TaskState::Accepted);
     assert_eq!(back.assignee.as_ref().map(|a| a.model.as_str()), Some("z-ai/glm-5.3-flash"));
     assert_eq!(back.complexity, 2);
+}
+
+#[test]
+fn round_trips_the_files_line() {
+    let mut task = node(6, None, NodeKind::Task, "Files task");
+    task.files = vec!["crates/ra-roadmap/src/model.rs".into(), "crates/ra-console/src/agent.rs".into()];
+    let text = render(std::slice::from_ref(&task));
+    assert!(text.contains("    files: crates/ra-roadmap/src/model.rs crates/ra-console/src/agent.rs"), "{text}");
+    let parsed = parse(&text).unwrap();
+    assert_eq!(parsed[0].files, task.files);
+    assert_eq!(render(&parsed), text);
 }
 
 #[test]

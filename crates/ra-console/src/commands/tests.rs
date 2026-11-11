@@ -93,6 +93,31 @@ async fn run_honors_the_model_of_the_node() {
 }
 
 #[tokio::test]
+async fn files_names_the_paths_and_the_prompt_lists_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task T parent 1", &store, &worker()).await.unwrap();
+    let (out, _) = run("files 2 crates/a/src/lib.rs crates\\b\\src\\main.rs", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["#2 names 2 files: crates/a/src/lib.rs crates/b/src/main.rs"]);
+    let (out, _) = run("show 2", &store, &worker()).await.unwrap();
+    assert!(out.iter().any(|l| l == "    files: crates/a/src/lib.rs crates/b/src/main.rs"), "{out:?}");
+
+    let provider = Scripted::new(vec![says("done", Vec::new())]);
+    let runner = worker().with_provider(provider.clone());
+    run("run 2", &store, &runner).await.unwrap();
+    let seen = provider.seen.lock();
+    let prompt = seen[0].messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
+    let at = prompt.find("Files:").unwrap_or_else(|| panic!("no Files: in {prompt}"));
+    let after = &prompt[at..];
+    assert!(after.contains("crates/a/src/lib.rs") && after.contains("crates/b/src/main.rs"), "{prompt}");
+    drop(seen);
+
+    let (out, _) = run("files 2", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["#2 names no files"]);
+    assert!(store.read(2).await.unwrap().files.is_empty());
+}
+
+#[tokio::test]
 async fn completes_names() {
     assert_eq!(complete("se"), ["set", "seed"]);
     assert_eq!(complete("q"), ["quit"]);

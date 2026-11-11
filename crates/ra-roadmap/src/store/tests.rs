@@ -89,6 +89,19 @@ async fn set_assessed_marks_and_clears() {
 }
 
 #[tokio::test]
+async fn set_files_round_trips_and_clears() {
+    let (_dir, store) = store().await;
+    let root = store.all().await.unwrap().remove(0).id;
+    let id = store.insert(Some(root), NodeKind::Task, "Task", None, None, 3).await.unwrap();
+    let files = vec!["src/a.rs".to_owned(), "src/b.rs".to_owned()];
+    store.set_files(id, &files).await.unwrap();
+    assert_eq!(store.read(id).await.unwrap().files, files);
+    assert!(store.set_files(id, &["a b".to_owned()]).await.is_err());
+    store.set_files(id, &[]).await.unwrap();
+    assert!(store.read(id).await.unwrap().files.is_empty());
+}
+
+#[tokio::test]
 async fn read_names_a_missing_node() {
     let (_dir, store) = store().await;
     let error = store.read(99).await.unwrap_err();
