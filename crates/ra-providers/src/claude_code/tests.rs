@@ -52,7 +52,8 @@ fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
     assert!(args.windows(2).any(|w| w == ["--max-turns", "7"]), "{args:?}");
     let at = args.iter().position(|a| a == "--allowedTools").unwrap();
     assert_eq!(args[at + 1], "Bash(cargo *)");
-    assert!(!args.contains(&"--tools".to_owned()), "{args:?}");
+    // a worker gets the built-in list without PowerShell, never the empty list of a chat
+    assert!(!args.windows(2).any(|w| w == ["--tools", ""]), "{args:?}");
 }
 
 #[test]
@@ -139,6 +140,10 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     assert!(ClaudeCode::new().new_allowed().iter().any(|r| r == "Bash(ls*)"));
     assert!(!ClaudeCode::new().new_allowed().iter().any(|r| r.starts_with("PowerShell")));
     assert!(args.windows(2).any(|w| w == ["--disallowedTools", "PowerShell"]), "{args:?}");
+    assert!(
+        args.windows(2).any(|w| w[0] == "--tools" && w[1].contains("Bash") && w[1].contains("Edit") && !w[1].contains("PowerShell")),
+        "{args:?}"
+    );
     assert!(!ClaudeCode::new().args(&request(None)).contains(&"--disallowedTools".to_owned()));
 
     let quiet = Conditions::default();
@@ -167,6 +172,10 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let claim = r#"{"type":"result","result":"Done, but I couldn't run any tests.","permission_denials":[{"tool_name":"Bash","tool_input":{"command":"make all"}}]}"#;
     let ids: Vec<String> = gotchas_of_event(&catalogue, claim, quiet, &mut tools).into_iter().map(|h| h.id).collect();
     assert_eq!(ids, ["untested-claim", "unmatched-denied"]);
+    // a PowerShell denial is the wrapper, whatever the command
+    let wrapped = r#"{"type":"result","result":"done","permission_denials":[{"tool_name":"PowerShell","tool_input":{"command":"cargo clippy -p rc-gui"}}]}"#;
+    let ids: Vec<String> = gotchas_of_event(&catalogue, wrapped, quiet, &mut tools).into_iter().map(|h| h.id).collect();
+    assert_eq!(ids, ["powershell-wrapped"]);
 }
 
 #[test]

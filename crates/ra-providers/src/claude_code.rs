@@ -19,6 +19,10 @@ use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvi
 /// Where the plan's limits are kept, beside the roadmap.
 pub const LIMITS_FILE: &str = "var/limits.json";
 
+/// The built-in tools a worker gets: the files, the search, Bash, the web, the plan and the
+/// subagents; not PowerShell, whose commands the allowlist cannot read on this platform.
+const WORKER_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep,TodoWrite,Task,WebFetch,WebSearch,NotebookEdit";
+
 /// The Claude Code provider.
 pub struct ClaudeCode {
     /// The command; `claude` on the path unless told otherwise.
@@ -140,9 +144,10 @@ impl ClaudeCode {
                 args.push("--allowedTools".to_owned());
                 args.extend(self.allowed_shell.iter().cloned());
             }
-            // no PowerShell tool: every one of its commands is refused here, and a worker that
-            // keeps trying it spends its turns on nothing
-            args.extend(["--disallowedTools".to_owned(), "PowerShell".to_owned()]);
+            // the built-in tools without PowerShell: every one of its commands is refused here,
+            // and a worker that keeps trying it spends its turns on nothing. A denied tool is
+            // still offered; a tool left off the list is not there to try
+            args.extend(["--tools".to_owned(), WORKER_TOOLS.to_owned(), "--disallowedTools".to_owned(), "PowerShell".to_owned()]);
             if let Some(rc) = &self.hooks {
                 args.extend(["--settings".to_owned(), hook_settings(rc)]);
             }
@@ -466,6 +471,12 @@ fn gotchas_of_event(
             hits.extend(catalogue.scan(Where::Answer, event.get("result").and_then(Value::as_str).unwrap_or("")));
             for denial in event.get("permission_denials").and_then(Value::as_array).into_iter().flatten() {
                 let command = denial.pointer("/tool_input/command").and_then(Value::as_str).unwrap_or("");
+                // a PowerShell denial is the wrapper, whatever the command was
+                if denial.get("tool_name").and_then(Value::as_str) == Some("PowerShell") {
+                    let message = catalogue.get("powershell-wrapped").map(|g| g.message.clone()).unwrap_or_default();
+                    hits.push(Hit { id: "powershell-wrapped".to_owned(), message, excerpt: snippet(command.lines().next().unwrap_or("")) });
+                    continue;
+                }
                 if !command.is_empty() && catalogue.command(command, conditions) == Verdict::Pass {
                     hits.push(Hit {
                         id: "unmatched-denied".to_owned(),

@@ -15,7 +15,7 @@
 [[gotcha]]
 id = "shell-outside-allowlist"
 where = "command"
-pattern = '^\s*(cd|dir|Get-ChildItem|Get-Content|Select-String|Set-Location|Start-Process|python|pip|npm|node)\b'
+pattern = '^\s*(cd|dir|Get-ChildItem|Get-Content|Select-String|Set-Location|Start-Process|python|pip|npm|node)\b|^\s*git\s+-C\b'
 message = "the shell here runs cargo, the read-only git commands and the read-only tools (ls, cat, grep, find); read files with Read, search with Grep and Glob, and start from the files on the card"
 remedy = { kind = "hint" }
 
