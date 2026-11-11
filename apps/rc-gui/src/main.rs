@@ -66,6 +66,9 @@ struct ContextView {
 #[derive(Default)]
 struct Ledger {
     by_model: Vec<(String, Totals)>,
+    /// The totals by roadmap node, `None` for the calls that served none; the tab sums them
+    /// up the tree, so the root reads as the total.
+    by_node: Vec<(Option<i64>, Totals)>,
     all_time: Option<Totals>,
     /// Each gotcha that fired: the id, how often, and its message from the catalogue, `None`
     /// for an id the catalogue does not hold.
@@ -233,7 +236,9 @@ impl App {
     /// Reads the ledger and the gotchas again: the same queries as `rc usage` and the same
     /// journal as `rc gotchas`, so the tab shows their numbers.
     fn refresh_ledger(&mut self) {
-        let (all_time, by_model) = self.rt.block_on(async { (self.worker.all_time().await, self.worker.by_model().await) });
+        let (all_time, by_model, by_node) = self
+            .rt
+            .block_on(async { (self.worker.all_time().await, self.worker.by_model().await, self.worker.by_node().await) });
         let catalogue = match Catalogue::load(Path::new(GOTCHAS_FILE)) {
             Ok(catalogue) => Some(catalogue),
             Err(e) => {
@@ -252,6 +257,7 @@ impl App {
             .collect();
         self.ledger = Ledger {
             by_model: by_model.unwrap_or_default(),
+            by_node: by_node.unwrap_or_default(),
             all_time,
             gotchas,
             unmatched: journal.unmatched(),
@@ -662,6 +668,18 @@ impl App {
         let depths = tree::depths(&self.roadmap);
         let nodes = self.roadmap.clone();
         let matched: HashSet<i64> = if searching { search_matches(&nodes, &needle) } else { HashSet::new() };
+        // the structure a hidden chip still needs: the ancestors of every card that stays shown;
+        // a milestone in a hidden state with nothing shown under it goes with its cards
+        let mut holds_shown: HashSet<i64> = HashSet::new();
+        for node in nodes.iter().filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && !self.hidden_states.contains(&n.state)) {
+            let mut parent = node.parent;
+            while let Some(id) = parent {
+                if !holds_shown.insert(id) {
+                    break;
+                }
+                parent = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent);
+            }
+        }
         let mut hidden_under: Vec<i64> = Vec::new();
         let mut shown_rows: Vec<i64> = Vec::new();
         let mut clicked: Option<i64> = None;
@@ -680,8 +698,9 @@ impl App {
                 if !searching && self.folded.contains(&node.id) {
                     hidden_under.push(node.id);
                 }
-                // a task in a hidden state stays out; the structure above it stays
-                if matches!(node.kind, NodeKind::Task | NodeKind::Subtask) && self.hidden_states.contains(&node.state) {
+                // a node in a hidden state stays out, unless it is the structure above a shown
+                // card; the project row always stays
+                if self.hidden_states.contains(&node.state) && node.kind != NodeKind::Project && !holds_shown.contains(&node.id) {
                     continue;
                 }
                 shown_rows.push(node.id);
@@ -911,6 +930,40 @@ impl App {
         let ledger = &self.ledger;
         egui::ScrollArea::vertical().id_salt("ledger").auto_shrink([false, false]).show(ui, |ui| {
             ui.set_max_width(980.0);
+            cards::card(ui, theme::ACCENT, false, |ui| {
+                ui.set_width(ui.available_width());
+                cards::section(ui, "USAGE BY CARD", theme::ACCENT);
+                ui.label(
+                    RichText::new("all time, summed up the roadmap: a milestone is its cards, the root is the total · the calls outside any card last")
+                        .color(theme::DIM)
+                        .small(),
+                );
+                let rows = usage_by_card(&self.roadmap, &ledger.by_node);
+                if rows.is_empty() {
+                    ui.label(RichText::new("the ledger is empty: no completion has run yet").color(theme::DIM));
+                } else {
+                    let depths = tree::depths(&self.roadmap);
+                    egui::Grid::new("usage-by-card").num_columns(6).spacing([22.0, 5.0]).striped(true).show(ui, |ui| {
+                        ui.label(RichText::new("card").small().strong().color(theme::DIM));
+                        for head in ["calls", "in", "out", "cached", "cost"] {
+                            cell_right(ui, RichText::new(head).small().strong().color(theme::DIM));
+                        }
+                        ui.end_row();
+                        for (node, t) in &rows {
+                            let (label, color) = match node {
+                                Some(node) => {
+                                    let depth = depths.get(&node.id).copied().unwrap_or(0);
+                                    let color = if node.kind == NodeKind::Project { theme::ACCENT } else { theme::lane(depth) };
+                                    (format!("{}#{} {}", "  ".repeat(depth), node.id, node.title), color)
+                                }
+                                None => ("outside the roadmap (pings, chats)".to_owned(), theme::DIM),
+                            };
+                            usage_row(ui, &label, t, color);
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
             cards::card(ui, theme::ONLINE, false, |ui| {
                 ui.set_width(ui.available_width());
                 cards::section(ui, "USAGE BY MODEL", theme::ONLINE);
@@ -1327,6 +1380,41 @@ fn cell_right(ui: &mut egui::Ui, text: RichText) {
 
 /// One row of the usage grid: the model, the calls, the tokens and the cost, the numbers as
 /// `rc usage` prints them.
+/// The ledger by card: every node whose subtree has calls, in tree order, with the sums of its
+/// subtree (so a milestone is its cards and the root is the total), then the calls that served
+/// no node. Empty while the ledger is.
+fn usage_by_card<'a>(nodes: &'a [Node], by_node: &[(Option<i64>, Totals)]) -> Vec<(Option<&'a Node>, Totals)> {
+    let own = |id: i64| by_node.iter().find(|(n, _)| *n == Some(id)).map(|(_, t)| *t);
+    let mut rows: Vec<(Option<&Node>, Totals)> = Vec::new();
+    for node in nodes {
+        let mut sum = Totals::default();
+        for member in tree::subtree(nodes, node.id) {
+            if let Some(t) = own(member.id) {
+                sum.merge(&t);
+            }
+        }
+        if sum.calls > 0 {
+            rows.push((Some(node), sum));
+        }
+    }
+    // a call booked to a node the roadmap no longer has still counts at the root
+    let root_has = rows.first().is_some_and(|(n, _)| n.is_some_and(|n| n.kind == NodeKind::Project));
+    let stray: Totals = by_node.iter().filter(|(id, _)| id.is_some_and(|id| !nodes.iter().any(|n| n.id == id))).fold(
+        Totals::default(),
+        |mut acc, (_, t)| {
+            acc.merge(t);
+            acc
+        },
+    );
+    if root_has && stray.calls > 0 {
+        rows[0].1.merge(&stray);
+    }
+    if let Some((_, t)) = by_node.iter().find(|(n, _)| n.is_none()) {
+        rows.push((None, *t));
+    }
+    rows
+}
+
 fn usage_row(ui: &mut egui::Ui, model: &str, t: &Totals, color: Color32) {
     ui.label(RichText::new(model).monospace().color(color));
     for n in [t.calls, t.prompt_tokens, t.completion_tokens, t.cached_tokens] {

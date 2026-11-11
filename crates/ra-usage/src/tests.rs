@@ -31,6 +31,16 @@ async fn the_totals_sum_the_rows_and_keep_an_unknown_cost_unknown() {
     assert_eq!(by_model[0].1.calls, 2);
     assert_eq!(by_model[1].0, "z-ai/glm-5.3-flash");
     assert_eq!(by_model[1].1.cost_usd, None);
+
+    // by node: the rows that served no node come first, as None
+    let by_node = store.by_node().await.unwrap();
+    assert_eq!(by_node.iter().map(|(n, _)| *n).collect::<Vec<_>>(), [None, Some(3), Some(4)]);
+    assert_eq!(by_node[1].1.cost_usd, Some(0.25));
+    let mut sum = Totals::default();
+    for (_, t) in &by_node {
+        sum.merge(t);
+    }
+    assert_eq!(sum, totals);
 }
 
 #[test]

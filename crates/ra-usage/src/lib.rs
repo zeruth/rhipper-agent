@@ -48,6 +48,17 @@ impl Totals {
             self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
         }
     }
+
+    /// Adds another set of sums, for a node's subtree.
+    pub fn merge(&mut self, other: &Self) {
+        self.calls += other.calls;
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.cached_tokens += other.cached_tokens;
+        if let Some(cost) = other.cost_usd {
+            self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
+        }
+    }
 }
 
 impl UsageStore {
@@ -126,6 +137,16 @@ impl UsageStore {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.iter().map(|row| (row.get("model"), totals_of(row))).collect())
+    }
+
+    /// The totals of every roadmap node that has rows, by id, with `None` for the rows that
+    /// served no node (a ping, a chat); a reader sums them up the tree.
+    ///
+    /// # Errors
+    /// When the query fails.
+    pub async fn by_node(&self) -> anyhow::Result<Vec<(Option<i64>, Totals)>> {
+        let rows = sqlx::query(concat!("select node, ", sums!(), " from usage group by node order by node")).fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(|row| (row.get::<Option<i64>, _>("node"), totals_of(row))).collect())
     }
 }
 
