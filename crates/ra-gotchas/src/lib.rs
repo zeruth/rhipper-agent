@@ -6,7 +6,8 @@
 //! Three places use it. The pre-tool hook asks [`Catalogue::command`] what to do with a command
 //! before it runs. The post-tool hook and the provider's stream reader ask [`Catalogue::scan`]
 //! what a result or an answer shows. The [`Journal`] keeps every hit, so `rc gotchas` can say
-//! which ones keep coming back and the next run can read [`Catalogue::notes`] about them.
+//! which ones keep coming back and the next run can read [`Catalogue::notes`] about them. The
+//! refused commands no gotcha names grow the catalogue through [`Catalogue::promote`].
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -15,6 +16,7 @@ use anyhow::Context;
 use regex::Regex;
 use serde::Deserialize;
 
+pub mod catalog;
 pub mod journal;
 
 pub use journal::Journal;
@@ -31,7 +33,7 @@ pub const UNMATCHED: &str = "unmatched-denied";
 pub const SEED_MARK: &str = "# from the seed of ra-gotchas ";
 
 /// The line that opens an entry in the TOML.
-const ENTRY_HEAD: &str = "[[gotcha]]";
+pub(crate) const ENTRY_HEAD: &str = "[[gotcha]]";
 
 /// The seed's entries as text, each with its id: the blocks [`Catalogue::refresh`] appends, so
 /// a project's file gains the entry as written, comments and quoting included.

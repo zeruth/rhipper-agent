@@ -12,6 +12,9 @@ pub mod local;
 pub mod openrouter;
 pub mod route;
 
+#[cfg(test)]
+mod tests;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;

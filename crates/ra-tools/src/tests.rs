@@ -1,5 +1,6 @@
 //! The tests of the toolbox: each tool over a temp workspace, the confinement and the allowlist.
 
+use super::commands::{MAX_LINES, MAX_OUTPUT, clip};
 use super::*;
 
 fn call(name: &str, args: serde_json::Value) -> ToolCall {
@@ -98,6 +99,21 @@ fn clip_keeps_the_head_and_the_tail() {
     assert_eq!(clip("short"), "short");
 }
 
+#[tokio::test]
+async fn a_long_command_output_reaches_the_agent_clipped_to_its_head_and_tail() {
+    let (_dir, tools) = workspace().await;
+    let build: String = (1..=1000).map(|n| format!("   Compiling crate-{n} v0.1.0\n")).collect();
+    let tools = tools.with_script(Arc::new(move |_: &str| Ok((0, build.clone()))));
+    let out = tools.execute(&call("run", json!({"command": "cargo build"}))).await;
+    // the lines of the output and the exit line, less what the marker stands for
+    assert!(out.lines().count() <= MAX_LINES + 1, "{} lines", out.lines().count());
+    assert!(out.contains("… 801 lines clipped …"), "{out}");
+    assert!(out.starts_with("   Compiling crate-1 v0.1.0\n"), "the head stays");
+    assert!(out.ends_with("   Compiling crate-1000 v0.1.0\nexit code 0"), "the tail and the verdict stay");
+    // a check is the lint's, not a turn's: it reads the whole output
+    assert_eq!(tools.check("cargo build").await.unwrap().1.lines().count(), 1001);
+}
+
 #[test]
 fn the_specs_name_every_tool_once() {
     let names: Vec<String> = Toolbox::specs().into_iter().map(|s| s.name).collect();
@@ -141,6 +157,19 @@ async fn a_scripted_toolbox_answers_a_command_from_the_script() {
     assert!(tools.check("rm -rf /").await.is_err(), "the allowlist comes before the script");
     // an acceptance's own check is the person's command: it runs past the allowlist
     assert_eq!(tools.check_acceptance("python tools/x.py").await.unwrap(), (false, "ran python tools/x.py\nexit code 101".to_owned()));
+}
+
+#[tokio::test]
+async fn a_command_past_the_toolboxs_limit_is_stopped_and_names_the_limit() {
+    let (_dir, tools) = workspace().await;
+    // the command splits on whitespace, so the program sleeps without a space
+    let sleep = "python -c __import__('time').sleep(3)";
+    let error = tools.clone().with_timeout(Duration::from_secs(1)).check_acceptance(&sleep).await.unwrap_err();
+    assert!(error.to_string().contains("ran past 1 s and was stopped"), "{error:#}");
+    // under a longer limit the same command finishes
+    let tools = tools.with_timeout(Duration::from_secs(1800));
+    assert_eq!(tools.timeout(), Duration::from_secs(1800));
+    assert!(tools.check_acceptance(&sleep.replace('3', "0")).await.unwrap().0);
 }
 
 #[test]

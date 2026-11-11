@@ -1343,7 +1343,7 @@ pub async fn plan(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Pla
         None => worker.model.clone(),
     };
     let provider = worker.provider_for(&model)?;
-    let brief = plan_brief(store, &node).await?;
+    let brief = plan_brief(store, &node, worker).await?;
     tracing::info!(target: crate::trace::PROGRESS, "#{id} {} · plan by {}", node.title, short(&model));
     let answer = provider
         .complete(CompletionRequest {
@@ -1376,14 +1376,40 @@ pub async fn plan(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Pla
     Ok(Plan { id, title: node.title, model, outline, usage: answer.usage })
 }
 
-/// What the planner reads: the project context with the standing direction, the node with its
-/// objective and acceptance, and the cards already under it with their states, so none comes
-/// back twice.
-async fn plan_brief(store: &Store, node: &Node) -> anyhow::Result<String> {
+/// The evidence block the planner reads beside the project context: the look-backs, the shared
+/// machine notes, the ledger's costliest cards of the last day when the worker has a ledger,
+/// and the other projects' digests, as [`ra_context::plan::block`] clips them; empty without
+/// any.
+pub async fn plan_evidence(root: &Path, worker: &Worker) -> String {
+    let mut sources = ra_context::plan::Sources::under(root, &crate::hub::dir());
+    if let Some(ledger) = worker.ledger()
+        && let Ok(cards) = ledger.costliest_cards(ra_usage::LAST_DAY, crate::plan::evidence::LEDGER_CARDS).await
+    {
+        sources.ledger = cards
+            .iter()
+            .map(|card| ra_context::plan::LedgerCard {
+                node: card.node,
+                cost_usd: card.totals.cost_usd,
+                turns: card.totals.turns,
+                tokens_per_turn: card.tokens_per_turn(),
+            })
+            .collect();
+    }
+    ra_context::plan::block(&sources)
+}
+
+/// What the planner reads: the project context with the standing direction, the evidence of
+/// the runs so far, the node with its objective and acceptance, and the cards already under it
+/// with their states, so none comes back twice.
+async fn plan_brief(store: &Store, node: &Node, worker: &Worker) -> anyhow::Result<String> {
     let mut text = String::new();
     let context = project_direction(store).await?;
     if !context.trim().is_empty() {
         let _ = writeln!(text, "# Project context\n{}", context.trim_end());
+    }
+    let evidence = plan_evidence(&workspace_of(store), worker).await;
+    if !evidence.is_empty() {
+        let _ = writeln!(text, "\n{}", evidence.trim_end());
     }
     let _ = writeln!(text, "\n# {} #{} {}", node.kind, node.id, node.title);
     if let Some(objective) = &node.objective {
@@ -1703,6 +1729,11 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             .await;
             return Ok(lines);
         }
+        // the ledger's mark before the run: the rows after it are the run's
+        let mark = match worker.ledger() {
+            Some(ledger) => ledger.last_id().await.ok(),
+            None => None,
+        };
         match run_picked(store, id, worker, tight).await {
             Ok(run_lines) => lines.extend(run_lines),
             Err(error) => {
@@ -1712,6 +1743,10 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         }
         ran += 1;
         planned = false;
+        // the card's claimed saving is judged on the run's own rows, as it lands
+        if let (Some(mark), Some(ledger), Ok(node)) = (mark, worker.ledger(), store.read(id).await) {
+            lines.extend(crate::retro::landed(&root, &node, ledger, mark).await);
+        }
         if stop_on_revision && store.read(id).await?.state == TaskState::NeedsRevision {
             done(&mut lines, format!("ran {ran} card(s) · stopped: #{id} needs revision")).await;
             return Ok(lines);
@@ -2052,13 +2087,21 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let acting = workspace_dir.clone().unwrap_or_else(|| root.clone());
     // what is dirty before the run, so the handoff names only what the run changed
     let dirty_before = git_status(&acting).await;
+    let run_started = std::time::SystemTime::now();
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
-    // the session of the last run of this node, so the harness keeps its context, unless it is
-    // stale: then the brief and the handoffs carry it, and the run says so first
-    let (resume, fresh) = match resume_of(&node, unix_now()) {
-        Ok(resume) => (resume, None),
-        Err(reason) => (None, Some(format!("  fresh start: {reason}; the brief and the handoffs go instead"))),
+    // a rerun opens a fresh session on the verdict alone: resuming the last session would pay
+    // its whole transcript again for a few lines of judgment. Any other run keeps the session
+    // of the last one, so the harness keeps its context, unless it is stale: then the brief and
+    // the handoffs carry it, and the run says so first
+    let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
+    let (resume, fresh) = if rerun.is_some() {
+        (None, Some("  fresh start: a rerun carries the verdict and the failing check, not the transcript".to_owned()))
+    } else {
+        match resume_of(&node, unix_now()) {
+            Ok(resume) => (resume, None),
+            Err(reason) => (None, Some(format!("  fresh start: {reason}; the brief and the handoffs go instead"))),
+        }
     };
     if let Some(fresh) = &fresh {
         tracing::info!(target: crate::trace::PROGRESS, "{}", fresh.trim_start());
@@ -2070,7 +2113,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
-                messages: harness_messages(&task, &project, &root, worker.debug),
+                messages: harness_messages(&task, rerun.as_deref(), &project, &root, worker.debug),
                 temperature: Some(0.4),
                 max_tokens: Some(4096),
                 tools: Vec::new(),
@@ -2125,7 +2168,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             Err(error) => Err(map_error(error)),
         }
     } else {
-        tool_loop(provider.as_ref(), worker, id, bare_context(&task, &project, worker.debug), workspace.as_deref(), budget, caps).await
+        let context = bare_context(&task, rerun.as_deref(), &project, worker.debug);
+        tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref(), budget, caps).await
     };
     // the handoff of this run, for the next one of the card; the done cards' files go
     let handoff = |outcome: &str, check: &str, report: &str, changed: Vec<String>| ra_context::Handoff {
@@ -2146,7 +2190,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 store.set_notes(id, &over.to_string()).await?;
             }
             store.set_state_by(id, TaskState::Failed, Source::Run).await?;
-            let changed = ra_context::changed_between(&dirty_before, &git_status(&acting).await);
+            let changed = run_changed(&acting, &dirty_before, &git_status(&acting).await, run_started);
             task.record(handoff("failed", "no check: the run failed", &format!("{error:#}"), changed));
             save_context(store, &root, &task).await;
             return Err(error);
@@ -2171,7 +2215,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // run, which the walk starts right away, opens on a small context again
     if let Some(cap) = session.capped {
         store.set_session(id, None, unix_now()).await?;
-        let changed = ra_context::changed_between(&dirty_before, &git_status(&acting).await);
+        let changed = run_changed(&acting, &dirty_before, &git_status(&acting).await, run_started);
         let report = capped_report(cap, &session, &changed, &node);
         store.set_notes(id, &report).await?;
         let why = format!("the turn cap of {cap} ended the run; the card continues in a fresh session");
@@ -2199,14 +2243,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the local checks before the card counts as done: no model call, the acceptance names
     // them (else the project, else the workspace tests), and they run in order up to the first
     // failure
-    let Checks { commands, lint: project_lint } = checks_of(&root, &node);
+    let Checks { commands, lint: project_lint, timeout } = checks_of(&root, &node);
     let command = commands.join(" · ");
-    let toolbox = worker.toolbox(workspace_dir.as_deref().unwrap_or(Path::new(".")));
+    let toolbox = worker.toolbox(workspace_dir.as_deref().unwrap_or(Path::new("."))).map(|toolbox| toolbox.with_timeout(timeout));
     // a cargo check builds in a target another project may share: the hub's lock on it, so
     // two builds do not fight over the directory
     let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root).await } else { None };
     let checks = run_checks(&toolbox, &commands).await;
-    let mut changed = ra_context::changed_between(&dirty_before, &git_status(&acting).await);
+    let mut changed = run_changed(&acting, &dirty_before, &git_status(&acting).await, run_started);
     // a fix pass edits the files the run before it dirtied, which `git status` shows no
     // differently: its change is the run's and its own together, so the lint reads the lines
     // it was sent to fix and the handoff still names them
@@ -2434,8 +2478,9 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
 /// The messages of a harness run: the worker's role, the project context and the machine notes
 /// as system messages, the task as the user turn. The machine notes name what tripped the last
 /// runs, so the worker does not find out the hard way again, and the warnings the last run of
-/// the card left, so a second attempt opens on the exact lines.
-fn harness_messages(task: &ra_context::TaskContext, project: &str, root: &Path, debug: bool) -> Vec<Message> {
+/// the card left, so a second attempt opens on the exact lines. On a rerun the `rerun` block
+/// stands in for the handoffs.
+fn harness_messages(task: &ra_context::TaskContext, rerun: Option<&str>, project: &str, root: &Path, debug: bool) -> Vec<Message> {
     let mut messages = vec![Message::system(SYSTEM)];
     if !project.is_empty() {
         messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
@@ -2451,8 +2496,21 @@ fn harness_messages(task: &ra_context::TaskContext, project: &str, root: &Path, 
     if debug {
         messages.push(Message::system(crate::retro::PROMPT));
     }
-    messages.push(Message::user(task.prompt()));
+    messages.push(Message::user(task_text(task, rerun)));
     messages
+}
+
+/// The task as the worker reads it: the brief, the outlines and the last handoffs, or on a
+/// rerun the brief, the outlines and the `rerun` block in place of the handoffs, whose reports
+/// are the transcript the rerun does not pay for.
+fn task_text(task: &ra_context::TaskContext, rerun: Option<&str>) -> String {
+    match rerun {
+        None => task.prompt(),
+        Some(block) => {
+            let bare = ra_context::TaskContext { handoffs: Vec::new(), ..task.clone() };
+            format!("{}\n{block}", bare.prompt())
+        }
+    }
 }
 
 /// The other projects' digests as a block of the system prompt, one line each, so the worker
@@ -2467,8 +2525,13 @@ fn digest_block(lines: &[String]) -> String {
 
 /// The task of a bare model, which reads the project context at the head of it and, in debug
 /// mode, the ask for its look back at the end.
-fn bare_context(task: &ra_context::TaskContext, project: &str, debug: bool) -> String {
-    let context = task.prompt();
+fn bare_context(task: &ra_context::TaskContext, rerun: Option<&str>, project: &str, debug: bool) -> String {
+    let mut context = task_text(task, rerun);
+    // a harness reads the last lint's warnings in its system messages; a bare model read them
+    // in the handoff, which a rerun leaves out, so they ride after the verdict instead
+    if rerun.is_some() && !task.last_warnings().is_empty() {
+        writeln!(context, "\n{}", warnings_note(task)).unwrap();
+    }
     let mut text = if project.is_empty() { context } else { format!("The project:\n{project}\n\n{context}") };
     if debug {
         text.push_str("\n\n");
@@ -2492,10 +2555,12 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let Prepared { workspace, root, task, project, budget, caps, effort } = prepare(store, &node, worker, false).await?;
     let harness = provider.has_own_tools();
     let checks = checks_of(&root, &node);
+    let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
+    let resume = if rerun.is_some() { Err("a rerun starts fresh on the verdict".to_owned()) } else { resume_of(&node, unix_now()) };
     let messages = if harness {
-        harness_messages(&task, &project, &root, worker.debug)
+        harness_messages(&task, rerun.as_deref(), &project, &root, worker.debug)
     } else {
-        vec![Message::system(SYSTEM), Message::user(bare_context(&task, &project, worker.debug))]
+        vec![Message::system(SYSTEM), Message::user(bare_context(&task, rerun.as_deref(), &project, worker.debug))]
     };
     let request = CompletionRequest {
         model: worker.model.clone(),
@@ -2505,7 +2570,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
         tools: if harness { Vec::new() } else { ra_tools::Toolbox::specs() },
         workspace,
         budget_usd: budget,
-        resume: resume_of(&node, unix_now()).unwrap_or_default(),
+        resume: resume.clone().unwrap_or_default(),
         max_turns: caps.limit(),
         effort: Some(effort.to_string()),
     };
@@ -2521,7 +2586,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             budget.map_or_else(|| "none".to_owned(), |b| format!("${b:.2}")),
             caps.hard.map_or_else(|| "none".to_owned(), |c| c.to_string()),
             caps.restart.map_or_else(String::new, |r| format!(" · fresh session after {r} turns")),
-            match resume_of(&node, unix_now()) {
+            match resume {
                 Ok(Some(session)) => session,
                 Ok(None) => "none".to_owned(),
                 Err(reason) => format!("none, {reason}"),
@@ -2732,6 +2797,29 @@ pub fn workspace_of(store: &Store) -> PathBuf {
     store.path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
+/// The files a run changed: the ones whose status line is new since the run began, and the
+/// dirty ones it wrote to in the same time, by their modification time. A file another card
+/// had already left dirty keeps its status line when this run edits it again, and the status
+/// difference alone missed it: the reviewer then judged the card on a diff without its main
+/// file (#152).
+fn run_changed(root: &Path, before: &str, after: &str, since: std::time::SystemTime) -> Vec<String> {
+    let mut changed = ra_context::changed_between(before, after);
+    for line in after.lines() {
+        let Some(path) = line.get(3..) else { continue };
+        let path = path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"');
+        if changed.iter().any(|c| c == path) {
+            continue;
+        }
+        let touched = std::fs::metadata(root.join(path)).and_then(|m| m.modified()).is_ok_and(|m| m >= since);
+        if touched {
+            changed.push(path.to_owned());
+        }
+    }
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
 /// `git status --porcelain` of `root`, or nothing where git has nothing to say.
 async fn git_status(root: &Path) -> String {
     match tokio::process::Command::new("git").args(["status", "--porcelain"]).current_dir(root).output().await {
@@ -2771,17 +2859,21 @@ struct Checks {
     commands: Vec<String>,
     /// The project's `lint` as the `[worker]` table has it; `None` leaves clippy in place.
     lint: Option<String>,
+    /// How long each check, and the lint, may run: the project's `check_timeout`.
+    timeout: std::time::Duration,
 }
 
 impl Checks {
-    /// One line naming both, for the dry run header, the activity log and the pair log.
+    /// One line naming both, for the dry run header, the activity log and the pair log; the
+    /// time limit only when the project set its own.
     fn describe(&self) -> String {
         let lint = match self.lint.as_deref() {
             None => "clippy over the changed crates",
             Some("") => "none",
             Some(command) => command,
         };
-        format!("check: {} · lint: {lint}", self.commands.join(" · then "))
+        let limit = if self.timeout == ra_tools::DEFAULT_TIMEOUT { String::new() } else { format!(" · {} s", self.timeout.as_secs()) };
+        format!("check: {}{limit} · lint: {lint}", self.commands.join(" · then "))
     }
 }
 
@@ -2792,6 +2884,7 @@ fn checks_of(root: &Path, node: &Node) -> Checks {
     Checks {
         commands: check_commands_or(node.acceptance.as_deref(), worker.check().unwrap_or(DEFAULT_CHECK)),
         lint: worker.lint().map(str::to_owned),
+        timeout: worker.check_timeout(),
     }
 }
 
@@ -3710,6 +3803,82 @@ fn resume_of(node: &Node, now: u64) -> Result<Option<String>, String> {
         return Err("the session is older than a day".to_owned());
     }
     Ok(Some(session.to_owned()))
+}
+
+/// Whether a run of `node` is a rerun: the card came back from its check or its reviewer, or a
+/// fix pass is on it. A rerun opens a fresh session and reads the verdict, not the transcript.
+fn is_rerun(node: &Node, worker: &Worker) -> bool {
+    node.state == TaskState::NeedsRevision || worker.fix.is_some()
+}
+
+/// How many lines of the failing check a rerun reads: the failures lead the block, so what is
+/// past this is the noise around them.
+const RERUN_CHECK_LINES: usize = 30;
+
+/// What a rerun reads in place of the handoffs: the last run's check line, its verdict and the
+/// files it changed, then from the head of the notes the reviewer's points and the failing
+/// check's output, clipped. The reports of the earlier runs stay in the file: a rerun pays for
+/// the judgment, not the transcript. `None` when no run is behind the card.
+fn rerun_block(task: &ra_context::TaskContext, node: &Node) -> Option<String> {
+    let last = task.handoffs.last()?;
+    let mut text = format!("The last run of this card came back; take it up on these lines, not afresh:\ncheck: {}\n", last.check.trim());
+    if let Some(verdict) = &last.verdict {
+        writeln!(text, "verdict: {}", verdict.trim()).unwrap();
+    }
+    if !last.changed.is_empty() {
+        writeln!(text, "changed: {}", last.changed.join(" ")).unwrap();
+    }
+    for block in judgment_of(node.notes.as_deref().unwrap_or_default()) {
+        writeln!(text, "\n{block}").unwrap();
+    }
+    Some(text)
+}
+
+/// The judgment at the head of a card's notes: the reviewer's verdict with its points, and the
+/// failing check's command and output up to its exit line, each a block, the check's clipped to
+/// [`RERUN_CHECK_LINES`] with its first and last lines kept. Nothing once the notes reach the
+/// checks that passed or the worker's own report.
+pub(crate) fn judgment_of(notes: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut lines = notes.lines().peekable();
+    while let Some(first) = lines.next() {
+        if first.starts_with("review by ") {
+            let mut block = vec![first];
+            while let Some(point) = lines.next_if(|l| l.starts_with("- ")) {
+                block.push(point);
+            }
+            blocks.push(block.join("\n"));
+        } else if first.starts_with("check failed: ") {
+            let mut block = vec![first];
+            // the output ends at its exit line; a command that could not run has none, so the
+            // scan also stops where the next block starts, and past what the notes keep of a
+            // failed check (its failures and the tail) regardless
+            for line in lines.by_ref() {
+                if line.starts_with("check passed: ") || block.len() >= 3 * TAIL_LINES {
+                    break;
+                }
+                block.push(line);
+                if line.starts_with("exit code ") {
+                    break;
+                }
+            }
+            blocks.push(clip_middle(&block));
+        } else if !first.trim().is_empty() {
+            break;
+        }
+    }
+    blocks
+}
+
+/// `lines` as a text, whole under [`RERUN_CHECK_LINES`], else their head and tail around a line
+/// that counts what is left in the notes of the card.
+fn clip_middle(lines: &[&str]) -> String {
+    if lines.len() <= RERUN_CHECK_LINES {
+        return lines.join("\n");
+    }
+    let half = RERUN_CHECK_LINES / 2;
+    let dropped = lines.len() - 2 * half;
+    format!("{}\n… {dropped} more lines in the notes of the card\n{}", lines[..half].join("\n"), lines[lines.len() - half..].join("\n"))
 }
 
 /// Whether a revised field is template text the model echoed back, such as `<the revised

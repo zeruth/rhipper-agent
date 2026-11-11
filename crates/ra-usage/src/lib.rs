@@ -246,6 +246,16 @@ impl UsageStore {
         Ok(totals_of(&row))
     }
 
+    /// The totals over the rows up to and including the row `until`: what the ledger held
+    /// before a run, as its saving is judged against it.
+    ///
+    /// # Errors
+    /// When the query fails.
+    pub async fn totals_until(&self, until: i64) -> anyhow::Result<Totals> {
+        let row = sqlx::query(concat!("select ", sums!(), " from usage where id <= ?")).bind(until).fetch_one(&self.pool).await?;
+        Ok(totals_of(&row))
+    }
+
     /// The newest `limit` rows written after the row `after`, the oldest first, with the tokens
     /// and the cost of each; 0 reads from the start.
     ///

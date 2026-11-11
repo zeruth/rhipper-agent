@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 pub mod digest;
+pub mod plan;
 
 /// The project context, beside the roadmap file.
 pub const PROJECT_FILE: &str = "rhipper.context.md";

@@ -722,6 +722,48 @@ async fn three_cards(dir: &std::path::Path, passing: bool) -> Store {
 }
 
 #[tokio::test]
+async fn a_walk_judges_a_landed_cards_saving_on_the_ledger_before_and_after_its_run() {
+    use ra_roadmap::store::Card;
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    // the card claims fewer tokens a turn, on a lesson another project shared
+    let card = Card { saving: Some("fewer tokens a turn"), evidence: Some("notes.log:3"), ..Card::new() };
+    let id = store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, "Smaller reads", &card).await.unwrap();
+    // the ledger carried 1000 tokens a turn before the run; the scripted run's calls carry 110
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    let before = ra_usage::Entry {
+        model: "claude-opus-5-5".to_owned(),
+        role: None,
+        node: None,
+        prompt_tokens: 1800,
+        completion_tokens: 200,
+        cached_tokens: 0,
+        cost_usd: None,
+        cost_computed: false,
+        turns: 2,
+    };
+    ledger.record(&before).await.unwrap();
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(accepted_runs(&["did it"]))).with_ledger(ledger);
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    let held = format!("[saving] #{id} held: claimed \"fewer tokens a turn\"; 1000 tokens a turn before, 110 after");
+    assert!(out.contains(&held), "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 1 card(s) · no card is ready");
+    // the verdict is under the card, shared as a machine note since the lesson held here too
+    let notes = crate::retro::recent(dir.path(), 5);
+    assert_eq!((notes.len(), notes[0].node, notes[0].machine, notes[0].text.as_str()), (1, Some(id), true, held.as_str()));
+    // another project's planner reads it as evidence, tagged; its workers' prompts do not
+    let other = tempfile::tempdir().unwrap();
+    let evidence = crate::retro::evidence(other.path());
+    assert!(evidence.iter().any(|l| l.source.starts_with("notes.log:") && l.text.ends_with(&format!("[machine] {held}"))), "{evidence:?}");
+    assert!(!crate::retro::machine_lines(other.path()).contains("[saving]"));
+    // a second walk has nothing to judge: the card is done and its claim read
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    assert_eq!(out, vec!["ran 0 card(s) · no card is ready"]);
+    assert_eq!(crate::retro::recent(dir.path(), 5).len(), 1);
+}
+
+#[tokio::test]
 async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_dependency() {
     let dir = tempfile::tempdir().unwrap();
     let store = three_cards(dir.path(), true).await;
@@ -1789,6 +1831,33 @@ async fn the_projects_check_stands_in_for_the_workspace_tests_and_an_empty_lint_
     assert!(out.iter().any(|l| l.contains("check passed: cargo test -q")), "{out:?}");
 }
 
+#[tokio::test]
+async fn the_projects_check_timeout_shows_on_the_dry_run_and_bounds_the_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // without the key the toolbox's ten minutes stand, and the line does not say so
+    let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("check: cargo test --workspace -q · lint: clippy over the changed crates")), "{out:?}");
+    std::fs::write(
+        dir.path().join(crate::router::ROUTES_FILE),
+        "[worker]\ncheck = \".\\\\gw.ps1 :m:task\"\nlint = \"\"\ncheck_timeout = 1800\n",
+    )
+    .unwrap();
+    let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("check: .\\gw.ps1 :m:task · 1800 s · lint: none")), "{out:?}");
+    // the check runs under the project's limit and passes; the start line carries the limit
+    let (seen, out) = run_writing_extra(dir.path()).await;
+    assert_eq!(seen, [".\\gw.ps1 :m:task"]);
+    assert!(out.iter().any(|l| l.contains("check passed: .\\gw.ps1 :m:task")), "{out:?}");
+    let pair = crate::pair::recent(dir.path(), 10);
+    assert!(
+        pair.iter().any(|l| l.starts_with("start #2 Probe") && l.contains("check: .\\gw.ps1 :m:task · 1800 s · lint: none")),
+        "{pair:?}"
+    );
+}
+
 /// The answer of a reassessment that keeps the text: the three lines the prompt asks for.
 fn keeps(objective: &str, acceptance: &str) -> ra_providers::Completion {
     says(&format!("overview: already sharp\nobjective: {objective}\nacceptance: {acceptance}"), Vec::new())
@@ -2076,10 +2145,62 @@ async fn a_second_run_of_a_node_resumes_its_session() {
     let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
     run("/run 2", &store, &runner).await.unwrap();
     assert_eq!(store.read(2).await.unwrap().session.as_deref(), Some("sess-1"));
+    // the person takes the card up again rather than the check sending it back: not a rerun
+    store.set_state(2, ra_roadmap::model::TaskState::InProgress).await.unwrap();
     run("/run 2", &store, &runner).await.unwrap();
     let seen = script.seen.lock();
     assert_eq!(seen[0].resume, None, "a first run has nothing to resume");
     assert_eq!(seen[1].resume.as_deref(), Some("sess-1"), "the second run resumes the first");
+}
+
+#[tokio::test]
+async fn a_rerun_of_a_card_sent_back_starts_fresh_on_the_verdict_without_the_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Greet parent 1", &store, &worker()).await.unwrap();
+    // the check passes, so the reviewer judges the first run and sends the card back; the fix
+    // role is off in the tests, so the next run is a plain rerun, which the reviewer accepts
+    let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\nexit code 0\n".to_owned())));
+    let provider = Scripted::new(vec![
+        says("wrote the greeting into hello.rs and read it back", vec![]),
+        says("needs revision\n- rename greet to salute", vec![]),
+        says("renamed it", vec![]),
+        says("accepted", vec![]),
+    ]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(script);
+    run("/run 2", &store, &worker).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("fresh start: a rerun carries the verdict")), "{}", out.join("\n"));
+    let seen = provider.seen.lock();
+    assert_eq!(seen.len(), 4);
+    let prompt = &seen[2].messages.last().unwrap().content;
+    assert!(prompt.contains("Task #2: Greet"), "{prompt}");
+    assert!(prompt.contains("verdict: needs revision (") && prompt.contains("- rename greet to salute"), "{prompt}");
+    assert!(!prompt.contains("wrote the greeting into hello.rs"), "the transcript of the first run went along:\n{prompt}");
+    assert!(!prompt.contains("Earlier runs of this task"), "{prompt}");
+    assert_eq!(seen[2].resume, None);
+    // the file keeps both runs for the person; the rerun did not pay for them
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    assert_eq!(task.handoffs.len(), 2, "{:?}", task.handoffs);
+}
+
+#[test]
+fn the_judgment_of_the_notes_is_the_verdict_and_the_failing_check_clipped_and_nothing_after() {
+    use crate::agent::judgment_of;
+    let notes = "review by m: needs revision (trivial)\n- a point\n\ncheck failed: cargo test -q\ntest a ... FAILED\n\nfailures:\n    a\nexit code 101\n\ncheck passed: python x.py · exit code 0\nok\nexit code 0\n\nthe worker's report";
+    let blocks = judgment_of(notes);
+    assert_eq!(blocks[0], "review by m: needs revision (trivial)\n- a point");
+    assert_eq!(blocks[1], "check failed: cargo test -q\ntest a ... FAILED\n\nfailures:\n    a\nexit code 101");
+    assert_eq!(blocks.len(), 2);
+    // a long output keeps its head and its tail
+    let long: Vec<String> = (0..60).map(|i| format!("line {i}")).collect();
+    let notes = format!("check failed: x\n{}\nexit code 1\n\nreport", long.join("\n"));
+    let block = &judgment_of(&notes)[0];
+    assert!(block.starts_with("check failed: x\nline 0\n") && block.ends_with("line 59\nexit code 1"), "{block}");
+    assert!(block.contains("… 32 more lines in the notes of the card"), "{block}");
+    assert!(!block.contains("report"));
+    assert!(judgment_of("the worker's report\n\ncheck failed: x").is_empty());
 }
 
 #[tokio::test]
@@ -2093,6 +2214,7 @@ async fn a_changed_objective_drops_the_resume() {
     let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
     run("/run 2", &store, &runner).await.unwrap();
     store.set_details(2, Some("another goal"), None).await.unwrap();
+    store.set_state(2, ra_roadmap::model::TaskState::InProgress).await.unwrap();
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     let seen = script.seen.lock();
     assert_eq!(seen[1].resume, None, "a changed card starts fresh");

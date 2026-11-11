@@ -78,6 +78,17 @@ impl<'a> Journal<'a> {
             .unwrap_or_default()
     }
 
+    /// The refused commands no gotcha names in several projects' journals, each with the name
+    /// of its project, oldest first within a project: what [`crate::catalog::draft`] reads to
+    /// tell the machine's problem from one project's slip.
+    #[must_use]
+    pub fn refused_across(journals: &[(&str, &Path)]) -> Vec<(String, String)> {
+        journals
+            .iter()
+            .flat_map(|(project, path)| Journal::at(path).unmatched().into_iter().map(move |command| ((*project).to_owned(), command)))
+            .collect()
+    }
+
     /// The ids of the last `limit` hits, newest first, for the machine notes of the next run.
     #[must_use]
     pub fn recent(&self, limit: usize) -> Vec<String> {

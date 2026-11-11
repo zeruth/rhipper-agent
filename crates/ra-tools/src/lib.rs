@@ -14,12 +14,12 @@ use ra_providers::{ToolCall, ToolSpec};
 use serde::Deserialize;
 use serde_json::json;
 
-/// The most characters a tool answer carries; a longer one is cut and says so.
-const MAX_OUTPUT: usize = 16_000;
+use commands::clip;
+
+mod commands;
+
 /// The most matches a search reports.
 const MAX_HITS: usize = 200;
-/// How long a command may run.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 /// The directories a search and a listing skip.
 const SKIPPED_DIRS: [&str; 4] = [".git", "target", "node_modules", "var"];
 
@@ -27,11 +27,16 @@ const SKIPPED_DIRS: [&str; 4] = [".git", "target", "node_modules", "var"];
 /// answers with the exit code and the output, or with why the command could not run.
 pub type Script = Arc<dyn Fn(&str) -> anyhow::Result<(i32, String)> + Send + Sync>;
 
+/// How long a command may run unless the project says otherwise.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_mins(10);
+
 /// The tools over one workspace.
 #[derive(Clone)]
 pub struct Toolbox {
     root: PathBuf,
     script: Option<Script>,
+    /// How long a command may run before it is stopped.
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for Toolbox {
@@ -48,7 +53,7 @@ impl Toolbox {
     pub fn new(root: &Path) -> anyhow::Result<Self> {
         let root = root.canonicalize().with_context(|| format!("no workspace at {}", root.display()))?;
         anyhow::ensure!(root.is_dir(), "the workspace {} is not a directory", root.display());
-        Ok(Self { root, script: None })
+        Ok(Self { root, script: None, timeout: DEFAULT_TIMEOUT })
     }
 
     /// The same toolbox, with `script` answering every command instead of the shell.
@@ -56,6 +61,19 @@ impl Toolbox {
     pub fn with_script(mut self, script: Script) -> Self {
         self.script = Some(script);
         self
+    }
+
+    /// The same toolbox, stopping a command after `timeout` instead of the default.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// How long a command may run here.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// The workspace.
@@ -278,76 +296,6 @@ impl Toolbox {
             _ => hits.join("\n"),
         })
     }
-
-    /// Runs an allowlisted command in the workspace under the ten-minute limit, for a check:
-    /// whether it exited with code 0, and its whole output ending with the exit line.
-    ///
-    /// # Errors
-    /// When the command is off the allowlist, cannot start or runs past the limit.
-    pub async fn check(&self, command: &str) -> anyhow::Result<(bool, String)> {
-        let text = self.run(command, true).await?;
-        let passed = text.lines().last() == Some("exit code 0");
-        Ok((passed, text))
-    }
-
-    /// Runs a command the person wrote in a card's acceptance, under the same limit and with
-    /// the same answer as [`check`](Self::check), but past the allowlist: the acceptance names
-    /// the project's own checks (a gradle wrapper, a python script), which a model never gets.
-    /// A `.ps1`, `.py` or `.sh` program starts through its interpreter, since none of them is an
-    /// executable on every platform.
-    ///
-    /// # Errors
-    /// When the command is empty, cannot start or runs past the limit.
-    pub async fn check_acceptance(&self, command: &str) -> anyhow::Result<(bool, String)> {
-        let text = self.run(command, false).await?;
-        let passed = text.lines().last() == Some("exit code 0");
-        Ok((passed, text))
-    }
-
-    async fn run(&self, command: &str, allowlisted: bool) -> anyhow::Result<String> {
-        let mut parts = command.split_whitespace();
-        let program = parts.next().context("the command is empty")?;
-        let mut args: Vec<&str> = parts.collect();
-        anyhow::ensure!(
-            !allowlisted || allowed(program, &args),
-            "{program} is not allowed; the commands are cargo, and git status, diff, log and show"
-        );
-        let (code, mut text) = if let Some(script) = &self.script {
-            let (code, text) = script(command)?;
-            (Some(code), text)
-        } else {
-            let program = match interpreter_of(program) {
-                Some((interpreter, leading)) => {
-                    args.splice(0..0, leading.iter().copied().chain(std::iter::once(program)));
-                    interpreter
-                }
-                None => program,
-            };
-            let child =
-                tokio::process::Command::new(program).args(&args).current_dir(&self.root).stdin(std::process::Stdio::null()).output();
-            let output = tokio::time::timeout(COMMAND_TIMEOUT, child)
-                .await
-                .map_err(|_| anyhow::anyhow!("{program} ran past {} seconds and was stopped", COMMAND_TIMEOUT.as_secs()))?
-                .with_context(|| format!("cannot start {program}"))?;
-            let mut text = String::new();
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-            if !output.stderr.is_empty() {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str(&String::from_utf8_lossy(&output.stderr));
-            }
-            (output.status.code(), text)
-        };
-        if !text.ends_with('\n') && !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&match code {
-            Some(code) => format!("exit code {code}"),
-            None => "stopped by a signal".to_owned(),
-        });
-        Ok(text)
-    }
 }
 
 /// The name of the crate that owns `file`, a workspace-relative path: the `[package]` of the
@@ -463,39 +411,6 @@ pub fn warnings_within(output: &str, ranges: &[(String, u32, u32)]) -> Vec<Strin
             })
         })
         .collect()
-}
-
-/// The interpreter a script program starts through, and the arguments before the script's
-/// path; None for a program that starts by itself.
-fn interpreter_of(program: &str) -> Option<(&'static str, &'static [&'static str])> {
-    let extension = Path::new(program).extension()?.to_str()?;
-    match extension {
-        "ps1" => Some(("powershell", &["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])),
-        "py" => Some(("python", &[])),
-        "sh" => Some(("sh", &[])),
-        _ => None,
-    }
-}
-
-/// Whether a command is on the allowlist: any cargo subcommand, and the git commands that only
-/// read the repository.
-fn allowed(program: &str, args: &[&str]) -> bool {
-    match program {
-        "cargo" => true,
-        "git" => matches!(args.first().copied(), Some("status" | "diff" | "log" | "show")),
-        _ => false,
-    }
-}
-
-/// A tool answer within the limit; a long one keeps its head and its tail, since a build log
-/// opens with the first error and closes with the verdict.
-fn clip(text: &str) -> String {
-    if text.chars().count() <= MAX_OUTPUT {
-        return text.to_owned();
-    }
-    let head: String = text.chars().take(MAX_OUTPUT / 2).collect();
-    let tail: String = text.chars().rev().take(MAX_OUTPUT / 2).collect::<Vec<_>>().into_iter().rev().collect();
-    format!("{head}\n… {} characters cut …\n{tail}", text.chars().count() - MAX_OUTPUT)
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(args: serde_json::Value) -> anyhow::Result<T> {

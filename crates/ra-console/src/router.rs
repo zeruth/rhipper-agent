@@ -102,6 +102,7 @@ impl fmt::Display for Rule {
 /// check = ".\\gw.ps1 :core:test"         # the check of a card whose acceptance names none
 /// lint = ""                             # the lint after a passed check; empty is none, absent is clippy
 /// turns = 20                            # a run ends after this many turns and the card goes on in a fresh session
+/// check_timeout = 1800                  # the seconds a check or the lint may run; 600 without it
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -126,9 +127,20 @@ pub struct WorkerConfig {
     /// run goes on until it answers.
     #[serde(default)]
     pub turns: Option<u32>,
+    /// The seconds a card's check, or its lint, may run before it is stopped and counts as
+    /// failed; absent or zero, the toolbox's ten minutes. A suite that builds and runs every
+    /// reference program outgrows that (rhipper-asm #69), and the project says so here.
+    #[serde(default)]
+    pub check_timeout: Option<u64>,
 }
 
 impl WorkerConfig {
+    /// How long a check or the lint may run: the table's seconds, else the toolbox's default.
+    #[must_use]
+    pub fn check_timeout(&self) -> std::time::Duration {
+        self.check_timeout.filter(|secs| *secs > 0).map_or(ra_tools::DEFAULT_TIMEOUT, std::time::Duration::from_secs)
+    }
+
     /// The project's default check, when the table names a non-empty one.
     #[must_use]
     pub fn check(&self) -> Option<&str> {

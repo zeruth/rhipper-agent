@@ -350,6 +350,9 @@ enum Command {
         /// Drafts rhipper.context.md from the workspace when there is none; an existing file is kept.
         #[arg(long)]
         init: bool,
+        /// The evidence block the milestone planner reads: the look-backs, the shared notes, the ledger's costliest cards, the other projects' digests.
+        #[arg(long, conflicts_with_all = ["id", "init"])]
+        plan: bool,
     },
 }
 
@@ -707,8 +710,11 @@ async fn run_main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Context { id, init } => {
+        Command::Context { id, init, plan } => {
             plain_tracing()?;
+            if plan {
+                return plan_context().await;
+            }
             context(id, init).await
         }
     }
@@ -731,6 +737,18 @@ async fn context(id: Option<i64>, init: bool) -> anyhow::Result<()> {
             }
             None => println!("no {}; `rc context --init` drafts one from the workspace", ra_context::PROJECT_FILE),
         },
+    }
+    Ok(())
+}
+
+/// Prints the evidence block the milestone planner reads, as `rc plan <id>` sends it.
+async fn plan_context() -> anyhow::Result<()> {
+    let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
+    let block = ra_console::agent::plan_evidence(Path::new("."), &worker).await;
+    if block.is_empty() {
+        println!("no evidence yet: no look-back, shared note, ledger row or other project's digest");
+    } else {
+        print!("{block}");
     }
     Ok(())
 }

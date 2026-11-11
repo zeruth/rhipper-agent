@@ -329,3 +329,46 @@ fn the_leftovers_are_the_files_of_a_rejected_card_still_dirty_and_a_clean_tree_h
     assert_eq!(found["x.rs"], [7, 9]);
     assert_eq!(found["new.rs"], [9]);
 }
+
+#[test]
+fn the_plan_context_carries_one_clipped_line_from_each_source_of_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("alpha");
+    let hub = dir.path().join("hub");
+    std::fs::create_dir_all(root.join("var")).unwrap();
+    std::fs::create_dir_all(hub.join(plan::DIGEST_DIR)).unwrap();
+    // no file of any source: no block at all
+    let mut sources = plan::Sources::under(&root, &hub);
+    assert_eq!(sources.this, "alpha");
+    assert_eq!(plan::block(&sources), "");
+    // the project's log: a card's line and one longer than the clip, oldest first, only the tail
+    let long = "x".repeat(plan::CLIP + 40);
+    let mut retro = String::new();
+    for n in 0..plan::LINES_A_SOURCE + 2 {
+        retro.push_str(&format!("100\t7\t0\tnote {n}\n"));
+    }
+    retro.push_str(&format!("100\t-\t2\t{long}\n"));
+    std::fs::write(&sources.retro, retro).unwrap();
+    // the shared notes: another project's and this project's own, which is left out
+    std::fs::write(&sources.notes, "100\tbeta\t1\tsed is refused\n100\talpha\t1\tmine\n").unwrap();
+    std::fs::write(
+        sources.digests.join("beta.txt"),
+        "name: beta\npath: C:/code/beta\npid: 1\nwhen: 100\nlast: ✓ #11 Shared notes\nready: 3\n",
+    )
+    .unwrap();
+    std::fs::write(sources.digests.join("alpha.txt"), "name: alpha\npath: C:/code/alpha\npid: 1\nwhen: 100\nready: 1\n").unwrap();
+    sources.ledger = vec![plan::LedgerCard { node: 12, cost_usd: Some(0.5), turns: 16, tokens_per_turn: 1200 }];
+    let block = plan::block(&sources);
+    assert!(block.starts_with("# Evidence\n\n## Look-backs"), "{block}");
+    assert!(block.contains("- retro.log:4 card #7: note 3\n"), "{block}");
+    assert!(!block.contains("note 2\n"), "{block}");
+    assert!(block.contains("- notes.log:1 (beta) sed is refused\n"), "{block}");
+    assert!(!block.contains("mine"), "{block}");
+    assert!(block.contains("- usage.db #12: card #12 cost $0.50 over 16 turn(s), 1200 tokens a turn\n"), "{block}");
+    assert!(block.contains("- beta · last: ✓ #11 Shared notes\n"), "{block}");
+    assert!(!block.contains("alpha ·"), "{block}");
+    // every line fits the clip, and the long one ends in an ellipsis
+    assert!(block.lines().all(|l| l.chars().count() <= plan::CLIP + 2), "{block}");
+    assert!(block.lines().any(|l| l.starts_with("- retro.log:8 x") && l.ends_with('…')), "{block}");
+    assert_eq!(plan::clip("short"), "short");
+}

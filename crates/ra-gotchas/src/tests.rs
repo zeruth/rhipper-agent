@@ -197,6 +197,55 @@ fn the_summary_counts_the_days_hits_by_gotcha_and_tallies_each_unmatched_command
 }
 
 #[test]
+fn a_refused_command_back_a_third_time_across_projects_is_drafted_with_its_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a/var/gotchas.log"), dir.path().join("b/var/gotchas.log"));
+    let refused = |command: &str| Hit { id: UNMATCHED.into(), message: "refused".into(), excerpt: command.into() };
+    // the same command word three times, from two projects, with different arguments
+    Journal::at(&a).record(Some(1), Where::Command, &refused("Select-String -Pattern foo src")).unwrap();
+    Journal::at(&b).record(None, Where::Command, &refused("Select-String foo")).unwrap();
+    Journal::at(&a).record(Some(2), Where::Command, &refused("Select-String bar *.rs")).unwrap();
+    // three times in one project is that project's habit; twice across two is not yet a third time
+    for _ in 0..3 {
+        Journal::at(&a).record(Some(2), Where::Command, &refused("Measure-Object -Line")).unwrap();
+    }
+    Journal::at(&a).record(Some(3), Where::Command, &refused("rm -rf build")).unwrap();
+    Journal::at(&b).record(Some(3), Where::Command, &refused("rm -rf target")).unwrap();
+    let lines = Journal::refused_across(&[("a", &a), ("b", &b)]);
+    assert_eq!(lines.len(), 8);
+    let drafts = catalog::draft(&lines);
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    assert_eq!(
+        (drafts[0].id.as_str(), drafts[0].hits, drafts[0].projects.as_slice()),
+        ("refused-select-string", 3, ["a".to_owned(), "b".to_owned()].as_slice())
+    );
+
+    // the catalogue gains the entry under its mark, and its pre-hook denies the command with the fix
+    let path = dir.path().join("a/var/gotchas.toml");
+    let (catalogue, drafted) = Catalogue::promote(&path, &lines).unwrap();
+    assert_eq!(drafted, ["refused-select-string"]);
+    assert_eq!(catalogue.entries.len(), Catalogue::seed().entries.len() + 1);
+    match catalogue.command("Select-String baz crates", Conditions::default()) {
+        Verdict::Deny { id, reason } => {
+            assert_eq!(id, "refused-select-string");
+            assert!(reason.contains("3 times across 2 projects (a, b)") && reason.contains("Grep"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(catalogue.command("ls | Select-String x", Conditions::default()), Verdict::Deny { .. }));
+    assert_eq!(catalogue.command("ls crates", Conditions::default()), Verdict::Pass);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(&format!("\n{}1 refused in a, b\n", catalog::DRAFT_MARK)), "{text}");
+    assert!(text.ends_with(&drafts[0].block()), "{text}");
+
+    // drafted once: a second pass finds the entry in place and leaves the file alone
+    let (again, drafted) = Catalogue::promote(&path, &lines).unwrap();
+    assert!(drafted.is_empty());
+    assert_eq!(again.entries.len(), catalogue.entries.len());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}
+
+#[test]
 fn a_load_writes_the_seed_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("var/gotchas.toml");
