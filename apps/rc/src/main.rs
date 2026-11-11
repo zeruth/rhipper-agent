@@ -50,11 +50,18 @@ enum Command {
         /// The nodes it waits for.
         waits_for: Vec<i64>,
     },
-    /// Sets the state of a node.
+    /// Sets the state of a node; cancelled removes the card, since a cancelled card does not stay on the roadmap.
     Set {
         id: i64,
         /// The state: one of the twelve lifecycle names.
         state: TaskState,
+    },
+    /// Removes a card; every waits-on reference to it goes with it.
+    Remove {
+        id: i64,
+        /// The card and everything under it; a card with children is refused without it.
+        #[arg(long)]
+        tree: bool,
     },
     /// One round trip to a model: the answer and the usage.
     Ping {
@@ -155,6 +162,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Set { id, state } => {
             plain_tracing()?;
             set(id, state).await
+        }
+        Command::Remove { id, tree } => {
+            plain_tracing()?;
+            let removed = open_store().await?.remove(id, tree).await?;
+            println!("removed {}", removed.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" "));
+            Ok(())
         }
         Command::Ping { model } => {
             plain_tracing()?;
@@ -478,7 +491,11 @@ async fn depend(id: i64, waits_for: &[i64]) -> anyhow::Result<()> {
 async fn set(id: i64, state: TaskState) -> anyhow::Result<()> {
     let store = open_store().await?;
     store.set_state(id, state).await?;
-    println!("#{id} is now {state}");
+    if state == TaskState::Cancelled {
+        println!("#{id} removed: a cancelled card does not stay on the roadmap");
+    } else {
+        println!("#{id} is now {state}");
+    }
     Ok(())
 }
 

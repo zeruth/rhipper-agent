@@ -406,21 +406,28 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
         Err(e) => Err(anyhow::anyhow!("{e:#}")),
     };
     let changed = ra_context::changed_between(&dirty_before, &git_status(&root).await);
+    // a failed check leads the notes and the handoff: the failed tests first, then the tail of
+    // the output, then the worker's answer, so the next run reads the failures before anything
+    let mut report = session.text.clone();
     let (mut passed, mut check_line) = match check {
         Ok((true, _)) => (true, format!("  check passed: {command}")),
         Ok((false, output)) => {
-            store.set_notes(id, &format!("{}\ncheck failed: {command}\n{}", session.text, last_lines(&output, 40))).await?;
-            (false, format!("  check failed: {command} · the output is in the notes"))
+            let failure = check_failure(&output);
+            report = format!("check failed: {command}\n{}\n\n{}", failure.text, session.text);
+            let count = match failure.failed {
+                0 => String::new(),
+                n => format!(" · {n} test(s) failed"),
+            };
+            (false, format!("  check failed: {command}{count} · the output is in the notes"))
         }
         Err(e) => {
-            store.set_notes(id, &format!("{}\ncheck failed: {command}\n{e:#}", session.text)).await?;
+            report = format!("check failed: {command}\n{e:#}\n\n{}", session.text);
             (false, format!("  check failed: {command} · {e:#}"))
         }
     };
     // the lint of what the run changed, once the check passed: the orchestrator finds the
     // warnings so the worker spends no turns on them. A lint that cannot run is a line, not a
     // verdict; a warning in a changed file is.
-    let mut report = session.text.clone();
     let mut lint_lines = Vec::new();
     if passed && let Ok(toolbox) = &toolbox {
         let lint = lint_changed(toolbox, &root, &changed).await;
@@ -592,6 +599,36 @@ pub fn check_command(acceptance: Option<&str>) -> String {
 fn last_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// How many lines of a failed check's output the notes keep after the failures.
+const TAIL_LINES: usize = 40;
+
+/// What a failed check's output comes to for the notes.
+struct CheckFailure {
+    /// The tests cargo marked `FAILED`; zero where the output is not a test run's.
+    failed: usize,
+    /// The `test … FAILED` and `panicked at` lines first, then the last [`TAIL_LINES`] lines.
+    text: String,
+}
+
+/// Reads a failed check's output: the failed tests and the panics lead, the tail follows, so a
+/// reader (the next run, the person) sees what broke before the noise around it. A failed test
+/// is `test name ... FAILED`, or `name --- FAILED` under `-q`; cargo names it again in its
+/// `failures:` list, and the first names are kept, once.
+fn check_failure(output: &str) -> CheckFailure {
+    let mut leading: Vec<&str> = Vec::new();
+    let mut failed = 0;
+    for line in output.lines().map(str::trim) {
+        let is_failure = line.ends_with(" FAILED") && (line.starts_with("test ") || line.contains(" --- "));
+        if (is_failure || line.contains("panicked at")) && !leading.contains(&line) {
+            leading.push(line);
+            failed += usize::from(is_failure);
+        }
+    }
+    let tail = last_lines(output, TAIL_LINES);
+    let text = if leading.is_empty() { tail } else { format!("{}\n\n{tail}", leading.join("\n")) };
+    CheckFailure { failed, text }
 }
 
 /// The machine notes of a run: what the gotchas say about the last hits in the journal, for the
@@ -989,3 +1026,6 @@ fn cost_text(cost: Option<f64>) -> String {
 fn short(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
+
+#[cfg(test)]
+mod tests;

@@ -41,7 +41,10 @@ impl Store {
             };
             std::fs::write(path, render(std::slice::from_ref(&root))).with_context(|| format!("cannot write {}", path.display()))?;
         }
-        Ok(Self { path: path.to_owned() })
+        let store = Self { path: path.to_owned() };
+        // a cancelled card does not exist: a file written before that rule loses them on open
+        store.remove_cancelled().await?;
+        Ok(store)
     }
 
     /// The file the store reads and writes.
@@ -171,11 +174,53 @@ impl Store {
         Ok(())
     }
 
-    /// Sets the state of a node.
+    /// Sets the state of a node. A card set to cancelled is removed with its subtree: a
+    /// cancelled card does not stay on the roadmap, where it would hold its phase open.
     pub async fn set_state(&self, id: i64, state: TaskState) -> anyhow::Result<()> {
+        if state == TaskState::Cancelled {
+            self.remove(id, true).await?;
+            return Ok(());
+        }
         let mut nodes = self.all().await?;
         node_mut(&mut nodes, id)?.state = state;
         self.write(nodes).await
+    }
+
+    /// Removes a node, and with `tree` its subtree; a node with children is refused without
+    /// `tree`, and the project is never removed. Every `waits-on` reference to a removed id goes
+    /// with it. Returns the ids removed, the node first.
+    pub async fn remove(&self, id: i64, tree: bool) -> anyhow::Result<Vec<i64>> {
+        let mut nodes = self.all().await?;
+        let node = nodes.iter().find(|n| n.id == id).with_context(|| format!("no node {id}"))?;
+        anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is the project; it stays");
+        let children: Vec<String> = nodes.iter().filter(|n| n.parent == Some(id)).map(|n| format!("#{}", n.id)).collect();
+        anyhow::ensure!(
+            tree || children.is_empty(),
+            "#{id} has {} card(s) under it ({}); remove them first, or the whole tree",
+            children.len(),
+            children.join(" ")
+        );
+        let removed: Vec<i64> = tree::subtree(&nodes, id).iter().map(|n| n.id).collect();
+        nodes.retain(|n| !removed.contains(&n.id));
+        for n in &mut nodes {
+            n.depends_on.retain(|d| !removed.contains(d));
+        }
+        self.write(nodes).await?;
+        Ok(removed)
+    }
+
+    /// Removes every cancelled card the file holds, with its subtree; how many went. An older
+    /// file may still carry them.
+    pub async fn remove_cancelled(&self) -> anyhow::Result<usize> {
+        let cancelled: Vec<i64> = self.all().await?.iter().filter(|n| n.state == TaskState::Cancelled).map(|n| n.id).collect();
+        let mut gone = 0;
+        for id in cancelled {
+            // a card under a cancelled card went with it already
+            if let Ok(removed) = self.remove(id, true).await {
+                gone += removed.len();
+            }
+        }
+        Ok(gone)
     }
 
     /// Assigns a node to a worker, or clears the assignment with `None`.

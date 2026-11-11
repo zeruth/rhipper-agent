@@ -316,8 +316,10 @@ async fn a_failing_check_leaves_the_node_needing_revision() {
     let (out, node) = checked_run(false).await;
     assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
     let notes = node.notes.unwrap_or_default();
-    assert!(notes.starts_with("done\ncheck failed: cargo test --workspace -q"), "{notes}");
-    assert!(out.iter().any(|l| l.contains("check failed: cargo test --workspace -q")), "{out:?}");
+    // the failed test leads the notes, the answer follows the output
+    assert!(notes.starts_with("check failed: cargo test --workspace -q\nprobe --- FAILED\n"), "{notes}");
+    assert!(notes.ends_with("\n\ndone"), "{notes}");
+    assert!(out.iter().any(|l| l.contains("check failed: cargo test --workspace -q · 1 test(s) failed")), "{out:?}");
 }
 
 #[tokio::test]

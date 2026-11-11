@@ -28,7 +28,8 @@ pub const COMMANDS: &[Spec] = &[
         usage: "<id> [path...]",
         help: "the workspace-relative paths a task touches, read first by its worker; no path clears them",
     },
-    Spec { name: "set", usage: "<id> <state>", help: "sets the state: the twelve lifecycle names" },
+    Spec { name: "set", usage: "<id> <state>", help: "sets the state: the twelve lifecycle names; cancelled removes the card" },
+    Spec { name: "remove", usage: "<id> [tree]", help: "removes a card and every waits-on reference to it; tree takes what is under it too" },
     Spec {
         name: "model",
         usage: "<id>",
@@ -43,7 +44,11 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "reassess-tree", usage: "<id>", help: "reassess for the node and its whole subtree" },
     Spec { name: "final", usage: "<id> [off]", help: "marks a node final, so no reassessment rewrites it; off clears the mark" },
     Spec { name: "seed", usage: "", help: "fills the roadmap with the improvement plan of the agent itself" },
-    Spec { name: "install", usage: "[dir]", help: "installs this build (rc and rc-gui) into a directory on the path; the running instances keep going" },
+    Spec {
+        name: "install",
+        usage: "[dir]",
+        help: "installs this build (rc and rc-gui) into a directory on the path; the running instances keep going",
+    },
     Spec { name: "clear", usage: "", help: "clears the log view" },
     Spec { name: "debug", usage: "", help: "toggles the trace lines in the log; the file copy always runs" },
     Spec { name: "quit", usage: "", help: "stops the console (also exit, or Ctrl+C twice)" },
@@ -160,7 +165,17 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             let id = id_text.parse::<i64>().context("the id is a node id")?;
             let state: TaskState = state_text.parse()?;
             store.set_state(id, state).await?;
-            out.push(format!("#{id} is now {state}"));
+            if state == TaskState::Cancelled {
+                out.push(format!("#{id} removed: a cancelled card does not stay on the roadmap"));
+            } else {
+                out.push(format!("#{id} is now {state}"));
+            }
+        }
+        "remove" | "rm" => {
+            let (id_text, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+            let id = id_text.parse::<i64>().context("usage: remove <id> [tree]")?;
+            let removed = store.remove(id, rest.trim() == "tree").await?;
+            out.push(format!("removed {}", removed.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" ")));
         }
         "seed" => {
             anyhow::ensure!(args.is_empty(), "usage: seed");

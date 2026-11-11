@@ -72,7 +72,8 @@ fn sweep(dir: &Path, lines: &mut Vec<String>) {
 /// path it started with either way.
 fn on_path(dir: &Path) -> String {
     let wanted = dir.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
-    let listed = |path: &str| path.split(if cfg!(windows) { ';' } else { ':' }).any(|p| p.trim_end_matches(['\\', '/']).to_lowercase() == wanted);
+    let listed =
+        |path: &str| path.split(if cfg!(windows) { ';' } else { ':' }).any(|p| p.trim_end_matches(['\\', '/']).to_lowercase() == wanted);
     if std::env::var("PATH").is_ok_and(|p| listed(&p)) {
         return format!("{} is on the path", dir.display());
     }

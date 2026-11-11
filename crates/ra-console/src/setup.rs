@@ -181,7 +181,9 @@ pub async fn init(root: &Path, worker: &Worker, mode: Mode) -> anyhow::Result<Ve
         }
         Mode::Draft | Mode::Import(_) => {
             let import = match &mode {
-                Mode::Import(file) => Some(std::fs::read_to_string(root.join(file)).with_context(|| format!("cannot read {}", file.display()))?),
+                Mode::Import(file) => {
+                    Some(std::fs::read_to_string(root.join(file)).with_context(|| format!("cannot read {}", file.display()))?)
+                }
                 Mode::Draft | Mode::Empty => None,
             };
             let text = outline_from_model(worker, root, import.as_deref()).await?;

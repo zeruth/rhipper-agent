@@ -1,0 +1,55 @@
+//! The tests of the agent loop's local work: what a failed check comes to in the notes.
+
+use super::*;
+
+/// A `cargo test` output with two failures among many passing tests, longer than the tail.
+fn sample_output() -> String {
+    let mut lines = vec!["running 60 tests".to_owned()];
+    for i in 0..50 {
+        lines.push(format!("test store::tests::a_passing_test_{i} ... ok"));
+    }
+    lines.push("test store::tests::a_run_records_its_handoff ... FAILED".to_owned());
+    lines.push("test agent::tests::a_check_names_its_failures ... FAILED".to_owned());
+    lines.push(String::new());
+    lines.push("failures:".to_owned());
+    lines.push(String::new());
+    lines.push("---- store::tests::a_run_records_its_handoff stdout ----".to_owned());
+    lines.push("thread 'store::tests::a_run_records_its_handoff' panicked at crates/ra-roadmap/src/store.rs:42:9:".to_owned());
+    lines.push("assertion `left == right` failed".to_owned());
+    lines.push("  left: 1".to_owned());
+    lines.push(" right: 2".to_owned());
+    lines.push(String::new());
+    lines.push("---- agent::tests::a_check_names_its_failures stdout ----".to_owned());
+    lines.push("thread 'agent::tests::a_check_names_its_failures' panicked at crates/ra-console/src/agent.rs:7:5:".to_owned());
+    lines.push("the check did not name them".to_owned());
+    lines.push(String::new());
+    lines.push("failures:".to_owned());
+    lines.push("    agent::tests::a_check_names_its_failures".to_owned());
+    lines.push("    store::tests::a_run_records_its_handoff".to_owned());
+    lines.push(String::new());
+    lines.push("test result: FAILED. 58 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out".to_owned());
+    lines.join("\n")
+}
+
+#[test]
+fn the_failed_tests_lead_the_notes_of_a_failed_check() {
+    let failure = check_failure(&sample_output());
+    assert_eq!(failure.failed, 2);
+    let lines: Vec<&str> = failure.text.lines().collect();
+    assert_eq!(lines[0], "test store::tests::a_run_records_its_handoff ... FAILED");
+    assert_eq!(lines[1], "test agent::tests::a_check_names_its_failures ... FAILED");
+    assert!(lines[2].contains("panicked at crates/ra-roadmap/src/store.rs:42:9"));
+    assert!(lines[3].contains("panicked at crates/ra-console/src/agent.rs:7:5"));
+    assert_eq!(lines[4], "");
+    // the tail follows the failures and is no longer than the forty lines kept
+    assert_eq!(lines.len(), 5 + TAIL_LINES);
+    assert!(failure.text.ends_with("test result: FAILED. 58 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out"));
+    assert!(!failure.text.contains("a_passing_test_0 "));
+}
+
+#[test]
+fn an_output_without_failed_tests_is_its_tail_alone() {
+    let failure = check_failure("error[E0425]: cannot find value `x`\n --> src/lib.rs:1:1\nerror: could not compile");
+    assert_eq!(failure.failed, 0);
+    assert_eq!(failure.text, "error[E0425]: cannot find value `x`\n --> src/lib.rs:1:1\nerror: could not compile");
+}
