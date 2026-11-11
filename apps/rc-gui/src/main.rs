@@ -4134,10 +4134,11 @@ impl Workspace {
             // width to what it is given, and an open-ended column would grow past the edge
             let right = (total - left - 12.0).max(200.0);
             // the height the two columns may take: the card's share of the window less what
-            // the header above them used, the bubble's own margins and stroke (6 and 3
-            // above and below, 1 of stroke: 20) and the spacing under the card; zero when
-            // the window has no spare room, and then the columns are what they always were
-            let columns = (budget - ui.min_rect().height() - 20.0 - 10.0).max(0.0);
+            // the header above them used and the bubble's own margins and stroke (6 and 3
+            // above and below, 1 of stroke: 20); the spacing under the card is already off
+            // the share. Zero when the window has no spare room, and then the columns are
+            // what they always were
+            let columns = (budget - ui.min_rect().height() - 20.0).max(0.0);
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 let queue = ui.allocate_ui_with_layout(egui::vec2(left, 0.0), Layout::top_down(Align::Min), |ui| {
