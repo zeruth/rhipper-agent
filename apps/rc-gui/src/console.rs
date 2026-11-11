@@ -311,10 +311,11 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let fit = ((room - overhead) / row).floor().max(0.0) as usize;
     let body = if bounded {
-        // the dashboard: the rows the room holds, less the folded line when steps fell off
-        // the top; a run with fewer steps than rows shows them all and pads to its room
+        // the dashboard: the rows the room holds; when steps fell off the top the folded line
+        // is one of them (the skip below counts it), and a run with fewer steps than rows
+        // shows them all and pads to its room
         let rows = fit.max(1);
-        if folded.len() > rows { rows.saturating_sub(1).max(1) } else { folded.len().max(1) }
+        if folded.len() > rows { rows } else { folded.len().max(1) }
     } else if run.live() {
         height.max(fit)
     } else {
@@ -325,7 +326,8 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     // rows end on the card's bottom edge instead of a part of a row short of it; the spacing
     // is this card's alone
     if bounded {
-        let rows = (body + usize::from(hidden > 0)) as f32;
+        // the rows drawn: the folded line stands in for one of the body's when steps hid
+        let rows = body.max(1) as f32;
         let extra = ((room - rows * row) / rows).clamp(0.0, row);
         // on the pixel grid: a fraction of a pixel between rows put the text between pixels,
         // and it snapped up or down a pixel from frame to frame
