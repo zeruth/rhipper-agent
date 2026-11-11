@@ -4020,8 +4020,16 @@ fn resume_of(node: &Node, now: u64) -> Result<Option<String>, String> {
 
 /// Whether a run of `node` is a rerun: the card came back from its check or its reviewer, or a
 /// fix pass is on it. A rerun opens a fresh session and reads the verdict, not the transcript.
+/// The walk takes only a ready card, so the person re-queues a card sent back with `rc set
+/// <id> defined`; that erases the state but not the reviewer's block at the head of the notes,
+/// which stands until the next run writes its report: a card whose notes open with a
+/// `needs revision` review is a rerun whatever its state (rhipper-asm #47: the five points
+/// were in the notes and not in the prompt, and the worker spent its first turns finding them).
 fn is_rerun(node: &Node, worker: &Worker) -> bool {
-    node.state == TaskState::NeedsRevision || worker.fix.is_some()
+    node.state == TaskState::NeedsRevision
+        || worker.fix.is_some()
+        || ra_context::review_of(node.notes.as_deref().unwrap_or_default())
+            .is_some_and(|review| review.lines().next().is_some_and(|first| first.contains("needs revision")))
 }
 
 /// How many lines of the failing check a rerun reads: the failures lead the block, so what is

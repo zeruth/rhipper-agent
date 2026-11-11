@@ -2470,6 +2470,34 @@ async fn a_rerun_of_a_card_sent_back_starts_fresh_on_the_verdict_without_the_tra
 }
 
 #[tokio::test]
+async fn a_card_sent_back_and_requeued_as_defined_is_still_a_rerun() {
+    // rhipper-asm #47: the walk takes only a ready card, so the person re-queued the card with
+    // `set defined`; that erased the state the rerun was keyed on, and the worker's prompt
+    // lost the five points. The review block at the head of the notes is the key now
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Greet parent 1", &store, &worker()).await.unwrap();
+    let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\nexit code 0\n".to_owned())));
+    let provider = Scripted::new(vec![
+        says("wrote the greeting into hello.rs and read it back", vec![]),
+        says("needs revision\n- rename greet to salute", vec![]),
+        says("renamed it", vec![]),
+        says("accepted", vec![]),
+    ]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(script);
+    run("/run 2", &store, &worker).await.unwrap();
+    run("/set 2 defined", &store, &worker).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("fresh start: a rerun carries the verdict")), "{}", out.join("\n"));
+    let seen = provider.seen.lock();
+    let prompt = &seen[2].messages.last().unwrap().content;
+    assert!(prompt.contains("## Review\n") && prompt.contains(")\n- rename greet to salute\n"), "{prompt}");
+    assert!(!prompt.contains("wrote the greeting into hello.rs"), "{prompt}");
+    assert_eq!(seen[2].resume, None);
+}
+
+#[tokio::test]
 async fn a_revision_prompt_lists_the_reviewers_points() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
