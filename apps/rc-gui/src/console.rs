@@ -194,7 +194,12 @@ fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: us
             // finished one shrinks to its cap. Room given is a bound: the card never grows
             // past it, whatever its own height setting
             let bounded = room.is_some();
-            let room = room.unwrap_or_else(|| ui.clip_rect().height());
+            // a bounded card hands the rows what is left under its title once the frame's
+            // margins and stroke (16 and 3) are off the room; the console hands the clip
+            let room = match room {
+                Some(room) => room - 19.0 - ui.min_rect().height(),
+                None => ui.clip_rect().height(),
+            };
             run_steps(ui, run, room, bounded);
             // a bounded card is exactly its room tall, live or finished: the dashboard gives
             // the run the height of the queue beside it, and the two read as one band. The
@@ -292,13 +297,15 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     // cap or fewer. In the console the room is the clip rect, and the card's own frame, title,
     // folded line and the spacing under it come off it before the rows: with the rows alone
     // counted the card overshot the view and its top was always cut off
-    // A bounded card (the dashboard) pads itself to its room after the rows, so its overhead
-    // is only what sits above them: the title row, the space under it, the frame's margins
-    // and stroke (24 + 4 + 19). The folded line, when the steps overflow, takes one of the
-    // rows. With the console's 96 here the card drew half its rows and padded the rest blank
-    let overhead = if bounded { 50.0 } else { 136.0 };
+    // A bounded card (the dashboard) gets the height left under its title and pads itself to
+    // it after the rows, so the rows are that height over a row's real height: the font's
+    // line, the field's margins (2 above and below) and the spacing between rows. A constant
+    // of 24 here drew a row or two short and padded the rest blank. The folded line, when
+    // the steps overflow, takes one of the rows. The console keeps its clip arithmetic
+    let row = if bounded { ui.fonts_mut(|f| f.row_height(&font)) + 4.0 + ui.spacing().item_spacing.y } else { 24.0 };
+    let overhead = if bounded { 0.0 } else { 136.0 };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let fit = ((room - overhead) / 24.0).floor().max(0.0) as usize;
+    let fit = ((room - overhead) / row).floor().max(0.0) as usize;
     let body = if bounded {
         // the dashboard: the rows the room holds, less the folded line when steps fell off
         // the top; a run with fewer steps than rows shows them all and pads to its room
