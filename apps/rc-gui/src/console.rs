@@ -333,7 +333,7 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
     // is this card's alone
     if bounded {
         // the rows drawn: the folded line stands in for one of the body's when steps hid
-        let rows = body.max(1) as u32 as f32;
+        let rows = f32::from(u16::try_from(body.max(1)).unwrap_or(u16::MAX));
         // a thin space at most: with few lines the rest of the room stays under them rather
         // than spread them apart
         let extra = ((room - rows * row) / rows).clamp(0.0, 3.0);
@@ -448,14 +448,14 @@ fn wheel(ui: &Ui, sink: &Sink, id: u64, rect: Rect) {
     let key = ui.make_persistent_id(("run-wheel", id));
     let mut rows = 0;
     ui.data_mut(|data| {
-        let rest = data.get_temp_mut_or_default::<f32>(key);
-        *rest += delta;
-        while *rest >= NOTCH {
-            *rest -= NOTCH;
+        let carried = data.get_temp_mut_or_default::<f32>(key);
+        *carried += delta;
+        while *carried >= NOTCH {
+            *carried -= NOTCH;
             rows += 2;
         }
-        while *rest <= -NOTCH {
-            *rest += NOTCH;
+        while *carried <= -NOTCH {
+            *carried += NOTCH;
             rows -= 2;
         }
     });
