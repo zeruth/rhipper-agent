@@ -93,6 +93,8 @@ struct App {
 /// Runs the console until it is told to quit. `worker` carries the badge model, the provider and
 /// the ledger the sessions write to.
 pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()> {
+    // the theme is the point: paint in color even under a launcher that set NO_COLOR
+    ratatui::crossterm::style::force_color_output(true);
     let mut terminal = ratatui::init();
     // the wheel scrolls the panes (Shift+drag still selects text in most terminals)
     let _ = execute!(std::io::stdout(), EnableMouseCapture);

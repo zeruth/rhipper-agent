@@ -14,5 +14,5 @@ pub mod theme;
 pub mod trace;
 pub mod ui;
 
-/// The build version, `0.1.<commits>+<hash>`, with `.dirty` when the tree had uncommitted changes.
+/// The build version, `0.1.<n>`: a counter in `var/build-number`, up by one per build.
 pub const VERSION: &str = env!("RA_VERSION");

@@ -1,21 +1,18 @@
-//! The build version: `0.1.<commits>` from the git history, with the short hash and a `.dirty`
-//! mark when the tree has uncommitted changes, so a running console names the build it is.
+//! The build number: `0.1.<n>`, counted up from zero in `var/build-number` every time the
+//! workspace sources change, so a running console names the build it is and two builds never
+//! share a name.
 
-use std::process::Command;
-
-fn git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
-    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
+use std::path::Path;
 
 fn main() {
-    let count = git(&["rev-list", "--count", "HEAD"]).unwrap_or_else(|| "0".to_owned());
-    let hash = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "nogit".to_owned());
-    let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
-    let version = format!("0.1.{count}+{hash}{}", if dirty { ".dirty" } else { "" });
-    println!("cargo:rustc-env=RA_VERSION={version}");
-    // the version moves with the history and the index; a plain edit shows on the next commit
-    for path in ["../../.git/HEAD", "../../.git/index", "../../.git/refs/heads"] {
-        println!("cargo:rerun-if-changed={path}");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let counter = root.join("var/build-number");
+    let current: u64 = std::fs::read_to_string(&counter).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let _ = std::fs::create_dir_all(root.join("var"));
+    let _ = std::fs::write(&counter, (current + 1).to_string());
+    println!("cargo:rustc-env=RA_VERSION=0.1.{current}");
+    // any source change in the workspace is a new build
+    for dir in ["crates", "apps"] {
+        println!("cargo:rerun-if-changed={}", root.join(dir).display());
     }
 }
