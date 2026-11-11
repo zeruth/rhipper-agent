@@ -125,4 +125,10 @@ pub type CompletionFuture<'a> = Pin<Box<dyn Future<Output = Result<Completion, P
 pub trait ModelProvider: Send + Sync {
     /// Runs one completion.
     fn complete(&self, request: CompletionRequest) -> CompletionFuture<'_>;
+
+    /// Whether the provider is a harness with tools of its own, which acts in the request's
+    /// workspace by itself. A bare model answers `false`, and the caller runs the tool loop.
+    fn has_own_tools(&self) -> bool {
+        false
+    }
 }

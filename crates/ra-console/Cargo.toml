@@ -14,6 +14,7 @@ workspace = true
 anyhow.workspace = true
 ra-providers.workspace = true
 ra-roadmap.workspace = true
+ra-tools.workspace = true
 ra-usage.workspace = true
 parking_lot.workspace = true
 ratatui.workspace = true

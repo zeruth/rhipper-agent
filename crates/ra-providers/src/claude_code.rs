@@ -118,6 +118,10 @@ impl ModelProvider for ClaudeCode {
     fn complete(&self, request: CompletionRequest) -> CompletionFuture<'_> {
         Box::pin(self.run(request))
     }
+
+    fn has_own_tools(&self) -> bool {
+        true
+    }
 }
 
 /// The system messages of a request, joined into the one system prompt the command line takes.

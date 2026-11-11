@@ -13,6 +13,7 @@ license = "AGPL-3.0-or-later"
 ra-console = { path = "crates/ra-console" }
 ra-providers = { path = "crates/ra-providers" }
 ra-roadmap = { path = "crates/ra-roadmap" }
+ra-tools = { path = "crates/ra-tools" }
 ra-usage = { path = "crates/ra-usage" }
 
 anyhow = "1.0.100"

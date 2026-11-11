@@ -100,6 +100,80 @@ async fn seed_fills_an_empty_roadmap_and_refuses_a_second_time() {
     assert!(out.iter().any(|l| l.contains("ping")), "the seed holds the ping task: {out:?}");
 }
 
+/// A provider that plays a script: each completion pops the next answer. It records the requests
+/// it saw, so a test can read what the loop sent.
+struct Scripted {
+    answers: parking_lot::Mutex<Vec<ra_providers::Completion>>,
+    seen: parking_lot::Mutex<Vec<ra_providers::CompletionRequest>>,
+}
+
+impl Scripted {
+    fn new(answers: Vec<ra_providers::Completion>) -> std::sync::Arc<Self> {
+        let mut answers = answers;
+        answers.reverse();
+        std::sync::Arc::new(Self { answers: parking_lot::Mutex::new(answers), seen: parking_lot::Mutex::new(Vec::new()) })
+    }
+}
+
+impl ra_providers::ModelProvider for Scripted {
+    fn complete(&self, request: ra_providers::CompletionRequest) -> ra_providers::CompletionFuture<'_> {
+        self.seen.lock().push(request);
+        let next = self.answers.lock().pop();
+        Box::pin(async move { next.ok_or_else(|| ra_providers::ProviderError::Other("the script ran out".into())) })
+    }
+}
+
+fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Completion {
+    let usage = ra_providers::Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 0, cost_usd: Some(0.01) };
+    ra_providers::Completion { text: text.to_owned(), usage, tool_calls: calls }
+}
+
+#[tokio::test]
+async fn run_on_a_bare_model_loops_through_the_tools_and_lands_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task Write the greeting parent 1", &store, &worker()).await.unwrap();
+    let write = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"hello.txt","content":"hello from the worker\n"}"#.into(),
+    };
+    let read = ra_providers::ToolCall { id: "call_2".into(), name: "read_file".into(), arguments: r#"{"path":"hello.txt"}"#.into() };
+    let provider =
+        Scripted::new(vec![says("", vec![write]), says("checking", vec![read]), says("wrote hello.txt and read it back", vec![])]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+
+    let (out, _) = run("run 2", &store, &worker).await.unwrap();
+    assert!(out[0].contains("3 turn(s), 2 tool call(s)"), "{out:?}");
+    assert!(out[0].contains("$0.03"), "{out:?}");
+    assert_eq!(std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(), "hello from the worker\n");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented);
+    assert_eq!(node.notes.as_deref(), Some("wrote hello.txt and read it back"));
+    assert_eq!(worker.tally().calls, 3);
+
+    // the loop sent the tools, the workspace, and the tool results in order
+    let seen = provider.seen.lock();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[0].tools.len(), 6);
+    assert_eq!(seen[0].workspace.as_deref().map(|p| p.canonicalize().unwrap()), Some(dir.path().canonicalize().unwrap()));
+    let last = &seen[2].messages;
+    assert_eq!(last[last.len() - 1].role, "tool");
+    assert!(last[last.len() - 1].content.starts_with("    1│hello from the worker"), "{}", last[last.len() - 1].content);
+    assert_eq!(last[last.len() - 3].tool_call_id.as_deref(), Some("call_1"));
+}
+
+#[tokio::test]
+async fn run_on_a_bare_model_fails_the_node_when_the_provider_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("add task T parent 1", &store, &worker()).await.unwrap();
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(Vec::new()));
+    let error = run("run 2", &store, &worker).await.unwrap_err();
+    assert!(format!("{error:#}").contains("the script ran out"), "{error:#}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Failed);
+}
+
 #[tokio::test]
 async fn run_refuses_a_project_and_names_a_missing_key() {
     let store = store().await;

@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context;
 use parking_lot::Mutex;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError, Usage};
 use ra_roadmap::model::{Node, NodeKind, TaskState};
@@ -53,6 +54,13 @@ impl Worker {
     /// The same worker, writing every completion to `ledger`.
     pub fn with_ledger(mut self, ledger: UsageStore) -> Self {
         self.ledger = Some(ledger);
+        self
+    }
+
+    /// The same worker, already connected to `provider` for its model's route; the tests hand in
+    /// a scripted one.
+    pub fn with_provider(self, provider: Arc<dyn ModelProvider>) -> Self {
+        *self.provider.lock() = Some((self.route(), provider));
         self
     }
 
@@ -163,38 +171,116 @@ pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<
     // the worker acts in the directory of the roadmap file: the project it describes
     let workspace =
         store.path().parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
-    let answer = provider
-        .complete(CompletionRequest {
-            model: worker.model.clone(),
-            messages: vec![Message::system(SYSTEM), Message::user(context)],
-            temperature: Some(0.4),
-            max_tokens: Some(4096),
-            tools: Vec::new(),
-            workspace,
-        })
-        .await;
-    let answer = match answer {
-        Ok(answer) => answer,
+    let session = if provider.has_own_tools() {
+        // a harness acts in the workspace by itself: one call carries the whole task
+        let answer = provider
+            .complete(CompletionRequest {
+                model: worker.model.clone(),
+                messages: vec![Message::system(SYSTEM), Message::user(context)],
+                temperature: Some(0.4),
+                max_tokens: Some(4096),
+                tools: Vec::new(),
+                workspace,
+            })
+            .await
+            .map_err(map_error);
+        match answer {
+            Ok(answer) => {
+                worker.record(Some(id), &answer.usage).await;
+                Ok(Session { text: answer.text, usage: answer.usage, calls: 0, turns: 1 })
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref()).await
+    };
+    let session = match session {
+        Ok(session) => session,
         Err(error) => {
             store.set_state(id, TaskState::Failed).await?;
-            return Err(map_error(error));
+            return Err(error);
         }
     };
-
-    worker.record(Some(id), &answer.usage).await;
-    store.set_notes(id, &answer.text).await?;
+    store.set_notes(id, &session.text).await?;
     store.set_state(id, TaskState::Implemented).await?;
     Ok(vec![
         format!(
-            "✓ #{} implemented on {} · in {} out {} · {}",
+            "✓ #{} implemented on {} · {} turn(s), {} tool call(s) · in {} out {} · {}",
             node.title,
             short(&worker.model),
-            answer.usage.prompt_tokens,
-            answer.usage.completion_tokens,
-            cost_text(answer.usage.cost_usd)
+            session.turns,
+            session.calls,
+            session.usage.prompt_tokens,
+            session.usage.completion_tokens,
+            cost_text(session.usage.cost_usd)
         ),
         "  the full answer is in the notes of the card in rhipper.md".to_owned(),
     ])
+}
+
+/// What one worker session came to: the final answer, the usage summed over its turns, and how
+/// much it did.
+struct Session {
+    text: String,
+    usage: Usage,
+    calls: usize,
+    turns: usize,
+}
+
+/// The most turns a tool loop takes before it stops the worker.
+const MAX_TURNS: usize = 40;
+
+/// The tool loop of a bare model: the model answers with tool calls, the toolbox executes them in
+/// the workspace, the results go back, until the model answers in words or the turns run out.
+async fn tool_loop(
+    provider: &dyn ModelProvider,
+    worker: &Worker,
+    id: i64,
+    context: String,
+    workspace: Option<&Path>,
+) -> anyhow::Result<Session> {
+    let workspace = workspace.context("the worker has no workspace to act in")?;
+    let toolbox = ra_tools::Toolbox::new(workspace)?;
+    let mut messages = vec![Message::system(SYSTEM), Message::user(context)];
+    let mut usage = Usage::default();
+    let mut calls = 0usize;
+    for turn in 1..=MAX_TURNS {
+        let answer = provider
+            .complete(CompletionRequest {
+                model: worker.model.clone(),
+                messages: messages.clone(),
+                temperature: Some(0.2),
+                max_tokens: Some(4096),
+                tools: ra_tools::Toolbox::specs(),
+                workspace: Some(workspace.to_path_buf()),
+            })
+            .await
+            .map_err(map_error)?;
+        // every turn is a completion of its own, so each lands in the ledger as it happens
+        worker.record(Some(id), &answer.usage).await;
+        add_usage(&mut usage, &answer.usage);
+        if answer.tool_calls.is_empty() {
+            return Ok(Session { text: answer.text, usage, calls, turns: turn });
+        }
+        messages.push(Message::assistant_calls(answer.text, answer.tool_calls.clone()));
+        for call in &answer.tool_calls {
+            tracing::debug!("#{id} turn {turn}: {}({})", call.name, call.arguments);
+            let result = toolbox.execute(call).await;
+            messages.push(Message::tool(&call.id, result));
+            calls += 1;
+        }
+    }
+    anyhow::bail!("the worker made {calls} tool call(s) in {MAX_TURNS} turns without finishing; the task may need splitting")
+}
+
+/// Adds one completion's usage to a running sum.
+fn add_usage(sum: &mut Usage, one: &Usage) {
+    sum.prompt_tokens += one.prompt_tokens;
+    sum.completion_tokens += one.completion_tokens;
+    sum.cached_tokens += one.cached_tokens;
+    if let Some(cost) = one.cost_usd {
+        sum.cost_usd = Some(sum.cost_usd.unwrap_or(0.0) + cost);
+    }
 }
 
 /// Reassesses one node: the model revises the objective and the acceptance for the work still
