@@ -39,6 +39,7 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1500.0, 940.0])
         .with_min_inner_size([980.0, 620.0])
+        .with_maximized(true)
         .with_title(format!("Rhipper Agent {}", ra_console::VERSION));
     if let Some(icon) = icon {
         viewport = viewport.with_icon(Arc::new(icon));
@@ -56,7 +57,12 @@ struct App {
     /// The roadmap as last read, and the mtime it came from.
     roadmap: Vec<Node>,
     roadmap_seen: Option<SystemTime>,
+    /// The width the roadmap's rows need, measured once per read of the file.
+    roadmap_width: f32,
     selected: Option<i64>,
+    /// The card last seen in progress; a new one takes the view, so a run started over MCP or
+    /// from the command line shows here as it starts.
+    followed: Option<i64>,
     folded: HashSet<i64>,
     input: String,
     history: Vec<String>,
@@ -132,7 +138,9 @@ impl App {
             started: Instant::now(),
             roadmap: Vec::new(),
             roadmap_seen: None,
+            roadmap_width: 360.0,
             selected: None,
+            followed: None,
             folded: HashSet::new(),
             input: String::new(),
             history: Vec::new(),
@@ -159,9 +167,18 @@ impl App {
         if modified != self.roadmap_seen {
             self.roadmap_seen = modified;
             match self.rt.block_on(self.store.all()) {
-                Ok(nodes) => self.roadmap = nodes,
+                Ok(nodes) => {
+                    self.roadmap_width = measure_roadmap(ctx, &nodes);
+                    self.roadmap = nodes;
+                }
                 Err(e) => tracing::warn!("the roadmap file does not parse: {e:#}"),
             }
+            // a card that just went to work takes the view, wherever the run was started
+            let working = self.roadmap.iter().find(|n| n.state == TaskState::InProgress).map(|n| n.id);
+            if working.is_some() && working != self.followed {
+                self.select(working);
+            }
+            self.followed = working;
         }
         while self.job_done.try_recv().is_ok() {
             self.job = None;
@@ -538,48 +555,44 @@ impl App {
             // the fields, each its own glowing card
             text_card(ui, "OBJECTIVE", node.objective.as_deref(), theme::WARN_TEXT);
             text_card(ui, "ACCEPTANCE", node.acceptance.as_deref(), theme::ONLINE);
-            ui.columns(2, |cols| {
-                if !node.files.is_empty() {
-                    cards::card(&mut cols[0], theme::DEBUG, false, |ui| {
-                        ui.set_width(ui.available_width());
-                        cards::section(ui, "FILES", theme::DEBUG);
-                        for file in &node.files {
-                            ui.label(RichText::new(file).monospace().color(theme::TEXT));
-                        }
-                    });
-                }
-                if !node.depends_on.is_empty() {
-                    cards::card(&mut cols[1], theme::TRACE, false, |ui| {
-                        ui.set_width(ui.available_width());
-                        cards::section(ui, "WAITS ON", theme::TRACE);
-                        ui.horizontal_wrapped(|ui| {
-                            for dep in &node.depends_on {
-                                match nodes.iter().find(|n| n.id == *dep) {
-                                    Some(d) => {
-                                        cards::badge(ui, &format!("#{} {}", d.id, d.title), theme::state_color(d.state))
-                                            .on_hover_text(d.state.to_string());
-                                    }
-                                    None => {
-                                        cards::badge(ui, &format!("#{dep} (missing)"), theme::ERROR_TEXT);
-                                    }
+            if !node.files.is_empty() {
+                cards::card(ui, theme::DEBUG, false, |ui| {
+                    ui.set_width(ui.available_width());
+                    cards::section(ui, "FILES", theme::DEBUG);
+                    for file in &node.files {
+                        ui.label(RichText::new(file).monospace().color(theme::TEXT));
+                    }
+                });
+                ui.add_space(6.0);
+            }
+            if !node.depends_on.is_empty() {
+                cards::card(ui, theme::TRACE, false, |ui| {
+                    ui.set_width(ui.available_width());
+                    cards::section(ui, "WAITS ON", theme::TRACE);
+                    ui.horizontal_wrapped(|ui| {
+                        for dep in &node.depends_on {
+                            match nodes.iter().find(|n| n.id == *dep) {
+                                Some(d) => {
+                                    cards::badge(ui, &format!("#{} {}", d.id, d.title), theme::state_color(d.state))
+                                        .on_hover_text(d.state.to_string());
+                                }
+                                None => {
+                                    cards::badge(ui, &format!("#{dep} (missing)"), theme::ERROR_TEXT);
                                 }
                             }
-                        });
+                        }
                     });
-                }
-            });
-            if node.notes.is_some() {
+                });
+                ui.add_space(6.0);
+            }
+            if let Some(notes) = node.notes.as_deref() {
                 cards::card(ui, theme::DIM, false, |ui| {
                     ui.set_width(ui.available_width());
                     cards::section(ui, "NOTES", theme::DIM);
-                    egui::ScrollArea::vertical().id_salt("notes").max_height(320.0).show(ui, |ui| {
-                        ui.label(RichText::new(node.notes.as_deref().unwrap_or("")).monospace().color(theme::mix(
-                            theme::TEXT,
-                            theme::DIM,
-                            0.3,
-                        )));
-                    });
+                    // the whole of the notes: the worker's report is the point of the card
+                    ui.label(RichText::new(notes).monospace().color(theme::mix(theme::TEXT, theme::DIM, 0.3)));
                 });
+                ui.add_space(6.0);
             }
             cards::card(ui, theme::TRACE, false, |ui| {
                 ui.set_width(ui.available_width());
@@ -699,9 +712,11 @@ impl eframe::App for App {
                     console::draw(ui, &self.sink, now, self.show_debug);
                 });
             });
+        // the roadmap takes the width its rows need, up to two fifths of the window
+        let width = self.roadmap_width.min(root.max_rect().width() * 0.4);
         egui::Panel::left("roadmap")
-            .resizable(true)
-            .default_size(460.0)
+            .resizable(false)
+            .exact_size(width)
             .frame(Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(8, 8)))
             .show(root, |ui| self.roadmap_panel(ui));
         egui::CentralPanel::default()
@@ -716,6 +731,24 @@ impl Drop for App {
     fn drop(&mut self) {
         ra_console::instance::release();
     }
+}
+
+/// The width the roadmap's rows need: the indent, the marks, the title and the badges of the
+/// widest row, every row counted whether folded or not and with room for its buttons, so the
+/// width is a property of the roadmap and not of what is picked.
+fn measure_roadmap(ctx: &egui::Context, nodes: &[Node]) -> f32 {
+    let depths = tree::depths(nodes);
+    let mut widest: f32 = 320.0;
+    for node in nodes {
+        let depth = depths.get(&node.id).copied().unwrap_or(0) as f32;
+        let size = if matches!(node.kind, NodeKind::Project | NodeKind::Milestone) { 15.0 } else { 14.5 };
+        let title = ctx.fonts_mut(|f| f.layout_no_wrap(node.title.clone(), FontId::proportional(size), theme::TEXT)).size().x;
+        // the arrow, the mark and the id in front; the state, the dots, the model, the final
+        // mark and the two buttons behind
+        let badges = 220.0 + if node.assignee.is_some() { 110.0 } else { 0.0 } + if node.is_final() { 50.0 } else { 0.0 };
+        widest = widest.max(depth * 16.0 + 86.0 + title + badges);
+    }
+    widest + 24.0
 }
 
 /// A field of the card as its own glowing card, titled in `color`.
