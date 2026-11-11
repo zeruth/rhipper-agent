@@ -91,6 +91,9 @@ struct Ledger {
     /// up the tree, so the root reads as the total.
     by_node: Vec<(Option<i64>, Totals)>,
     all_time: Option<Totals>,
+    /// The calls of the selected card, the latest first, with the turns and the tokens of each;
+    /// read again when the selection moves.
+    calls: Vec<ra_usage::Call>,
     /// Each gotcha that fired: the id, how often, and its message from the catalogue, `None`
     /// for an id the catalogue does not hold.
     gotchas: Vec<(String, usize, Option<String>)>,
@@ -379,8 +382,17 @@ impl App {
     /// Reads the ledger and the gotchas again: the same queries as `rc usage` and the same
     /// journal as `rc gotchas`, so the tab shows their numbers.
     fn refresh_ledger(&mut self) {
-        let (all_time, by_model, by_node) =
-            self.rt.block_on(async { (self.worker.all_time().await, self.worker.by_model().await, self.worker.by_node().await) });
+        let (all_time, by_model, by_node, calls) = self.rt.block_on(async {
+            (
+                self.worker.all_time().await,
+                self.worker.by_model().await,
+                self.worker.by_node().await,
+                match self.selected {
+                    Some(id) => self.worker.calls_of(Some(id)).await,
+                    None => None,
+                },
+            )
+        });
         let catalogue = match Catalogue::load(Path::new(GOTCHAS_FILE)) {
             Ok(catalogue) => Some(catalogue),
             Err(e) => {
@@ -401,6 +413,7 @@ impl App {
             by_model: by_model.unwrap_or_default(),
             by_node: by_node.unwrap_or_default(),
             all_time,
+            calls: calls.unwrap_or_default(),
             gotchas,
             unmatched: journal.unmatched(),
             catalogue: catalogue.map_or(0, |c| c.entries.len()),
@@ -474,9 +487,16 @@ impl App {
         }
     }
 
-    /// Picks a card; the model field of the card view follows.
+    /// Picks a card; the model field of the card view and the ledger's calls follow.
     fn select(&mut self, id: Option<i64>) {
+        if self.selected == id {
+            return;
+        }
         self.selected = id;
+        self.ledger.calls = match id {
+            Some(id) => self.rt.block_on(self.worker.calls_of(Some(id))).unwrap_or_default(),
+            None => Vec::new(),
+        };
     }
 
     /// The keys of the roadmap column: Up and Down move the selection along the rows shown,
@@ -572,11 +592,14 @@ impl App {
         self.browsing = None;
         let name = line.split_whitespace().next().unwrap_or("").trim_start_matches(['/', '.']).to_ascii_lowercase();
         self.sink.push(Kind::Input, line.clone());
-        if matches!(name.as_str(), "run" | "reassess" | "reassess-tree" | "ping") {
+        // the slow commands go to the runtime: a model call, and an install that copies the
+        // binaries and reads the registry
+        if matches!(name.as_str(), "run" | "reassess" | "reassess-tree" | "ping" | "install") {
             let arg = line.split_whitespace().nth(1).unwrap_or("").to_owned();
             self.job = Some(match name.as_str() {
                 "run" => format!("running #{arg}"),
                 "ping" => "pinging the model".to_owned(),
+                "install" => "installing the build".to_owned(),
                 other => format!("{other} #{arg}"),
             });
             let (store, sink, worker, tx) = (self.store.clone(), self.sink.clone(), self.worker.clone(), self.job_tx.clone());
@@ -1011,9 +1034,9 @@ impl App {
                     ui.label(RichText::new("the ledger is empty: no completion has run yet").color(theme::DIM));
                 } else {
                     let depths = tree::depths(&self.roadmap);
-                    egui::Grid::new("usage-by-card").num_columns(6).spacing([22.0, 5.0]).striped(true).show(ui, |ui| {
+                    egui::Grid::new("usage-by-card").num_columns(7).spacing([22.0, 5.0]).striped(true).show(ui, |ui| {
                         ui.label(RichText::new("card").small().strong().color(theme::DIM));
-                        for head in ["calls", "in", "out", "cached", "cost"] {
+                        for head in ["calls", "turns", "in", "out", "cached", "cost"] {
                             cell_right(ui, RichText::new(head).small().strong().color(theme::DIM));
                         }
                         ui.end_row();
@@ -1032,6 +1055,38 @@ impl App {
                 }
             });
             ui.add_space(6.0);
+            cards::card(ui, theme::ACCENT, false, |ui| {
+                ui.set_width(ui.available_width());
+                let selected = self.selected.and_then(|id| self.roadmap.iter().find(|n| n.id == id));
+                let title = selected.map_or_else(|| "CALLS OF THE SELECTED CARD".to_owned(), |n| format!("CALLS OF #{} {}", n.id, n.title));
+                cards::section(ui, &title, theme::ACCENT);
+                ui.label(RichText::new("each call of the card, the latest first, with the turns it took").color(theme::DIM).small());
+                if selected.is_none() {
+                    ui.label(RichText::new("pick a card in the roadmap column to list its calls").color(theme::DIM));
+                } else if ledger.calls.is_empty() {
+                    ui.label(RichText::new("no call has served this card yet").color(theme::DIM));
+                } else {
+                    egui::Grid::new("calls-of-card").num_columns(7).spacing([22.0, 5.0]).striped(true).show(ui, |ui| {
+                        ui.label(RichText::new("when (UTC)").small().strong().color(theme::DIM));
+                        ui.label(RichText::new("model").small().strong().color(theme::DIM));
+                        for head in ["turns", "in", "out", "cached", "cost"] {
+                            cell_right(ui, RichText::new(head).small().strong().color(theme::DIM));
+                        }
+                        ui.end_row();
+                        for call in &ledger.calls {
+                            ui.label(RichText::new(&call.at).monospace().color(theme::DIM));
+                            ui.label(RichText::new(&call.model).monospace().color(theme::TEXT));
+                            for n in [call.turns, call.prompt_tokens, call.completion_tokens, call.cached_tokens] {
+                                cell_right(ui, RichText::new(n.to_string()).color(theme::TEXT));
+                            }
+                            let cost = call.cost_usd.map_or_else(|| "—".to_owned(), |c| format!("${c:.4}"));
+                            cell_right(ui, RichText::new(cost).color(theme::TEXT));
+                            ui.end_row();
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
             cards::card(ui, theme::ONLINE, false, |ui| {
                 ui.set_width(ui.available_width());
                 cards::section(ui, "USAGE BY MODEL", theme::ONLINE);
@@ -1041,9 +1096,9 @@ impl App {
                 if ledger.by_model.is_empty() {
                     ui.label(RichText::new("the ledger is empty: no completion has run yet").color(theme::DIM));
                 } else {
-                    egui::Grid::new("usage").num_columns(6).spacing([22.0, 5.0]).striped(true).show(ui, |ui| {
+                    egui::Grid::new("usage").num_columns(7).spacing([22.0, 5.0]).striped(true).show(ui, |ui| {
                         ui.label(RichText::new("model").small().strong().color(theme::DIM));
-                        for head in ["calls", "in", "out", "cached", "cost"] {
+                        for head in ["calls", "turns", "in", "out", "cached", "cost"] {
                             cell_right(ui, RichText::new(head).small().strong().color(theme::DIM));
                         }
                         ui.end_row();
@@ -1170,9 +1225,12 @@ impl App {
                         cards::badge_marked(ui, "$", "no budget", theme::DIM)
                             .on_hover_text("budgets are off; `budgets on` caps a run by its card's complexity");
                     }
-                    let model =
-                        node.assignee.as_ref().map_or_else(|| format!("{} (badge)", short(&self.worker.model)), |a| a.model.clone());
-                    cards::badge_marked(ui, "◉", &model, theme::TRACE).on_hover_text("the model a run of this card uses");
+                    // the card's own model, else the session's: the one on the status bar
+                    let (model, from) = node.assignee.as_ref().map_or_else(
+                        || (short(&self.worker.model).to_owned(), "the session's model, from the status bar; this card names none of its own"),
+                        |a| (a.model.clone(), "the model this card names; a run uses it over the session's"),
+                    );
+                    cards::badge_marked(ui, "◉", &model, theme::TRACE).on_hover_text(from);
                     // a click steps the effort up, high wrapping round to low
                     let effort = cards::badge_marked(ui, "⚡", &node.effort.to_string(), theme::WARN_TEXT)
                         .interact(egui::Sense::click())
@@ -1708,7 +1766,7 @@ fn usage_by_card<'a>(nodes: &'a [Node], by_node: &[(Option<i64>, Totals)]) -> Ve
 
 fn usage_row(ui: &mut egui::Ui, model: &str, t: &Totals, color: Color32) {
     ui.label(RichText::new(model).monospace().color(color));
-    for n in [t.calls, t.prompt_tokens, t.completion_tokens, t.cached_tokens] {
+    for n in [t.calls, t.turns, t.prompt_tokens, t.completion_tokens, t.cached_tokens] {
         cell_right(ui, RichText::new(n.to_string()).color(color));
     }
     let cost = t.cost_usd.map_or_else(|| "—".to_owned(), |c| format!("${c:.4}"));

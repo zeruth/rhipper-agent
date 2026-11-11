@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use parking_lot::Mutex;
-use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError, Usage};
+use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError, TurnUsage, Usage};
 use ra_roadmap::model::{Effort, Node, NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
@@ -204,9 +204,22 @@ impl Worker {
         }
     }
 
-    /// Books one completion against the tally and the ledger. A ledger that cannot be written is
-    /// a warning, not a failed run: the answer already came back.
-    pub(crate) async fn record(&self, node: Option<i64>, usage: &Usage) {
+    /// The ledger's calls of one node, the latest first (`None` for the calls that served none);
+    /// `None` as a whole without a ledger, or when it cannot be read.
+    pub async fn calls_of(&self, node: Option<i64>) -> Option<Vec<ra_usage::Call>> {
+        let ledger = self.ledger.as_ref()?;
+        match ledger.calls_of(node).await {
+            Ok(rows) => Some(rows),
+            Err(e) => {
+                tracing::warn!("cannot read the usage ledger: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Books one completion of `turns` turns against the tally and the ledger. A ledger that
+    /// cannot be written is a warning, not a failed run: the answer already came back.
+    pub(crate) async fn record(&self, node: Option<i64>, usage: &Usage, turns: u64) {
         let entry = Entry {
             model: self.model.clone(),
             node,
@@ -214,6 +227,7 @@ impl Worker {
             completion_tokens: usage.completion_tokens,
             cached_tokens: usage.cached_tokens,
             cost_usd: usage.cost_usd,
+            turns,
         };
         self.tally.lock().add(&entry);
         if let Some(ledger) = &self.ledger {
@@ -287,7 +301,7 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
         })
         .await
         .map_err(map_error)?;
-    worker.record(None, &answer.usage).await;
+    worker.record(None, &answer.usage, answer.turns).await;
     Ok(vec![
         format!("{} says: {}", short(&worker.model), answer.text.trim()),
         format!(
@@ -362,14 +376,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             .map_err(map_error);
         match answer {
             Ok(answer) => {
-                worker.record(Some(id), &answer.usage).await;
+                worker.record(Some(id), &answer.usage, answer.turns).await;
                 gotcha_hits.clone_from(&answer.gotchas);
                 if let Some(session) = answer.session_id.as_deref() {
                     // kept on the node with the card's fingerprint: the next run of it resumes
                     // this session while the card reads the same
                     store.set_session(id, Some((session, &card_fingerprint(&node))), unix_now()).await?;
                 }
-                Ok(Session { text: answer.text, usage: answer.usage, calls: 0, turns: answer.turns, cap })
+                Ok(Session { text: answer.text, usage: answer.usage, calls: 0, turns: answer.turns, turn_usage: answer.turn_usage, cap })
             }
             Err(error) => Err(error),
         }
@@ -466,7 +480,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
     };
     let mut lines = vec![
         format!(
-            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · in {} out {} · {}",
+            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · in {} out {}{} · {}",
             if passed { "✓" } else { "✗" },
             id,
             node.title,
@@ -475,6 +489,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker) -> anyhow::Result<
             session.calls,
             session.usage.prompt_tokens,
             session.usage.completion_tokens,
+            turn_sizes(&session.turn_usage),
             cost_text(session.usage.cost_usd)
         ),
         check_line,
@@ -804,8 +819,31 @@ struct Session {
     usage: Usage,
     calls: usize,
     turns: u64,
+    /// The tokens of each turn, when the provider showed them.
+    turn_usage: Vec<TurnUsage>,
     /// The turn cap the run had, when it had one.
     cap: Option<u32>,
+}
+
+/// The sizes of the turns for the run line: the largest and the average, in tokens read and
+/// written, as ` · per turn largest 41k, avg 12k`; nothing when the provider showed no turns.
+fn turn_sizes(turns: &[TurnUsage]) -> String {
+    let Ok(count) = u64::try_from(turns.len()) else { return String::new() };
+    if count == 0 {
+        return String::new();
+    }
+    let largest = turns.iter().map(TurnUsage::total).max().unwrap_or(0);
+    let average = turns.iter().map(TurnUsage::total).sum::<u64>() / count;
+    format!(" · per turn largest {}, avg {}", kilo(largest), kilo(average))
+}
+
+/// A token count in short: `812`, `4.1k`, `120k`.
+fn kilo(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1000..=9999 => format!("{}.{}k", n / 1000, (n % 1000) / 100),
+        _ => format!("{}k", n / 1000),
+    }
 }
 
 /// The dollar budget of a run on a node of `complexity`, when `--budget` names none: c1 $0.25,
@@ -857,6 +895,7 @@ async fn tool_loop(
     let toolbox = worker.toolbox(workspace)?;
     let mut messages = vec![Message::system(SYSTEM), Message::user(context)];
     let mut usage = Usage::default();
+    let mut turn_usage = Vec::new();
     let mut calls = 0usize;
     let mut turn = 0u32;
     loop {
@@ -884,10 +923,11 @@ async fn tool_loop(
             .await
             .map_err(map_error)?;
         // every turn is a completion of its own, so each lands in the ledger as it happens
-        worker.record(Some(id), &answer.usage).await;
+        worker.record(Some(id), &answer.usage, 1).await;
         add_usage(&mut usage, &answer.usage);
+        turn_usage.push(TurnUsage::of(&answer.usage));
         if answer.tool_calls.is_empty() {
-            return Ok(Session { text: answer.text, usage, calls, turns: u64::from(turn), cap });
+            return Ok(Session { text: answer.text, usage, calls, turns: u64::from(turn), turn_usage, cap });
         }
         // the budget is checked before the tools run: the work it would pay for is not done
         if let Some((budget, spent)) = budget.zip(usage.cost_usd).filter(|(budget, spent)| spent > budget) {
@@ -1025,7 +1065,7 @@ async fn reassess_one(store: &Store, worker: &Worker, provider: &dyn ModelProvid
         })
         .await
         .map_err(map_error)?;
-    worker.record(Some(id), &answer.usage).await;
+    worker.record(Some(id), &answer.usage, answer.turns).await;
     let mut overview: Option<String> = None;
     let mut objective: Option<String> = None;
     let mut acceptance: Option<String> = None;

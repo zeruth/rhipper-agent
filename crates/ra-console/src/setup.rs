@@ -244,7 +244,7 @@ async fn outline_from_model(worker: &Worker, root: &Path, import: Option<&str>) 
         })
         .await
         .map_err(agent::map_error)?;
-    worker.record(None, &answer.usage).await;
+    worker.record(None, &answer.usage, answer.turns).await;
     Ok(answer.text)
 }
 

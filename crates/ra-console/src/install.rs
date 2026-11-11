@@ -101,7 +101,22 @@ fn on_path(dir: &Path) -> String {
     if !cfg!(windows) {
         return format!("add {} to your PATH", dir.display());
     }
-    // the user's own path in the registry, not the session's: setx would clip a long one
+    // the user's own path in the registry, not the session's. A read first, through `reg`,
+    // which answers at once; PowerShell starts slowly and is only worth it for the write, which
+    // setx would clip on a long path
+    let registry = std::process::Command::new("reg").args(["query", r"HKCU\Environment", "/v", "Path"]).output();
+    if let Ok(out) = &registry
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let value = text.lines().find_map(|l| l.trim_start().strip_prefix("Path")).map(|rest| {
+            // `Path    REG_EXPAND_SZ    <value>`
+            rest.trim_start().split_once(char::is_whitespace).map_or("", |(_, v)| v.trim())
+        });
+        if value.is_some_and(listed) {
+            return format!("{} is on the user's path; a new terminal sees it", dir.display());
+        }
+    }
     let script = format!(
         "$user = [Environment]::GetEnvironmentVariable('Path', 'User'); if (($user -split ';') -notcontains '{0}') {{ [Environment]::SetEnvironmentVariable('Path', ($user.TrimEnd(';') + ';{0}'), 'User'); 'added' }} else {{ 'present' }}",
         dir.display()

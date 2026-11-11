@@ -13,7 +13,15 @@ impl ModelProvider for Answers {
     fn complete(&self, _: CompletionRequest) -> CompletionFuture<'_> {
         let text = self.0.clone();
         Box::pin(async move {
-            Ok(Completion { text, usage: Usage::default(), turns: 1, tool_calls: Vec::new(), session_id: None, gotchas: Vec::new() })
+            Ok(Completion {
+                text,
+                usage: Usage::default(),
+                turns: 1,
+                turn_usage: Vec::new(),
+                tool_calls: Vec::new(),
+                session_id: None,
+                gotchas: Vec::new(),
+            })
         })
     }
 }

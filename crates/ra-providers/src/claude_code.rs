@@ -14,7 +14,7 @@ use ra_gotchas::{Catalogue, Conditions, Hit, Journal, Verdict, Where};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvider, ProviderError, Usage};
+use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvider, ProviderError, TurnUsage, Usage};
 
 /// Where the plan's limits are kept, beside the roadmap.
 pub const LIMITS_FILE: &str = "var/limits.json";
@@ -165,8 +165,10 @@ impl ClaudeCode {
             args.extend(["--system-prompt".to_owned(), system]);
         }
         if request.workspace.is_some() {
-            // a worker: the file tools and the allowed shell commands, inside the workspace
-            args.extend(["--permission-mode".to_owned(), "acceptEdits".to_owned()]);
+            // a worker: the file tools and the allowed shell commands, inside the workspace, and
+            // no MCP servers: the project's .mcp.json would hand it the agent itself, holding
+            // target/debug/rc.exe for the run and a `run` tool of its own
+            args.extend(["--permission-mode".to_owned(), "acceptEdits".to_owned(), "--strict-mcp-config".to_owned()]);
             // a cap only when the request or the provider names one; none stands by default
             if let Some(cap) = request.max_turns.or(self.max_turns) {
                 args.extend(["--max-turns".to_owned(), cap.to_string()]);
@@ -224,6 +226,8 @@ impl ClaudeCode {
         let mut result: Option<String> = None;
         let mut last_line = String::new();
         let mut gotchas: Vec<Hit> = Vec::new();
+        // the tokens of each assistant turn, as the events show them
+        let mut turns = TurnTally::default();
         // which tool each call id belongs to, so only a shell's output is read for gotchas
         let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         // a console holds the binary while var/console.pid is in the workspace
@@ -234,6 +238,7 @@ impl ClaudeCode {
                 for step in progress_of(&line, request.workspace.as_deref()) {
                     tracing::info!(target: "ra::progress", "{step}");
                 }
+                turns.note(&line);
                 if let Some(catalogue) = &self.catalogue {
                     // where the hit showed, from the event that carried it
                     let place = if line.contains(r#""type":"assistant""#) {
@@ -281,6 +286,7 @@ impl ClaudeCode {
             // a result names the reason itself, exit code or not
             Some(result) => parse_result(&result).map(|mut completion| {
                 completion.gotchas = gotchas;
+                completion.turn_usage = turns.into_turns();
                 completion
             }),
             None => {
@@ -289,6 +295,40 @@ impl ClaudeCode {
                 Err(ProviderError::Other(format!("claude exited with {status} and no result: {}", snippet(reason))))
             }
         }
+    }
+}
+
+/// The tokens of the assistant turns of a stream, one record per turn. The harness emits one
+/// `assistant` event per content block, all with the message id and the usage of the turn, so
+/// the events of one id fold into one record and the last one read stands.
+#[derive(Default)]
+struct TurnTally {
+    turns: Vec<(Option<String>, TurnUsage)>,
+}
+
+impl TurnTally {
+    /// Books the turn one stream event belongs to; any other event is passed over.
+    fn note(&mut self, line: &str) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { return };
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+            return;
+        }
+        let Some(usage) = event.pointer("/message/usage") else { return };
+        let count = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let turn = TurnUsage {
+            // the input is everything read, cached or not, as the result's usage counts it
+            input_tokens: count("input_tokens") + count("cache_read_input_tokens") + count("cache_creation_input_tokens"),
+            output_tokens: count("output_tokens"),
+        };
+        let id = event.pointer("/message/id").and_then(serde_json::Value::as_str).map(str::to_owned);
+        match self.turns.last_mut() {
+            Some((last, booked)) if id.is_some() && *last == id => *booked = turn,
+            _ => self.turns.push((id, turn)),
+        }
+    }
+
+    fn into_turns(self) -> Vec<TurnUsage> {
+        self.turns.into_iter().map(|(_, turn)| turn).collect()
     }
 }
 
@@ -442,7 +482,7 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
         cost_usd: parsed.total_cost_usd,
     });
     let session_id = parsed.session_id.filter(|s| !s.trim().is_empty());
-    Ok(Completion { text, usage, turns: parsed.num_turns, tool_calls: Vec::new(), session_id, gotchas: Vec::new() })
+    Ok(Completion { text, usage, turns: parsed.num_turns, turn_usage: Vec::new(), tool_calls: Vec::new(), session_id, gotchas: Vec::new() })
 }
 
 /// The gotchas one stream event shows: a command about to run that the catalogue would refuse

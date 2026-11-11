@@ -114,6 +114,9 @@ pub struct Completion {
     /// The turns the run took, as a harness reports them; one from a provider that answers a
     /// single completion.
     pub turns: u64,
+    /// The tokens of each assistant turn, in order, as the provider showed them go by; one
+    /// entry from a provider that answers a single completion, none from one that cannot tell.
+    pub turn_usage: Vec<TurnUsage>,
     /// The tool calls the answer asks for; empty means a plain answer.
     pub tool_calls: Vec<ToolCall>,
     /// The harness session the answer came from, for a later run to resume; `None` from a
@@ -122,6 +125,27 @@ pub struct Completion {
     /// The gotchas the run hit, as the provider saw them go by: the commands the machine refused,
     /// the errors it knows, the claims the answer made. Empty from a provider that does not look.
     pub gotchas: Vec<ra_gotchas::Hit>,
+}
+
+/// The tokens of one assistant turn: what it read, cached or not, and what it wrote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl TurnUsage {
+    /// The one turn of a single completion.
+    #[must_use]
+    pub fn of(usage: &Usage) -> Self {
+        Self { input_tokens: usage.prompt_tokens, output_tokens: usage.completion_tokens }
+    }
+
+    /// Both sides together, the size of the turn.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
 }
 
 /// The token counts of one execution, as the provider reported them.

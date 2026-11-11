@@ -3,7 +3,23 @@
 use super::*;
 
 fn entry(model: &str, node: Option<i64>, cost: Option<f64>) -> Entry {
-    Entry { model: model.to_owned(), node, prompt_tokens: 100, completion_tokens: 10, cached_tokens: 40, cost_usd: cost }
+    Entry { model: model.to_owned(), node, prompt_tokens: 100, completion_tokens: 10, cached_tokens: 40, cost_usd: cost, turns: 1 }
+}
+
+#[tokio::test]
+async fn a_row_carries_its_turn_count_and_the_calls_of_a_node_list_it() {
+    let store = UsageStore::in_memory().await.unwrap();
+    store.record(&Entry { turns: 12, ..entry("claude-opus-5-5", Some(3), Some(0.25)) }).await.unwrap();
+    store.record(&entry("z-ai/glm-5.3-flash", Some(3), None)).await.unwrap();
+    store.record(&entry("claude-opus-5-5", None, Some(0.1))).await.unwrap();
+    assert_eq!(store.totals().await.unwrap().turns, 14);
+    // the latest call first, each with its own turns
+    let calls = store.calls_of(Some(3)).await.unwrap();
+    assert_eq!(calls.iter().map(|c| (c.model.as_str(), c.turns)).collect::<Vec<_>>(), [("z-ai/glm-5.3-flash", 1), ("claude-opus-5-5", 12)]);
+    assert_eq!(calls[1].prompt_tokens, 100);
+    assert_eq!(calls[1].cost_usd, Some(0.25));
+    assert_eq!(store.calls_of(None).await.unwrap().len(), 1);
+    assert!(store.calls_of(Some(9)).await.unwrap().is_empty());
 }
 
 #[tokio::test]

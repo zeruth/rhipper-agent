@@ -26,15 +26,26 @@ const LAPS_PER_SECOND: f32 = 0.22;
 /// the bottom. `show_debug` lets the trace lines through.
 pub(crate) fn draw(ui: &mut Ui, sink: &Sink, show_debug: bool) {
     let lines: Vec<Line> = sink.with_lines(<[Line]>::to_vec);
+    // a live run's card keeps the bottom of the log until its result is in: whatever arrives
+    // while it works goes above it, and it settles into its place when it ends
+    let mut live: Vec<(usize, &Line, u64, Run)> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         if matches!(line.kind, Kind::Log(tracing::Level::DEBUG | tracing::Level::TRACE)) && !show_debug {
             continue;
         }
         let run = line.run.and_then(|id| sink.run(id).map(|run| (id, run)));
         match run {
+            Some((id, run)) if line.kind == Kind::Run && run.live() => {
+                live.push((index, line, id, run));
+                continue;
+            }
             Some((id, run)) if line.kind == Kind::Run => run_card(ui, sink, id, &line.text, &run, index),
             _ => bubble(ui, line, index),
         }
+        ui.add_space(6.0);
+    }
+    for (index, line, id, run) in live {
+        run_card(ui, sink, id, &line.text, &run, index);
         ui.add_space(6.0);
     }
 }
@@ -188,29 +199,34 @@ fn run_title(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, lane: Co
 /// with the rows it has not filled yet left open; a finished one shrinks to its steps. The
 /// steps that fell off the top fold into one line that shows them on hover.
 fn run_steps(ui: &mut Ui, run: &Run) {
-    let height = usize::from(run.height);
-    let body = if run.live() { height } else { height.min(run.steps.len().max(1)) };
-    let hidden = run.steps.len().saturating_sub(body);
     let font = FontId::monospace(12.5);
+    // a step that repeats the one before folds into it with a count at the end; the rows are
+    // counted after the folding, so the card shows as many entries as it has rows for
+    let mut folded: Vec<(&str, usize)> = Vec::new();
+    for step in &run.steps {
+        match folded.last_mut() {
+            Some((last, count)) if *last == step.as_str() => *count += 1,
+            _ => folded.push((step.as_str(), 1)),
+        }
+    }
+    let height = usize::from(run.height);
+    let body = if run.live() { height } else { height.min(folded.len().max(1)) };
+    let hidden = folded.len().saturating_sub(body);
+    // the entries that fell off the top fold into one line, which takes a row of its own
     let skip = if hidden > 0 { hidden + 1 } else { 0 };
     if hidden > 0 {
-        ui.label(RichText::new(format!("⋯ {skip} earlier steps")).font(font.clone()).color(theme::DIM).italics()).on_hover_ui(|ui| {
-            for step in run.steps.iter().take(skip) {
-                ui.label(RichText::new(step).font(font.clone()).color(theme::TEXT));
+        let earlier: usize = folded.iter().take(skip).map(|(_, n)| n).sum();
+        ui.label(RichText::new(format!("⋯ {earlier} earlier steps")).font(font.clone()).color(theme::DIM).italics()).on_hover_ui(|ui| {
+            for (step, count) in folded.iter().take(skip) {
+                let text = if *count > 1 { format!("{step}  ×{count}") } else { (*step).to_owned() };
+                ui.label(RichText::new(text).font(font.clone()).color(theme::TEXT));
             }
         });
     }
     if run.steps.is_empty() {
         ui.label(RichText::new(if run.live() { "starting…" } else { "no steps" }).font(font.clone()).color(theme::DIM).italics());
     }
-    // a step that repeats the one before folds into it with a count at the end
-    let mut shown: Vec<(&str, usize)> = Vec::new();
-    for step in run.steps.iter().skip(skip) {
-        match shown.last_mut() {
-            Some((last, count)) if *last == step.as_str() => *count += 1,
-            _ => shown.push((step.as_str(), 1)),
-        }
-    }
+    let shown: Vec<(&str, usize)> = folded.into_iter().skip(skip).collect();
     let drawn = shown.len();
     for (step, count) in shown {
         let (tool, rest, color) = step_tool(step);

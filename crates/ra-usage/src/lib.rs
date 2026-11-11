@@ -1,6 +1,6 @@
-//! Token and cost accounting. One row per completion: the model, the tokens, the cost the
-//! provider reported and the roadmap node it served. The provider's own dashboard stays the
-//! authoritative bill; this is the local record the budgets and the routing read.
+//! Token and cost accounting. One row per completion: the model, the tokens, the turns, the
+//! cost the provider reported and the roadmap node it served. The provider's own dashboard stays
+//! the authoritative bill; this is the local record the budgets and the routing read.
 
 use anyhow::Context;
 use sqlx::Row;
@@ -24,6 +24,9 @@ pub struct Entry {
     pub cached_tokens: u64,
     /// The cost in dollars as the provider reported it; `None` when it reported none.
     pub cost_usd: Option<f64>,
+    /// The assistant turns the completion took: one from a bare model, what the harness
+    /// reports from a run.
+    pub turns: u64,
 }
 
 /// The sums over a set of entries.
@@ -35,6 +38,20 @@ pub struct Totals {
     pub cached_tokens: u64,
     /// The summed cost of the entries that reported one; `None` when none did.
     pub cost_usd: Option<f64>,
+    pub turns: u64,
+}
+
+/// One row of the ledger, as the ledger tab lists the calls of a card.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call {
+    /// When the row was written, as `SQLite` writes it: `YYYY-MM-DD HH:MM:SS`, UTC.
+    pub at: String,
+    pub model: String,
+    pub turns: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cached_tokens: u64,
+    pub cost_usd: Option<f64>,
 }
 
 impl Totals {
@@ -44,6 +61,7 @@ impl Totals {
         self.prompt_tokens += entry.prompt_tokens;
         self.completion_tokens += entry.completion_tokens;
         self.cached_tokens += entry.cached_tokens;
+        self.turns += entry.turns;
         if let Some(cost) = entry.cost_usd {
             self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
         }
@@ -55,6 +73,7 @@ impl Totals {
         self.prompt_tokens += other.prompt_tokens;
         self.completion_tokens += other.completion_tokens;
         self.cached_tokens += other.cached_tokens;
+        self.turns += other.turns;
         if let Some(cost) = other.cost_usd {
             self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
         }
@@ -94,11 +113,17 @@ impl UsageStore {
                 prompt_tokens integer not null,
                 completion_tokens integer not null,
                 cached_tokens integer not null,
-                cost_usd real
+                cost_usd real,
+                turns integer not null default 1
             )",
         )
         .execute(&self.pool)
         .await?;
+        // a ledger from before the turn count: its rows read as one turn each
+        let columns = sqlx::query("pragma table_info(usage)").fetch_all(&self.pool).await?;
+        if !columns.iter().any(|c| c.get::<String, _>("name") == "turns") {
+            sqlx::query("alter table usage add column turns integer not null default 1").execute(&self.pool).await?;
+        }
         Ok(())
     }
 
@@ -107,15 +132,18 @@ impl UsageStore {
     /// # Errors
     /// When the row cannot be written.
     pub async fn record(&self, entry: &Entry) -> anyhow::Result<()> {
-        sqlx::query("insert into usage (model, node, prompt_tokens, completion_tokens, cached_tokens, cost_usd) values (?, ?, ?, ?, ?, ?)")
-            .bind(&entry.model)
-            .bind(entry.node)
-            .bind(i64::try_from(entry.prompt_tokens)?)
-            .bind(i64::try_from(entry.completion_tokens)?)
-            .bind(i64::try_from(entry.cached_tokens)?)
-            .bind(entry.cost_usd)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "insert into usage (model, node, prompt_tokens, completion_tokens, cached_tokens, cost_usd, turns) values (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&entry.model)
+        .bind(entry.node)
+        .bind(i64::try_from(entry.prompt_tokens)?)
+        .bind(i64::try_from(entry.completion_tokens)?)
+        .bind(i64::try_from(entry.cached_tokens)?)
+        .bind(entry.cost_usd)
+        .bind(i64::try_from(entry.turns)?)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -148,6 +176,36 @@ impl UsageStore {
         let rows = sqlx::query(concat!("select node, ", sums!(), " from usage group by node order by node")).fetch_all(&self.pool).await?;
         Ok(rows.iter().map(|row| (row.get::<Option<i64>, _>("node"), totals_of(row))).collect())
     }
+
+    /// The calls that served one node, the latest first; `None` lists the calls that served
+    /// no node.
+    ///
+    /// # Errors
+    /// When the query fails.
+    pub async fn calls_of(&self, node: Option<i64>) -> anyhow::Result<Vec<Call>> {
+        let rows = sqlx::query(
+            "select at, model, turns, prompt_tokens, completion_tokens, cached_tokens, cost_usd from usage \
+             where node is ? order by id desc",
+        )
+        .bind(node)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let count = |name: &str| u64::try_from(row.get::<i64, _>(name)).unwrap_or(0);
+                Call {
+                    at: row.get("at"),
+                    model: row.get("model"),
+                    turns: count("turns"),
+                    prompt_tokens: count("prompt_tokens"),
+                    completion_tokens: count("completion_tokens"),
+                    cached_tokens: count("cached_tokens"),
+                    cost_usd: row.get("cost_usd"),
+                }
+            })
+            .collect())
+    }
 }
 
 /// One connection, so the writes of parallel jobs queue instead of colliding, and so an in-memory
@@ -163,7 +221,8 @@ macro_rules! sums {
          coalesce(sum(prompt_tokens), 0) as prompt, \
          coalesce(sum(completion_tokens), 0) as completion, \
          coalesce(sum(cached_tokens), 0) as cached, \
-         sum(cost_usd) as cost"
+         sum(cost_usd) as cost, \
+         coalesce(sum(turns), 0) as turns"
     };
 }
 use sums;
@@ -176,6 +235,7 @@ fn totals_of(row: &sqlx::sqlite::SqliteRow) -> Totals {
         completion_tokens: count("completion"),
         cached_tokens: count("cached"),
         cost_usd: row.get::<Option<f64>, _>("cost"),
+        turns: count("turns"),
     }
 }
 

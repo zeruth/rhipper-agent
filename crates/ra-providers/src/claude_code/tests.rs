@@ -98,6 +98,9 @@ fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
     // settings only: the user's hooks are for their own sessions
     assert!(!args.windows(2).any(|w| w == ["--tools", ""]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--setting-sources", "project,local"]), "{args:?}");
+    // no MCP servers: the project's own would be the agent itself
+    assert!(args.contains(&"--strict-mcp-config".to_owned()), "{args:?}");
+    assert!(!ClaudeCode::new().args(&request(None)).contains(&"--strict-mcp-config".to_owned()));
     assert!(!ClaudeCode::new().args(&request(None)).contains(&"--setting-sources".to_owned()));
 }
 
@@ -168,6 +171,34 @@ fn the_stream_shows_tool_calls_and_text_but_not_thinking() {
     assert!(progress_of(r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#, Some(root)).is_empty());
     assert!(progress_of(r#"{"type":"result","result":"done"}"#, Some(root)).is_empty());
     assert!(progress_of("not json", Some(root)).is_empty());
+}
+
+#[test]
+fn the_stream_tallies_the_tokens_of_each_turn() {
+    // three turns: the second comes as two events of one message, and the last one read stands
+    let stream = [
+        r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+        r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":1000,"cache_creation_input_tokens":200,"output_tokens":40},"content":[{"type":"text","text":"looking"}]}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+        r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":5,"cache_read_input_tokens":1200,"output_tokens":10},"content":[{"type":"text","text":"editing"}]}}"#,
+        r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":5,"cache_read_input_tokens":1200,"output_tokens":90},"content":[{"type":"tool_use","name":"Edit","input":{}}]}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+        r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":7,"cache_read_input_tokens":1500,"output_tokens":25},"content":[{"type":"text","text":"done"}]}}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"done"}"#,
+        "not json",
+    ];
+    let mut tally = TurnTally::default();
+    for line in stream {
+        tally.note(line);
+    }
+    assert_eq!(
+        tally.into_turns(),
+        [
+            TurnUsage { input_tokens: 1203, output_tokens: 40 },
+            TurnUsage { input_tokens: 1205, output_tokens: 90 },
+            TurnUsage { input_tokens: 1507, output_tokens: 25 },
+        ]
+    );
 }
 
 #[test]

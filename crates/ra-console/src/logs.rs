@@ -127,12 +127,22 @@ impl Sink {
         id
     }
 
-    /// Closes a run with its outcome.
+    /// Closes a run with its outcome. The run's line moves to the end of the log: a live card
+    /// holds the bottom while it works, and it is released where it is when it ends, after
+    /// whatever arrived meanwhile, not back where it began.
     pub fn close_run(&self, id: u64, outcome: &str) {
         if let Some(run) = self.inner.runs.lock().0.get_mut(&id) {
             run.took = Some(run.started.elapsed());
             run.outcome = Some(outcome.to_owned());
         }
+        let mut lines = self.inner.lines.lock();
+        if let Some(at) = lines.iter().position(|l| l.kind == Kind::Run && l.run == Some(id))
+            && at + 1 < lines.len()
+        {
+            let line = lines.remove(at);
+            lines.push(line);
+        }
+        drop(lines);
         self.bump();
     }
 
@@ -230,6 +240,16 @@ mod tests {
             assert_eq!(lines.len(), 1);
             assert_eq!(lines[0].kind, Kind::Run);
             assert_eq!(lines[0].text, "#15 Files · opus-5-5");
+        });
+        // a run that ends after other lines arrived is released after them, not where it began
+        sink.progress(&format!("{RUN_START}#16 Next · opus-5-5"));
+        sink.push(Kind::Output, "a line that came while it worked".to_owned());
+        sink.push(Kind::Output, "and another".to_owned());
+        sink.progress(&format!("{RUN_END}✓"));
+        sink.with_lines(|lines| {
+            let kinds: Vec<Kind> = lines.iter().map(|l| l.kind).collect();
+            assert_eq!(kinds, [Kind::Run, Kind::Output, Kind::Output, Kind::Run]);
+            assert_eq!(lines[3].text, "#16 Next · opus-5-5");
         });
     }
 
