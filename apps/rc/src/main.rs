@@ -43,6 +43,8 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         complexity: u8,
     },
+    /// Prints the first ready card: a defined task whose waits-on are all accepted.
+    Next,
     /// Links a node to the nodes it waits for.
     Depend {
         /// The node that waits.
@@ -163,6 +165,10 @@ async fn main() -> anyhow::Result<()> {
             plain_tracing()?;
             add(kind, &title, parent, objective.as_deref(), acceptance.as_deref(), complexity).await
         }
+        Command::Next => {
+            plain_tracing()?;
+            next().await
+        }
         Command::Depend { id, waits_for } => {
             plain_tracing()?;
             depend(id, &waits_for).await
@@ -200,7 +206,8 @@ async fn main() -> anyhow::Result<()> {
                 Some(model) => model,
                 None => store.read(id).await?.assignee.map_or_else(|| ra_console::ui::DEFAULT_MODEL.to_owned(), |a| a.model),
             };
-            let mut worker = Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns).with_effort(effort);
+            let mut worker =
+                Worker::new(picked).with_ledger(open_ledger().await?).with_budget(budget).with_turns(turns).with_effort(effort);
             if no_debug {
                 worker = worker.with_debug(false);
             }
@@ -457,6 +464,7 @@ async fn show(id: Option<i64>) -> anyhow::Result<()> {
         }
         None => nodes.iter().collect(),
     };
+    let states = tree::effective_states(&nodes);
     for node in picked {
         let indent = "  ".repeat(tree::depth(&nodes, node.id));
         let assignee = match &node.assignee {
@@ -464,13 +472,32 @@ async fn show(id: Option<i64>) -> anyhow::Result<()> {
             None => String::new(),
         };
         let mark = if node.is_final() { " [final]" } else { "" };
-        println!("{}#{} {} [{}]{mark}{assignee}", indent, node.id, node.title, node.state);
+        println!("{}#{} {} [{}]{mark}{assignee}", indent, node.id, node.title, state_label(states[&node.id], node.state));
         if let Some(objective) = &node.objective {
-            println!("{}    {}", indent, objective);
+            println!("{indent}    {objective}");
         }
         if !node.files.is_empty() {
-            println!("{}    files: {}", indent, node.files.join(" "));
+            println!("{indent}    files: {}", node.files.join(" "));
         }
+    }
+    Ok(())
+}
+
+/// The computed state with the stored one when they differ, `ready (defined)`, else the one.
+fn state_label(computed: TaskState, stored: TaskState) -> String {
+    if computed == stored { stored.to_string() } else { format!("{computed} ({stored})") }
+}
+
+async fn next() -> anyhow::Result<()> {
+    let nodes = open_store().await?.all().await?;
+    match tree::next_ready(&nodes) {
+        Some(node) => {
+            println!("#{} {}", node.id, node.title);
+            if let Some(objective) = &node.objective {
+                println!("    {objective}");
+            }
+        }
+        None => println!("no card is ready"),
     }
     Ok(())
 }

@@ -46,13 +46,23 @@ pub struct Hit {
     pub buttons: Vec<(u16, u16, Button)>,
 }
 
+/// The roadmap as the rows read it: the children of every node, and the state each card stands in
+/// once its waits-on are read.
+struct Shape {
+    children: HashMap<i64, Vec<Node>>,
+    states: HashMap<i64, TaskState>,
+}
+
 /// The rows of one card and, when it is open, of its whole subtree. `width` is the outer width of
 /// this card's box; a child's box takes two columns less, one for each side of its parent. The
 /// outline takes the lane color of the depth: bright on the hovered chain and the selected card,
 /// dim everywhere else.
+// the recursion carries the pane's whole state down; a struct for it would be these arguments
+// under another name
+#[allow(clippy::too_many_arguments)]
 fn rows_of(
     node: &Node,
-    children: &HashMap<i64, Vec<Node>>,
+    shape: &Shape,
     folded: &[i64],
     selected: Option<i64>,
     chain: &std::collections::HashSet<i64>,
@@ -65,8 +75,10 @@ fn rows_of(
     let in_chain = chain.contains(&id);
     let lane = if in_chain || is_selected { theme::lane(depth) } else { theme::dim_lane(depth) };
     let outline_style = Style::new().fg(lane).bg(theme::PANEL);
-    let folded_here = children.contains_key(&id) && folded.contains(&id);
-    let mut rows = vec![Row { id, border: true, buttons: Vec::new(), line: titled_edge(node, is_selected, width, outline_style) }];
+    let folded_here = shape.children.contains_key(&id) && folded.contains(&id);
+    let computed = shape.states.get(&id).copied().unwrap_or(node.state);
+    let mut rows =
+        vec![Row { id, border: true, buttons: Vec::new(), line: titled_edge(node, computed, is_selected, width, outline_style) }];
 
     // the objective and the acceptance of every open card, each in its own rounded bubble in the
     // accent, sealed off from the parent's outline. The notes and the buttons stay with the picked
@@ -128,18 +140,13 @@ fn rows_of(
     // the children, embedded: each child's box is two columns narrower, this card's outline runs
     // down both sides of it, and a blank line of the card separates the parent from its children
     // and each child from the next
-    if !folded_here {
-        if let Some(kids) = children.get(&id) {
-            for kid in kids {
-                rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(Vec::new(), width, outline_style) });
-                for row in rows_of(kid, children, folded, selected, chain, hover_button, depth + 1, width.saturating_sub(2)) {
-                    rows.push(Row {
-                        id: row.id,
-                        border: row.border,
-                        buttons: row.buttons,
-                        line: frame_row(row.line, width, outline_style),
-                    });
-                }
+    if !folded_here
+        && let Some(kids) = shape.children.get(&id)
+    {
+        for kid in kids {
+            rows.push(Row { id, border: false, buttons: Vec::new(), line: boxed_row(Vec::new(), width, outline_style) });
+            for row in rows_of(kid, shape, folded, selected, chain, hover_button, depth + 1, width.saturating_sub(2)) {
+                rows.push(Row { id: row.id, border: row.border, buttons: row.buttons, line: frame_row(row.line, width, outline_style) });
             }
         }
     }
@@ -168,8 +175,9 @@ fn short_title(title: &str, room: usize) -> String {
 /// The top edge of a card, with the role, the id, the title and the badges set into the outline
 /// itself, the way the objective labels sit in their rules. A project, a milestone or a section
 /// reads as `Roadmap:`, a task or a subtask as `Task:`. The title clips when it would not fit, and
-/// the filler run closes the edge to `width`.
-fn titled_edge(node: &Node, is_selected: bool, width: usize, outline_style: Style) -> Line<'static> {
+/// the filler run closes the edge to `width`. The state badge is the computed one, with the stored
+/// one in brackets when they differ: `[ready (defined)]`.
+fn titled_edge(node: &Node, computed: TaskState, is_selected: bool, width: usize, outline_style: Style) -> Line<'static> {
     let title_style = if is_selected {
         Style::new().fg(theme::WARN_TEXT).bold().bg(theme::PANEL)
     } else {
@@ -181,12 +189,17 @@ fn titled_edge(node: &Node, is_selected: bool, width: usize, outline_style: Styl
         _ => "Roadmap: ",
     };
     let assignee = node.assignee.as_ref().map_or(0, |a| format!(" [{}:{}]", a.role, a.model).chars().count());
+    let state = if computed == node.state {
+        format!(" [{}]", node.state.serde_name())
+    } else {
+        format!(" [{} ({})]", computed.serde_name(), node.state.serde_name())
+    };
     let overhead = 2usize
         + if node.kind == NodeKind::Project { 2 } else { 0 }
         + format!("#{} ", node.id).chars().count()
         + role.chars().count()
         + format!(" {{c{}}}", node.complexity).chars().count()
-        + format!(" [{}]", node.state.serde_name()).chars().count()
+        + state.chars().count()
         + assignee
         + 2; // the space and the closing corner
     let title = short_title(&node.title, width.saturating_sub(overhead).max(4));
@@ -198,7 +211,7 @@ fn titled_edge(node: &Node, is_selected: bool, width: usize, outline_style: Styl
     spans.push(badge(role.to_owned(), theme::TRACE));
     spans.push(Span::styled(title, title_style));
     spans.push(badge(format!(" {{c{}}}", node.complexity), theme::DIM));
-    spans.push(badge(format!(" [{}]", node.state.serde_name()), state_color(node.state)));
+    spans.push(badge(state, state_color(computed)));
     if let Some(assignee) = &node.assignee {
         spans.push(badge(format!(" [{}:{}]", assignee.role, assignee.model), theme::TRACE));
     }
@@ -330,11 +343,12 @@ pub fn draw(
             Some(parent) => children.entry(parent).or_default().push(node.clone()),
         }
     }
+    let shape = Shape { children, states: ra_roadmap::tree::effective_states(nodes) };
     let width = area.width as usize;
     let empty = std::collections::HashSet::new();
     let mut rows: Vec<Row> = Vec::new();
     for root in &roots {
-        rows.extend(rows_of(root, &children, folded, selected, &empty, None, 0, width));
+        rows.extend(rows_of(root, &shape, folded, selected, &empty, None, 0, width));
     }
     // the card and the button under the pointer, on this frame's layout, then the rows again with
     // the chain bright and the button hot
@@ -355,7 +369,7 @@ pub fn draw(
         }
         rows.clear();
         for root in &roots {
-            rows.extend(rows_of(root, &children, folded, selected, &chain, hover_button, 0, width));
+            rows.extend(rows_of(root, &shape, folded, selected, &chain, hover_button, 0, width));
         }
     }
 

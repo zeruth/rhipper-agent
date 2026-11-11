@@ -709,7 +709,11 @@ impl App {
             // debug mode: a run ends with the worker's own look back, kept for the next runs
             let debug = self.worker.debug;
             let (mark, color, hint) = if debug {
-                ("⚙", theme::DEBUG, "debug mode: a run ends with what would have made it faster, kept for the next runs · click to turn off")
+                (
+                    "⚙",
+                    theme::DEBUG,
+                    "debug mode: a run ends with what would have made it faster, kept for the next runs · click to turn off",
+                )
             } else {
                 ("○", theme::DIM, "debug mode off: runs are not asked what would have made them faster · click to turn on")
             };
@@ -1259,7 +1263,7 @@ impl App {
                 });
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
-                    cards::badge(ui, &node.state.to_string(), theme::state_color(node.state));
+                    state_badges(ui, &nodes, &node);
                     cards::badge(ui, &node.kind.to_string(), theme::DIM);
                     cards::priority(ui, node.complexity);
                     if self.worker.budgets {
@@ -1684,7 +1688,7 @@ fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node]
                 _ => title,
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                cards::badge(ui, &node.state.to_string(), theme::state_color(node.state));
+                state_badges(ui, nodes, node);
                 if node.is_final() {
                     cards::badge(ui, "final", theme::WARN);
                 }
@@ -1846,14 +1850,25 @@ fn action(ui: &mut egui::Ui, text: &str, color: Color32) -> bool {
     ui.add(button).clicked()
 }
 
-/// The task the workers hold next: the first in progress, else the first ready, else the first
-/// defined task.
+/// The task the workers hold next: the first in progress, else the first ready, stored or computed
+/// from its waits-on, else the first defined task.
 fn current_task(nodes: &[Node]) -> Option<&Node> {
     nodes
         .iter()
         .find(|n| matches!(n.state, TaskState::InProgress | TaskState::Assigned))
-        .or_else(|| nodes.iter().find(|n| n.state == TaskState::Ready))
+        .or_else(|| tree::next_ready(nodes))
         .or_else(|| nodes.iter().find(|n| n.state == TaskState::Defined && n.kind != NodeKind::Project))
+}
+
+/// The state badge of a card: the state computed from its waits-on, and when that differs from
+/// the stored one, the stored one dimmed beside it. Nothing is written to the file either way.
+fn state_badges(ui: &mut egui::Ui, nodes: &[Node], node: &Node) {
+    let computed = tree::effective_state(nodes, node);
+    cards::badge(ui, &computed.to_string(), theme::state_color(computed));
+    if computed != node.state {
+        cards::badge(ui, &node.state.to_string(), theme::DIM)
+            .on_hover_text(format!("stored as {}; {computed} is read from its waits-on, not written", node.state));
+    }
 }
 
 fn short(model: &str) -> &str {

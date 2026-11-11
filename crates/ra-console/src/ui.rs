@@ -764,12 +764,13 @@ fn short_title(title: &str, room: usize) -> String {
     }
 }
 
-/// The task the workers hold next: the first node in progress, else the first planned one.
+/// The task the workers hold next: the first node in progress, else the first ready one, stored
+/// or computed from its waits-on, else the first planned one.
 fn current_task(nodes: &[ra_roadmap::model::Node]) -> Option<ra_roadmap::model::Node> {
     nodes
         .iter()
         .find(|n| matches!(n.state, ra_roadmap::model::TaskState::InProgress | ra_roadmap::model::TaskState::Assigned))
-        .or_else(|| nodes.iter().find(|n| n.state == ra_roadmap::model::TaskState::Ready))
+        .or_else(|| ra_roadmap::tree::next_ready(nodes))
         .or_else(|| {
             nodes.iter().find(|n| n.state == ra_roadmap::model::TaskState::Defined && n.kind != ra_roadmap::model::NodeKind::Project)
         })
