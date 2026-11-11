@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use ra_providers::local::Role;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError, TurnUsage, Usage};
 use ra_roadmap::history::Source;
-use ra_roadmap::model::{Effort, Estimate, Node, NodeKind, TaskState};
+use ra_roadmap::model::{Effort, Estimate, Gambit, GambitState, Node, NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 use ra_usage::{Entry, Totals, UsageStore};
@@ -28,6 +28,16 @@ const GOTCHAS_FILE: &str = "var/gotchas.toml";
 const GOTCHAS_LOG: &str = "var/gotchas.log";
 /// How many of the latest hits the machine notes of a run draw on.
 const RECENT_HITS: usize = 30;
+/// The environment variable a run sets to the id of its card, so the hooks the harness calls
+/// know which card's context to point at.
+pub const CARD_VAR: &str = "RHIPPER_CARD";
+/// The files the post hook already answered a whole-file Read on, one `<card>\t<path>` a line;
+/// a run starts it afresh, so the hint fires once per file per run.
+pub const READ_HINTS_FILE: &str = "var/runs/read-hints";
+/// A Read of this many lines or more without a range gets the hint.
+const LONG_READ: usize = 400;
+/// How many function ranges the hint names.
+const HINT_RANGES: usize = 8;
 
 /// The short names of the Claude models and the ids they stand for on the Claude Code route: the
 /// ids move with the releases, the names stay, and a person types the name.
@@ -695,6 +705,98 @@ fn settings_check(root: &Path) -> Result<String, String> {
     ))
 }
 
+/// Marks the start of a run of card `id` for the hooks: the card id in this process's
+/// environment, which the harness and its hooks inherit, and the read hints of the last run
+/// forgotten.
+fn begin_run(root: &Path, id: i64) {
+    // SAFETY: the console runs one card at a time and reads no environment on another thread
+    // while a run starts
+    unsafe { std::env::set_var(CARD_VAR, id.to_string()) };
+    let _ = std::fs::remove_file(root.join(READ_HINTS_FILE));
+}
+
+/// The hint the post hook answers a whole-file Read with: for a `Read` of a file of
+/// [`LONG_READ`] lines or more without an offset or a limit, the card's outline (`rc context
+/// <id>`) and the line ranges of the functions the card names, so the next Read takes a range.
+/// Nothing for a ranged Read, a short file, or a file this run was already told about. The card
+/// is the one in [`CARD_VAR`], else the newest context file under `var/context/`.
+#[must_use]
+pub fn read_hint(root: &Path, call: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    if call.get("tool_name").and_then(Value::as_str) != Some("Read") {
+        return None;
+    }
+    let input = call.get("tool_input")?;
+    if !input.get("offset").is_none_or(Value::is_null) || !input.get("limit").is_none_or(Value::is_null) {
+        return None;
+    }
+    let file = input.get("file_path").and_then(Value::as_str)?;
+    let path = if Path::new(file).is_absolute() { PathBuf::from(file) } else { root.join(file) };
+    let text = std::fs::read_to_string(&path).ok()?;
+    if text.lines().count() < LONG_READ {
+        return None;
+    }
+    let card = card_of_run(root)?;
+    let shown = path.strip_prefix(root).unwrap_or(&path).display().to_string().replace('\\', "/");
+    if !first_hint(root, card, &shown) {
+        return None;
+    }
+    // the functions the card names come first; a card that names none gets the file's head
+    let brief = std::fs::read_to_string(ra_context::TaskContext::path(root, card)).unwrap_or_default();
+    let items = ra_context::items(&path, &text);
+    let named: Vec<&(usize, usize, String)> = items
+        .iter()
+        .filter(|(_, _, item)| ra_context::item_name(item).is_some_and(|name| name.len() > 2 && brief.contains(name)))
+        .collect();
+    let picked: Vec<&(usize, usize, String)> = if named.is_empty() { items.iter().collect() } else { named };
+    let ranges: Vec<String> = picked
+        .iter()
+        .take(HINT_RANGES)
+        .map(|(start, end, item)| format!("{} {start}-{end}", ra_context::item_name(item).unwrap_or(item)))
+        .collect();
+    let mut hint =
+        format!("{shown} is {} lines: read it by range (offset, limit). Its outline is in `rc context {card}`", text.lines().count());
+    if !ranges.is_empty() {
+        hint.push_str(&format!("; the ranges: {}", ranges.join(", ")));
+    }
+    Some(hint)
+}
+
+/// The card a hook is running under: [`CARD_VAR`] when the run set it, else the newest file of
+/// `var/context/`, the one the run just wrote.
+fn card_of_run(root: &Path) -> Option<i64> {
+    if let Some(id) = std::env::var(CARD_VAR).ok().and_then(|v| v.trim().parse().ok()) {
+        return Some(id);
+    }
+    std::fs::read_dir(root.join(ra_context::CONTEXT_DIR))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let id: i64 = path.file_stem()?.to_str()?.parse().ok()?;
+            Some((entry.metadata().ok()?.modified().ok()?, id))
+        })
+        .max()
+        .map(|(_, id)| id)
+}
+
+/// Whether `file` was not yet hinted for `card` this run, noting it so the next ask says no.
+fn first_hint(root: &Path, card: i64, file: &str) -> bool {
+    let memo = root.join(READ_HINTS_FILE);
+    let line = format!("{card}\t{file}");
+    if std::fs::read_to_string(&memo).is_ok_and(|text| text.lines().any(|l| l == line)) {
+        return false;
+    }
+    if let Some(dir) = memo.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut text = std::fs::read_to_string(&memo).unwrap_or_default();
+    text.push_str(&line);
+    text.push('\n');
+    let _ = std::fs::write(&memo, text);
+    true
+}
+
 /// git on the path, and whether `root` is a repository: the review reads the diff and the
 /// worktrees branch from HEAD.
 async fn git_check(root: &Path) -> Result<String, String> {
@@ -1095,11 +1197,12 @@ pub async fn plan(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Pla
     Ok(Plan { id, title: node.title, model, outline, usage: answer.usage })
 }
 
-/// What the planner reads: the project context, the node with its objective and acceptance,
-/// and the cards already under it with their states, so none comes back twice.
+/// What the planner reads: the project context with the standing direction, the node with its
+/// objective and acceptance, and the cards already under it with their states, so none comes
+/// back twice.
 async fn plan_brief(store: &Store, node: &Node) -> anyhow::Result<String> {
     let mut text = String::new();
-    let context = project_context(store);
+    let context = project_direction(store).await?;
     if !context.trim().is_empty() {
         let _ = writeln!(text, "# Project context\n{}", context.trim_end());
     }
@@ -1331,8 +1434,8 @@ pub fn limits_tight(limits: &ra_providers::limits::Limits) -> bool {
 /// # Errors
 /// When the roadmap cannot be read, or the run fails.
 pub async fn run_next(store: &Store, worker: &Worker) -> anyhow::Result<Vec<String>> {
-    let nodes = store.all().await?;
-    match tree::next_ready(&nodes) {
+    let roadmap = store.load().await?;
+    match tree::next_ready(&roadmap.nodes, &roadmap.gambits) {
         Some(node) => run(store, node.id, worker).await,
         None => Ok(vec!["no card is ready".to_owned()]),
     }
@@ -1357,7 +1460,7 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     let root = workspace_of(store);
     write_digest(store, &root, Some(format!("walk · pid {} · started {}", std::process::id(), clock(unix_now()))), None, None).await;
     loop {
-        let nodes = store.all().await?;
+        let roadmap = store.load().await?;
         // the walk's end, whichever way, goes to the paired session's feed and the digest
         let done = async |lines: &mut Vec<String>, text: String| {
             crate::pair::event(&root, &format!("walk {text}"));
@@ -1367,7 +1470,7 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         // the plan's room decides the pick before each card: a window that got tight during
         // the walk takes the small cards from here on
         let tight = plan_tight(&root);
-        let Some(id) = batch_ready(&nodes, tight).map(|n| n.id) else {
+        let Some(id) = batch_ready(&roadmap.nodes, &roadmap.gambits, tight).map(|n| n.id) else {
             done(&mut lines, format!("ran {ran} card(s) · no card is ready")).await;
             return Ok(lines);
         };
@@ -1489,10 +1592,10 @@ pub fn stop_walk(root: &Path) -> String {
 /// window's walk view. With `tight` the picks are the smallest ready card first, as a walk picks
 /// when the plan's window is tight ([`plan_tight`]). Nothing is written.
 #[must_use]
-pub fn walk_order(nodes: &[Node], tight: bool) -> Vec<i64> {
+pub fn walk_order(nodes: &[Node], gambits: &[Gambit], tight: bool) -> Vec<i64> {
     let mut nodes = nodes.to_vec();
     let mut order = Vec::new();
-    while let Some(id) = batch_ready(&nodes, tight).map(|n| n.id) {
+    while let Some(id) = batch_ready(&nodes, gambits, tight).map(|n| n.id) {
         order.push(id);
         if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
             node.state = TaskState::Implemented;
@@ -1501,26 +1604,27 @@ pub fn walk_order(nodes: &[Node], tight: bool) -> Vec<i64> {
     order
 }
 
-/// The first card a batch runs, in tree order: a defined task whose waits-on are each accepted or
-/// implemented. Implemented counts beside accepted here, unlike in [`tree::next_ready`]: the cards
-/// the batch implements are not accepted until the person reviews, and their dependents are what
-/// the batch is meant to run ahead of that review. A card whose waits-on failed, left the roadmap
-/// or are still open is not picked, so every pick moves a card out of defined and the loop ends.
-/// With `tight` the pick is the ready card of the lowest complexity, the first in tree order
-/// among equals: what is left of the window finishes small cards whole rather than starting a
-/// large one it cannot end.
-fn batch_ready(nodes: &[Node], tight: bool) -> Option<&Node> {
-    ready_cards(nodes, tight).into_iter().next()
+/// The first card a batch runs: a defined task whose waits-on are each accepted or implemented,
+/// scored as `rc next` scores ([`tree::rank`]): priority, then the gambits, then tree order.
+/// Implemented counts beside accepted here, unlike in [`tree::next_ready`]: the cards the batch
+/// implements are not accepted until the person reviews, and their dependents are what the batch
+/// is meant to run ahead of that review. A card whose waits-on failed, left the roadmap or are
+/// still open is not picked, so every pick moves a card out of defined and the loop ends. With
+/// `tight` the pick is the ready card of the lowest complexity, the best scored among equals:
+/// what is left of the window finishes small cards whole rather than starting a large one it
+/// cannot end.
+fn batch_ready<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Option<&'a Node> {
+    ready_cards(nodes, gambits, tight).into_iter().next()
 }
 
-/// Every card a batch may run, in the order [`batch_ready`] would pick them: tree order, or by
+/// Every card a batch may run, in the order [`batch_ready`] would pick them: by score, or by
 /// complexity with `tight`, the smallest first.
-fn ready_cards(nodes: &[Node], tight: bool) -> Vec<&Node> {
+fn ready_cards<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Vec<&'a Node> {
     let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && matches!(d.state, TaskState::Accepted | TaskState::Implemented));
-    let mut ready: Vec<&Node> = nodes
+    let candidates = nodes
         .iter()
-        .filter(|n| n.state == TaskState::Defined && matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.depends_on.iter().all(met))
-        .collect();
+        .filter(|n| n.state == TaskState::Defined && matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.depends_on.iter().all(met));
+    let mut ready: Vec<&Node> = tree::rank(nodes, candidates, gambits).into_iter().map(|s| s.node).collect();
     if tight {
         ready.sort_by_key(|n| n.complexity);
     }
@@ -1636,8 +1740,9 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     let mut lines = Vec::new();
     let mut ran = 0;
     loop {
-        let nodes = store.all().await?;
-        let ids: Vec<i64> = ready_cards(&nodes, plan_tight(&root)).iter().take(width).map(|n| n.id).collect();
+        let roadmap = store.load().await?;
+        let nodes = roadmap.nodes;
+        let ids: Vec<i64> = ready_cards(&nodes, &roadmap.gambits, plan_tight(&root)).iter().take(width).map(|n| n.id).collect();
         if ids.is_empty() {
             lines.push(format!("ran {ran} card(s) · no card is ready"));
             return Ok(lines);
@@ -1718,7 +1823,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     }
     let session = if provider.has_own_tools() {
         // a harness acts in the workspace by itself: one call carries the whole task, and the
-        // harness holds it to the budget
+        // harness holds it to the budget; its hooks learn the card from the environment
+        begin_run(&acting, id);
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
@@ -1743,7 +1849,15 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                     // this session while the card reads the same
                     store.set_session(id, Some((session, &card_fingerprint(&node))), unix_now()).await?;
                 }
-                Ok(Session { text: answer.text, usage: answer.usage, calls: 0, turns: answer.turns, turn_usage: answer.turn_usage, cap })
+                Ok(Session {
+                    text: answer.text,
+                    usage: answer.usage,
+                    calls: 0,
+                    turns: answer.turns,
+                    turn_usage: answer.turn_usage,
+                    cap,
+                    reads: answer.reads,
+                })
             }
             Err(error) => Err(error),
         }
@@ -1869,7 +1983,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the run against its estimate, on the check line so the handoff carries it: the next run
     // reads what the last one spent against what the card was sized at
     let verdict = estimate_verdict(estimate_of(&node), &session.usage, session.turns);
-    check_line = format!("{check_line} · {verdict}");
+    let sizes = turn_sizes(&session);
+    check_line = format!("{check_line} · {verdict} · {sizes}");
     // what to do with the build, on the same line: the window restarts on the milestone commit,
     // not per card
     if let Some(advice) = build_advice(&changed) {
@@ -1896,7 +2011,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     };
     let mut lines = vec![
         format!(
-            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · in {} out {}{} · {} · {verdict}",
+            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · in {} out {} · {sizes} · {} · {verdict}",
             if passed { "✓" } else { "✗" },
             id,
             node.title,
@@ -1905,7 +2020,6 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             session.calls,
             session.usage.prompt_tokens,
             session.usage.completion_tokens,
-            turn_sizes(&session.turn_usage),
             cost_text(session.usage.cost_usd)
         ),
         check_line,
@@ -1913,8 +2027,12 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     lines.extend(fresh);
     lines.extend(noted);
     lines.extend(lint_lines);
-    // in debug mode the worker's own look back: kept for the next runs, and named here
+    // in debug mode the files the run read again, the context every later turn carried, and
+    // the worker's own look back: kept for the next runs, and named here
     if worker.debug {
+        if let Some(again) = reread(&session.reads) {
+            lines.push(format!("  re-read: {again}"));
+        }
         let mut notes = crate::retro::parse(&session.text);
         // a bullet without its tag is put to the classify role, when it has a model: the
         // worker forgets the tag more often than it misplaces it
@@ -1975,6 +2093,8 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     task.outlines = ra_context::outline_files(&root, &brief.files, &last_change(&root, node, &task).await);
     let project =
         if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
+    // the active gambits ride after the project context as the person's standing direction
+    let project = ra_context::with_direction(&project, &direction_lines(&store.gambits().await?));
     // an explicit budget, else the complexity's while budgets are on, else none at all; a turn
     // cap only when one was asked for. No limit stands by default: the person asked for none
     let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
@@ -2043,6 +2163,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let provider = worker.provider()?;
     let Prepared { workspace, root, task, project, budget, cap, effort } = prepare(store, &node, worker, false).await?;
     let harness = provider.has_own_tools();
+    let checks = checks_of(&root, &node);
     let messages = if harness {
         harness_messages(&task, &project, &root, worker.debug)
     } else {
@@ -2076,9 +2197,18 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
                 Ok(None) => "none".to_owned(),
                 Err(reason) => format!("none, {reason}"),
             },
-            checks_of(&root, &node).describe()
+            checks.describe()
         ),
     ];
+    // what the pre hook makes of a check when the worker runs it itself: the command as it
+    // runs, with its tail, shown before a run does it
+    if let Ok(catalogue) = Catalogue::load(&root.join(GOTCHAS_FILE)) {
+        for check in &checks.commands {
+            if let ra_gotchas::Verdict::Rewrite { command, .. } = catalogue.command(check, ra_gotchas::Conditions::default()) {
+                lines.push(format!("  the pre hook runs `{check}` as `{command}`"));
+            }
+        }
+    }
     let command = provider.command_line(&request);
     if let Some(command) = &command {
         // the effort and the allowed tools, named before the argument list buries them
@@ -2239,6 +2369,33 @@ async fn last_change(root: &Path, node: &Node, task: &ra_context::TaskContext) -
 #[must_use]
 pub fn project_context(store: &Store) -> String {
     ra_context::Project::load(&workspace_of(store)).unwrap_or_default()
+}
+
+/// The person's standing direction as a run, the planner and a reassessment read it: one line per
+/// active gambit, in the order of the file, with its weight and its focus words; the parked and
+/// the done ones stay out.
+#[must_use]
+pub fn direction_lines(gambits: &[Gambit]) -> Vec<String> {
+    gambits
+        .iter()
+        .filter(|g| g.state == GambitState::Active)
+        .map(|g| {
+            let mut line = format!("g{} {} {{w{}}}", g.id, g.text, g.weight);
+            if !g.focus.is_empty() {
+                let _ = write!(line, " · focus: {}", g.focus.join(" "));
+            }
+            line
+        })
+        .collect()
+}
+
+/// The project context with the standing direction after it, for the prompts that plan and
+/// reassess; empty while neither is there.
+///
+/// # Errors
+/// When the roadmap cannot be read.
+pub async fn project_direction(store: &Store) -> anyhow::Result<String> {
+    Ok(ra_context::with_direction(&project_context(store), &direction_lines(&store.gambits().await?)))
 }
 
 /// The workspace: the directory of the roadmap file.
@@ -2468,18 +2625,42 @@ struct Session {
     turn_usage: Vec<TurnUsage>,
     /// The turn cap the run had, when it had one.
     cap: Option<u32>,
+    /// The files the run read, one entry per read, relative to the workspace.
+    reads: Vec<String>,
 }
 
-/// The sizes of the turns for the run line: the largest and the average, in tokens read and
-/// written, as ` · per turn largest 41k, avg 12k`; nothing when the provider showed no turns.
-fn turn_sizes(turns: &[TurnUsage]) -> String {
-    let Ok(count) = u64::try_from(turns.len()) else { return String::new() };
-    if count == 0 {
-        return String::new();
+/// The size of the turns for the run line and the handoff: the context a turn carried is the
+/// cost of the run, so the average tokens a turn read and wrote leads, as `avg 12k tokens a
+/// turn, largest 41k`; the largest only when the provider showed each turn, the average from the
+/// sum over the turns when it showed only that.
+fn turn_sizes(session: &Session) -> String {
+    let shown: Vec<u64> = session.turn_usage.iter().map(TurnUsage::total).collect();
+    let count = u64::try_from(shown.len()).unwrap_or(0);
+    if count > 0 {
+        let average = shown.iter().sum::<u64>() / count;
+        let largest = shown.iter().copied().max().unwrap_or(0);
+        return format!("avg {} tokens a turn, largest {}", kilo(average), kilo(largest));
     }
-    let largest = turns.iter().map(TurnUsage::total).max().unwrap_or(0);
-    let average = turns.iter().map(TurnUsage::total).sum::<u64>() / count;
-    format!(" · per turn largest {}, avg {}", kilo(largest), kilo(average))
+    let total = session.usage.prompt_tokens + session.usage.completion_tokens;
+    format!("avg {} tokens a turn", kilo(total / session.turns.max(1)))
+}
+
+/// How many files a run line names of the ones a run read again.
+const REREAD_SHOWN: usize = 3;
+
+/// The files a run read more than once, the most re-read first, at most [`REREAD_SHOWN`] of
+/// them, as `c.rs ×12, x86.rs ×9, abi.rs ×7`; nothing when every file was read once.
+fn reread(reads: &[String]) -> Option<String> {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for path in reads {
+        *counts.entry(path.as_str()).or_default() += 1;
+    }
+    let mut again: Vec<(&str, usize)> = counts.into_iter().filter(|(_, n)| *n > 1).collect();
+    if again.is_empty() {
+        return None;
+    }
+    again.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    Some(again.iter().take(REREAD_SHOWN).map(|(path, n)| format!("{path} ×{n}")).collect::<Vec<_>>().join(", "))
 }
 
 /// A token count in short: `812`, `4.1k`, `120k`.
@@ -2589,6 +2770,7 @@ async fn tool_loop(
     let mut turn_usage = Vec::new();
     let mut calls = 0usize;
     let mut turn = 0u32;
+    let mut reads: Vec<String> = Vec::new();
     loop {
         turn += 1;
         if let Some(cap) = cap
@@ -2618,7 +2800,7 @@ async fn tool_loop(
         add_usage(&mut usage, &answer.usage);
         turn_usage.push(TurnUsage::of(&answer.usage));
         if answer.tool_calls.is_empty() {
-            return Ok(Session { text: answer.text, usage, calls, turns: u64::from(turn), turn_usage, cap });
+            return Ok(Session { text: answer.text, usage, calls, turns: u64::from(turn), turn_usage, cap, reads });
         }
         // the budget is checked before the tools run: the work it would pay for is not done
         if let Some((budget, spent)) = budget.zip(usage.cost_usd).filter(|(budget, spent)| spent > budget) {
@@ -2627,6 +2809,12 @@ async fn tool_loop(
         messages.push(Message::assistant_calls(answer.text, answer.tool_calls.clone()));
         for call in &answer.tool_calls {
             tracing::debug!("#{id} turn {turn}: {}({})", call.name, call.arguments);
+            if call.name == "read_file"
+                && let Some(path) =
+                    serde_json::from_str::<serde_json::Value>(&call.arguments).ok().and_then(|a| a["path"].as_str().map(str::to_owned))
+            {
+                reads.push(path);
+            }
             let result = toolbox.execute(call).await;
             messages.push(Message::tool(&call.id, result));
             calls += 1;
@@ -2716,9 +2904,11 @@ pub async fn reassess(store: &Store, id: i64, worker: &Worker, recursive: bool) 
 }
 
 /// One reassessment: the model returns two lines, and the store takes them. The prompt carries the
-/// node's own notes and its children with their states, so the revision names only the work the
-/// subtree still owes. With `propose`, the model may add the cards the objective lacks; they wait
-/// in the proposals file for the person's word, less the ones declined before.
+/// person's standing direction, the node's own notes and its children with their states, so the
+/// revision names only the work the subtree still owes. With `propose`, the model may add the
+/// cards the objective lacks and, while gambits stand, name a child no gambit covers as one to
+/// park; both wait in the proposals file for the person's word, less the ones declined before.
+/// Nothing is parked on the model's say-so.
 async fn reassess_one(
     store: &Store,
     worker: &Worker,
@@ -2730,7 +2920,12 @@ async fn reassess_one(
     let node = store.read(id).await?;
     let old_objective = node.objective.clone();
     let old_acceptance = node.acceptance.clone();
+    let direction = direction_lines(&store.gambits().await?);
     let mut ask = context_of(store, &node).await?.text;
+    if !direction.is_empty() {
+        ask.push('\n');
+        ask.push_str(&ra_context::with_direction("", &direction));
+    }
     if let Some(notes) = &node.notes {
         ask.push_str(&format!("\nNotes of earlier work on this node: {}\n", first_line(notes)));
     }
@@ -2756,6 +2951,13 @@ async fn reassess_one(
              card after the three, each as:\ncard: <title> | <objective, one line> | <acceptance, one line>\n\
              Add none when the children cover the objective.",
         );
+        if !direction.is_empty() {
+            ask.push_str(
+                "\nWhen a child card serves none of the person's standing direction above, you may propose parking it, one \
+                 line each, as:\npark: #<its id> | <why no direction covers it, one line>\nThe person decides; propose \
+                 none when every child serves a direction.",
+            );
+        }
     }
     let answer = provider
         .complete(CompletionRequest {
@@ -2781,6 +2983,14 @@ async fn reassess_one(
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("card:") {
             if let Some(proposal) = Proposal::parse(rest) {
+                proposals.push(proposal);
+            }
+        } else if let Some(rest) = line.strip_prefix("park:") {
+            // only a child still open can be parked, and only while a direction stands to miss
+            if propose
+                && !direction.is_empty()
+                && let Some(proposal) = Proposal::parse_park(rest, nodes.iter().filter(|n| n.parent == Some(id)))
+            {
                 proposals.push(proposal);
             }
         } else if let Some(rest) = line.strip_prefix("overview:") {
@@ -2810,13 +3020,14 @@ async fn reassess_one(
     if let Some(revised) = after.iter().find(|n| n.id == id) {
         store.set_assessed(id, assessed_line(revised, Some(&fingerprint(revised, &after))).as_deref()).await?;
     }
-    // what the person declined before, and what a child already is, does not come back as new
+    // what the person declined before, and what a child already is, does not come back as new;
+    // a park is keyed by the card it names, so a reworded reason is the same proposal
     if propose {
         let declined: Vec<&str> = declined_of(&node).collect();
         let mut seen: Vec<String> = nodes.iter().filter(|n| n.parent == Some(id)).map(|n| n.title.to_lowercase()).collect();
         proposals.retain(|p| {
-            let key = p.title.to_lowercase();
-            let fresh = !declined.contains(&declined_mark(&p.title).as_str()) && !seen.contains(&key);
+            let key = p.park.map_or_else(|| p.title.to_lowercase(), |card| format!("park #{card}"));
+            let fresh = !declined.contains(&declined_mark(&key).as_str()) && !seen.contains(&key);
             seen.push(key);
             fresh
         });
@@ -2858,12 +3069,17 @@ async fn reassess_one(
     Ok(receipt)
 }
 
-/// A card the architect found missing under a milestone, waiting for the person's word.
+/// A card the architect found missing under a milestone, or one it found serving none of the
+/// person's standing direction, waiting for the person's word.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposal {
     pub title: String,
     pub objective: String,
     pub acceptance: String,
+    /// The child this proposal would park, when it is a park rather than a new card; its title
+    /// is `title` and the architect's reason `objective`. Accepting blocks the card: it stays on
+    /// the roadmap and out of the walk.
+    pub park: Option<i64>,
 }
 
 impl Proposal {
@@ -2873,7 +3089,20 @@ impl Proposal {
         let mut parts = rest.split('|').map(str::trim);
         let title = parts.next().filter(|t| !t.is_empty() && !is_placeholder(t))?;
         let field = |value: Option<&str>| value.filter(|v| !is_placeholder(v)).unwrap_or("").to_owned();
-        Some(Self { title: title.to_owned(), objective: field(parts.next()), acceptance: field(parts.next()) })
+        Some(Self { title: title.to_owned(), objective: field(parts.next()), acceptance: field(parts.next()), park: None })
+    }
+
+    /// A `park:` line of the architect's answer: `#<id> | <reason>`, where the id is one of
+    /// `children` and the card is still open; anything else is noise.
+    fn parse_park<'a>(rest: &str, children: impl IntoIterator<Item = &'a Node>) -> Option<Self> {
+        let (id, reason) = rest.split_once('|').map_or((rest.trim(), ""), |(id, reason)| (id.trim(), reason.trim()));
+        let id: i64 = id.trim_start_matches('#').parse().ok()?;
+        let child = children.into_iter().find(|n| n.id == id)?;
+        if matches!(child.state, TaskState::Implemented | TaskState::Accepted | TaskState::Blocked | TaskState::Cancelled) {
+            return None;
+        }
+        let reason = if is_placeholder(reason) { String::new() } else { reason.to_owned() };
+        Some(Self { title: child.title.clone(), objective: reason, acceptance: String::new(), park: Some(id) })
     }
 }
 
@@ -2895,6 +3124,7 @@ pub fn proposals_of(store: &Store, id: i64) -> Vec<Proposal> {
                 title: title.to_owned(),
                 objective: parts.next().unwrap_or("").to_owned(),
                 acceptance: parts.next().unwrap_or("").to_owned(),
+                park: parts.next().and_then(|p| p.trim().parse().ok()),
             })
         })
         .collect()
@@ -2913,17 +3143,34 @@ fn save_proposals(store: &Store, id: i64, proposals: &[Proposal]) -> anyhow::Res
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
     let flat = |text: &str| text.replace(['\t', '\n'], " ");
-    let text: String = proposals.iter().map(|p| format!("{}\t{}\t{}\n", flat(&p.title), flat(&p.objective), flat(&p.acceptance))).collect();
+    let text: String = proposals
+        .iter()
+        .map(|p| {
+            let park = p.park.map(|id| id.to_string()).unwrap_or_default();
+            format!("{}\t{}\t{}\t{park}\n", flat(&p.title), flat(&p.objective), flat(&p.acceptance))
+        })
+        .collect();
     std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))
 }
 
-/// The list the person reads: a lead naming the commands, then one numbered line per proposal.
+/// The list the person reads: a lead naming the commands, then one numbered line per proposal;
+/// a park names the card it would set aside and the architect's reason.
 #[must_use]
 pub fn proposal_lines(id: i64, proposals: &[Proposal]) -> Vec<String> {
-    let mut out =
-        vec![format!("? {} card(s) proposed under #{id}; /accept {id} <n> adds one, /decline {id} <n> drops it for good", proposals.len())];
+    let mut out = vec![format!(
+        "? {} card(s) proposed under #{id}; /accept {id} <n> takes one, /decline {id} <n> drops it for good",
+        proposals.len()
+    )];
     for (n, p) in proposals.iter().enumerate() {
-        out.push(format!("  {}. {} — {}", n + 1, p.title, if p.objective.is_empty() { "no objective" } else { &p.objective }));
+        out.push(match p.park {
+            Some(card) => format!(
+                "  {}. park #{card} {} — {}",
+                n + 1,
+                p.title,
+                if p.objective.is_empty() { "no standing direction covers it" } else { &p.objective }
+            ),
+            None => format!("  {}. {} — {}", n + 1, p.title, if p.objective.is_empty() { "no objective" } else { &p.objective }),
+        });
     }
     out
 }
@@ -2938,15 +3185,30 @@ fn take_proposal(store: &Store, id: i64, n: usize) -> anyhow::Result<(Proposal, 
     Ok((taken, proposals))
 }
 
-/// Accepts proposal `n` of milestone `id`: a task under it with the proposed text, then the list
-/// that still waits.
+/// Accepts proposal `n` of milestone `id`: a task under it with the proposed text, or the named
+/// card blocked with the reason on its notes when the proposal was a park; then the list that
+/// still waits.
 pub async fn accept_proposal(store: &Store, id: i64, n: usize) -> anyhow::Result<Vec<String>> {
     let (taken, rest) = take_proposal(store, id, n)?;
     fn field(text: &str) -> Option<&str> {
         (!text.is_empty()).then_some(text)
     }
-    let new = store.insert(Some(id), NodeKind::Task, &taken.title, field(&taken.objective), field(&taken.acceptance), 3).await?;
-    let mut out = vec![format!("#{new} {} added under #{id}", taken.title)];
+    let first = match taken.park {
+        Some(card) => {
+            // blocked keeps the card on the roadmap and out of the walk; the reason goes on its
+            // notes, so a later reader knows why it stopped
+            store.set_state(card, TaskState::Blocked).await?;
+            if !taken.objective.is_empty() {
+                store.set_notes(card, &format!("parked on the person's word: {}", taken.objective)).await?;
+            }
+            format!("#{card} {} parked under #{id}: blocked on your word, `/set {card} defined` brings it back", taken.title)
+        }
+        None => {
+            let new = store.insert(Some(id), NodeKind::Task, &taken.title, field(&taken.objective), field(&taken.acceptance), 3).await?;
+            format!("#{new} {} added under #{id}", taken.title)
+        }
+    };
+    let mut out = vec![first];
     if !rest.is_empty() {
         out.extend(proposal_lines(id, &rest));
     }
@@ -2958,12 +3220,15 @@ pub async fn accept_proposal(store: &Store, id: i64, n: usize) -> anyhow::Result
 pub async fn decline_proposal(store: &Store, id: i64, n: usize) -> anyhow::Result<Vec<String>> {
     let node = store.read(id).await?;
     let (taken, rest) = take_proposal(store, id, n)?;
-    let mark = declined_mark(&taken.title);
+    let mark = declined_mark(&taken.park.map_or_else(|| taken.title.clone(), |card| format!("park #{card}")));
     if !declined_of(&node).any(|h| h == mark) {
         let line = format!("{} -{mark}", assessed_line(&node, assessed_mark(&node)).unwrap_or_default());
         store.set_assessed(id, Some(line.trim())).await?;
     }
-    let mut out = vec![format!("declined {}: it does not return", taken.title)];
+    let mut out = vec![match taken.park {
+        Some(card) => format!("declined parking #{card} {}: it stays, and is not proposed again", taken.title),
+        None => format!("declined {}: it does not return", taken.title),
+    }];
     if !rest.is_empty() {
         out.extend(proposal_lines(id, &rest));
     }

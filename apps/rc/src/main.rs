@@ -79,11 +79,33 @@ enum Command {
         #[arg(long)]
         clear_session: bool,
     },
-    /// Prints the first ready card: a defined task whose waits-on are all accepted.
-    Next,
+    /// Prints the ready card the walk takes next: by priority, then the active gambits whose
+    /// focus matches it, then the order of the file.
+    Next {
+        /// Prints every ready card in that order, with its score and the gambits that moved it.
+        #[arg(long)]
+        why: bool,
+    },
     /// Lints the roadmap: placeholder text, a card without acceptance or files, a waits-on that names
     /// no card or comes back to its own, a complexity outside 1..5; one line each, exit code 1 when any.
     Check,
+    /// Lists the gambits: the standing directions that order the walk, each with its weight, its state and its focus.
+    Gambits,
+    /// Adds a gambit or changes one: its state, its weight or the words a card matches on.
+    Gambit {
+        #[command(subcommand)]
+        action: GambitAction,
+    },
+    /// Sets the person's priority on a card, 1 to 5, which the walk takes first; `--clear` leaves the order to the file and the gambits.
+    Priority {
+        id: i64,
+        /// The priority, 1 to 5.
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        priority: Option<u8>,
+        /// Clears the priority.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Links a node to the nodes it waits for.
     Depend {
         /// The node that waits.
@@ -317,6 +339,32 @@ enum Command {
     },
 }
 
+/// What `rc gambit` does with a gambit; the id is `g2` or `2`.
+#[derive(Subcommand)]
+enum GambitAction {
+    /// Adds a gambit, active.
+    Add {
+        /// The text, one line.
+        text: Vec<String>,
+        /// The weight, 1 to 5.
+        #[arg(long, default_value_t = 3)]
+        weight: u8,
+        /// The words a card matches on, in its title, its milestone's title or its files; none matches every card.
+        #[arg(long, num_args = 1..)]
+        focus: Vec<String>,
+    },
+    /// Parks a gambit: it waits and steers nothing.
+    Park { id: String },
+    /// Makes a gambit active again.
+    Activate { id: String },
+    /// Marks a gambit done; it stays in the file as a record.
+    Done { id: String },
+    /// Sets the weight of a gambit, 1 to 5.
+    Weight { id: String, weight: u8 },
+    /// Replaces the focus words of a gambit; none makes it match every card.
+    Focus { id: String, words: Vec<String> },
+}
+
 /// What `rc worktree` does with the worktrees of the cards.
 #[derive(Subcommand)]
 enum WorktreeAction {
@@ -363,13 +411,52 @@ async fn main() -> anyhow::Result<()> {
             };
             edit_card(id, &edit).await
         }
-        Command::Next => {
+        Command::Next { why } => {
             plain_tracing()?;
-            next().await
+            next(why).await
         }
         Command::Check => {
             plain_tracing()?;
             check().await
+        }
+        Command::Gambits => {
+            plain_tracing()?;
+            for line in ra_console::commands::gambit_lines(&open_store().await?.gambits().await?) {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        // the console's line parser is the one parser of the gambit commands; the CLI only
+        // shapes the words
+        Command::Gambit { action } => {
+            plain_tracing()?;
+            let line = match action {
+                GambitAction::Add { text, weight, focus } => {
+                    let text = text.join(" ");
+                    anyhow::ensure!(!text.trim().is_empty(), "a gambit is not empty");
+                    let store = open_store().await?;
+                    let id = store.add_gambit(&text, weight, &focus).await?;
+                    println!("g{id} {} {{w{weight}}} [active]", text.trim());
+                    if !focus.is_empty() {
+                        println!("    focus: {}", focus.join(" "));
+                    }
+                    return Ok(());
+                }
+                GambitAction::Park { id } => format!("/gambit {id} park"),
+                GambitAction::Activate { id } => format!("/gambit {id} activate"),
+                GambitAction::Done { id } => format!("/gambit {id} done"),
+                GambitAction::Weight { id, weight } => format!("/gambit {id} weight {weight}"),
+                GambitAction::Focus { id, words } => format!("/gambit {id} focus {}", words.join(" ")),
+            };
+            console_line(&line).await
+        }
+        Command::Priority { id, priority, clear } => {
+            plain_tracing()?;
+            let value = match priority {
+                Some(p) if !clear => p.to_string(),
+                _ => "none".to_owned(),
+            };
+            console_line(&format!("/priority {id} {value}")).await
         }
         Command::Depend { id, waits_for } => {
             plain_tracing()?;
@@ -621,6 +708,16 @@ fn hook(event: &str) -> anyhow::Result<()> {
     let Ok(call) = serde_json::from_str::<serde_json::Value>(input.trim_start_matches('\u{feff}')) else { return Ok(()) };
     let cwd =
         call.get("cwd").and_then(serde_json::Value::as_str).map_or_else(|| std::env::current_dir().unwrap_or_default(), PathBuf::from);
+    // a file the worker read is not the machine talking: no gotcha reads it, but a whole long
+    // file read at once gets the outline instead, catalogue or not
+    if call.get("tool_name").and_then(serde_json::Value::as_str) == Some("Read") {
+        if event == "post"
+            && let Some(hint) = ra_console::agent::read_hint(&cwd, &call)
+        {
+            println!("{}", serde_json::json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": hint}}));
+        }
+        return Ok(());
+    }
     let Ok(catalogue) = ra_gotchas::Catalogue::load(&cwd.join("var/gotchas.toml")) else { return Ok(()) };
     // a running console or window holds its binary only while it runs from target/; an
     // installed one leaves the build free, so the lock itself is asked, not the pid file
@@ -798,6 +895,17 @@ async fn open_store() -> anyhow::Result<Store> {
     Store::open(&store_path(), "Rhipper Agent").await
 }
 
+/// Runs one console line over the roadmap and prints what it says; for the commands that call
+/// no model, so the worker is bare.
+async fn console_line(line: &str) -> anyhow::Result<()> {
+    let store = open_store().await?;
+    let worker = Worker::new(ra_console::ui::DEFAULT_MODEL);
+    for line in ra_console::commands::run(line, &store, &worker).await?.0 {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 /// A command over a roadmap needs one: a directory without it is told what `rc init` does,
 /// rather than getting a bare file on the quiet.
 fn ensure_roadmap(roadmap: &Path) -> anyhow::Result<()> {
@@ -873,16 +981,23 @@ fn state_label(computed: TaskState, stored: TaskState) -> String {
     if computed == stored { stored.to_string() } else { format!("{computed} ({stored})") }
 }
 
-async fn next() -> anyhow::Result<()> {
-    let nodes = open_store().await?.all().await?;
-    match tree::next_ready(&nodes) {
-        Some(node) => {
-            println!("#{} {}", node.id, node.title);
-            if let Some(objective) = &node.objective {
-                println!("    {objective}");
-            }
+/// Prints the card the walk takes next; with `why`, every ready card in the walk's order with
+/// its score, the picked one first.
+async fn next(why: bool) -> anyhow::Result<()> {
+    let roadmap = open_store().await?.load().await?;
+    let ranked = tree::ranked(&roadmap.nodes, &roadmap.gambits);
+    if ranked.is_empty() {
+        println!("no card is ready");
+    } else if why {
+        for score in &ranked {
+            println!("{}", score.line());
         }
-        None => println!("no card is ready"),
+    } else {
+        let node = ranked[0].node;
+        println!("#{} {}", node.id, node.title);
+        if let Some(objective) = &node.objective {
+            println!("    {objective}");
+        }
     }
     Ok(())
 }

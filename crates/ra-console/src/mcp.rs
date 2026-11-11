@@ -155,6 +155,12 @@ fn tools() -> Vec<Value> {
         ),
         tool("gotchas", "The gotchas that fired, by how often, and the refused commands no gotcha names yet.", json!({}), &[]),
         tool(
+            "gambits",
+            "The gambits: the person's standing directions that order the walk, one per line with its weight 1 to 5, its state (active, parked or done) and the focus words a card matches on.",
+            json!({}),
+            &[],
+        ),
+        tool(
             "handoffs",
             "The handoffs of a card's earlier runs, oldest first: when, model, outcome, the check, the files changed, the report and the lint warnings.",
             json!({"id": id}),
@@ -306,6 +312,7 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
             Ok(commands::run(&line, store, worker).await?.0)
         }
         "gotchas" => Ok(gotchas(&agent::workspace_of(store))),
+        "gambits" => Ok(commands::gambit_lines(&store.gambits().await?)),
         "handoffs" => {
             let id = need_id()?;
             // the node is read for its existence: a missing card is an error, a card without

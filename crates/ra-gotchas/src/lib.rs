@@ -45,13 +45,16 @@ pub enum Where {
 pub enum Remedy {
     /// The message goes to the worker.
     Hint,
-    /// The command runs changed: `insert` after its first word, unless it matches `unless`;
-    /// `when` limits the rewrite to a condition of the machine.
+    /// The command runs changed: `insert` after its first word, or on its end with `append`,
+    /// unless it matches `unless`; `when` limits the rewrite to a condition of the machine.
     Rewrite {
         insert: String,
         /// How many words of the command come before the insert; one unless said otherwise.
         #[serde(default = "one")]
         after: usize,
+        /// The insert goes on the end of the command, after everything: a pipe, a redirect.
+        #[serde(default)]
+        append: bool,
         #[serde(default, with = "serde_regex_opt")]
         unless: Option<Regex>,
         #[serde(default)]
@@ -141,30 +144,40 @@ impl Catalogue {
         self.entries.iter().find(|g| g.id == id)
     }
 
-    /// What to do with a command about to run: the first command gotcha that matches decides.
+    /// What to do with a command about to run: the first hint or allow that matches decides;
+    /// the rewrites before it compose, each on the command as the one before left it.
+    #[must_use]
     pub fn command(&self, command: &str, conditions: Conditions) -> Verdict {
-        for gotcha in self.entries.iter().filter(|g| g.place == Where::Command && g.pattern.is_match(command)) {
+        let mut current = command.to_owned();
+        let mut rewritten: Option<(String, Vec<String>)> = None;
+        for gotcha in self.entries.iter().filter(|g| g.place == Where::Command) {
+            if !gotcha.pattern.is_match(&current) {
+                continue;
+            }
             match &gotcha.remedy {
                 Remedy::Hint => return Verdict::Deny { id: gotcha.id.clone(), reason: gotcha.message.clone() },
-                Remedy::Allow => return Verdict::Pass,
-                Remedy::Rewrite { insert, after, unless, when } => {
+                Remedy::Allow => break,
+                Remedy::Rewrite { insert, after, append, unless, when } => {
                     let applies = match when.as_deref() {
                         Some("console-running") => conditions.console_running,
                         Some(_) => false,
                         None => true,
                     };
-                    if !applies || unless.as_ref().is_some_and(|u| u.is_match(command)) {
+                    if !applies || unless.as_ref().is_some_and(|u| u.is_match(&current)) {
                         continue;
                     }
-                    return Verdict::Rewrite {
-                        id: gotcha.id.clone(),
-                        command: insert_after(command, *after, insert),
-                        reason: gotcha.message.clone(),
-                    };
+                    current = if *append { format!("{} {insert}", current.trim_end()) } else { insert_after(&current, *after, insert) };
+                    match &mut rewritten {
+                        None => rewritten = Some((gotcha.id.clone(), vec![gotcha.message.clone()])),
+                        Some((_, reasons)) => reasons.push(gotcha.message.clone()),
+                    }
                 }
             }
         }
-        Verdict::Pass
+        match rewritten {
+            Some((id, reasons)) => Verdict::Rewrite { id, command: current, reason: reasons.join("; ") },
+            None => Verdict::Pass,
+        }
     }
 
     /// The gotchas a result or an answer shows, each once, with the first line that matched.

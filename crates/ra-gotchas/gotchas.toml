@@ -10,8 +10,9 @@
 # remedy:  hint     — the message goes to the worker: as the reason of a denied command, as
 #                     context after a result, and in the machine notes of later runs
 #          rewrite  — the command runs changed: `insert` goes after the first `after` words (one
-#                     unless said), unless the command already matches `unless`;
-#                     `when = "console-running"` limits it to the time a console holds the binary
+#                     unless said), or on the end with `append = true`, unless the command
+#                     already matches `unless`; `when = "console-running"` limits it to the time
+#                     a console holds the binary; the rewrites compose, in the order written
 #          allow    — the command runs as it is; the hit is only counted
 
 [[gotcha]]
@@ -34,6 +35,13 @@ where = "command"
 pattern = '^\s*cargo\s+(build|test|clippy|check|run)\b'
 message = "a console or a window holds its binary while it runs, so a workspace build cannot relink it; build and test the crates (-p) or exclude the binaries"
 remedy = { kind = "rewrite", insert = "--workspace --exclude rc --exclude rc-gui", after = 2, unless = '(-p |--package |--exclude rc|--bin )', when = "console-running" }
+
+[[gotcha]]
+id = "long-output"
+where = "command"
+pattern = '^\s*cargo\s+(test|build|clippy|check)\b'
+message = "a cargo test, build or clippy prints more than a turn should carry, and every later turn carries it again; the tail is what matters, so the command runs with `2>&1 | tail -n 80` on its end"
+remedy = { kind = "rewrite", insert = "2>&1 | tail -n 80", append = true, unless = '\|\s*\S|>\s*[^&\s]' }
 
 [[gotcha]]
 id = "binary-locked-result"

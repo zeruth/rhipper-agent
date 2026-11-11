@@ -46,7 +46,10 @@ async fn the_tool_table_lists_every_tool_with_a_schema() {
     let names: Vec<&str> = reply["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["show", "add", "details", "set", "depend", "run", "reassess", "model", "ping", "usage", "context", "gotchas", "handoffs"]
+        [
+            "show", "add", "details", "set", "depend", "run", "reassess", "model", "ping", "usage", "context", "gotchas", "gambits",
+            "handoffs"
+        ]
     );
     assert!(reply["result"]["tools"].as_array().unwrap().iter().all(|t| t["inputSchema"]["type"] == "object"));
 }

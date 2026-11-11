@@ -584,6 +584,17 @@ impl Store {
         self.write(roadmap).await
     }
 
+    /// Replaces the focus words of a gambit; none makes it match every card.
+    ///
+    /// # Errors
+    /// When a word holds whitespace, the gambit is unknown or the file cannot be written.
+    pub async fn set_gambit_focus(&self, id: u32, focus: &[String]) -> anyhow::Result<()> {
+        anyhow::ensure!(focus.iter().all(|w| !w.is_empty() && !w.contains(char::is_whitespace)), "a focus word holds no whitespace");
+        let mut roadmap = self.load().await?;
+        gambit_mut(&mut roadmap.gambits, id)?.focus = focus.to_vec();
+        self.write(roadmap).await
+    }
+
     /// Writes the file back as the `rhipper.md` text. The file is small, so a blocking write stays
     /// fine.
     async fn write(&self, roadmap: Roadmap) -> anyhow::Result<()> {

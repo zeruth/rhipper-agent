@@ -21,6 +21,31 @@ pub const PROJECT_FILE: &str = "rhipper.context.md";
 /// Where the tasks' files live, under the workspace.
 pub const CONTEXT_DIR: &str = "var/context";
 
+/// The heading under which the active gambits ride with the project context: the person's
+/// standing direction, which a run, the planner and a reassessment read as such.
+pub const DIRECTION_HEADING: &str = "## The person's standing direction";
+
+/// The project context with the person's standing direction after it, one line per active
+/// gambit as the roadmap lists them; the context alone when there is none, and the direction
+/// alone when the project file is still empty. The file is not touched: the gambits live in the
+/// roadmap and change there.
+#[must_use]
+pub fn with_direction(project: &str, direction: &[String]) -> String {
+    if direction.is_empty() {
+        return project.to_owned();
+    }
+    let mut text = project.trim_end().to_owned();
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(DIRECTION_HEADING);
+    text.push('\n');
+    for line in direction {
+        let _ = writeln!(text, "- {line}");
+    }
+    text
+}
+
 /// How many items an outline names before it counts the rest.
 const OUTLINE_ROOM: usize = 60;
 
@@ -200,6 +225,32 @@ pub fn outline(path: &Path, text: &str) -> String {
 pub fn outline_marked(path: &Path, text: &str, changed: &[(usize, usize)]) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let items = items(path, text);
+    let hidden = items.len().saturating_sub(OUTLINE_ROOM);
+    let mut out = format!("{} ({} lines)", path.display().to_string().replace('\\', "/"), lines.len());
+    if extension == "rs"
+        && let Some(doc) = lines.iter().find_map(|l| l.strip_prefix("//!").map(str::trim)).filter(|d| !d.is_empty())
+    {
+        out.push_str(&format!(" — {}", clip(doc, 140)));
+    }
+    out.push('\n');
+    for (start, end, item) in items.iter().take(OUTLINE_ROOM) {
+        let mark = if changed.iter().any(|&(from, to)| from <= *end && to >= *start) { '*' } else { ' ' };
+        let _ = writeln!(out, "{mark} {start:>5}  {}", clip(item, 110));
+    }
+    if hidden > 0 {
+        out.push_str(&format!("         … and {hidden} more\n"));
+    }
+    out
+}
+
+/// The items of a file with the lines each owns, 1-based and inclusive: an item reaches from
+/// its line to the line before the next one, the last to the end of the file. The same items
+/// the outline lists, for a hint that names a range to read.
+#[must_use]
+pub fn items(path: &Path, text: &str) -> Vec<(usize, usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let mut items: Vec<(usize, String)> = Vec::new();
     // the tests module of a Rust file is not where a change lands; its functions stay out
     let mut in_tests = false;
@@ -223,24 +274,26 @@ pub fn outline_marked(path: &Path, text: &str, changed: &[(usize, usize)]) -> St
         let Some(item) = item else { continue };
         items.push((number + 1, item));
     }
-    let hidden = items.len().saturating_sub(OUTLINE_ROOM);
-    let mut out = format!("{} ({} lines)", path.display().to_string().replace('\\', "/"), lines.len());
-    if extension == "rs"
-        && let Some(doc) = lines.iter().find_map(|l| l.strip_prefix("//!").map(str::trim)).filter(|d| !d.is_empty())
-    {
-        out.push_str(&format!(" — {}", clip(doc, 140)));
+    let ends: Vec<usize> = (0..items.len()).map(|i| items.get(i + 1).map_or(lines.len().max(items[i].0), |(next, _)| next - 1)).collect();
+    items.into_iter().zip(ends).map(|((start, item), end)| (start, end, item)).collect()
+}
+
+/// The name an item declares: the word after its keyword, `hook` of `pub fn hook(event: &str)`,
+/// `Worker` of `impl Worker`; `None` for an item with no word after the keyword.
+#[must_use]
+pub fn item_name(item: &str) -> Option<&str> {
+    let mut rest = item.trim_start();
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = match after.strip_prefix('(') {
+            Some(scoped) => scoped.split_once(')')?.1,
+            None => after,
+        }
+        .trim_start();
     }
-    out.push('\n');
-    for (index, (start, item)) in items.iter().take(OUTLINE_ROOM).enumerate() {
-        // an item owns its lines up to the next item, the last one up to the end of the file
-        let end = items.get(index + 1).map_or(lines.len().max(*start), |(next, _)| next - 1);
-        let mark = if changed.iter().any(|&(from, to)| from <= end && to >= *start) { '*' } else { ' ' };
-        let _ = writeln!(out, "{mark} {start:>5}  {}", clip(item, 110));
-    }
-    if hidden > 0 {
-        out.push_str(&format!("         … and {hidden} more\n"));
-    }
-    out
+    let keyword = KEYWORDS.iter().filter(|k| rest.starts_with(*k)).max_by_key(|k| k.len())?;
+    let name = rest[keyword.len()..].trim_start();
+    let end = name.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(name.len());
+    (end > 0).then(|| &name[..end])
 }
 
 /// The words a Rust item opens with, after any `pub`.

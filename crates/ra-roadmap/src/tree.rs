@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::model::{Node, NodeKind, TaskState};
+use crate::model::{Gambit, GambitState, Node, NodeKind, TaskState};
 
 /// The subtree of `root` in preorder: the node, then each child's subtree, in the order of the
 /// list. Empty when no node has that id.
@@ -80,11 +80,95 @@ pub fn effective_states(nodes: &[Node]) -> HashMap<i64, TaskState> {
     nodes.iter().map(|n| (n.id, effective_in(&by_id, n))).collect()
 }
 
-/// The first card in tree order whose effective state is ready: the one `rc next` names.
+/// The ready card the walk takes first: the best of [`ranked`], the one `rc next` names.
 #[must_use]
-pub fn next_ready(nodes: &[Node]) -> Option<&Node> {
+pub fn next_ready<'a>(nodes: &'a [Node], gambits: &'a [Gambit]) -> Option<&'a Node> {
+    ranked(nodes, gambits).into_iter().next().map(|s| s.node)
+}
+
+/// What places a card in the walk: its priority, then the gambits that pull it forward.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Score<'a> {
+    pub node: &'a Node,
+    /// The card's priority; 0 when the person set none.
+    pub priority: u8,
+    /// The summed weights of `gambits`.
+    pub weight: u32,
+    /// The active gambits whose focus matches the card, in the order of the file.
+    pub gambits: Vec<&'a Gambit>,
+}
+
+impl Score<'_> {
+    /// The line `rc next --why` prints: the card, its priority, the summed weight and the
+    /// gambits that moved it, `#3 A local route · p5 · +6 · g1 Local first {w3}, g2 …`.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let priority = self.node.priority.map_or_else(|| "p-".to_owned(), |p| format!("p{p}"));
+        let moved = if self.gambits.is_empty() {
+            "no gambit".to_owned()
+        } else {
+            self.gambits.iter().map(|g| format!("g{} {} {{w{}}}", g.id, g.text, g.weight)).collect::<Vec<_>>().join(", ")
+        };
+        format!("#{} {} · {priority} · +{} · {moved}", self.node.id, self.node.title, self.weight)
+    }
+}
+
+/// The score of one card: its priority, and every active gambit whose focus matches it. A focus
+/// word matches when the card's title, its milestone's title or one of its files (its own or the
+/// nearest ancestor's) contains it, case apart; a gambit with no focus matches every card.
+#[must_use]
+pub fn score<'a>(nodes: &'a [Node], node: &'a Node, gambits: &'a [Gambit]) -> Score<'a> {
     let by_id: HashMap<i64, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
-    nodes.iter().find(|n| effective_in(&by_id, n) == TaskState::Ready)
+    score_in(&by_id, node, gambits)
+}
+
+/// The ready cards, the walk's pick first: by priority, then by the summed weight of the matching
+/// gambits, then in tree order. The sort is stable, so the tiebreak is the order of the file.
+#[must_use]
+pub fn ranked<'a>(nodes: &'a [Node], gambits: &'a [Gambit]) -> Vec<Score<'a>> {
+    let by_id: HashMap<i64, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
+    let ready = nodes.iter().filter(|n| effective_in(&by_id, n) == TaskState::Ready);
+    rank(nodes, ready, gambits)
+}
+
+/// `candidates` scored and ordered as [`ranked`] orders the ready cards; for a caller with its
+/// own idea of readiness, such as a batch that counts implemented waits-on as met.
+#[must_use]
+pub fn rank<'a>(nodes: &'a [Node], candidates: impl IntoIterator<Item = &'a Node>, gambits: &'a [Gambit]) -> Vec<Score<'a>> {
+    let by_id: HashMap<i64, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
+    let mut scores: Vec<Score<'a>> = candidates.into_iter().map(|n| score_in(&by_id, n, gambits)).collect();
+    scores.sort_by_key(|s| std::cmp::Reverse((s.priority, s.weight)));
+    scores
+}
+
+fn score_in<'a>(by_id: &HashMap<i64, &'a Node>, node: &'a Node, gambits: &'a [Gambit]) -> Score<'a> {
+    let title = node.title.to_lowercase();
+    let milestone = milestone_in(by_id, node).map(|m| m.title.to_lowercase());
+    let files: Vec<String> = files_in(by_id, node).0.iter().map(|f| f.to_lowercase()).collect();
+    let matched: Vec<&Gambit> = gambits
+        .iter()
+        .filter(|g| g.state == GambitState::Active)
+        .filter(|g| {
+            g.focus.iter().any(|word| {
+                let word = word.to_lowercase();
+                title.contains(&word) || milestone.as_deref().is_some_and(|m| m.contains(&word)) || files.iter().any(|f| f.contains(&word))
+            }) || g.focus.is_empty()
+        })
+        .collect();
+    let weight = matched.iter().map(|g| u32::from(g.weight)).sum();
+    Score { node, priority: node.priority.unwrap_or(0), weight, gambits: matched }
+}
+
+/// The nearest milestone above the node, itself included.
+fn milestone_in<'a>(by_id: &HashMap<i64, &'a Node>, node: &'a Node) -> Option<&'a Node> {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if current.kind == NodeKind::Milestone {
+            return Some(current);
+        }
+        cursor = current.parent.and_then(|id| by_id.get(&id).copied());
+    }
+    None
 }
 
 /// The faults `rc check` reports, one line each with the id, in tree order: placeholder text in

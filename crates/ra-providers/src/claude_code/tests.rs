@@ -209,6 +209,7 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let at = args.iter().position(|a| a == "--settings").expect("--settings");
     let settings: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
     assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Bash|PowerShell");
+    assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read");
     assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "\"C:\\tools\\rc.exe\" hook pre");
     assert_eq!(settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "\"C:\\tools\\rc.exe\" hook post");
     // a chat completion carries no hooks
@@ -244,9 +245,17 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     assert!(gotchas_of_event(&catalogue, reading, quiet, &mut tools).is_empty());
     let quoted = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"notes: Not logged in · Please run /login"}]}}"#;
     assert!(gotchas_of_event(&catalogue, quoted, quiet, &mut tools).is_empty());
-    let fine =
-        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap"}}]}}"#;
+    let fine = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap 2>&1 | tail -n 40"}}]}}"#;
     assert!(gotchas_of_event(&catalogue, fine, quiet, &mut tools).is_empty());
+    // a cargo test without a tail is rewritten, and the rewrite counts
+    let untailed =
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap"}}]}}"#;
+    assert_eq!(gotchas_of_event(&catalogue, untailed, quiet, &mut tools)[0].id, "long-output");
+    // the reads of an event, relative to the workspace; a Bash call or a Grep is not one
+    let root = Path::new(r"C:\work\repo");
+    let two = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"C:\\work\\repo\\crates\\c.rs"}},{"type":"tool_use","name":"Grep","input":{"pattern":"fn"}},{"type":"tool_use","name":"Read","input":{"file_path":"D:\\elsewhere\\x.rs"}}]}}"#;
+    assert_eq!(reads_of(two, Some(root)), ["crates/c.rs", "D:/elsewhere/x.rs"]);
+    assert!(reads_of(fine, Some(root)).is_empty());
     let locked = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"error: failed to remove file `rc.exe`\nAccess is denied. (os error 5)"}]}}"#;
     assert_eq!(gotchas_of_event(&catalogue, locked, quiet, &mut tools)[0].id, "binary-locked-result");
     let claim = r#"{"type":"result","result":"Done, but I couldn't run any tests.","permission_denials":[{"tool_name":"Bash","tool_input":{"command":"make all"}}]}"#;

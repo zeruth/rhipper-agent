@@ -74,8 +74,9 @@ struct App {
     started: Instant,
     /// Shown under the prompt until the next key (Tab's choices, for one).
     hint: Option<String>,
-    /// The last-known roadmap nodes, for the tree pane.
+    /// The last-known roadmap nodes, for the tree pane, and the gambits read with them.
     roadmap: Option<Vec<ra_roadmap::model::Node>>,
+    gambits: Vec<ra_roadmap::model::Gambit>,
     /// The mtime of the roadmap file behind `roadmap`; the tick re-reads only when it moves.
     roadmap_seen: Option<SystemTime>,
     /// How far into the activity file the log has read.
@@ -141,6 +142,7 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
         started: Instant::now(),
         hint: None,
         roadmap: None,
+        gambits: Vec::new(),
         roadmap_seen: None,
         // the activity of other processes from here on; what they did before stays in the file
         activity_offset: std::fs::metadata(ACTIVITY_FILE).map_or(0, |m| m.len()),
@@ -307,10 +309,11 @@ pub async fn run(store: Store, worker: Worker, sink: Sink) -> anyhow::Result<()>
                 let modified = store.modified();
                 if modified != app.roadmap_seen {
                     app.roadmap_seen = modified;
-                    match store.all().await {
-                        Ok(nodes) => {
-                            if app.roadmap.as_ref() != Some(&nodes) {
-                                app.roadmap = Some(nodes);
+                    match store.load().await {
+                        Ok(roadmap) => {
+                            if app.roadmap.as_ref() != Some(&roadmap.nodes) || app.gambits != roadmap.gambits {
+                                app.roadmap = Some(roadmap.nodes);
+                                app.gambits = roadmap.gambits;
                                 dirty = true;
                             }
                         }
@@ -894,7 +897,7 @@ fn draw_usage(f: &mut Frame, area: Rect, app: &App) {
         inner,
     );
     // the task badge: the node the workers hold next, planned or in progress
-    let task_node = app.roadmap.as_deref().and_then(current_task);
+    let task_node = app.roadmap.as_deref().and_then(|nodes| current_task(nodes, &app.gambits));
     let inner = usage_panel(f, task);
     let mut spans = vec![Span::styled("◇ ", Style::new().fg(theme::TRACE))];
     match task_node {
@@ -977,13 +980,13 @@ fn short_title(title: &str, room: usize) -> String {
     }
 }
 
-/// The task the workers hold next: the first node in progress, else the first ready one, stored
-/// or computed from its waits-on, else the first planned one.
-fn current_task(nodes: &[ra_roadmap::model::Node]) -> Option<ra_roadmap::model::Node> {
+/// The task the workers hold next: the first node in progress, else the ready card the walk
+/// scores highest, the one `rc next` names, else the first planned one.
+fn current_task(nodes: &[ra_roadmap::model::Node], gambits: &[ra_roadmap::model::Gambit]) -> Option<ra_roadmap::model::Node> {
     nodes
         .iter()
         .find(|n| matches!(n.state, ra_roadmap::model::TaskState::InProgress | ra_roadmap::model::TaskState::Assigned))
-        .or_else(|| ra_roadmap::tree::next_ready(nodes))
+        .or_else(|| ra_roadmap::tree::next_ready(nodes, gambits))
         .or_else(|| {
             nodes.iter().find(|n| n.state == ra_roadmap::model::TaskState::Defined && n.kind != ra_roadmap::model::NodeKind::Project)
         })

@@ -31,7 +31,7 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
     assert_eq!(catalogue.command("git status --short", Conditions::default()), Verdict::Pass);
     // a pipe through tail keeps the output short; the harness judges its parts
     assert_eq!(catalogue.command("cargo test -p ra-gotchas 2>&1 | tail -15", Conditions::default()), Verdict::Pass);
-    assert_eq!(catalogue.command("cargo test -p ra-gotchas", Conditions::default()), Verdict::Pass);
+    assert!(matches!(catalogue.command("cargo test -p ra-gotchas", Conditions::default()), Verdict::Rewrite { .. }));
     // a shell inside a shell is no way around the allowlist
     for command in ["powershell.exe -NoProfile -File x.ps1", "sh var/check.sh", "bash -c 'cargo test'"] {
         assert!(matches!(catalogue.command(command, Conditions::default()), Verdict::Deny { .. }), "{command}");
@@ -48,18 +48,61 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
 fn a_workspace_build_is_rewritten_only_while_a_console_runs() {
     let catalogue = Catalogue::seed();
     let running = Conditions { console_running: true };
+    // the tail rewrite composes on the end of it; the first id names the verdict
     match catalogue.command("cargo test -q", running) {
-        Verdict::Rewrite { id, command, .. } => {
+        Verdict::Rewrite { id, command, reason } => {
             assert_eq!(id, "binary-locked");
-            assert_eq!(command, "cargo test --workspace --exclude rc --exclude rc-gui -q");
+            assert_eq!(command, "cargo test --workspace --exclude rc --exclude rc-gui -q 2>&1 | tail -n 80");
+            assert!(reason.contains("holds its binary") && reason.contains("; a cargo test"), "{reason}");
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(catalogue.command("cargo test -p ra-roadmap", running), Verdict::Pass);
-    assert_eq!(catalogue.command("cargo test -q", Conditions::default()), Verdict::Pass);
-    match catalogue.command("cargo build", running) {
-        Verdict::Rewrite { command, .. } => assert_eq!(command, "cargo build --workspace --exclude rc --exclude rc-gui"),
+    match catalogue.command("cargo test -p ra-roadmap 2>&1 | tail -20", running) {
+        Verdict::Pass => {}
         other => panic!("{other:?}"),
+    }
+    match catalogue.command("cargo test -q", Conditions::default()) {
+        Verdict::Rewrite { id, command, .. } => {
+            assert_eq!(id, "long-output");
+            assert_eq!(command, "cargo test -q 2>&1 | tail -n 80");
+        }
+        other => panic!("{other:?}"),
+    }
+    match catalogue.command("cargo build", running) {
+        Verdict::Rewrite { command, .. } => assert_eq!(command, "cargo build --workspace --exclude rc --exclude rc-gui 2>&1 | tail -n 80"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_cargo_command_without_a_tail_gets_one_on_its_end() {
+    let catalogue = Catalogue::seed();
+    let quiet = Conditions::default();
+    for (command, expected) in [
+        ("cargo test -p ra-gotchas", "cargo test -p ra-gotchas 2>&1 | tail -n 80"),
+        ("cargo clippy --workspace -- -D warnings", "cargo clippy --workspace -- -D warnings 2>&1 | tail -n 80"),
+        ("cargo build -p rc ", "cargo build -p rc 2>&1 | tail -n 80"),
+        ("cargo check -p ra-console", "cargo check -p ra-console 2>&1 | tail -n 80"),
+    ] {
+        match catalogue.command(command, quiet) {
+            Verdict::Rewrite { id, command, reason } => {
+                assert_eq!(id, "long-output");
+                assert_eq!(command, expected);
+                assert!(reason.contains("tail"), "{reason}");
+            }
+            other => panic!("{command}: {other:?}"),
+        }
+    }
+    // a command that already pipes, or redirects to a file, is left as it is; so is cargo run
+    for command in [
+        "cargo test -p ra-gotchas 2>&1 | tail -n 40",
+        "cargo test -p ra-gotchas | Select-Object -Last 30",
+        "cargo build 2>&1 | grep -E 'error|warning'",
+        "cargo test > var/test.log 2>&1",
+        "cargo run -p rc -- doctor",
+        "cargo fmt -p ra-gotchas",
+    ] {
+        assert_eq!(catalogue.command(command, quiet), Verdict::Pass, "{command}");
     }
 }
 

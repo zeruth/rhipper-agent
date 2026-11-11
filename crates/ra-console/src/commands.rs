@@ -2,7 +2,7 @@
 //! goes through the orchestrator, which the console drives through the same store.
 
 use anyhow::Context;
-use ra_roadmap::model::{Effort, Node, NodeKind, TaskState};
+use ra_roadmap::model::{Effort, Gambit, GambitState, Node, NodeKind, TaskState};
 use ra_roadmap::store::{Edit, Store};
 use ra_roadmap::tree;
 use ra_usage::Totals;
@@ -48,6 +48,13 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "assign", usage: "<id> <model|none>", help: "the model one node runs on, over the badge; none clears it" },
     Spec { name: "budgets", usage: "[on|off]", help: "whether a run is capped in dollars by its card's complexity; off unless turned on" },
     Spec { name: "effort", usage: "<id> <low|medium|high>", help: "the effort a run of the card asks of its model; medium when unset" },
+    Spec { name: "priority", usage: "<id> <1-5|none>", help: "the person's priority on a card, taken first by the walk; none clears it" },
+    Spec { name: "gambits", usage: "", help: "the gambits: the standing directions that order the walk, with weight and state" },
+    Spec {
+        name: "gambit",
+        usage: "add <text> [w<n>] | <id> park|activate|done | <id> weight <n> | <id> focus [words]",
+        help: "adds a gambit (weight 3 unless w<n> ends the line) or changes one: its state, its weight 1 to 5, or the words a card matches on",
+    },
     Spec { name: "key", usage: "[<paste> | clear]", help: "stores, shows the state of, or clears the OpenRouter key" },
     Spec { name: "ping", usage: "", help: "one round trip to the badge model" },
     Spec {
@@ -340,6 +347,73 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             store.set_effort(id, effort).await?;
             out.push(format!("#{id} runs at {effort} effort"));
         }
+        "priority" => {
+            const USAGE: &str = "usage: priority <id> <1-5|none>";
+            let (id_text, value) = args.split_once(char::is_whitespace).context(USAGE)?;
+            let id = id_text.parse::<i64>().context("the id is a node id")?;
+            let priority = match value.trim() {
+                "none" | "clear" => None,
+                n => Some(n.parse::<u8>().context(USAGE)?),
+            };
+            store.set_priority(id, priority).await?;
+            out.push(match priority {
+                Some(p) => format!("#{id} has priority {p}"),
+                None => format!("#{id} has no priority: the file and the gambits order it"),
+            });
+        }
+        "gambits" => {
+            anyhow::ensure!(args.is_empty(), "usage: gambits");
+            out.extend(gambit_lines(&store.gambits().await?));
+        }
+        "gambit" => {
+            const USAGE: &str =
+                "usage: gambit add <text> [w<n>] | gambit <id> park|activate|done | gambit <id> weight <n> | gambit <id> focus [words]";
+            let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+            let rest = rest.trim();
+            if first == "add" {
+                // a trailing w<n> is the weight; the words before it are the text
+                let (text, weight) = match rest.rsplit_once(char::is_whitespace) {
+                    Some((text, last)) if last.len() > 1 && last.starts_with('w') && last[1..].chars().all(|c| c.is_ascii_digit()) => {
+                        (text.trim(), last[1..].parse::<u8>().context("the weight is 1 to 5")?)
+                    }
+                    _ => (rest, 3),
+                };
+                anyhow::ensure!(!text.is_empty(), "{USAGE}");
+                let id = store.add_gambit(text, weight, &[]).await?;
+                out.push(format!("g{id} {text} {{w{weight}}} [active]"));
+                return Ok((out, Outcome::Continue));
+            }
+            let id = gambit_id(first).context(USAGE)?;
+            let (action, words) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let words = words.trim();
+            match action {
+                "park" | "activate" | "done" => {
+                    anyhow::ensure!(words.is_empty(), "{USAGE}");
+                    let state = match action {
+                        "park" => GambitState::Parked,
+                        "activate" => GambitState::Active,
+                        _ => GambitState::Done,
+                    };
+                    store.set_gambit_state(id, state).await?;
+                    out.push(format!("g{id} is now {state}"));
+                }
+                "weight" => {
+                    let weight = words.parse::<u8>().context("usage: gambit <id> weight <1-5>")?;
+                    store.set_gambit_weight(id, weight).await?;
+                    out.push(format!("g{id} weighs {weight}"));
+                }
+                "focus" => {
+                    let focus: Vec<String> = words.split_whitespace().map(str::to_owned).collect();
+                    store.set_gambit_focus(id, &focus).await?;
+                    out.push(if focus.is_empty() {
+                        format!("g{id} matches every card")
+                    } else {
+                        format!("g{id} focuses on {}", focus.join(" "))
+                    });
+                }
+                _ => anyhow::bail!("{USAGE}"),
+            }
+        }
         "remove" | "rm" => {
             let (id_text, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
             let id = id_text.parse::<i64>().context("usage: remove <id> [tree]")?;
@@ -570,6 +644,28 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
         other => anyhow::bail!("no command /{other}; /help lists them"),
     }
     Ok((out, Outcome::Continue))
+}
+
+/// The gambits as the console, the CLI and the MCP server list them: one line each as the file
+/// writes it, the focus words under it; a word when there are none.
+#[must_use]
+pub fn gambit_lines(gambits: &[Gambit]) -> Vec<String> {
+    if gambits.is_empty() {
+        return vec!["no gambits yet: gambit add <text> [w<n>] states a direction".to_owned()];
+    }
+    let mut out = Vec::new();
+    for gambit in gambits {
+        out.push(format!("g{} {} {{w{}}} [{}]", gambit.id, gambit.text, gambit.weight, gambit.state));
+        if !gambit.focus.is_empty() {
+            out.push(format!("    focus: {}", gambit.focus.join(" ")));
+        }
+    }
+    out
+}
+
+/// The number of a gambit as typed, `g2` or `2`.
+fn gambit_id(text: &str) -> Option<u32> {
+    text.strip_prefix('g').unwrap_or(text).parse().ok()
 }
 
 /// One run cut out of the activity log: from its start marker to its end marker, or to the end

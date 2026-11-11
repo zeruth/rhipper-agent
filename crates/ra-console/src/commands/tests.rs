@@ -409,6 +409,50 @@ impl ra_providers::ModelProvider for Scripted {
     }
 }
 
+#[tokio::test]
+async fn gambit_commands_add_change_and_list_them_and_priority_marks_a_card() {
+    let store = store().await;
+    run("/add task Ledger parent 1", &store, &worker()).await.unwrap();
+    let (out, _) = run("/gambits", &store, &worker()).await.unwrap();
+    assert!(out[0].starts_with("no gambits yet"), "{out:?}");
+    let (out, _) = run("/gambit add Ship the ledger first w5", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["g1 Ship the ledger first {w5} [active]"]);
+    // without a trailing w<n> the weight is 3 and the words all go in the text
+    let (out, _) = run("/gambit add Keep it local", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["g2 Keep it local {w3} [active]"]);
+    let (out, _) = run("/gambit g1 focus ledger usage", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["g1 focuses on ledger usage"]);
+    let (out, _) = run("/gambit 2 park", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["g2 is now parked"]);
+    let (out, _) = run("/gambit 2 weight 4", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["g2 weighs 4"]);
+    let (out, _) = run("/gambits", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["g1 Ship the ledger first {w5} [active]", "    focus: ledger usage", "g2 Keep it local {w4} [parked]"]);
+    let (out, _) = run("/gambit 2 activate", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["g2 is now active"]);
+    let (out, _) = run("/gambit 1 done", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["g1 is now done"]);
+    let gambits = store.gambits().await.unwrap();
+    assert_eq!(gambits[0].state, GambitState::Done);
+    assert_eq!(gambits[1].weight, 4);
+    // the errors name what is wrong
+    let error = run("/gambit 9 park", &store, &worker()).await.unwrap_err();
+    assert!(format!("{error:#}").contains("no gambit g9"), "{error:#}");
+    let error = run("/gambit 1 weight 7", &store, &worker()).await.unwrap_err();
+    assert!(format!("{error:#}").contains("1 to 5"), "{error:#}");
+    let error = run("/gambit 1 shelve", &store, &worker()).await.unwrap_err();
+    assert!(format!("{error:#}").starts_with("usage: gambit"), "{error:#}");
+
+    let (out, _) = run("/priority 2 5", &store, &worker()).await.unwrap();
+    assert_eq!(out, vec!["#2 has priority 5"]);
+    assert_eq!(store.read(2).await.unwrap().priority, Some(5));
+    let error = run("/priority 2 6", &store, &worker()).await.unwrap_err();
+    assert!(format!("{error:#}").contains("1 to 5"), "{error:#}");
+    let (out, _) = run("/priority 2 none", &store, &worker()).await.unwrap();
+    assert_eq!(out[0], "#2 has no priority: the file and the gambits order it");
+    assert_eq!(store.read(2).await.unwrap().priority, None);
+}
+
 fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Completion {
     let usage =
         ra_providers::Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 0, cost_usd: Some(0.01), cost_computed: false };
@@ -420,6 +464,7 @@ fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Complet
         tool_calls: calls,
         session_id: None,
         gotchas: Vec::new(),
+        reads: Vec::new(),
     }
 }
 
@@ -562,6 +607,32 @@ async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_depend
     assert_eq!(script.seen.lock().len(), 3);
 }
 
+#[tokio::test]
+async fn a_matching_gambit_pulls_a_later_card_ahead_in_the_walk_and_a_priority_ahead_of_that() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = three_cards(dir.path(), true).await;
+    store.rename(3, "The local route").await.unwrap();
+    store.add_gambit("Local first", 3, &["local".to_owned()]).await.unwrap();
+    // #3 matches the gambit, so it goes before #2 A; the rest follow in the file's order
+    let roadmap = store.load().await.unwrap();
+    assert_eq!(crate::agent::walk_order(&roadmap.nodes, &roadmap.gambits, false), vec![3, 2, 4]);
+    assert_eq!(ra_roadmap::tree::next_ready(&roadmap.nodes, &roadmap.gambits).map(|n| n.id), Some(3));
+    // a priority on #2 puts it ahead of the matching card
+    store.set_priority(2, Some(4)).await.unwrap();
+    let roadmap = store.load().await.unwrap();
+    assert_eq!(crate::agent::walk_order(&roadmap.nodes, &roadmap.gambits, false), vec![2, 3, 4]);
+    store.set_priority(2, None).await.unwrap();
+    // the walk itself runs in the scored order
+    let script = Scripted::new(vec![says("did B", vec![]), says("did A", vec![]), says("did C", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    let ran: Vec<&String> = out.iter().filter(|l| l.starts_with('✓')).collect();
+    assert_eq!(ran.len(), 3, "{out:?}");
+    assert!(ran[0].starts_with("✓ #3 The local route implemented"), "{out:?}");
+    assert!(ran[1].starts_with("✓ #2 A implemented"), "{out:?}");
+    assert_eq!(store.read(3).await.unwrap().notes.as_deref(), Some("did B"));
+}
+
 /// One git command in `dir`, which must succeed; the identity is given so a commit needs none
 /// configured on the machine.
 fn git_ok(dir: &std::path::Path, args: &[&str]) -> String {
@@ -695,8 +766,8 @@ async fn run_all_in_a_tight_window_takes_the_smallest_ready_card_first_and_the_s
     store.set_complexity(2, 4).await.unwrap();
     store.set_complexity(3, 1).await.unwrap();
     let nodes = store.all().await.unwrap();
-    assert_eq!(crate::agent::walk_order(&nodes, false), vec![2, 3, 4]);
-    assert_eq!(crate::agent::walk_order(&nodes, true), vec![3, 4, 2]);
+    assert_eq!(crate::agent::walk_order(&nodes, &[], false), vec![2, 3, 4]);
+    assert_eq!(crate::agent::walk_order(&nodes, &[], true), vec![3, 4, 2]);
     // a tenth of the window left: the walk takes the c1 before the c4 that stands earlier
     plan_at(dir.path(), 0.9);
     let script = Scripted::new(vec![says("did B", vec![]), says("did C", vec![]), says("did A", vec![])]);
@@ -754,6 +825,8 @@ async fn a_dry_run_prints_the_prompt_and_leaves_the_card_as_it_was() {
     assert!(out.iter().any(|l| l.contains("effort medium") && l.contains("Bash(cargo *)")), "{text}");
     assert!(out.iter().any(|l| l == "  --resume") && out.iter().any(|l| l == "  sess-1"), "{text}");
     assert!(text.contains("--- system ---") && text.contains("--- user ---") && text.contains("Probe"), "{text}");
+    // the check as the pre hook would run it: a cargo test without a tail gets one
+    assert!(out.iter().any(|l| l.starts_with("  the pre hook runs `cargo test") && l.ends_with("2>&1 | tail -n 80`")), "{text}");
     let after = store.read(2).await.unwrap();
     assert_eq!(after.state, before.state);
     assert_eq!(after.session.as_deref(), Some("sess-1"));
@@ -762,6 +835,26 @@ async fn a_dry_run_prints_the_prompt_and_leaves_the_card_as_it_was() {
     let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
     assert!(out.iter().any(|l| l.contains("tools: read_file write_file")), "{}", out.join("\n"));
     assert_eq!(store.read(2).await.unwrap().state, before.state);
+}
+
+#[tokio::test]
+async fn a_dry_run_shows_the_active_gambits_in_the_system_messages_and_not_the_parked_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    store.add_gambit("Local first", 3, &["local".to_owned()]).await.unwrap();
+    let parked = store.add_gambit("Polish the window", 2, &[]).await.unwrap();
+    store.set_gambit_state(parked, ra_roadmap::model::GambitState::Parked).await.unwrap();
+    let (out, _) = run("/run 2 dry", &store, &Worker::new("claude-sonnet-5-5")).await.unwrap();
+    let system_end = out.iter().position(|l| l == "--- user ---").expect("the user turn follows the system messages");
+    let system = out[..system_end].join("\n");
+    assert!(system.contains(ra_context::DIRECTION_HEADING), "{system}");
+    assert!(system.contains("- g1 Local first {w3} · focus: local"), "{system}");
+    assert!(!system.contains("Polish the window"), "{system}");
+    // a bare model reads it at the head of its task
+    let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
+    let text = out.join("\n");
+    assert!(text.contains("- g1 Local first {w3} · focus: local") && !text.contains("Polish the window"), "{text}");
 }
 
 #[tokio::test]
@@ -1242,6 +1335,64 @@ async fn a_reassess_tree_proposes_cards_the_person_accepts_or_declines() {
 }
 
 #[tokio::test]
+async fn a_reassessment_proposes_parking_a_card_no_gambit_covers_and_the_person_decides() {
+    let store = store().await;
+    store.insert(Some(1), ra_roadmap::model::NodeKind::Milestone, "M", Some("ship it."), Some("it ships."), 3).await.unwrap();
+    store.insert(Some(2), ra_roadmap::model::NodeKind::Task, "T", Some("do it."), Some("it is done."), 2).await.unwrap();
+    store.insert(Some(2), ra_roadmap::model::NodeKind::Task, "Local cache", Some("cache it."), Some("it caches."), 2).await.unwrap();
+    store.add_gambit("Local first", 3, &["local".to_owned()]).await.unwrap();
+    // the project, the milestone, then its two children, parent first; the milestone's answer
+    // keeps its text and asks to park #3, the one card no direction covers
+    let parks =
+        says("overview: T serves no direction\nobjective: ship it.\nacceptance: it ships.\npark: #3 | nothing local about it", Vec::new());
+    let provider =
+        Scripted::new(vec![keeps("the agent.", "it works."), parks, keeps("do it.", "it is done."), keeps("cache it.", "it caches.")]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+    let (out, _) = run("/reassess-tree 1", &store, &worker).await.unwrap();
+    // the prompts carry the direction, and the milestone's alone offers the park
+    let seen = provider.seen.lock();
+    assert!(seen.iter().all(|r| r.messages.iter().any(|m| m.content.contains("- g1 Local first {w3} · focus: local"))), "{seen:?}");
+    let milestone = seen.iter().find(|r| r.messages.iter().any(|m| m.content.contains("Task #2: M"))).expect("the milestone's call");
+    assert!(milestone.messages.iter().any(|m| m.content.contains("park: #<its id>")), "{milestone:?}");
+    assert!(!seen[0].messages.iter().any(|m| m.content.contains("park: #<its id>")), "the project is not asked");
+    drop(seen);
+    let list = out.iter().find(|l| l.contains("1 card(s) proposed under #2")).expect("the list");
+    assert!(list.contains("\n  1. park #3 T — nothing local about it"), "{list}");
+    // shown, not applied: #3 is as it was until the person says so
+    assert_eq!(store.read(3).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
+    let (shown, _) = run("/proposals 2", &store, &worker).await.unwrap();
+    assert!(shown[1].contains("park #3 T"), "{shown:?}");
+
+    let (out, _) = run("/accept 2 1", &store, &worker).await.unwrap();
+    assert!(out[0].starts_with("#3 T parked under #2: blocked on your word"), "{out:?}");
+    let parked = store.read(3).await.unwrap();
+    assert_eq!(parked.state, ra_roadmap::model::TaskState::Blocked);
+    assert_eq!(parked.notes.as_deref(), Some("parked on the person's word: nothing local about it"));
+    assert_eq!(store.read(4).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
+}
+
+#[tokio::test]
+async fn a_declined_park_keeps_the_card_and_is_not_proposed_again() {
+    let store = store().await;
+    store.insert(Some(1), ra_roadmap::model::NodeKind::Milestone, "M", Some("ship it."), Some("it ships."), 3).await.unwrap();
+    store.insert(Some(2), ra_roadmap::model::NodeKind::Task, "T", Some("do it."), Some("it is done."), 2).await.unwrap();
+    store.add_gambit("Local first", 3, &["local".to_owned()]).await.unwrap();
+    run("/final 3", &store, &worker()).await.unwrap();
+    let parks = || says("overview: x\nobjective: ship it.\nacceptance: it ships.\npark: #3 | nothing local about it", Vec::new());
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![parks()]));
+    let (out, _) = run("/reassess-tree 2", &store, &worker).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("park #3 T")), "{out:?}");
+    let (out, _) = run("/decline 2 1", &store, &worker).await.unwrap();
+    assert_eq!(out, vec!["declined parking #3 T: it stays, and is not proposed again"]);
+    assert_eq!(store.read(3).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
+    // the next pass, after an edit, offers the same park: the declined mark keeps it out
+    store.set_details(2, Some("ship it all."), None).await.unwrap();
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![parks()]));
+    let (out, _) = run("/reassess-tree 2", &store, &worker).await.unwrap();
+    assert!(!out.iter().any(|l| l.contains("proposed")), "{out:?}");
+}
+
+#[tokio::test]
 async fn run_on_a_bare_model_fails_the_node_when_the_provider_does() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
@@ -1294,6 +1445,9 @@ async fn a_run_that_reports_more_than_its_estimate_says_so() {
     let (out, handoff) = sized_run(400_000, None).await;
     assert!(out[0].contains("over the estimate of 120k tokens, 15 turns"), "{out:?}");
     assert!(handoff.contains("over the estimate"), "{handoff}");
+    // the context a turn carried, on the run line and in the handoff
+    assert!(out[0].contains("avg 400k tokens a turn, largest 400k"), "{out:?}");
+    assert!(handoff.contains("avg 400k tokens a turn"), "{handoff}");
 }
 
 #[tokio::test]

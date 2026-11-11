@@ -5,7 +5,7 @@
 use egui::epaint::RectShape;
 use egui::{Align, Color32, CornerRadius, Frame, InnerResponse, Layout, Margin, Painter, Rect, RichText, Stroke, Ui};
 use ra_roadmap::history::{self, Change};
-use ra_roadmap::model::{Node, NodeKind, TaskState};
+use ra_roadmap::model::{Gambit, GambitState, Node, NodeKind, TaskState};
 
 use crate::theme;
 
@@ -502,5 +502,96 @@ pub(crate) fn row_menu(ui: &mut Ui, node: &Node) -> Option<RowPick> {
     if pick.is_some() {
         ui.close();
     }
+    pick
+}
+
+/// What a gambit bubble was asked for: a click flips the gambit between active and parked,
+/// its menu sets the weight or marks it done.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GambitPick {
+    State(GambitState),
+    Weight(u8),
+}
+
+/// The color of a gambit's state: an active one carries the accent, a parked one waits in the
+/// warning tint, a done one is dim.
+pub(crate) fn gambit_color(state: GambitState) -> Color32 {
+    match state {
+        GambitState::Active => theme::accent(),
+        GambitState::Parked => theme::warn_text(),
+        GambitState::Done => theme::dim(),
+    }
+}
+
+/// The weight of a gambit as five dots, `weight` of them lit, in the same warm-to-hot run as a
+/// card's complexity dots.
+pub(crate) fn weight(ui: &mut Ui, weight: u8) -> egui::Response {
+    let lit = usize::from(weight.clamp(1, 5));
+    let hot = theme::mix(theme::warn_text(), theme::accent(), (f32::from(weight.clamp(1, 5)) - 1.0) / 4.0);
+    let response = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for i in 0..5 {
+                let color = if i < lit { hot } else { alpha(theme::dim(), 90) };
+                ui.label(RichText::new("●").color(color).small());
+            }
+        })
+        .response;
+    response.on_hover_text(format!("weight {weight} of 5"))
+}
+
+/// A gambit as a bubble in the roadmap column's vocabulary: its number, its text, its weight
+/// dots and a state badge. A click parks an active one or activates a parked or done one; a
+/// right click opens the menu of weights and the done mark. The pick is the caller's to write.
+pub(crate) fn gambit_bubble(ui: &mut Ui, gambit: &Gambit) -> Option<GambitPick> {
+    let color = gambit_color(gambit.state);
+    let active = gambit.state == GambitState::Active;
+    let inner = bubble(ui, color, active, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(RichText::new(format!("g{}", gambit.id)).small().color(theme::dim()));
+            let text = RichText::new(&gambit.text).color(if gambit.state == GambitState::Done { theme::dim() } else { theme::text() });
+            ui.label(if gambit.state == GambitState::Done { text.strikethrough() } else { text });
+            weight(ui, gambit.weight);
+            badge(ui, gambit.state.serde_name(), color);
+        });
+    });
+    let response = ui.interact(inner.response.rect, ui.scope_id().with(("gambit", gambit.id)), egui::Sense::click());
+    let hint = if gambit.focus.is_empty() {
+        "click parks or activates; right click sets the weight or marks it done".to_owned()
+    } else {
+        format!("focus: {}\nclick parks or activates; right click sets the weight or marks it done", gambit.focus.join(" "))
+    };
+    let response = response.on_hover_text(hint);
+    let mut pick = None;
+    if response.clicked() {
+        pick = Some(GambitPick::State(if active { GambitState::Parked } else { GambitState::Active }));
+    }
+    response.context_menu(|ui| {
+        ui.set_min_width(140.0);
+        ui.label(RichText::new(format!("g{} · {}", gambit.id, gambit.state)).color(theme::dim()).small());
+        for w in 1..=5u8 {
+            let mark = if w == gambit.weight { "●" } else { "○" };
+            if ui.button(RichText::new(format!("{mark}  weight {w}")).color(theme::text())).clicked() {
+                pick = Some(GambitPick::Weight(w));
+            }
+        }
+        ui.separator();
+        for state in GambitState::ALL {
+            let tint = gambit_color(state);
+            let mark = if state == gambit.state { "●" } else { "○" };
+            let text = RichText::new(format!("{mark}  {state}")).color(if state == gambit.state {
+                tint
+            } else {
+                theme::mix(theme::text(), tint, 0.6)
+            });
+            if ui.button(text).clicked() {
+                pick = Some(GambitPick::State(state));
+            }
+        }
+        if pick.is_some() {
+            ui.close();
+        }
+    });
     pick
 }

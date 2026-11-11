@@ -8,6 +8,18 @@ use super::*;
 const SOURCE: &str = "//! The store over a file.\n//! More.\n\nuse std::path::Path;\n\npub struct Store {\n    path: PathBuf,\n}\n\nimpl Store {\n    pub async fn open(path: &Path) -> anyhow::Result<Self> {\n        todo!()\n    }\n\n    fn write(&self) {}\n}\n\npub(crate) fn helper<T>(x: T) -> T\nwhere\n    T: Clone,\n{\n    x\n}\n\nconst ROOM: usize = 3;\n\n#[cfg(test)]\nmod tests;\n";
 
 #[test]
+fn the_standing_direction_rides_after_the_project_context() {
+    let direction = vec!["g1 Local first {w3} · focus: local".to_owned(), "g2 Ship small {w1}".to_owned()];
+    assert_eq!(with_direction("# P\n\nA project.\n", &[]), "# P\n\nA project.\n");
+    assert_eq!(
+        with_direction("# P\n\nA project.\n", &direction),
+        "# P\n\nA project.\n\n## The person's standing direction\n- g1 Local first {w3} · focus: local\n- g2 Ship small {w1}\n"
+    );
+    // no project file yet: the direction stands alone
+    assert!(with_direction("", &direction).starts_with(DIRECTION_HEADING));
+}
+
+#[test]
 fn a_rust_outline_names_the_items_with_their_lines() {
     let text = outline(Path::new("crates/x/src/store.rs"), SOURCE);
     let mut lines = text.lines();

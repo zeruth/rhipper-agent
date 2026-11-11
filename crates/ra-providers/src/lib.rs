@@ -131,6 +131,10 @@ pub struct Completion {
     /// The gotchas the run hit, as the provider saw them go by: the commands the machine refused,
     /// the errors it knows, the claims the answer made. Empty from a provider that does not look.
     pub gotchas: Vec<ra_gotchas::Hit>,
+    /// The files the run read, one entry per read, relative to the workspace, as a harness showed
+    /// them go by: a file read many times is context every later turn carried. Empty from a
+    /// provider that cannot tell.
+    pub reads: Vec<String>,
 }
 
 /// The tokens of one assistant turn: what it read, cached or not, and what it wrote.

@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use ra_providers::{CompletionRequest, Message};
-use ra_roadmap::outline;
+use ra_roadmap::model::GambitState;
 use ra_roadmap::store::Store;
+use ra_roadmap::{markdown, outline};
 
 use crate::agent::{self, Worker};
 
@@ -82,10 +83,12 @@ pub fn hint(root: &Path) -> Vec<String> {
     lines
 }
 
-/// What the model reads to draft a roadmap: the project context's draft, the head of the
-/// README, the layout two levels deep with the file counts, and the headings of the documents.
-pub fn brief(root: &Path) -> String {
-    let mut text = ra_context::Project::draft(root);
+/// What the model reads to draft a roadmap: the project context's draft with the person's
+/// standing direction after it when there is one, the head of the README, the layout two levels
+/// deep with the file counts, and the headings of the documents.
+#[must_use]
+pub fn brief(root: &Path, direction: &[String]) -> String {
+    let mut text = ra_context::with_direction(&ra_context::Project::draft(root), direction);
     if let Some(readme) = ["README.md", "README", "readme.md"].iter().find_map(|n| std::fs::read_to_string(root.join(n)).ok()) {
         let head: Vec<&str> = readme.lines().take(150).collect();
         text.push_str("\n## README\n\n");
@@ -186,7 +189,10 @@ pub async fn init(root: &Path, worker: &Worker, mode: Mode) -> anyhow::Result<Ve
                 }
                 Mode::Draft | Mode::Empty => None,
             };
-            let answer = outline_from_model(worker, root, import.as_deref()).await?;
+            // a document that is a roadmap file brings its gambits: they steer the draft and
+            // stand in the new file
+            let gambits = import.as_deref().and_then(|text| markdown::parse_file(text).ok()).map(|r| r.gambits).unwrap_or_default();
+            let answer = outline_from_model(worker, root, import.as_deref(), &agent::direction_lines(&gambits)).await?;
             // the one answer carries the outline and, after the marker, the project context
             let (text, context) = answer.split_once(CONTEXT_MARK).map_or((answer.as_str(), None), |(o, c)| (o, Some(c.trim())));
             let parsed = match outline::parse(text) {
@@ -198,6 +204,12 @@ pub async fn init(root: &Path, worker: &Worker, mode: Mode) -> anyhow::Result<Ve
                 }
             };
             let store = Store::open(&path, parsed.title.as_deref().unwrap_or(&fallback)).await?;
+            for gambit in &gambits {
+                let id = store.add_gambit(&gambit.text, gambit.weight, &gambit.focus).await?;
+                if gambit.state != GambitState::Active {
+                    store.set_gambit_state(id, gambit.state).await?;
+                }
+            }
             let ids = store.import(1, &parsed).await?;
             lines.push(format!(
                 "{ROADMAP_FILE} written: {} ({} cards) {} by {}",
@@ -232,11 +244,11 @@ pub async fn init(root: &Path, worker: &Worker, mode: Mode) -> anyhow::Result<Ve
 /// The line that parts the outline from the project context in the model's answer.
 const CONTEXT_MARK: &str = "---context---";
 
-/// One chat completion that answers with the outline: the brief of the directory, and the file
-/// to convert when there is one.
-async fn outline_from_model(worker: &Worker, root: &Path, import: Option<&str>) -> anyhow::Result<String> {
+/// One chat completion that answers with the outline: the brief of the directory with the
+/// standing direction, and the file to convert when there is one.
+async fn outline_from_model(worker: &Worker, root: &Path, import: Option<&str>, direction: &[String]) -> anyhow::Result<String> {
     let provider = worker.provider()?;
-    let brief = brief(root);
+    let brief = brief(root, direction);
     let user = match import {
         Some(text) => format!(
             "Convert the document below into the outline, keeping every item and its order; group a flat list under milestones you name; an item the document marks as done gets [done]. The project, for context:\n\n{brief}\n\n## The document to convert\n\n{text}"

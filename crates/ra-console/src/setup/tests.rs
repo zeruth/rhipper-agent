@@ -21,6 +21,7 @@ impl ModelProvider for Answers {
                 tool_calls: Vec::new(),
                 session_id: None,
                 gotchas: Vec::new(),
+                reads: Vec::new(),
             })
         })
     }
@@ -49,10 +50,16 @@ fn the_candidates_are_the_roadmap_shaped_files_and_the_hint_names_them() {
     assert!(hint[0].starts_with("no rhipper.md in"), "{hint:?}");
     assert!(hint.iter().any(|l| l.contains("rc init --import")), "{hint:?}");
     assert!(hint.last().unwrap().contains("TODO.md, docs/roadmap-2026.md"), "{hint:?}");
-    let brief = brief(dir.path());
-    assert!(brief.starts_with("# Demo\n"), "{brief}");
-    assert!(brief.contains("## README") && brief.contains("## Layout") && brief.contains("src/ — 1 rs"), "{brief}");
-    assert!(brief.contains("docs/notes.md:\n  # Notes"), "{brief}");
+    let plain = brief(dir.path(), &[]);
+    assert!(plain.starts_with("# Demo\n"), "{plain}");
+    assert!(plain.contains("## README") && plain.contains("## Layout") && plain.contains("src/ — 1 rs"), "{plain}");
+    assert!(plain.contains("docs/notes.md:\n  # Notes"), "{plain}");
+    assert!(!plain.contains(ra_context::DIRECTION_HEADING), "{plain}");
+    // the standing direction rides between the context and the README
+    let steered = brief(dir.path(), &["g1 Local first {w3} · focus: local".to_owned()]);
+    let heading = steered.find(ra_context::DIRECTION_HEADING).expect("the heading");
+    assert!(heading < steered.find("## README").unwrap(), "{steered}");
+    assert!(steered.contains("- g1 Local first {w3} · focus: local\n"), "{steered}");
 }
 
 #[tokio::test]

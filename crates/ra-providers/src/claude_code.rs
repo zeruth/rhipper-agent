@@ -76,6 +76,7 @@ impl ClaudeCode {
             // `cargo test 2>&1 | tail -20` passes and keeps the output short
             allowed_shell: [
                 "Bash(cargo *)",
+                "Bash(rustfmt *)",
                 "Bash(git status*)",
                 "Bash(git diff*)",
                 "Bash(git log*)",
@@ -101,6 +102,7 @@ impl ClaudeCode {
                 "Bash(paste *)",
                 "Bash(tr *)",
                 "PowerShell(cargo *)",
+                "PowerShell(rustfmt *)",
                 "PowerShell(git status*)",
                 "PowerShell(git diff*)",
                 "PowerShell(git log*)",
@@ -282,6 +284,8 @@ impl ClaudeCode {
         let mut result: Option<String> = None;
         let mut last_line = String::new();
         let mut gotchas: Vec<Hit> = Vec::new();
+        // the files the worker read, in order, for the run line to name the ones it read again
+        let mut reads: Vec<String> = Vec::new();
         // the tokens of each assistant turn, as the events show them
         let mut turns = TurnTally::default();
         // which tool each call id belongs to, so only a shell's output is read for gotchas
@@ -297,6 +301,7 @@ impl ClaudeCode {
                     tracing::info!(target: "ra::progress", "{step}");
                 }
                 turns.note(&line);
+                reads.extend(reads_of(&line, request.workspace.as_deref()));
                 if let Some(catalogue) = &self.catalogue {
                     // where the hit showed, from the event that carried it
                     let place = if line.contains(r#""type":"assistant""#) {
@@ -354,6 +359,7 @@ impl ClaudeCode {
             Some(result) => parse_result(&result).map(|mut completion| {
                 completion.gotchas = gotchas;
                 completion.turn_usage = turns.into_turns();
+                completion.reads = reads;
                 completion
             }),
             None => {
@@ -457,20 +463,46 @@ fn progress_of(line: &str, workspace: Option<&Path>) -> Vec<String> {
         .collect()
 }
 
+/// The files one stream event reads: the `file_path` of each `Read` call in an assistant event,
+/// relative to the workspace. Nothing from any other event.
+fn reads_of(line: &str, workspace: Option<&Path>) -> Vec<String> {
+    use serde_json::Value;
+    if !line.contains(r#""name":"Read""#) {
+        return Vec::new();
+    }
+    let Ok(event) = serde_json::from_str::<Value>(line) else { return Vec::new() };
+    if event.get("type").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    event
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| {
+            block.get("type").and_then(Value::as_str) == Some("tool_use") && block.get("name").and_then(Value::as_str) == Some("Read")
+        })
+        .filter_map(|block| block.pointer("/input/file_path").and_then(Value::as_str))
+        .map(|path| relative(path, workspace))
+        .collect()
+}
+
+/// A path inside the workspace relative to it, with forward slashes; another path as it came.
+fn relative(path: &str, workspace: Option<&Path>) -> String {
+    let shown = workspace
+        .and_then(|root| Path::new(path).strip_prefix(root).ok())
+        .map_or_else(|| path.to_owned(), |p| p.to_string_lossy().into_owned());
+    shown.replace('\\', "/")
+}
+
 /// One tool call as a line: `$ cargo test` for a command, `Read src/main.rs` for a file tool,
 /// `Grep pattern` for a search; a path inside the workspace is shown relative to it.
 fn describe_call(name: &str, input: &serde_json::Value, workspace: Option<&Path>) -> String {
     let field = |key: &str| input.get(key).and_then(serde_json::Value::as_str);
-    let relative = |path: &str| {
-        let shown = workspace
-            .and_then(|root| Path::new(path).strip_prefix(root).ok())
-            .map_or_else(|| path.to_owned(), |p| p.to_string_lossy().into_owned());
-        shown.replace('\\', "/")
-    };
     match name {
         "Bash" | "PowerShell" => format!("$ {}", clip_line(field("command").unwrap_or(""), 120)),
         _ => match field("file_path").or_else(|| field("path")).or_else(|| field("notebook_path")) {
-            Some(path) => format!("{name} {}", relative(path)),
+            Some(path) => format!("{name} {}", relative(path, workspace)),
             None => match field("pattern").or_else(|| field("description")).or_else(|| field("query")) {
                 Some(what) => format!("{name} {}", clip_line(what, 100)),
                 None => name.to_owned(),
@@ -583,7 +615,16 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
         cost_computed: false,
     });
     let session_id = parsed.session_id.filter(|s| !s.trim().is_empty());
-    Ok(Completion { text, usage, turns: parsed.num_turns, turn_usage: Vec::new(), tool_calls: Vec::new(), session_id, gotchas: Vec::new() })
+    Ok(Completion {
+        text,
+        usage,
+        turns: parsed.num_turns,
+        turn_usage: Vec::new(),
+        tool_calls: Vec::new(),
+        session_id,
+        gotchas: Vec::new(),
+        reads: Vec::new(),
+    })
 }
 
 /// Writes a run's system prompt under the workspace's `var/runs`, one file per process, so two
@@ -674,7 +715,8 @@ fn gotchas_of_event(
             hits.extend(catalogue.scan(Where::Answer, event.get("result").and_then(Value::as_str).unwrap_or("")));
             for denial in event.get("permission_denials").and_then(Value::as_array).into_iter().flatten() {
                 let command = denial.pointer("/tool_input/command").and_then(Value::as_str).unwrap_or("");
-                if !command.is_empty() && catalogue.command(command, conditions) == Verdict::Pass {
+                // a rewrite is no reason to refuse: only a gotcha that would deny it names one
+                if !command.is_empty() && !matches!(catalogue.command(command, conditions), Verdict::Deny { .. }) {
                     hits.push(Hit {
                         id: ra_gotchas::UNMATCHED.to_owned(),
                         message: "the harness refused a command no gotcha names; see rc gotchas".to_owned(),
@@ -689,15 +731,16 @@ fn gotchas_of_event(
 }
 
 /// The `--settings` JSON that routes the harness's tool hooks to `rc hook pre` and `rc hook
-/// post`, so a command the catalogue knows is refused or rewritten before it runs and a result
-/// it knows gets its hint right after, with no model call.
+/// post`, so a command the catalogue knows is refused or rewritten before it runs, a result
+/// it knows gets its hint right after, and a whole-file Read is answered with the outline,
+/// with no model call.
 fn hook_settings(rc: &Path) -> String {
     // the JSON encoder escapes the backslashes of a Windows path itself
     let command = |event: &str| format!("\"{}\" hook {event}", rc.display());
     serde_json::json!({
         "hooks": {
             "PreToolUse": [{"matcher": "Bash|PowerShell", "hooks": [{"type": "command", "command": command("pre"), "timeout": 10}]}],
-            "PostToolUse": [{"matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit", "hooks": [{"type": "command", "command": command("post"), "timeout": 10}]}]
+            "PostToolUse": [{"matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read", "hooks": [{"type": "command", "command": command("post"), "timeout": 10}]}]
         }
     })
     .to_string()

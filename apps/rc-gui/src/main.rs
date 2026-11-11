@@ -28,7 +28,7 @@ use ra_console::commands::{self, Outcome};
 use ra_console::logs::{Kind, Sink};
 use ra_gotchas::{Catalogue, Journal};
 use ra_roadmap::history::{Change, Source};
-use ra_roadmap::model::{Node, NodeKind, TaskState};
+use ra_roadmap::model::{Gambit, GambitState, Node, NodeKind, TaskState};
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 use ra_usage::{Totals, UsageStore};
@@ -1393,8 +1393,13 @@ struct Workspace {
     worker: Worker,
     sink: Sink,
     started: Instant,
-    /// The roadmap as last read, and the mtime it came from.
+    /// The roadmap as last read, its gambits, and the mtime it came from.
     roadmap: Vec<Node>,
+    gambits: Vec<Gambit>,
+    /// The one-line field under the gambit bubbles while `+` holds it open; Enter adds.
+    new_gambit: Option<String>,
+    /// Whether the done gambits are unfolded from under their dim header.
+    done_gambits_open: bool,
     roadmap_seen: Option<SystemTime>,
     /// The last state change of every card, read with the roadmap; the tooltip shows it.
     last_changes: HashMap<i64, Change>,
@@ -1566,6 +1571,9 @@ impl Workspace {
             sink,
             started: Instant::now(),
             roadmap: Vec::new(),
+            gambits: Vec::new(),
+            new_gambit: None,
+            done_gambits_open: false,
             roadmap_seen: None,
             last_changes: HashMap::new(),
             roadmap_width: 360.0,
@@ -1871,12 +1879,14 @@ impl Workspace {
         let modified = self.store.modified();
         if modified != self.roadmap_seen {
             self.roadmap_seen = modified;
-            match self.rt.block_on(self.store.all()) {
-                Ok(nodes) => {
+            match self.rt.block_on(self.store.load()) {
+                Ok(roadmap) => {
+                    let nodes = roadmap.nodes;
                     self.roadmap_width = measure_roadmap(ctx, &nodes);
                     // the project's name, for its tab and the window's title
                     self.project_title = nodes.iter().find(|n| n.kind == NodeKind::Project).map(|n| n.title.clone());
                     self.roadmap = nodes;
+                    self.gambits = roadmap.gambits;
                     self.refresh_costs();
                 }
                 Err(e) => tracing::warn!("the roadmap file does not parse: {e:#}"),
@@ -2403,7 +2413,7 @@ impl Workspace {
                 None => ("○", theme::dim(), format!("probing the local server at {url}")),
             };
             cards::badge_marked(ui, mark, "local", color).on_hover_text(hint);
-            match current_task(&self.roadmap) {
+            match current_task(&self.roadmap, &self.gambits) {
                 Some(node) => {
                     cards::badge_marked(ui, "◇", &format!("#{} {}", node.id, node.title), theme::trace())
                         .on_hover_text("the task the workers hold next");
@@ -2514,6 +2524,7 @@ impl Workspace {
                 }
             });
         });
+        self.gambit_band(ui);
         // the column's width is measured once per reload, like the titles
         if self.show_cost && self.cost_width.is_none() {
             self.cost_width = Some(measure_costs(ui, &self.costs));
@@ -2610,7 +2621,7 @@ impl Workspace {
                 RoadmapView::Walk => {
                     // the projected order: the cards as a walk would take them, numbered,
                     // the filters and the search applying as in the tree
-                    let order = ra_console::agent::walk_order(&nodes, ra_console::agent::limits_tight(&self.limits));
+                    let order = ra_console::agent::walk_order(&nodes, &self.gambits, ra_console::agent::limits_tight(&self.limits));
                     if order.is_empty() {
                         ui.label(RichText::new("no card is ready to walk").color(theme::dim()).italics());
                     }
@@ -2673,6 +2684,105 @@ impl Workspace {
         if let Some(parent) = out.add_under {
             self.new_card = Some(NewCard::under(parent));
             self.tab = Tab::Card;
+        }
+    }
+
+    /// The gambits above the column: the active and parked ones as bubbles in a wrapped row,
+    /// a `+` that opens the one-line field, and the done ones folded under a dim header. A pick
+    /// on a bubble writes through the store and the column reloads.
+    fn gambit_band(&mut self, ui: &mut egui::Ui) {
+        let gambits = self.gambits.clone();
+        let (done, live): (Vec<&Gambit>, Vec<&Gambit>) = gambits.iter().partition(|g| g.state == GambitState::Done);
+        let mut pick: Option<(u32, cards::GambitPick)> = None;
+        let mut open_field = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(RichText::new("GAMBITS").small().strong().color(theme::dim()));
+            for gambit in &live {
+                if let Some(p) = cards::gambit_bubble(ui, gambit) {
+                    pick = Some((gambit.id, p));
+                }
+            }
+            if self.new_gambit.is_none()
+                && ui.small_button(RichText::new("+").color(theme::accent())).on_hover_text("add a gambit").clicked()
+            {
+                open_field = true;
+            }
+        });
+        if open_field {
+            self.new_gambit = Some(String::new());
+        }
+        // the field: one line of text; Enter adds it active at weight 3, Escape drops it
+        let mut add = None;
+        if let Some(text) = self.new_gambit.as_mut() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("+").color(theme::accent()));
+                let response = ui.add(
+                    egui::TextEdit::singleline(text)
+                        .hint_text(
+                            RichText::new("a gambit: one line of direction; Enter adds it at weight 3").color(theme::dim()).italics(),
+                        )
+                        .desired_width(ui.available_width() - 24.0),
+                );
+                if open_field {
+                    response.request_focus();
+                }
+                if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    add = Some(text.trim().to_owned());
+                } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    add = Some(String::new());
+                }
+            });
+        }
+        if let Some(text) = add {
+            self.new_gambit = None;
+            if !text.is_empty() {
+                self.add_gambit(&text);
+            }
+        }
+        if !done.is_empty() {
+            let arrow = if self.done_gambits_open { "▾" } else { "▸" };
+            let header = RichText::new(format!("{arrow} {} done", done.len())).small().color(theme::dim());
+            if ui.add(egui::Label::new(header).sense(egui::Sense::click())).clicked() {
+                self.done_gambits_open = !self.done_gambits_open;
+            }
+            if self.done_gambits_open {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for gambit in &done {
+                        if let Some(p) = cards::gambit_bubble(ui, gambit) {
+                            pick = Some((gambit.id, p));
+                        }
+                    }
+                });
+            }
+        }
+        ui.add_space(2.0);
+        if let Some((id, pick)) = pick {
+            let written = match pick {
+                cards::GambitPick::State(state) => {
+                    self.rt.block_on(self.store.set_gambit_state(id, state)).map(|()| format!("g{id} → {state}"))
+                }
+                cards::GambitPick::Weight(w) => self.rt.block_on(self.store.set_gambit_weight(id, w)).map(|()| format!("g{id} weight {w}")),
+            };
+            match written {
+                Ok(what) => {
+                    self.sink.push(Kind::Output, what);
+                    self.roadmap_seen = None;
+                }
+                Err(e) => self.sink.push(Kind::Error, format!("cannot set g{id}: {e:#}")),
+            }
+        }
+    }
+
+    /// Writes a gambit from the band's field, active at weight 3, and has the roadmap read again.
+    fn add_gambit(&mut self, text: &str) {
+        match self.rt.block_on(self.store.add_gambit(text, 3, &[])) {
+            Ok(id) => {
+                self.sink.push(Kind::Output, format!("g{id} {text}"));
+                self.roadmap_seen = None;
+            }
+            Err(e) => self.sink.push(Kind::Error, format!("cannot add the gambit: {e:#}")),
         }
     }
 
@@ -3747,9 +3857,10 @@ impl Workspace {
     /// The project's card on the dashboard: its name and state in the header; at the left the
     /// card a run is on, then the next ready cards, in the roadmap's own rows; at the right the
     /// latest run's card, live or finished. Returns true when the header asks for the tab.
+    #[allow(clippy::too_many_lines)]
     fn dashboard_card(&mut self, ui: &mut egui::Ui, lane: Color32, page: f32) -> bool {
         let nodes = self.roadmap.clone();
-        let order = ra_console::agent::walk_order(&nodes, ra_console::agent::limits_tight(&self.limits));
+        let order = ra_console::agent::walk_order(&nodes, &self.gambits, ra_console::agent::limits_tight(&self.limits));
         let live = self.sink.live_run();
         // the card the live run is on: its id leads the run's title
         let running: Option<i64> = live.and_then(|id| {
@@ -4450,13 +4561,13 @@ fn action(ui: &mut egui::Ui, text: &str, color: Color32) -> bool {
     ui.add(button).clicked()
 }
 
-/// The task the workers hold next: the first in progress, else the first ready, stored or computed
-/// from its waits-on, else the first defined task.
-fn current_task(nodes: &[Node]) -> Option<&Node> {
+/// The task the workers hold next: the first in progress, else the ready card the walk scores
+/// highest, the one `rc next` names, else the first defined task.
+fn current_task<'a>(nodes: &'a [Node], gambits: &'a [Gambit]) -> Option<&'a Node> {
     nodes
         .iter()
         .find(|n| matches!(n.state, TaskState::InProgress | TaskState::Assigned))
-        .or_else(|| tree::next_ready(nodes))
+        .or_else(|| tree::next_ready(nodes, gambits))
         .or_else(|| nodes.iter().find(|n| n.state == TaskState::Defined && n.kind != NodeKind::Project))
 }
 

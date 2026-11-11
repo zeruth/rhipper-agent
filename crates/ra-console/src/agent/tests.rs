@@ -1,6 +1,36 @@
-//! The tests of the agent loop's local work: what a failed check comes to in the notes.
+//! The tests of the agent loop's local work: what a failed check comes to in the notes, and
+//! what the run line says of the turns.
 
 use super::*;
+
+#[test]
+fn the_turn_sizes_lead_with_the_average_and_name_the_largest_when_shown() {
+    let usage = Usage { prompt_tokens: 30_000, completion_tokens: 600, cached_tokens: 0, cost_usd: None, cost_computed: false };
+    let mut session = Session { text: String::new(), usage, calls: 0, turns: 3, turn_usage: Vec::new(), cap: None, reads: Vec::new() };
+    // a provider that showed only the sum: the average over the turns
+    assert_eq!(turn_sizes(&session), "avg 10k tokens a turn");
+    session.turn_usage = vec![
+        TurnUsage { input_tokens: 5_000, output_tokens: 200 },
+        TurnUsage { input_tokens: 20_000, output_tokens: 200 },
+        TurnUsage { input_tokens: 5_000, output_tokens: 200 },
+    ];
+    assert_eq!(turn_sizes(&session), "avg 10k tokens a turn, largest 20k");
+    // no turns at all: the sum stands for one
+    session.turns = 0;
+    session.turn_usage.clear();
+    assert_eq!(turn_sizes(&session), "avg 30k tokens a turn");
+}
+
+#[test]
+fn the_files_read_again_are_named_most_first_and_three_at_most() {
+    let reads: Vec<String> = ["c.rs", "x86.rs", "c.rs", "abi.rs", "once.rs", "c.rs", "x86.rs", "abi.rs", "z.rs", "z.rs"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    assert_eq!(reread(&reads).as_deref(), Some("c.rs ×3, abi.rs ×2, x86.rs ×2"));
+    assert_eq!(reread(&["a.rs".to_owned(), "b.rs".to_owned()]), None);
+    assert_eq!(reread(&[]), None);
+}
 
 /// A `cargo test` output with two failures among many passing tests, longer than the tail.
 fn sample_output() -> String {
@@ -210,4 +240,54 @@ async fn the_doctor_reads_the_roadmap_and_opens_the_ledger_of_a_directory() {
     // the settings line names the sources a worker loads and what the project has for them
     let settings = settings_check(dir.path()).unwrap();
     assert!(settings.starts_with("a worker loads project,local: .claude/settings.json absent"));
+}
+
+/// A PostToolUse event for a Read of `file` in `root`, with the range the worker gave.
+fn read_event(root: &Path, file: &str, offset: Option<u64>, limit: Option<u64>) -> serde_json::Value {
+    let mut input = serde_json::json!({"file_path": root.join(file).display().to_string()});
+    if let Some(offset) = offset {
+        input["offset"] = offset.into();
+    }
+    if let Some(limit) = limit {
+        input["limit"] = limit.into();
+    }
+    serde_json::json!({"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_input": input, "cwd": root.display().to_string()})
+}
+
+#[test]
+fn a_whole_file_read_of_a_long_file_is_answered_with_the_outline_once_per_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // a 500-line source with three functions, and a card whose brief names the middle one
+    let mut source = String::new();
+    for (line, name) in [(1, "alpha"), (201, "beta"), (401, "gamma")] {
+        while source.lines().count() < line - 1 {
+            source.push_str("    let _ = 0;\n");
+        }
+        source.push_str(&format!("pub fn {name}() {{\n"));
+    }
+    while source.lines().count() < 500 {
+        source.push_str("    let _ = 0;\n");
+    }
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/big.rs"), &source).unwrap();
+    std::fs::write(root.join("src/small.rs"), "pub fn tiny() {}\n").unwrap();
+    std::fs::create_dir_all(root.join(ra_context::CONTEXT_DIR)).unwrap();
+    std::fs::write(root.join(ra_context::CONTEXT_DIR).join("7.md"), "# Task #7 context\n\n## Brief\n\nchange `beta` in src/big.rs\n")
+        .unwrap();
+
+    let hint = read_hint(root, &read_event(root, "src/big.rs", None, None)).expect("a whole-file read gets the hint");
+    assert!(hint.contains("rc context 7"), "{hint}");
+    assert!(hint.contains("beta 201-400"), "{hint}");
+    assert!(!hint.contains("alpha"), "only the function the card names: {hint}");
+    // the same file again this run: the worker was told
+    assert_eq!(read_hint(root, &read_event(root, "src/big.rs", None, None)), None);
+    // a ranged read and a short file need no hint
+    begin_run(root, 7);
+    assert_eq!(read_hint(root, &read_event(root, "src/big.rs", Some(200), Some(60))), None);
+    assert_eq!(read_hint(root, &read_event(root, "src/big.rs", None, Some(60))), None);
+    assert_eq!(read_hint(root, &read_event(root, "src/small.rs", None, None)), None);
+    // a new run forgets what the last one said
+    assert!(read_hint(root, &read_event(root, "src/big.rs", None, None)).is_some());
+    unsafe { std::env::remove_var(CARD_VAR) };
 }

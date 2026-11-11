@@ -1,7 +1,7 @@
 //! The tests of the tree walks.
 
 use super::*;
-use crate::model::{NodeKind, TaskState};
+use crate::model::{Gambit, GambitState, NodeKind, TaskState};
 
 fn node(id: i64, parent: Option<i64>) -> Node {
     Node {
@@ -114,8 +114,50 @@ fn next_names_the_first_ready_card() {
         task(4, TaskState::Defined, &[2]),
         task(5, TaskState::Defined, &[]),
     ];
-    assert_eq!(next_ready(&nodes).map(|n| n.id), Some(4));
-    assert!(next_ready(&nodes[..3]).is_none());
+    assert_eq!(next_ready(&nodes, &[]).map(|n| n.id), Some(4));
+    assert!(next_ready(&nodes[..3], &[]).is_none());
+}
+
+fn gambit(id: u32, weight: u8, state: GambitState, focus: &[&str]) -> Gambit {
+    Gambit { id, text: format!("gambit {id}"), weight, state, focus: focus.iter().map(|w| (*w).to_owned()).collect() }
+}
+
+#[test]
+fn the_walk_scores_the_ready_cards() {
+    // under the milestone "The console": #2 first in the file, #3 matches g1 by its title and g2
+    // by its files, #4 matches nothing but carries a priority; g3 matches #3 too but is parked
+    let mut root = node(1, None);
+    root.kind = NodeKind::Milestone;
+    root.title = "The console".to_owned();
+    let nodes = vec![
+        root,
+        Node { title: "Refresh the badge".to_owned(), ..task(2, TaskState::Defined, &[]) },
+        Node {
+            title: "A local route".to_owned(),
+            files: vec!["crates/ra-providers/src/lib.rs".to_owned()],
+            ..task(3, TaskState::Defined, &[])
+        },
+        Node { title: "Ship it".to_owned(), priority: Some(5), ..task(4, TaskState::Defined, &[]) },
+    ];
+    let gambits = vec![
+        gambit(1, 3, GambitState::Active, &["Local"]),
+        gambit(2, 2, GambitState::Active, &["ra-providers"]),
+        gambit(3, 5, GambitState::Parked, &["local"]),
+        gambit(4, 1, GambitState::Active, &["console"]),
+    ];
+    // the matching card comes before the earlier one; the priority before both
+    assert_eq!(next_ready(&nodes[..3], &gambits).map(|n| n.id), Some(3));
+    assert_eq!(next_ready(&nodes, &gambits).map(|n| n.id), Some(4));
+    let scores = ranked(&nodes, &gambits);
+    assert_eq!(scores.iter().map(|s| s.node.id).collect::<Vec<_>>(), vec![4, 3, 2]);
+    // the milestone's title matches every card through g4; the parked gambit moves nothing
+    assert_eq!((scores[1].priority, scores[1].weight), (0, 6));
+    assert_eq!(scores[1].gambits.iter().map(|g| g.id).collect::<Vec<_>>(), vec![1, 2, 4]);
+    assert_eq!((scores[2].priority, scores[2].weight), (0, 1));
+    let line = scores[1].line();
+    assert!(line.starts_with("#3 A local route") && line.contains("g1 gambit 1 {w3}") && line.contains("+6"), "{line}");
+    // without gambits the file's order stands
+    assert_eq!(ranked(&nodes[..3], &[]).iter().map(|s| s.node.id).collect::<Vec<_>>(), vec![2, 3]);
 }
 
 /// A card with everything a card needs: the lint has nothing to say about it.
