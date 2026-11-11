@@ -161,7 +161,10 @@ fn clipped(ui: &mut Ui, raw: &str, limit: usize, font: &FontId, color: Color32) 
 /// that one line, and a finished card folds itself after a minute.
 fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: usize, room: Option<f32>) {
     let lane = theme::lane(1 + index % 9);
-    let elapsed = run.started.elapsed().as_secs_f32();
+    // the animation runs on the window's clock, not the run's: every live card on the
+    // dashboard breathes and its light laps in step, instead of each on its own start time
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed = ui.input(|i| i.time) as f32;
     let base = if failed(run) {
         theme::accent()
     } else if run.live() {
