@@ -1,38 +1,50 @@
 //! The console pane of the workspace: the session log as bubbles, the runs as framed cards
 //! with their steps, humming while they work. Hovering a clipped line shows the whole of it.
 
-use egui::{Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke, StrokeKind, Ui};
+use std::f32::consts::{FRAC_PI_2, PI};
+use std::time::Duration;
+
+use egui::{Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, Painter, Pos2, Rect, RichText, Stroke, Ui, Vec2, pos2};
 use ra_console::logs::{Kind, Line, Run, Sink};
 
 use crate::theme;
 
 /// The most characters a bubble shows of a line before it clips, with the rest on hover.
 const CLIP: usize = 600;
+/// The most characters a step shows before it clips, with the rest on hover.
+const STEP_CLIP: usize = 140;
+/// The corner radius of a run card, which the light follows.
+const RADIUS: f32 = 10.0;
+/// The points of wheel one notch is worth; a notch over a card is two rows, as the buttons are.
+const NOTCH: f32 = 50.0;
+/// The segments the tail of the light is drawn in.
+const SEGMENTS: u8 = 48;
+/// The laps the light makes along the border in a second.
+const LAPS_PER_SECOND: f32 = 0.22;
 
 /// Draws the log into `ui`, oldest first; the caller wraps it in a scroll area that sticks to
-/// the bottom. `now` is the frame time in seconds, for the hum of a live run. `show_debug` lets
-/// the trace lines through.
-pub(crate) fn draw(ui: &mut Ui, sink: &Sink, now: f64, show_debug: bool) {
+/// the bottom. `show_debug` lets the trace lines through.
+pub(crate) fn draw(ui: &mut Ui, sink: &Sink, show_debug: bool) {
     let lines: Vec<Line> = sink.with_lines(<[Line]>::to_vec);
-    let total = lines.len();
     for (index, line) in lines.iter().enumerate() {
-        if matches!(line.kind, Kind::Log(tracing::Level::DEBUG) | Kind::Log(tracing::Level::TRACE)) && !show_debug {
+        if matches!(line.kind, Kind::Log(tracing::Level::DEBUG | tracing::Level::TRACE)) && !show_debug {
             continue;
         }
-        match (line.kind, line.run.and_then(|id| sink.run(id))) {
-            (Kind::Run, Some(run)) => run_card(ui, sink, line.run.unwrap_or(0), &line.text, &run, index, now),
-            _ => bubble(ui, line, index, total),
+        let run = line.run.and_then(|id| sink.run(id).map(|run| (id, run)));
+        match run {
+            Some((id, run)) if line.kind == Kind::Run => run_card(ui, sink, id, &line.text, &run, index),
+            _ => bubble(ui, line, index),
         }
         ui.add_space(6.0);
     }
 }
 
 /// One log entry as a rounded bubble, in the color of its kind.
-fn bubble(ui: &mut Ui, line: &Line, index: usize, _total: usize) {
-    let lane = theme::lane(1 + index % 9);
+fn bubble(ui: &mut Ui, line: &Line, index: usize) {
+    let tint = theme::lane(1 + index % 9);
     let (border, text, fill) = match line.kind {
         Kind::Input => (theme::ACCENT, theme::TEXT, theme::PANEL_RAISED),
-        Kind::Output | Kind::Diff => (lane, lane, theme::PANEL),
+        Kind::Output | Kind::Diff => (tint, tint, theme::PANEL),
         Kind::Banner => (theme::ACCENT, theme::ACCENT, theme::PANEL),
         Kind::Error | Kind::Log(tracing::Level::ERROR) => (theme::ACCENT, theme::ERROR_TEXT, theme::PANEL),
         Kind::Log(tracing::Level::WARN) => (theme::WARN, theme::WARN_TEXT, theme::PANEL),
@@ -71,13 +83,7 @@ fn bubble(ui: &mut Ui, line: &Line, index: usize, _total: usize) {
                     (Kind::Diff, Some('-')) => theme::ERROR_TEXT,
                     _ => text,
                 };
-                let shown: String = raw.chars().take(CLIP).collect();
-                let label = ui.label(
-                    RichText::new(if raw.chars().count() > CLIP { format!("{shown}…") } else { shown }).font(font.clone()).color(color),
-                );
-                if raw.chars().count() > CLIP {
-                    label.on_hover_text(RichText::new(raw).font(font.clone()));
-                }
+                clipped(ui, raw, CLIP, &font, color);
             }
         })
         .response;
@@ -86,33 +92,29 @@ fn bubble(ui: &mut Ui, line: &Line, index: usize, _total: usize) {
     }
 }
 
+/// A line of text that clips at `limit` characters, with the whole of it on hover.
+fn clipped(ui: &mut Ui, raw: &str, limit: usize, font: &FontId, color: Color32) {
+    let count = raw.chars().count();
+    if count <= limit {
+        ui.label(RichText::new(raw).font(font.clone()).color(color));
+        return;
+    }
+    let shown: String = raw.chars().take(limit).collect();
+    ui.label(RichText::new(format!("{shown}…")).font(font.clone()).color(color)).on_hover_text(RichText::new(raw).font(font.clone()));
+}
+
 /// A worker run as a card: the title and the clock or the outcome on top, the latest steps
-/// inside at the run's height, a soft light flowing along the border while it is live.
-fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: usize, now: f64) {
+/// inside at the run's height, a soft light flowing along the border while it is live. The
+/// wheel over the card sizes the card, not the log.
+fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: usize) {
     let lane = theme::lane(1 + index % 9);
-    let failed = run.outcome.as_deref().is_some_and(|o| o.starts_with('✗'));
-    let base = if failed {
+    let elapsed = run.started.elapsed().as_secs_f32();
+    let base = if failed(run) {
         theme::ACCENT
     } else if run.live() {
-        // the border breathes between the dim and the bright lane while the run works
-        let pulse = ((now * 1.6).sin() as f32 * 0.5 + 0.5) * 0.6 + 0.2;
+        // the border breathes between the rule and the bright lane while the run works
+        let pulse = ((elapsed * 1.6).sin() * 0.5 + 0.5) * 0.6 + 0.2;
         theme::mix(theme::RULE, lane, pulse)
-    } else {
-        lane
-    };
-    let clock = |d: std::time::Duration| {
-        let s = d.as_secs();
-        if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) } else { format!("{s}s") }
-    };
-    let status = match (&run.outcome, run.took) {
-        (Some(outcome), Some(took)) => format!("{outcome} · {}", clock(took)),
-        (Some(outcome), None) => outcome.clone(),
-        (None, _) => format!("{} · {} steps", clock(run.started.elapsed()), run.steps.len()),
-    };
-    let status_color = if failed {
-        theme::ERROR_TEXT
-    } else if run.live() {
-        theme::WARN_TEXT
     } else {
         lane
     };
@@ -124,118 +126,195 @@ fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: us
     let response = frame
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                // the task and the model as badges, the way the status bar wears them
-                match title.rsplit_once(" · ") {
-                    Some((task, model)) => {
-                        crate::cards::badge_marked(ui, "◇", task, theme::TRACE);
-                        crate::cards::badge_marked(ui, "◉", model, theme::ACCENT);
-                    }
-                    None => {
-                        crate::cards::badge_marked(ui, "◇", title, theme::TRACE);
-                    }
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // the height of the card, two rows a notch, by the buttons or the wheel
-                    if ui.small_button("▾").on_hover_text("fewer rows").clicked() {
-                        sink.resize_run(id, -2);
-                    }
-                    if ui.small_button("▴").on_hover_text("more rows").clicked() {
-                        sink.resize_run(id, 2);
-                    }
-                    ui.label(RichText::new(&status).color(status_color).small());
-                });
-            });
+            run_title(ui, sink, id, title, run, lane);
             ui.add_space(4.0);
-            let height = usize::from(run.height);
-            let body = if run.live() { height } else { height.min(run.steps.len().max(1)) };
-            let hidden = run.steps.len().saturating_sub(body);
-            let font = FontId::monospace(12.5);
-            if hidden > 0 {
-                let folded = run.steps.len() - body + 1;
-                let label = ui.label(RichText::new(format!("⋯ {folded} earlier steps")).font(font.clone()).color(theme::DIM).italics());
-                label.on_hover_ui(|ui| {
-                    for step in run.steps.iter().take(folded) {
-                        ui.label(RichText::new(step).font(font.clone()).color(theme::TEXT));
-                    }
-                });
-            }
-            let skip = if hidden > 0 { hidden + 1 } else { 0 };
-            if run.steps.is_empty() {
-                ui.label(RichText::new(if run.live() { "starting…" } else { "no steps" }).font(font.clone()).color(theme::DIM).italics());
-            }
-            for step in run.steps.iter().skip(skip) {
-                let color = if step.starts_with("$ ") {
-                    theme::WARN_TEXT
-                } else if step.starts_with("⚠ ") {
-                    theme::ERROR_TEXT
-                } else if step.starts_with("… ") {
-                    theme::TEXT
-                } else {
-                    theme::DIM
-                };
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("▸").color(if run.live() { theme::ACCENT } else { theme::DIM }).font(font.clone()));
-                    let shown: String = step.chars().take(140).collect();
-                    let label = ui.label(
-                        RichText::new(if step.chars().count() > 140 { format!("{shown}…") } else { shown }).font(font.clone()).color(color),
-                    );
-                    if step.chars().count() > 140 {
-                        label.on_hover_text(RichText::new(step).font(font.clone()));
-                    }
-                });
-            }
-            // the rows a live run has not filled yet stay open, so the card keeps its height
-            if run.live() {
-                for _ in run.steps.len().saturating_sub(skip)..body {
-                    ui.label(RichText::new(" ").font(font.clone()));
-                }
-            }
+            run_steps(ui, run);
         })
         .response;
-    // the wheel over the card sizes the card, not the log
-    if response.hovered() {
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-        if scroll.abs() > 0.5 && ui.input(|i| i.modifiers.ctrl) {
-            sink.resize_run(id, if scroll > 0.0 { 1 } else { -1 });
+    wheel(ui, sink, id, response.rect);
+    if run.live() {
+        hum(ui.painter(), response.rect, lane, elapsed);
+    }
+}
+
+/// Whether the run ended badly.
+fn failed(run: &Run) -> bool {
+    run.outcome.as_deref().is_some_and(|o| o.starts_with('✗'))
+}
+
+/// A duration as the card's clock shows it.
+fn clock(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) } else { format!("{s}s") }
+}
+
+/// The title row of a run card: the task and the model as badges, the way the status bar wears
+/// them; the clock and the step count while the run is live, the outcome and how long it took
+/// when it ends; and the two buttons that size the card.
+fn run_title(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, lane: Color32) {
+    let status = match (&run.outcome, run.took) {
+        (Some(outcome), Some(took)) => format!("{outcome} · {}", clock(took)),
+        (Some(outcome), None) => outcome.clone(),
+        (None, _) => format!("{} · {} steps", clock(run.started.elapsed()), run.steps.len()),
+    };
+    let status_color = if failed(run) {
+        theme::ERROR_TEXT
+    } else if run.live() {
+        theme::WARN_TEXT
+    } else {
+        lane
+    };
+    ui.horizontal(|ui| {
+        if let Some((task, model)) = title.rsplit_once(" · ") {
+            crate::cards::badge_marked(ui, "◇", task, theme::TRACE);
+            crate::cards::badge_marked(ui, "◉", model, theme::ACCENT);
+        } else {
+            crate::cards::badge_marked(ui, "◇", title, theme::TRACE);
         }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // the height of the card, two rows a notch, by the buttons or the wheel
+            if ui.small_button("▾").on_hover_text("fewer rows").clicked() {
+                sink.resize_run(id, -2);
+            }
+            if ui.small_button("▴").on_hover_text("more rows").clicked() {
+                sink.resize_run(id, 2);
+            }
+            ui.label(RichText::new(status).color(status_color).small());
+        });
+    });
+}
+
+/// The body of a run card: the latest steps at the run's height. A live run keeps its height,
+/// with the rows it has not filled yet left open; a finished one shrinks to its steps. The
+/// steps that fell off the top fold into one line that shows them on hover.
+fn run_steps(ui: &mut Ui, run: &Run) {
+    let height = usize::from(run.height);
+    let body = if run.live() { height } else { height.min(run.steps.len().max(1)) };
+    let hidden = run.steps.len().saturating_sub(body);
+    let font = FontId::monospace(12.5);
+    let skip = if hidden > 0 { hidden + 1 } else { 0 };
+    if hidden > 0 {
+        ui.label(RichText::new(format!("⋯ {skip} earlier steps")).font(font.clone()).color(theme::DIM).italics()).on_hover_ui(|ui| {
+            for step in run.steps.iter().take(skip) {
+                ui.label(RichText::new(step).font(font.clone()).color(theme::TEXT));
+            }
+        });
+    }
+    if run.steps.is_empty() {
+        ui.label(RichText::new(if run.live() { "starting…" } else { "no steps" }).font(font.clone()).color(theme::DIM).italics());
+    }
+    let mark = if run.live() { theme::ACCENT } else { theme::DIM };
+    for step in run.steps.iter().skip(skip) {
+        let color = if step.starts_with("$ ") {
+            theme::WARN_TEXT
+        } else if step.starts_with("⚠ ") {
+            theme::ERROR_TEXT
+        } else if step.starts_with("… ") {
+            theme::TEXT
+        } else {
+            theme::DIM
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("▸").color(mark).font(font.clone()));
+            clipped(ui, step, STEP_CLIP, &font, color);
+        });
     }
     if run.live() {
-        hum(ui, response.rect, lane, now);
+        for _ in run.steps.len().saturating_sub(skip)..body {
+            ui.label(RichText::new(" ").font(font.clone()));
+        }
+    }
+}
+
+/// The wheel over a card sizes that card and nothing else: the scroll is taken before the
+/// console's scroll area sees it, and every notch of it is two rows, the way the buttons go.
+/// The fraction of a notch left over waits for the next, so a trackpad adds up the same way.
+fn wheel(ui: &Ui, sink: &Sink, id: u64, rect: Rect) {
+    if !ui.rect_contains_pointer(rect) {
+        return;
+    }
+    let delta = ui.input_mut(|input| std::mem::replace(&mut input.smooth_scroll_delta, Vec2::ZERO).y);
+    let key = ui.make_persistent_id(("run-wheel", id));
+    let mut rows = 0;
+    ui.data_mut(|data| {
+        let rest = data.get_temp_mut_or_default::<f32>(key);
+        *rest += delta;
+        while *rest >= NOTCH {
+            *rest -= NOTCH;
+            rows += 2;
+        }
+        while *rest <= -NOTCH {
+            *rest += NOTCH;
+            rows -= 2;
+        }
+    });
+    if rows != 0 {
+        sink.resize_run(id, rows);
     }
 }
 
 /// The light that flows along a live card's border: a bright head with a soft tail, around the
-/// rounded rectangle once every few seconds.
-fn hum(ui: &Ui, rect: egui::Rect, lane: Color32, now: f64) {
-    let painter = ui.painter();
-    let perimeter = 2.0 * (rect.width() + rect.height());
-    let head = ((now * 0.22) % 1.0) as f32 * perimeter;
+/// rounded rectangle once every few seconds, a wider glow under a thin bright line.
+fn hum(painter: &Painter, rect: Rect, lane: Color32, elapsed: f32) {
+    let radius = RADIUS.min(rect.width() * 0.5).min(rect.height() * 0.5);
+    let perimeter = perimeter_of(rect, radius);
+    let head = (elapsed * LAPS_PER_SECOND).fract() * perimeter;
     let tail = 140.0f32.min(perimeter * 0.3);
-    let segments = 48;
-    for i in 0..segments {
-        let d = tail * (i as f32 / segments as f32);
-        let at = (head - d).rem_euclid(perimeter);
-        let alpha = (1.0 - d / tail).powi(2);
-        let color = Color32::from_rgba_unmultiplied(lane.r(), lane.g(), lane.b(), (alpha * 220.0) as u8);
-        let (a, b) = (point_on(rect, at), point_on(rect, (at + tail / segments as f32).min(perimeter)));
-        painter.line_segment([a, b], Stroke::new(2.5, color));
+    let step = tail / f32::from(SEGMENTS);
+    for i in 0..SEGMENTS {
+        let behind = step * f32::from(i);
+        let at = head - behind;
+        let near = (1.0 - behind / tail).powi(2);
+        let points = [point_on(rect, radius, at), point_on(rect, radius, at - step)];
+        painter.line_segment(points, Stroke::new(6.0, lane.gamma_multiply(near * 0.25)));
+        painter.line_segment(points, Stroke::new(2.0, lane.gamma_multiply(near * 0.9)));
     }
-    // the corners stay rounded under the light
-    painter.rect_stroke(rect, CornerRadius::same(10), Stroke::new(1.0, Color32::TRANSPARENT), StrokeKind::Outside);
 }
 
-/// The point `distance` along the border of `rect`, clockwise from the top-left corner.
-fn point_on(rect: egui::Rect, distance: f32) -> egui::Pos2 {
-    let (w, h) = (rect.width(), rect.height());
-    let d = distance.rem_euclid(2.0 * (w + h));
-    if d < w {
-        egui::pos2(rect.left() + d, rect.top())
-    } else if d < w + h {
-        egui::pos2(rect.right(), rect.top() + (d - w))
-    } else if d < 2.0 * w + h {
-        egui::pos2(rect.right() - (d - w - h), rect.bottom())
-    } else {
-        egui::pos2(rect.left(), rect.bottom() - (d - 2.0 * w - h))
+/// The length of the border of `rect` with corners rounded by `radius`.
+fn perimeter_of(rect: Rect, radius: f32) -> f32 {
+    2.0 * (rect.width() + rect.height()) - 8.0 * radius + 2.0 * PI * radius
+}
+
+/// The point `distance` along the border of `rect`, with corners rounded by `radius`, clockwise
+/// from where the top edge begins; any distance wraps around.
+fn point_on(rect: Rect, radius: f32, distance: f32) -> Pos2 {
+    let (width, height) = (rect.width() - 2.0 * radius, rect.height() - 2.0 * radius);
+    let arc = FRAC_PI_2 * radius;
+    let mut dist = distance.rem_euclid(perimeter_of(rect, radius));
+    if dist < width {
+        return pos2(rect.left() + radius + dist, rect.top());
     }
+    dist -= width;
+    if dist < arc {
+        return corner(pos2(rect.right() - radius, rect.top() + radius), radius, dist / radius - FRAC_PI_2);
+    }
+    dist -= arc;
+    if dist < height {
+        return pos2(rect.right(), rect.top() + radius + dist);
+    }
+    dist -= height;
+    if dist < arc {
+        return corner(pos2(rect.right() - radius, rect.bottom() - radius), radius, dist / radius);
+    }
+    dist -= arc;
+    if dist < width {
+        return pos2(rect.right() - radius - dist, rect.bottom());
+    }
+    dist -= width;
+    if dist < arc {
+        return corner(pos2(rect.left() + radius, rect.bottom() - radius), radius, dist / radius + FRAC_PI_2);
+    }
+    dist -= arc;
+    if dist < height {
+        return pos2(rect.left(), rect.bottom() - radius - dist);
+    }
+    dist -= height;
+    corner(pos2(rect.left() + radius, rect.top() + radius), radius, dist / radius + PI)
+}
+
+/// The point at `angle` on the circle of `radius` around `center`; angles turn clockwise on the
+/// screen, from three o'clock.
+fn corner(center: Pos2, radius: f32, angle: f32) -> Pos2 {
+    center + Vec2::angled(angle) * radius
 }

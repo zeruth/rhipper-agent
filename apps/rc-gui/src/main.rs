@@ -753,7 +753,6 @@ impl eframe::App for App {
             self.splash(root);
             return;
         }
-        let now = root.input(|i| i.time);
         egui::Panel::top("status")
             .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(8, 6)))
             .show(root, |ui| self.status_bar(ui));
@@ -768,7 +767,7 @@ impl eframe::App for App {
             .show(root, |ui| {
                 ui.label(RichText::new("CONSOLE").small().strong().color(theme::DIM));
                 egui::ScrollArea::vertical().id_salt("console").auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                    console::draw(ui, &self.sink, now, self.show_debug);
+                    console::draw(ui, &self.sink, self.show_debug);
                 });
             });
         // the roadmap takes the width its rows need, up to two fifths of the window
