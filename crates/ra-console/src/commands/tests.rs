@@ -682,7 +682,8 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
     let dir = tempfile::tempdir().unwrap();
     cargo_project(dir.path(), true);
     git_ok(dir.path(), &["init", "-q"]);
-    // no rhipper.toml: the default cap of 120k stands, and no turn cap does
+    // the project names a context cap of 120k and no turn cap; without the line no cap stands
+    std::fs::write(dir.path().join("rhipper.toml"), "[worker]\ncontext = 120000\n").unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     // the stream showed five turns, the last of 131k input, before the harness stopped the run
@@ -710,7 +711,7 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
         out[0].ends_with("the context cap of 120k tokens (a turn of 131k) ended the run; the card continues in a fresh session"),
         "{out:?}"
     );
-    assert_eq!(harness.requests.lock().last().unwrap().max_context, Some(120_000), "the default cap went with the request");
+    assert_eq!(harness.requests.lock().last().unwrap().max_context, Some(120_000), "the project's cap went with the request");
     let node = store.read(2).await.unwrap();
     assert_eq!(node.state, ra_roadmap::model::TaskState::InProgress);
     assert_eq!(node.session, None, "the next run starts fresh");

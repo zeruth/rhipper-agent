@@ -2147,7 +2147,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 budget_usd: budget,
                 resume,
                 max_turns: caps.limit(),
-                max_context: Some(caps.context),
+                max_context: caps.context,
                 effort: Some(effort.to_string()),
             })
             .await;
@@ -2518,13 +2518,13 @@ struct Caps {
     /// the card continues in a fresh session.
     restart: Option<u32>,
     /// The project's `[worker] context`: a harness run ends the same way after a turn whose
-    /// input passes this many tokens.
-    context: u64,
+    /// input passes this many tokens; `None`, the default, is no cap.
+    context: Option<u64>,
 }
 
 impl Default for Caps {
     fn default() -> Self {
-        Self { hard: None, restart: None, context: crate::router::DEFAULT_CONTEXT }
+        Self { hard: None, restart: None, context: None }
     }
 }
 
@@ -2592,7 +2592,7 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     let caps = Caps {
         hard: worker.turns,
         restart: router.as_ref().and_then(|router| router.worker.turns()),
-        context: router.as_ref().map_or(crate::router::DEFAULT_CONTEXT, |router| router.worker.context()),
+        context: router.as_ref().and_then(|router| router.worker.context()),
     };
     let effort = worker.effort.unwrap_or(node.effort);
     Ok(Prepared { workspace, root, task, project, budget, caps, effort })
@@ -2695,7 +2695,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
         budget_usd: budget,
         resume: resume.clone().unwrap_or_default(),
         max_turns: caps.limit(),
-        max_context: Some(caps.context),
+        max_context: caps.context,
         effort: Some(effort.to_string()),
     };
     let mut lines = vec![
@@ -2706,11 +2706,11 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             worker.route().name()
         ),
         format!(
-            "  budget {} · turn cap {}{} · fresh session past {} tokens a turn · resume {} · {}",
+            "  budget {} · turn cap {}{}{} · resume {} · {}",
             budget.map_or_else(|| "none".to_owned(), |b| format!("${b:.2}")),
             caps.hard.map_or_else(|| "none".to_owned(), |c| c.to_string()),
             caps.restart.map_or_else(String::new, |r| format!(" · fresh session after {r} turns")),
-            kilo(caps.context),
+            caps.context.map_or_else(String::new, |c| format!(" · fresh session past {} tokens a turn", kilo(c))),
             match resume {
                 Ok(Some(session)) => session,
                 Ok(None) => "none".to_owned(),

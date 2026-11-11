@@ -22,9 +22,6 @@ pub const REVIEWER: &str = "reviewer";
 /// The role of the architect that splits a milestone or a section into cards.
 pub const PLANNER: &str = "planner";
 
-/// The input tokens a turn may carry when the project's `[worker] context` names no count.
-pub const DEFAULT_CONTEXT: u64 = 120_000;
-
 /// The complexities a rule is for: one, or a range with both ends in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
@@ -131,9 +128,10 @@ pub struct WorkerConfig {
     /// run goes on until it answers.
     #[serde(default)]
     pub turns: Option<u32>,
-    /// The input tokens a turn may carry before the run ends the same way: a session's turns
-    /// cost by the context they carry, and the turn cap alone let one reach 150k to 270k tokens
-    /// a turn (rhipper-asm #47, #107). Absent or zero, [`DEFAULT_CONTEXT`].
+    /// The input tokens a turn may carry before the run ends the same way. Absent or zero, no
+    /// cap: the harness compacts its own context as it goes, and a forced restart throws away
+    /// what the session holds (the person: "claude manages context on its own … let it keep
+    /// going unless we have a need to /clear"). A project that wants the restart names a count.
     #[serde(default)]
     pub context: Option<u64>,
     /// The seconds a card's check, or its lint, may run before it is stopped and counts as
@@ -164,10 +162,10 @@ impl WorkerConfig {
     }
 
     /// The input tokens a turn may carry before the run ends and the card continues fresh: the
-    /// table's count when positive, else [`DEFAULT_CONTEXT`].
+    /// table's count when positive; `None`, no cap, otherwise.
     #[must_use]
-    pub fn context(&self) -> u64 {
-        self.context.filter(|tokens| *tokens > 0).unwrap_or(DEFAULT_CONTEXT)
+    pub fn context(&self) -> Option<u64> {
+        self.context.filter(|tokens| *tokens > 0)
     }
 
     /// The project's lint: `None` leaves the lint to the agent, `Some("")` turns it off.

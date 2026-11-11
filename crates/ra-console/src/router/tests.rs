@@ -35,9 +35,9 @@ fn the_worker_table_allows_a_projects_commands_in_both_shells_and_sets_its_envir
 
 #[test]
 fn the_context_cap_is_the_tables_count_and_120k_without_it() {
-    assert_eq!(Router::parse("[worker]\ncontext = 80000\n").unwrap().worker.context(), 80_000);
-    assert_eq!(WorkerConfig::default().context(), 120_000);
-    assert_eq!(Router::parse("[worker]\ncontext = 0\n").unwrap().worker.context(), 120_000, "zero is the default");
+    assert_eq!(Router::parse("[worker]\ncontext = 80000\n").unwrap().worker.context(), Some(80_000));
+    assert_eq!(WorkerConfig::default().context(), None, "no cap unless the project names one");
+    assert_eq!(Router::parse("[worker]\ncontext = 0\n").unwrap().worker.context(), None, "zero is no cap");
 }
 
 #[test]

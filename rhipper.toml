@@ -2,9 +2,8 @@
 # the `[role]` table. A key left out keeps the default.
 
 [worker]
-# A run restarts in a fresh session after this many turns, with its handoff carried over, so
-# the context a turn carries stays small; the agent's own cards ran 30 to 90 turns tonight.
-turns = 60
+# No turn or context cap: the harness compacts its own context, and a run goes on until it
+# answers (`turns = N` or `context = N` would end it with a handoff and continue fresh).
 
 [role]
 # The model of each cheap role a run ends with. A key left out goes to the local server at
