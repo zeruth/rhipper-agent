@@ -382,13 +382,10 @@ fn main() -> anyhow::Result<()> {
     // thread's stack (one megabyte on Windows) once the walk, the review, the plan and the
     // parallel runs were in it: every command overflowed before it began. The work runs on a
     // thread with room.
-    let worker = std::thread::Builder::new()
-        .name("rc".to_owned())
-        .stack_size(256 << 20)
-        .spawn(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-            runtime.block_on(run_main())
-        })?;
+    let worker = std::thread::Builder::new().name("rc".to_owned()).stack_size(256 << 20).spawn(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        runtime.block_on(run_main())
+    })?;
     worker.join().map_err(|_| anyhow::anyhow!("the command's thread panicked"))?
 }
 
@@ -732,7 +729,9 @@ fn hook(event: &str) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    let Ok(catalogue) = ra_gotchas::Catalogue::load(&cwd.join("var/gotchas.toml")) else { return Ok(()) };
+    // the seed's new entries reach a project's catalogue here too: a worker started from an
+    // installed rc, not the console, has only the hook to bring them
+    let Ok((catalogue, _)) = ra_gotchas::Catalogue::refresh(&cwd.join("var/gotchas.toml")) else { return Ok(()) };
     // a running console or window holds its binary only while it runs from target/; an
     // installed one leaves the build free, so the lock itself is asked, not the pid file
     let locked = |name: &str| {
@@ -801,12 +800,18 @@ fn hook(event: &str) -> anyhow::Result<()> {
 /// Prints the gotchas by how often they fired, and the refused commands no gotcha names yet.
 fn gotchas() -> anyhow::Result<()> {
     let catalogue = ra_gotchas::Catalogue::load(Path::new("var/gotchas.toml"))?;
+    let later = std::fs::read_to_string("var/gotchas.toml").map_or(0, |text| ra_gotchas::Catalogue::from_seed_later(&text));
+    let seeded = match later {
+        0 => String::new(),
+        n => format!(", {n} of them from the seed since the file was written"),
+    };
     let journal = ra_gotchas::Journal::at(Path::new("var/gotchas.log"));
     let counts = journal.counts();
     if counts.is_empty() {
-        println!("no gotcha has fired yet; the catalogue holds {} entries in var/gotchas.toml", catalogue.entries.len());
+        println!("no gotcha has fired yet; the catalogue holds {} entries in var/gotchas.toml{seeded}", catalogue.entries.len());
         return Ok(());
     }
+    println!("the catalogue holds {} entries in var/gotchas.toml{seeded}", catalogue.entries.len());
     println!("{:<26} {:>5}  message", "gotcha", "hits");
     for (id, count) in &counts {
         let message = catalogue.get(id).map_or("a refused command no gotcha names; see below", |g| g.message.as_str());

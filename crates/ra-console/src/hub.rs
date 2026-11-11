@@ -10,9 +10,23 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 /// The hub's directory: `%LOCALAPPDATA%\rhipper\agent` on Windows (the IDE keeps its own
-/// directories beside it under `rhipper`), `~/.local/share/rhipper/agent` elsewhere.
+/// directories beside it under `rhipper`), `~/.local/share/rhipper/agent` elsewhere. `RHIPPER_HUB`
+/// names another, for the tests of the crates that build this one without `cfg(test)`; this
+/// crate's own tests get a directory of their own under the temp directory, one a process, so a
+/// test's digest, note, lock or mailbox never reaches the machine's hub and every project's runs.
 #[must_use]
 pub fn dir() -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("rhipper-test-hub-{}", std::process::id()));
+    }
+    dir_from(std::env::var_os("RHIPPER_HUB").as_deref())
+}
+
+/// [`dir`] given the value of `RHIPPER_HUB`: the machine's hub without one.
+fn dir_from(hub_var: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(hub) = hub_var.filter(|h| !h.is_empty()) {
+        return PathBuf::from(hub);
+    }
     if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("rhipper"), |d| PathBuf::from(d).join("rhipper")).join("agent")
     } else {
@@ -221,7 +235,8 @@ fn parse_digest(text: &str) -> Option<Digest> {
 
 /// The other projects' digests as one line each, clipped at [`DIGEST_WIDTH`], for the system
 /// prompt of a run in `root`: the project's own is left out, and a stale one, whose writer is
-/// gone and which is older than a day, is dropped. Never their files or notes.
+/// gone and which is older than a day, or whose project is no longer on disk, is dropped. Never
+/// their files or notes.
 #[must_use]
 pub fn digest_lines(root: &Path) -> Vec<String> {
     digest_lines_with(&digest_dir(), root, pid_alive, unix_now())
@@ -251,7 +266,8 @@ pub fn digests_in(dir: &Path, alive: impl Fn(u32) -> bool, now: u64) -> Vec<Dige
         .iter()
         .filter_map(|file| parse_digest(&std::fs::read_to_string(file).ok()?))
         .filter(|digest| {
-            let stale = now.saturating_sub(digest.when) > DIGEST_STALE && !alive(digest.pid);
+            // a project that is gone, a temp directory a test ran in say, has nothing to report
+            let stale = !Path::new(&digest.path).exists() || (now.saturating_sub(digest.when) > DIGEST_STALE && !alive(digest.pid));
             if stale {
                 let _ = std::fs::remove_file(dir.join(format!("{}.txt", digest.name)));
             }

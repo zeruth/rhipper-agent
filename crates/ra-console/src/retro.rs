@@ -14,10 +14,11 @@ use std::path::{Path, PathBuf};
 pub const RETRO_FILE: &str = "var/retro.log";
 
 /// The shared store of the `[machine]` bullets of every project on this machine, under the hub
-/// directory: `time<TAB>project<TAB>kind<TAB>text`. The tests write to a file of their own.
+/// directory: `time<TAB>project<TAB>kind<TAB>text`. The tests' hub is a temp directory of
+/// their own, so their notes never reach the machine's.
 #[must_use]
 pub fn shared_file() -> PathBuf {
-    if cfg!(test) { std::env::temp_dir().join("rhipper-test-notes.log") } else { crate::hub::dir().join("notes.log") }
+    crate::hub::dir().join("notes.log")
 }
 
 /// The heading the worker writes, matched without its marks and its case.

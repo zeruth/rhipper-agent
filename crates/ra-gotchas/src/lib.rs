@@ -9,6 +9,7 @@
 //! which ones keep coming back and the next run can read [`Catalogue::notes`] about them.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::Context;
@@ -21,6 +22,31 @@ pub const SEED: &str = include_str!("../gotchas.toml");
 /// The id the journal gives a command the harness refused that no gotcha names: not an entry of
 /// the catalogue, but a hit all the same, so the catalogue can grow from it.
 pub const UNMATCHED: &str = "unmatched-denied";
+
+/// The comment line that heads the entries a later seed brought to a project's catalogue; the
+/// build's version follows it, so the file says which build added what.
+pub const SEED_MARK: &str = "# from the seed of ra-gotchas ";
+
+/// The line that opens an entry in the TOML.
+const ENTRY_HEAD: &str = "[[gotcha]]";
+
+/// The seed's entries as text, each with its id: the blocks [`Catalogue::refresh`] appends, so
+/// a project's file gains the entry as written, comments and quoting included.
+fn seed_blocks() -> Vec<(String, String)> {
+    SEED.split(ENTRY_HEAD)
+        .skip(1)
+        .map(|rest| {
+            let body = rest.trim();
+            let id = body
+                .lines()
+                .find_map(|line| line.strip_prefix("id = \""))
+                .and_then(|tail| tail.split('"').next())
+                .expect("every seed entry has an id")
+                .to_owned();
+            (id, format!("{ENTRY_HEAD}\n{body}\n"))
+        })
+        .collect()
+}
 
 /// Where a gotcha shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -139,7 +165,43 @@ impl Catalogue {
         Self::parse(&text).with_context(|| path.display().to_string())
     }
 
+    /// Loads the catalogue at `path` as [`Self::load`] does, then brings it the seed's new
+    /// entries: every seed entry whose id the file lacks is appended under a comment line
+    /// naming the build that brought it, and the entries the file has, changed or not, stay its
+    /// own byte for byte. Nothing is written when nothing is missing. Returns the catalogue as
+    /// it stands and the ids it gained.
+    ///
+    /// # Errors
+    /// When the file cannot be read or written, or does not parse.
+    pub fn refresh(path: &Path) -> anyhow::Result<(Self, Vec<String>)> {
+        let have = Self::load(path)?;
+        let missing: Vec<(String, String)> = seed_blocks().into_iter().filter(|(id, _)| have.get(id).is_none()).collect();
+        if missing.is_empty() {
+            return Ok((have, Vec::new()));
+        }
+        let mut text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let _ = writeln!(text, "\n{SEED_MARK}{}, {} new", env!("CARGO_PKG_VERSION"), missing.len());
+        for (_, block) in &missing {
+            text.push('\n');
+            text.push_str(block);
+        }
+        std::fs::write(path, &text).with_context(|| format!("cannot write {}", path.display()))?;
+        let merged = Self::parse(&text).with_context(|| path.display().to_string())?;
+        Ok((merged, missing.into_iter().map(|(id, _)| id).collect()))
+    }
+
+    /// How many entries of a catalogue's text came from the seed after the file was written:
+    /// the ones under its [`SEED_MARK`] lines.
+    #[must_use]
+    pub fn from_seed_later(text: &str) -> usize {
+        text.find(SEED_MARK).map_or(0, |at| text[at..].matches(ENTRY_HEAD).count())
+    }
+
     /// The entry with `id`.
+    #[must_use]
     pub fn get(&self, id: &str) -> Option<&Gotcha> {
         self.entries.iter().find(|g| g.id == id)
     }

@@ -524,9 +524,19 @@ fn connect(route: Route) -> anyhow::Result<Arc<dyn ModelProvider>> {
                 }
                 Err(e) => tracing::warn!("the worker table is off: {e:#}"),
             }
-            // the project's catalogue when it has one; the seed otherwise, written by the
-            // hook in the run's own directory, not here (a test runs where no var/ belongs)
-            let catalogue = if Path::new(GOTCHAS_FILE).exists() { Catalogue::load(Path::new(GOTCHAS_FILE)) } else { Ok(Catalogue::seed()) };
+            // the project's catalogue when it has one, brought what the seed gained since it
+            // was written; the seed otherwise, written by the hook in the run's own directory,
+            // not here (a test runs where no var/ belongs)
+            let catalogue = if Path::new(GOTCHAS_FILE).exists() {
+                Catalogue::refresh(Path::new(GOTCHAS_FILE)).map(|(catalogue, added)| {
+                    if !added.is_empty() {
+                        tracing::info!("{GOTCHAS_FILE} gained {} from the seed", added.join(", "));
+                    }
+                    catalogue
+                })
+            } else {
+                Ok(Catalogue::seed())
+            };
             match (std::env::current_exe(), catalogue) {
                 (Ok(rc), Ok(catalogue)) => harness = harness.with_gotchas(rc, catalogue),
                 (_, Err(e)) => tracing::warn!("the gotchas are off: {e:#}"),
@@ -1452,6 +1462,9 @@ pub async fn run_next(store: &Store, worker: &Worker) -> anyhow::Result<Vec<Stri
 pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
     let mut lines = Vec::new();
     let mut ran = 0;
+    // the card the last run continued and how many runs in a row it has had: a card the
+    // project's turn cap keeps ending is picked again fresh, up to [`RESTARTS`] times
+    let mut again: Option<(i64, usize)> = None;
     // one walk per project: the lock is held for the whole of it
     let Some(_lock) = take_walk_lock(&workspace_of(store)) else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
@@ -1474,6 +1487,19 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             done(&mut lines, format!("ran {ran} card(s) · no card is ready")).await;
             return Ok(lines);
         };
+        let runs = match again {
+            Some((last, runs)) if last == id => runs + 1,
+            _ => 1,
+        };
+        again = Some((id, runs));
+        if runs > RESTARTS {
+            done(
+                &mut lines,
+                format!("ran {ran} card(s) · stopped: #{id} continued {RESTARTS} times in a row; raise [worker] turns or split the card"),
+            )
+            .await;
+            return Ok(lines);
+        }
         match run_picked(store, id, worker, tight).await {
             Ok(run_lines) => lines.extend(run_lines),
             Err(error) => {
@@ -1495,6 +1521,10 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         }
     }
 }
+
+/// How many runs in a row a walk gives one card before it stops: a card the project's turn cap
+/// ends this often is too large for the cap.
+const RESTARTS: usize = 5;
 
 /// The file a `stop` leaves for a walk, which reads it between runs.
 const WALK_STOP: &str = "var/walk.stop";
@@ -1609,10 +1639,11 @@ pub fn walk_order(nodes: &[Node], gambits: &[Gambit], tight: bool) -> Vec<i64> {
 /// Implemented counts beside accepted here, unlike in [`tree::next_ready`]: the cards the batch
 /// implements are not accepted until the person reviews, and their dependents are what the batch
 /// is meant to run ahead of that review. A card whose waits-on failed, left the roadmap or are
-/// still open is not picked, so every pick moves a card out of defined and the loop ends. With
-/// `tight` the pick is the ready card of the lowest complexity, the best scored among equals:
-/// what is left of the window finishes small cards whole rather than starting a large one it
-/// cannot end.
+/// still open is not picked, so every pick moves a card out of defined and the loop ends; a
+/// card still in progress is picked too, since a walk holds the project and such a card is one
+/// a run left to continue, as the project's turn cap does. With `tight` the pick is the ready
+/// card of the lowest complexity, the best scored among equals: what is left of the window
+/// finishes small cards whole rather than starting a large one it cannot end.
 fn batch_ready<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Option<&'a Node> {
     ready_cards(nodes, gambits, tight).into_iter().next()
 }
@@ -1621,9 +1652,11 @@ fn batch_ready<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Opt
 /// complexity with `tight`, the smallest first.
 fn ready_cards<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Vec<&'a Node> {
     let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && matches!(d.state, TaskState::Accepted | TaskState::Implemented));
-    let candidates = nodes
-        .iter()
-        .filter(|n| n.state == TaskState::Defined && matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.depends_on.iter().all(met));
+    let candidates = nodes.iter().filter(|n| {
+        matches!(n.state, TaskState::Defined | TaskState::InProgress)
+            && matches!(n.kind, NodeKind::Task | NodeKind::Subtask)
+            && n.depends_on.iter().all(met)
+    });
     let mut ready: Vec<&Node> = tree::rank(nodes, candidates, gambits).into_iter().map(|s| s.node).collect();
     if tight {
         ready.sort_by_key(|n| n.complexity);
@@ -1804,7 +1837,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let provider = worker.provider()?;
     store.set_state_by(id, TaskState::InProgress, Source::Run).await?;
 
-    let Prepared { workspace, root, mut task, project, budget, cap, effort } = prepare(store, &node, worker, true).await?;
+    let Prepared { workspace, root, mut task, project, budget, caps, effort } = prepare(store, &node, worker, true).await?;
     let workspace_dir = workspace.clone();
     // where the changes land: the worktree when the run has one, else the project
     let acting = workspace_dir.clone().unwrap_or_else(|| root.clone());
@@ -1835,7 +1868,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 workspace,
                 budget_usd: budget,
                 resume,
-                max_turns: cap,
+                max_turns: caps.limit(),
                 effort: Some(effort.to_string()),
             })
             .await
@@ -1855,14 +1888,30 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                     calls: 0,
                     turns: answer.turns,
                     turn_usage: answer.turn_usage,
-                    cap,
+                    cap: caps.limit(),
+                    capped: None,
                     reads: answer.reads,
+                })
+            }
+            // the harness reports its turns running out as an error; when the project's cap
+            // is what ran out, the run ended as meant and the card continues fresh
+            Err(error) if caps.restarts_at().is_some() && format!("{error:#}").contains("error_max_turns") => {
+                let restart = caps.restarts_at().unwrap_or_default();
+                Ok(Session {
+                    text: String::new(),
+                    usage: Usage::default(),
+                    calls: 0,
+                    turns: u64::from(restart),
+                    turn_usage: Vec::new(),
+                    cap: Some(restart),
+                    capped: Some(restart),
+                    reads: Vec::new(),
                 })
             }
             Err(error) => Err(error),
         }
     } else {
-        tool_loop(provider.as_ref(), worker, id, bare_context(&task, &project, worker.debug), workspace.as_deref(), budget, cap).await
+        tool_loop(provider.as_ref(), worker, id, bare_context(&task, &project, worker.debug), workspace.as_deref(), budget, caps).await
     };
     // the handoff of this run, for the next one of the card; the done cards' files go
     let handoff = |outcome: &str, check: &str, report: &str, changed: Vec<String>| ra_context::Handoff {
@@ -1901,6 +1950,36 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         } else {
             noted.push(format!("  notes-for #{to}: left on its context"));
         }
+    }
+    // the project's turn cap ended the run: no check, no verdict, the card stays in progress
+    // with a handoff of what was done and what is left, and its session is dropped so the next
+    // run, which the walk starts right away, opens on a small context again
+    if let Some(cap) = session.capped {
+        store.set_session(id, None, unix_now()).await?;
+        let changed = ra_context::changed_between(&dirty_before, &git_status(&acting).await);
+        let report = capped_report(cap, &session, &changed, &node);
+        store.set_notes(id, &report).await?;
+        let why = format!("the turn cap of {cap} ended the run; the card continues in a fresh session");
+        let mut last = handoff("continues", &format!("no check: {why}"), &report, changed);
+        if let Some(branch) = &worker.branch {
+            last.check = format!("{} · branch {branch}", last.check);
+        }
+        task.record(last);
+        save_context(store, &root, &task).await;
+        let sizes = turn_sizes(&session);
+        let mut lines = vec![format!(
+            "↻ #{id} {} continues on {} · turns {}/{cap}, {} tool call(s) · in {} out {} · {sizes} · {} · {why}",
+            node.title,
+            short(&worker.model),
+            session.turns,
+            session.calls,
+            session.usage.prompt_tokens,
+            session.usage.completion_tokens,
+            cost_text(session.usage.cost_usd)
+        )];
+        lines.extend(fresh);
+        lines.extend(noted);
+        return Ok((lines, session.usage.cost_usd, gotcha_hits.len()));
     }
     // the local checks before the card counts as done: no model call, the acceptance names
     // them (else the project, else the workspace tests), and they run in order up to the first
@@ -1982,7 +2061,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     }
     // the run against its estimate, on the check line so the handoff carries it: the next run
     // reads what the last one spent against what the card was sized at
-    let verdict = estimate_verdict(estimate_of(&node), &session.usage, session.turns);
+    let verdict = estimate_verdict(estimate_of(&node), average_turn(&session));
     let sizes = turn_sizes(&session);
     check_line = format!("{check_line} · {verdict} · {sizes}");
     // what to do with the build, on the same line: the window restarts on the milestone commit,
@@ -2070,10 +2149,34 @@ struct Prepared {
     /// The project context; empty while there is none.
     project: String,
     budget: Option<f64>,
-    /// The turn cap, when `--turns` named one; nothing caps a run by default.
-    cap: Option<u32>,
+    caps: Caps,
     /// The effort the run asks of the model: `--effort` when it was passed, else the card's.
     effort: Effort,
+}
+
+/// The turn caps of a run; nothing caps a run by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Caps {
+    /// The hard cap, when `--turns` named one: a run that reaches it failed.
+    hard: Option<u32>,
+    /// The project's `[worker] turns`, when it names one: the run ends there with a handoff and
+    /// the card continues in a fresh session.
+    restart: Option<u32>,
+}
+
+impl Caps {
+    /// The turns the provider is told, the lower of the two: the one that ends a run first.
+    fn limit(self) -> Option<u32> {
+        match (self.hard, self.restart) {
+            (Some(hard), Some(restart)) => Some(hard.min(restart)),
+            (hard, restart) => hard.or(restart),
+        }
+    }
+
+    /// The restart cap, when it is the one that ends the run first.
+    fn restarts_at(self) -> Option<u32> {
+        self.restart.filter(|r| self.hard.is_none_or(|hard| *r < hard))
+    }
 }
 
 /// Builds what a run of `node` sends. The context of the task is the brief of the card, the
@@ -2098,9 +2201,9 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // an explicit budget, else the complexity's while budgets are on, else none at all; a turn
     // cap only when one was asked for. No limit stands by default: the person asked for none
     let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
-    let cap = worker.turns;
+    let caps = Caps { hard: worker.turns, restart: crate::router::Router::load(&root).ok().and_then(|router| router.worker.turns()) };
     let effort = worker.effort.unwrap_or(node.effort);
-    Ok(Prepared { workspace, root, task, project, budget, cap, effort })
+    Ok(Prepared { workspace, root, task, project, budget, caps, effort })
 }
 
 /// The messages of a harness run: the worker's role, the project context and the machine notes
@@ -2161,7 +2264,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; run a task");
     let worker = &worker.for_card(&workspace_of(store), &node)?;
     let provider = worker.provider()?;
-    let Prepared { workspace, root, task, project, budget, cap, effort } = prepare(store, &node, worker, false).await?;
+    let Prepared { workspace, root, task, project, budget, caps, effort } = prepare(store, &node, worker, false).await?;
     let harness = provider.has_own_tools();
     let checks = checks_of(&root, &node);
     let messages = if harness {
@@ -2178,7 +2281,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
         workspace,
         budget_usd: budget,
         resume: resume_of(&node, unix_now()).unwrap_or_default(),
-        max_turns: cap,
+        max_turns: caps.limit(),
         effort: Some(effort.to_string()),
     };
     let mut lines = vec![
@@ -2189,9 +2292,10 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             worker.route().name()
         ),
         format!(
-            "  budget {} · turn cap {} · resume {} · {}",
+            "  budget {} · turn cap {}{} · resume {} · {}",
             budget.map_or_else(|| "none".to_owned(), |b| format!("${b:.2}")),
-            cap.map_or_else(|| "none".to_owned(), |c| c.to_string()),
+            caps.hard.map_or_else(|| "none".to_owned(), |c| c.to_string()),
+            caps.restart.map_or_else(String::new, |r| format!(" · fresh session after {r} turns")),
             match resume_of(&node, unix_now()) {
                 Ok(Some(session)) => session,
                 Ok(None) => "none".to_owned(),
@@ -2625,8 +2729,42 @@ struct Session {
     turn_usage: Vec<TurnUsage>,
     /// The turn cap the run had, when it had one.
     cap: Option<u32>,
+    /// The project's turn cap that ended the run, when one did: the card continues in a fresh
+    /// session instead of being judged.
+    capped: Option<u32>,
     /// The files the run read, one entry per read, relative to the workspace.
     reads: Vec<String>,
+}
+
+/// What a tool call did, for the handoff of a run its cap ended: the tool and the path or the
+/// command it took, `write_file hello.txt`; the tool alone when it took neither.
+fn call_summary(call: &ra_providers::ToolCall) -> String {
+    let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap_or_default();
+    match arguments["path"].as_str().or_else(|| arguments["command"].as_str()) {
+        Some(what) => format!("{} {}", call.name, what.trim()),
+        None => call.name.clone(),
+    }
+}
+
+/// The report a run its cap ended leaves for the next run of the card, which starts fresh: how
+/// it ended, what changed, what the worker said and did, and what is left, which is the whole
+/// acceptance since no check ran.
+fn capped_report(cap: u32, session: &Session, changed: &[String], node: &Node) -> String {
+    let mut text = format!(
+        "the turn cap of {cap} ended the run after {} turn(s), {} tool call(s); the card continues in a fresh session\n",
+        session.turns, session.calls
+    );
+    if changed.is_empty() {
+        text.push_str("changed: nothing\n");
+    } else {
+        let _ = writeln!(text, "changed: {}", changed.join(", "));
+    }
+    let acceptance = node.acceptance.as_deref().map(str::trim).filter(|a| !a.is_empty()).unwrap_or("none written");
+    let _ = writeln!(text, "left: the check did not run; the acceptance stands: {acceptance}");
+    if !session.text.trim().is_empty() {
+        let _ = write!(text, "\n{}", session.text.trim());
+    }
+    text
 }
 
 /// The size of the turns for the run line and the handoff: the context a turn carried is the
@@ -2634,15 +2772,22 @@ struct Session {
 /// turn, largest 41k`; the largest only when the provider showed each turn, the average from the
 /// sum over the turns when it showed only that.
 fn turn_sizes(session: &Session) -> String {
-    let shown: Vec<u64> = session.turn_usage.iter().map(TurnUsage::total).collect();
-    let count = u64::try_from(shown.len()).unwrap_or(0);
-    if count > 0 {
-        let average = shown.iter().sum::<u64>() / count;
-        let largest = shown.iter().copied().max().unwrap_or(0);
-        return format!("avg {} tokens a turn, largest {}", kilo(average), kilo(largest));
+    let average = average_turn(session);
+    let largest = session.turn_usage.iter().map(TurnUsage::total).max();
+    match largest {
+        Some(largest) => format!("avg {} tokens a turn, largest {}", kilo(average), kilo(largest)),
+        None => format!("avg {} tokens a turn", kilo(average)),
     }
-    let total = session.usage.prompt_tokens + session.usage.completion_tokens;
-    format!("avg {} tokens a turn", kilo(total / session.turns.max(1)))
+}
+
+/// The tokens an average turn of the session read and wrote: over the turns the provider showed,
+/// else the sum over the turns it counted.
+fn average_turn(session: &Session) -> u64 {
+    let shown: Vec<u64> = session.turn_usage.iter().map(TurnUsage::total).collect();
+    match u64::try_from(shown.len()).unwrap_or(0) {
+        0 => (session.usage.prompt_tokens + session.usage.completion_tokens) / session.turns.max(1),
+        count => shown.iter().sum::<u64>() / count,
+    }
 }
 
 /// How many files a run line names of the ones a run read again.
@@ -2667,6 +2812,7 @@ fn reread(reads: &[String]) -> Option<String> {
 fn kilo(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
+        1000..=9999 if n % 1000 < 100 => format!("{}k", n / 1000),
         1000..=9999 => format!("{}.{}k", n / 1000, (n % 1000) / 100),
         _ => format!("{}k", n / 1000),
     }
@@ -2706,11 +2852,12 @@ pub fn estimate_of(node: &Node) -> Estimate {
     node.estimate.unwrap_or_else(|| estimate_for(node.complexity))
 }
 
-/// The verdict of a run against its estimate, for the run line and the handoff: `over the
-/// estimate of 120k tokens, 15 turns` or `under the estimate of …`.
-fn estimate_verdict(estimate: Estimate, usage: &Usage, turns: u64) -> String {
-    let side = if estimate.is_over(usage.prompt_tokens + usage.completion_tokens, turns) { "over" } else { "under" };
-    format!("{side} the estimate of {estimate}")
+/// The verdict of a run against its estimate, for the run line and the handoff: the estimate's
+/// tokens a turn against the run's average, `over the estimate of 8k a turn at 400k a turn` or
+/// `under the estimate of …`; the total is not the measure, the context a turn carried is.
+fn estimate_verdict(estimate: Estimate, average: u64) -> String {
+    let side = if estimate.is_over(average) { "over" } else { "under" };
+    format!("{side} the estimate of {} a turn at {} a turn", kilo(estimate.a_turn()), kilo(average))
 }
 
 /// What to do with the build after a run, from the files it changed, for the run line and the
@@ -2752,8 +2899,10 @@ impl std::fmt::Display for OverBudget {
 impl std::error::Error for OverBudget {}
 
 /// The tool loop of a bare model: the model answers with tool calls, the toolbox executes them in
-/// the workspace, the results go back, until the model answers in words, the `cap` turns run out
-/// when there is one, or the summed cost crosses `budget` when there is one.
+/// the workspace, the results go back, until the hard cap of `caps` runs out when there is one,
+/// or the summed cost crosses `budget` when there is one. The restart cap of `caps` ends the run
+/// too, but as a session to continue from: what the model said and the calls it made stand in
+/// for its answer, and the card goes on in a fresh session.
 async fn tool_loop(
     provider: &dyn ModelProvider,
     worker: &Worker,
@@ -2761,7 +2910,7 @@ async fn tool_loop(
     context: String,
     workspace: Option<&Path>,
     budget: Option<f64>,
-    cap: Option<u32>,
+    caps: Caps,
 ) -> anyhow::Result<Session> {
     let workspace = workspace.context("the worker has no workspace to act in")?;
     let toolbox = worker.toolbox(workspace)?;
@@ -2771,14 +2920,28 @@ async fn tool_loop(
     let mut calls = 0usize;
     let mut turn = 0u32;
     let mut reads: Vec<String> = Vec::new();
+    // what the worker said and did, for the handoff when the restart cap ends the run
+    let mut said: Vec<String> = Vec::new();
+    let mut did: Vec<String> = Vec::new();
+    let limit = caps.limit();
     loop {
         turn += 1;
-        if let Some(cap) = cap
+        if let Some(cap) = caps.hard
             && turn > cap
         {
             anyhow::bail!(
                 "the worker made {calls} tool call(s) in {cap} turns without finishing; raise the cap with --turns or split the task"
             );
+        }
+        if let Some(restart) = caps.restart
+            && turn > restart
+        {
+            let mut text = said.join("\n");
+            if !did.is_empty() {
+                let _ = write!(text, "\ncalls: {}", did.join(" · "));
+            }
+            let text = text.trim().to_owned();
+            return Ok(Session { text, usage, calls, turns: u64::from(restart), turn_usage, cap: limit, capped: Some(restart), reads });
         }
         let answer = provider
             .complete(CompletionRequest {
@@ -2790,7 +2953,7 @@ async fn tool_loop(
                 workspace: Some(workspace.to_path_buf()),
                 budget_usd: budget,
                 resume: None,
-                max_turns: cap,
+                max_turns: limit,
                 effort: None,
             })
             .await
@@ -2800,12 +2963,16 @@ async fn tool_loop(
         add_usage(&mut usage, &answer.usage);
         turn_usage.push(TurnUsage::of(&answer.usage));
         if answer.tool_calls.is_empty() {
-            return Ok(Session { text: answer.text, usage, calls, turns: u64::from(turn), turn_usage, cap, reads });
+            return Ok(Session { text: answer.text, usage, calls, turns: u64::from(turn), turn_usage, cap: limit, capped: None, reads });
         }
         // the budget is checked before the tools run: the work it would pay for is not done
         if let Some((budget, spent)) = budget.zip(usage.cost_usd).filter(|(budget, spent)| spent > budget) {
             return Err(OverBudget { budget, spent, turns: turn, calls }.into());
         }
+        if !answer.text.trim().is_empty() {
+            said.push(answer.text.trim().to_owned());
+        }
+        did.extend(answer.tool_calls.iter().map(call_summary));
         messages.push(Message::assistant_calls(answer.text, answer.tool_calls.clone()));
         for call in &answer.tool_calls {
             tracing::debug!("#{id} turn {turn}: {}({})", call.name, call.arguments);

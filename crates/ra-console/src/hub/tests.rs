@@ -22,8 +22,10 @@ fn a_digest_written_from_one_project_is_read_from_another_as_one_line_and_never_
     let now = 1_700_000_000;
     assert!(digest_lines_with(&dir, beta.path(), |_| true, now).is_empty());
     let mut digest = digest_of(&project_name(alpha.path()), 4242, now);
-    // a short path and one file, so the whole of it fits the line
-    digest.path = "C:/code/alpha".to_owned();
+    // a path that is on disk, short texts and one file, so the whole of it fits the line
+    digest.path = alpha.path().display().to_string();
+    digest.live = Some("#12 The digest".to_owned());
+    digest.last = Some("✓ #11 Shared notes".to_owned());
     digest.changed = vec!["hub.rs".to_owned()];
     write_digest_in(&dir, &digest).unwrap();
     // the other project reads it whole, in one line; the writer reads nothing back
@@ -31,8 +33,8 @@ fn a_digest_written_from_one_project_is_read_from_another_as_one_line_and_never_
     assert_eq!(lines.len(), 1);
     let line = &lines[0];
     assert!(line.starts_with(&format!("{} ({})", digest.name, digest.path)), "{line}");
-    assert!(line.contains("live: #12 The digest · pid 4242"), "{line}");
-    assert!(line.contains("last: ✓ #11 Shared notes implemented"), "{line}");
+    assert!(line.contains(" · live: #12 The digest · "), "{line}");
+    assert!(line.contains(" · last: ✓ #11 Shared notes · "), "{line}");
     assert!(line.contains("3 ready"), "{line}");
     assert!(line.ends_with("3 ready · changed: hub.rs"), "{line}");
     assert!(!line.contains('\n'));
@@ -61,16 +63,42 @@ fn a_stale_digest_is_dropped_but_a_fresh_or_live_one_is_kept() {
     let dir = hub.path().join("digest");
     let now = 1_700_000_000;
     let day = 24 * 60 * 60;
-    write_digest_in(&dir, &digest_of("old-dead", 1, now - day - 1)).unwrap();
-    write_digest_in(&dir, &digest_of("old-alive", 2, now - 3 * day)).unwrap();
-    write_digest_in(&dir, &digest_of("fresh-dead", 3, now - day + 60)).unwrap();
+    let on_disk = |name: &str, pid: u32, when: u64| {
+        let mut digest = digest_of(name, pid, when);
+        digest.path = me.path().display().to_string();
+        digest
+    };
+    write_digest_in(&dir, &on_disk("old-dead", 1, now - day - 1)).unwrap();
+    write_digest_in(&dir, &on_disk("old-alive", 2, now - 3 * day)).unwrap();
+    write_digest_in(&dir, &on_disk("fresh-dead", 3, now - day + 60)).unwrap();
+    // a project whose directory is gone, a test's temp dir say, is dropped however fresh or live
+    write_digest_in(&dir, &digest_of("gone", 2, now)).unwrap();
     let alive = |pid: u32| pid == 2;
     let lines = digest_lines_with(&dir, me.path(), alive, now);
     let names: Vec<&str> = lines.iter().map(|l| l.split_once(' ').unwrap().0).collect();
     assert_eq!(names, ["fresh-dead", "old-alive"]);
-    // the stale one is gone from the directory too
+    // the stale and the gone are gone from the directory too
     assert!(!dir.join("old-dead.txt").exists());
+    assert!(!dir.join("gone.txt").exists());
     assert!(dir.join("old-alive.txt").exists());
+}
+
+#[test]
+fn the_tests_hub_is_a_temp_directory_of_this_process_and_rhipper_hub_names_another() {
+    let hub = dir();
+    assert!(hub.starts_with(std::env::temp_dir()), "{}", hub.display());
+    assert!(hub.ends_with(format!("rhipper-test-hub-{}", std::process::id())), "{}", hub.display());
+    // what the tests write lands under it: digests, locks, the shared notes
+    assert!(digest_dir().starts_with(&hub));
+    assert!(locks_dir().starts_with(&hub));
+    assert!(crate::retro::shared_file().starts_with(&hub));
+    let named = tempfile::tempdir().unwrap();
+    assert_eq!(dir_from(Some(named.path().as_os_str())), named.path());
+    // an empty variable is no hub; the machine's is used, and it is never the tests' one
+    let machine = dir_from(Some(std::ffi::OsStr::new("")));
+    assert_eq!(machine, dir_from(None));
+    assert!(machine.ends_with("agent"), "{}", machine.display());
+    assert_ne!(machine, hub);
 }
 
 #[test]

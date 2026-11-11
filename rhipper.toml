@@ -1,6 +1,11 @@
 # The project's agent settings, beside rhipper.md: `[[route]]` rules, the `[worker]` table and
 # the `[role]` table. A key left out keeps the default.
 
+[worker]
+# A run restarts in a fresh session after this many turns, with its handoff carried over, so
+# the context a turn carries stays small; the agent's own cards ran 30 to 90 turns tonight.
+turns = 60
+
 [role]
 # The model of each cheap role a run ends with. A key left out goes to the local server at
 # RHIPPER_LOCAL_URL (default http://127.0.0.1:8080/v1) when it answers a ping, under

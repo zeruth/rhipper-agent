@@ -6,7 +6,8 @@ use super::*;
 #[test]
 fn the_turn_sizes_lead_with_the_average_and_name_the_largest_when_shown() {
     let usage = Usage { prompt_tokens: 30_000, completion_tokens: 600, cached_tokens: 0, cost_usd: None, cost_computed: false };
-    let mut session = Session { text: String::new(), usage, calls: 0, turns: 3, turn_usage: Vec::new(), cap: None, reads: Vec::new() };
+    let mut session =
+        Session { text: String::new(), usage, calls: 0, turns: 3, turn_usage: Vec::new(), cap: None, capped: None, reads: Vec::new() };
     // a provider that showed only the sum: the average over the turns
     assert_eq!(turn_sizes(&session), "avg 10k tokens a turn");
     session.turn_usage = vec![

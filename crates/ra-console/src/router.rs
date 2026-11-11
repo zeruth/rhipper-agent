@@ -101,6 +101,7 @@ impl fmt::Display for Rule {
 /// allow = ["rhtest", "Bash(ninja *)"]   # commands the worker may run here, on top of the defaults
 /// check = ".\\gw.ps1 :core:test"         # the check of a card whose acceptance names none
 /// lint = ""                             # the lint after a passed check; empty is none, absent is clippy
+/// turns = 20                            # a run ends after this many turns and the card goes on in a fresh session
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -120,6 +121,11 @@ pub struct WorkerConfig {
     /// crates, as a Rust project wants; empty, no lint for this project; else this command.
     #[serde(default)]
     pub lint: Option<String>,
+    /// The turns a run gets before it ends with a handoff and the walk starts the card again in
+    /// a fresh session, so the context every turn carries starts small again; absent or zero, a
+    /// run goes on until it answers.
+    #[serde(default)]
+    pub turns: Option<u32>,
 }
 
 impl WorkerConfig {
@@ -127,6 +133,13 @@ impl WorkerConfig {
     #[must_use]
     pub fn check(&self) -> Option<&str> {
         self.check.as_deref().map(str::trim).filter(|c| !c.is_empty())
+    }
+
+    /// The turns after which a run ends and the card continues fresh, when the table names a
+    /// positive count.
+    #[must_use]
+    pub fn turns(&self) -> Option<u32> {
+        self.turns.filter(|turns| *turns > 0)
     }
 
     /// The project's lint: `None` leaves the lint to the agent, `Some("")` turns it off.

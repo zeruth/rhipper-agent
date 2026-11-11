@@ -197,10 +197,18 @@ pub struct Estimate {
 }
 
 impl Estimate {
-    /// Whether `tokens` or `turns` passed the estimate.
+    /// The tokens the estimate allows a turn: its tokens over its turns. The context a turn
+    /// carries is the cost of a run, so this is the figure a run is judged against.
     #[must_use]
-    pub fn is_over(self, tokens: u64, turns: u64) -> bool {
-        tokens > self.tokens || turns > self.turns
+    pub fn a_turn(self) -> u64 {
+        self.tokens / self.turns.max(1)
+    }
+
+    /// Whether a run that averaged `tokens_a_turn` ran over the estimate: a run of many lean
+    /// turns is under, a run of few huge turns is over.
+    #[must_use]
+    pub fn is_over(self, tokens_a_turn: u64) -> bool {
+        tokens_a_turn > self.a_turn()
     }
 }
 

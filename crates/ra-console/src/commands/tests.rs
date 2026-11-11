@@ -505,6 +505,58 @@ async fn run_on_a_bare_model_loops_through_the_tools_and_lands_the_answer() {
     assert_eq!(last[last.len() - 3].tool_call_id.as_deref(), Some("call_1"));
 }
 
+#[tokio::test]
+async fn a_project_turn_cap_ends_the_run_with_a_handoff_and_the_walk_takes_the_card_up_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    // a repository, so the handoff can name what the run changed
+    git_ok(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nturns = 2\n").unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let write = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"hello.txt","content":"hello from the worker\n"}"#.into(),
+    };
+    let read = ra_providers::ToolCall { id: "call_2".into(), name: "read_file".into(), arguments: r#"{"path":"hello.txt"}"#.into() };
+    // three turns of work: the cap ends the first run after two, the third lands in the second
+    let script = Scripted::new(vec![says("", vec![write]), says("checking", vec![read]), says("wrote hello.txt and read it back", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(out[0].starts_with("↻ #2 Probe continues on glm-5.3-flash · turns 2/2, 2 tool call(s)"), "{out:?}");
+    assert!(out[0].ends_with("the turn cap of 2 ended the run; the card continues in a fresh session"), "{out:?}");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::InProgress);
+    assert_eq!(node.session, None, "the next run starts fresh");
+    // the handoff says how it ended, what was done and what is left
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    assert_eq!(task.handoffs.len(), 1);
+    let last = &task.handoffs[0];
+    assert_eq!(last.outcome, "continues");
+    assert!(last.check.starts_with("no check: the turn cap of 2 ended the run"), "{}", last.check);
+    assert!(last.report.contains("changed: hello.txt"), "{}", last.report);
+    assert!(last.report.contains("left: the check did not run; the acceptance stands:"), "{}", last.report);
+    assert!(last.report.contains("checking\ncalls: write_file hello.txt · read_file hello.txt"), "{}", last.report);
+
+    // the walk picks the card up again, and the second run finishes it
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    assert!(out[0].starts_with("✓ #2 Probe implemented on glm-5.3-flash · turns 1/2, 0 tool call(s)"), "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 1 card(s) · no card is ready");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented);
+    assert_eq!(node.notes.as_deref(), Some("wrote hello.txt and read it back"));
+    assert_eq!(ra_context::TaskContext::open(dir.path(), 2).handoffs.len(), 2);
+    // the second run opened on a small context: no tool result of the first run, only its handoff
+    let seen = script.seen.lock();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[2].resume.is_none());
+    assert!(seen[2].messages.iter().all(|m| m.role != "tool"), "{:?}", seen[2].messages);
+    let prompt = &seen[2].messages.last().unwrap().content;
+    assert!(prompt.contains("the turn cap of 2 ended the run"), "{prompt}");
+}
+
 /// A one-crate Cargo project in `dir` whose single test passes or fails.
 fn cargo_project(dir: &std::path::Path, passing: bool) {
     std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n")
@@ -1423,9 +1475,9 @@ fn the_complexity_sets_the_estimate_unless_the_card_names_one() {
     assert_eq!(estimate_of(&node), Estimate { tokens: 500, turns: 1 });
 }
 
-/// A run of a c3 card whose scripted provider reports `tokens` read in one turn; the lines and
-/// the handoff of the run.
-async fn sized_run(tokens: u64, estimate: Option<ra_roadmap::model::Estimate>) -> (Vec<String>, String) {
+/// A run of a c3 card whose harness reports `tokens` read evenly over `turns` turns; the lines
+/// and the handoff of the run.
+async fn sized_run(tokens: u64, turns: u64, estimate: Option<ra_roadmap::model::Estimate>) -> (Vec<String>, String) {
     let dir = tempfile::tempdir().unwrap();
     cargo_project(dir.path(), true);
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
@@ -1433,7 +1485,10 @@ async fn sized_run(tokens: u64, estimate: Option<ra_roadmap::model::Estimate>) -
     store.set_estimate(2, estimate).await.unwrap();
     let mut answer = says("done", vec![]);
     answer.usage.prompt_tokens = tokens;
-    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![answer]));
+    answer.turns = turns;
+    let a_turn = ra_providers::Usage { prompt_tokens: tokens / turns, completion_tokens: 10 / turns, ..answer.usage };
+    answer.turn_usage = (0..turns).map(|_| ra_providers::TurnUsage::of(&a_turn)).collect();
+    let worker = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(Scripted::new(vec![answer]))));
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
     let context = std::fs::read_to_string(dir.path().join("var/context/2.md")).unwrap();
     let handoff = context.split("## Handoff ").nth(1).unwrap().to_owned();
@@ -1441,9 +1496,10 @@ async fn sized_run(tokens: u64, estimate: Option<ra_roadmap::model::Estimate>) -
 }
 
 #[tokio::test]
-async fn a_run_that_reports_more_than_its_estimate_says_so() {
-    let (out, handoff) = sized_run(400_000, None).await;
-    assert!(out[0].contains("over the estimate of 120k tokens, 15 turns"), "{out:?}");
+async fn a_run_whose_turns_carried_more_than_the_estimates_is_over() {
+    // a c3 card is 120k tokens over 15 turns, 8k a turn: one turn of 400k is over the measure
+    let (out, handoff) = sized_run(400_000, 1, None).await;
+    assert!(out[0].contains("over the estimate of 8k a turn at 400k a turn"), "{out:?}");
     assert!(handoff.contains("over the estimate"), "{handoff}");
     // the context a turn carried, on the run line and in the handoff
     assert!(out[0].contains("avg 400k tokens a turn, largest 400k"), "{out:?}");
@@ -1451,14 +1507,15 @@ async fn a_run_that_reports_more_than_its_estimate_says_so() {
 }
 
 #[tokio::test]
-async fn a_run_under_its_estimate_says_so_and_the_card_can_size_itself() {
-    let (out, handoff) = sized_run(100, None).await;
-    assert!(out[0].contains("under the estimate of 120k tokens, 15 turns"), "{out:?}");
+async fn a_run_of_many_lean_turns_is_under_whatever_its_total_and_the_card_can_size_itself() {
+    // 100k in all, more turns than the estimate, but 5k a turn against its 8k
+    let (out, handoff) = sized_run(100_000, 20, None).await;
+    assert!(out[0].contains("under the estimate of 8k a turn at 5k a turn"), "{out:?}");
     assert!(handoff.contains("under the estimate"), "{handoff}");
-    // the card's own line is the measure: 110 tokens against 50 is over
+    // the card's own line is the measure: 110 tokens a turn against 50 is over
     let estimate = ra_roadmap::model::Estimate { tokens: 50, turns: 1 };
-    let (out, _) = sized_run(100, Some(estimate)).await;
-    assert!(out[0].contains("over the estimate of 50 tokens, 1 turns"), "{out:?}");
+    let (out, _) = sized_run(100, 1, Some(estimate)).await;
+    assert!(out[0].contains("over the estimate of 50 a turn at 110 a turn"), "{out:?}");
 }
 
 /// The script behind a harness: it brings its own tools, as Claude Code does.

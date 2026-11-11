@@ -182,3 +182,38 @@ fn a_load_writes_the_seed_once() {
         .unwrap();
     assert!(Catalogue::load(&path).is_err());
 }
+
+#[test]
+fn a_refresh_brings_the_seeds_new_entries_and_keeps_the_files_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("var/gotchas.toml");
+    // a project written from an older seed: no long-output entry, and a message of its own
+    let seed = Catalogue::seed();
+    let long_output = seed.get("long-output").unwrap();
+    let (_, block) = seed_blocks().into_iter().find(|(id, _)| id == "long-output").unwrap();
+    assert!(SEED.contains(&block), "the seed's blocks are its own text");
+    let own = SEED.replacen(&format!("{block}\n"), "", 1).replace("a console or a window holds its binary", "the window holds rc.exe");
+    assert!(Catalogue::parse(&own).unwrap().get("long-output").is_none(), "{own}");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &own).unwrap();
+
+    let (merged, added) = Catalogue::refresh(&path).unwrap();
+    assert_eq!(added, ["long-output"]);
+    assert_eq!(merged.entries.len(), seed.entries.len());
+    assert_eq!(merged.get("long-output").unwrap().message, long_output.message);
+    // the project's entries stay its own, changed or not, byte for byte
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with(&own), "the file's own text was rewritten");
+    assert!(merged.get("binary-locked").unwrap().message.starts_with("the window holds rc.exe"));
+    assert!(text[own.len()..].starts_with(&format!("\n{SEED_MARK}")), "{}", &text[own.len()..]);
+    assert_eq!(Catalogue::from_seed_later(&text), 1);
+    assert_eq!(Catalogue::from_seed_later(&own), 0);
+
+    // nothing missing: the file is not touched
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let (again, added) = Catalogue::refresh(&path).unwrap();
+    assert!(added.is_empty());
+    assert_eq!(again.entries.len(), seed.entries.len());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before);
+}
