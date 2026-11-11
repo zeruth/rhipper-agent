@@ -157,6 +157,9 @@ pub struct Digest {
     pub ready: usize,
     /// The files the last run changed.
     pub changed: Vec<String>,
+    /// The uncommitted leftovers: the files changed by cards that need revision and still dirty
+    /// in the tree, each as `path (#id …)`, so a later card knows the tree it inherits.
+    pub leftovers: Vec<String>,
 }
 
 /// The longest a digest line gets in a system prompt: about fifty tokens a project.
@@ -198,6 +201,9 @@ pub fn write_digest_in(dir: &Path, digest: &Digest) -> anyhow::Result<()> {
     if !digest.changed.is_empty() {
         let _ = writeln!(text, "changed: {}", digest.changed.join(" "));
     }
+    if !digest.leftovers.is_empty() {
+        let _ = writeln!(text, "leftovers: {}", digest.leftovers.join(", "));
+    }
     std::fs::write(dir.join(format!("{}.txt", digest.name)), text).context("cannot write the project's digest")
 }
 
@@ -227,6 +233,7 @@ fn parse_digest(text: &str) -> Option<Digest> {
             "last" => digest.last = Some(value.to_owned()),
             "ready" => digest.ready = value.parse().ok()?,
             "changed" => digest.changed = value.split_whitespace().map(str::to_owned).collect(),
+            "leftovers" => digest.leftovers = value.split(", ").map(str::to_owned).collect(),
             _ => {}
         }
     }
@@ -289,6 +296,9 @@ fn digest_line(digest: &Digest) -> String {
     parts.push(format!("{} ready", digest.ready));
     if !digest.changed.is_empty() {
         parts.push(format!("changed: {}", digest.changed.join(" ")));
+    }
+    if !digest.leftovers.is_empty() {
+        parts.push(format!("leftovers: {}", digest.leftovers.join(", ")));
     }
     let line = parts.join(" · ");
     if line.chars().count() <= DIGEST_WIDTH {

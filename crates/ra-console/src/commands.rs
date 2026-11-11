@@ -655,7 +655,9 @@ pub fn gambit_lines(gambits: &[Gambit]) -> Vec<String> {
     }
     let mut out = Vec::new();
     for gambit in gambits {
-        out.push(format!("g{} {} {{w{}}} [{}]", gambit.id, gambit.text, gambit.weight, gambit.state));
+        // the flag sits on the line itself, so a glance at the list says who may plan
+        let plan_next = if gambit.plan_next { " plan-next" } else { "" };
+        out.push(format!("g{} {} {{w{}}} [{}]{plan_next}", gambit.id, gambit.text, gambit.weight, gambit.state));
         if !gambit.focus.is_empty() {
             out.push(format!("    focus: {}", gambit.focus.join(" ")));
         }
@@ -851,6 +853,9 @@ async fn seed(store: &Store) -> anyhow::Result<Vec<i64>> {
     store.depend_on(t4, t3).await?;
     Ok(ids)
 }
+
+pub mod review;
+pub mod run;
 
 #[cfg(test)]
 mod tests;

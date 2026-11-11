@@ -11,6 +11,12 @@ use ra_roadmap::store::{Card, Edit, Store};
 use ra_roadmap::{history, markdown, tree};
 use ra_usage::UsageStore;
 
+#[cfg(test)]
+mod tests;
+
+mod doctor;
+mod status;
+
 #[derive(Parser)]
 #[command(name = "rc", version = ra_console::VERSION, about = "Rhipper Agent: the roadmap-driven multi-model development orchestrator")]
 struct Options {
@@ -502,7 +508,7 @@ async fn run_main() -> anyhow::Result<()> {
         }
         Command::Doctor => {
             plain_tracing()?;
-            doctor().await
+            doctor::run(Path::new(".")).await
         }
         Command::Ping { model } => {
             plain_tracing()?;
@@ -524,6 +530,12 @@ async fn run_main() -> anyhow::Result<()> {
             println!("{}", Status::header());
             for row in &rows {
                 println!("{}", row.line());
+                // with --all, the cards each project has in hand go under its row, costed
+                if all {
+                    for line in status::card_lines_of(Path::new(&row.path)).await {
+                        println!("{line}");
+                    }
+                }
             }
             Ok(())
         }
@@ -827,26 +839,14 @@ fn gotchas() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints the doctor's checks as a table; a required one failing is the error, so the exit code
-/// says it.
-async fn doctor() -> anyhow::Result<()> {
-    use ra_console::agent::Check;
-    let checks = ra_console::agent::doctor(Path::new(".")).await;
-    for line in Check::table(&checks) {
-        println!("{line}");
-    }
-    let blocking = Check::blocking(&checks);
-    anyhow::ensure!(blocking.is_empty(), "a run needs: {}", blocking.join(", "));
-    Ok(())
-}
-
 /// Opens the usage ledger under `var/`.
 async fn open_ledger() -> anyhow::Result<UsageStore> {
     std::fs::create_dir_all("var")?;
     UsageStore::open(Path::new("var/usage.db")).await
 }
 
-/// Prints the ledger by model, the costliest first, and the total.
+/// Prints the ledger by model and role, the costliest first, and the total: a cheap role's
+/// calls (`local/qwen3-8b · summary`) listed beside the worker's.
 async fn usage() -> anyhow::Result<()> {
     // the plan's windows first: the room left matters more than the dollars already spent
     let limits = ra_providers::limits::Limits::load(Path::new(ra_providers::claude_code::LIMITS_FILE));
@@ -863,14 +863,18 @@ async fn usage() -> anyhow::Result<()> {
     }
     println!();
     let ledger = open_ledger().await?;
-    let rows = ledger.by_model().await?;
+    let rows = ledger.by_role().await?;
     if rows.is_empty() {
         println!("the ledger is empty: no completion has run yet");
         return Ok(());
     }
     let cost = |c: Option<f64>| c.map_or("—".to_owned(), |c| format!("${c:.4}"));
     println!("{:<34} {:>6} {:>10} {:>10} {:>10} {:>10}", "model", "calls", "in", "out", "cached", "cost");
-    for (model, t) in &rows {
+    for (model, role, t) in &rows {
+        let model = match role {
+            Some(role) => format!("{model} · {role}"),
+            None => model.clone(),
+        };
         println!(
             "{model:<34} {:>6} {:>10} {:>10} {:>10} {:>10}",
             t.calls,
@@ -942,16 +946,27 @@ async fn show(id: Option<i64>) -> anyhow::Result<()> {
     // the gambits come first, as in the file: the direction before the work
     if id.is_none() && !roadmap.gambits.is_empty() {
         for gambit in &roadmap.gambits {
-            println!("g{} {} {{w{}}} [{}]", gambit.id, gambit.text, gambit.weight, gambit.state);
-            if !gambit.focus.is_empty() {
-                println!("    focus: {}", gambit.focus.join(" "));
+            for line in ra_console::commands::gambit_lines(std::slice::from_ref(gambit)) {
+                println!("{line}");
             }
         }
         println!();
     }
+    let root = store_path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    for line in show_lines(&nodes, id, &root)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The lines `rc show` prints for the roadmap, or the subtree under `id`: each node with its
+/// state, then its objective, files and dependencies indented under it. A node asked for by id
+/// also shows the reviewer's verdict on its last run, from its context under `root`, so
+/// acceptance is one glance; the whole roadmap does not open a file per card.
+fn show_lines(nodes: &[ra_roadmap::model::Node], id: Option<i64>, root: &Path) -> anyhow::Result<Vec<String>> {
     let picked: Vec<_> = match id {
         Some(id) => {
-            let subtree = tree::subtree(&nodes, id);
+            let subtree = tree::subtree(nodes, id);
             if subtree.is_empty() {
                 anyhow::bail!("no node {id}");
             }
@@ -959,27 +974,47 @@ async fn show(id: Option<i64>) -> anyhow::Result<()> {
         }
         None => nodes.iter().collect(),
     };
-    let states = tree::effective_states(&nodes);
+    let states = tree::effective_states(nodes);
+    let mut lines = Vec::new();
     for node in picked {
-        let indent = "  ".repeat(tree::depth(&nodes, node.id));
+        let indent = "  ".repeat(tree::depth(nodes, node.id));
         let assignee = match &node.assignee {
             Some(a) => format!(" ← {}:{}", a.role, a.model),
             None => String::new(),
         };
         let mark = if node.is_final() { " [final]" } else { "" };
         let priority = node.priority.map(|p| format!(" {{p{p}}}")).unwrap_or_default();
-        println!("{}#{} {}{priority} [{}]{mark}{assignee}", indent, node.id, node.title, state_label(states[&node.id], node.state));
+        lines.push(format!(
+            "{}#{} {}{priority} [{}]{mark}{assignee}",
+            indent,
+            node.id,
+            node.title,
+            state_label(states[&node.id], node.state)
+        ));
+        if id.is_some()
+            && let Some(verdict) = last_verdict(root, node.id)
+        {
+            lines.push(format!("{indent}    verdict: {verdict}"));
+        }
         if let Some(objective) = &node.objective {
-            println!("{indent}    {objective}");
+            lines.push(format!("{indent}    {objective}"));
         }
         if !node.files.is_empty() {
-            println!("{indent}    files: {}", node.files.join(" "));
+            lines.push(format!("{indent}    files: {}", node.files.join(" ")));
         }
         if !node.depends_on.is_empty() {
-            println!("{indent}    waits on: {}", node.depends_on.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" "));
+            lines
+                .push(format!("{indent}    waits on: {}", node.depends_on.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" ")));
         }
     }
-    Ok(())
+    Ok(lines)
+}
+
+/// The first line of the reviewer's verdict on the last run of `id`, from its context file
+/// under `root`; `None` for a card never run or never judged.
+fn last_verdict(root: &Path, id: i64) -> Option<String> {
+    let handoff = ra_context::TaskContext::open(root, id).handoffs.pop()?;
+    handoff.verdict.as_deref()?.lines().next().map(|line| line.trim().to_owned())
 }
 
 /// Prints the roadmap, or the subtree under `id`, as a Markdown checklist.

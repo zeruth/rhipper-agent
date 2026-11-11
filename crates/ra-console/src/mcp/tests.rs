@@ -174,6 +174,7 @@ async fn the_handoffs_tool_lists_the_runs_of_a_card() {
         model: "z-ai/glm-5.3-flash".into(),
         outcome: "needs revision".into(),
         check: "cargo test -p x · failed".into(),
+        verdict: None,
         changed: vec!["src/nop.rs".into()],
         report: "Decoded the byte.\nThe test is missing.".into(),
         warnings: vec!["warning: unused variable `x`".into()],

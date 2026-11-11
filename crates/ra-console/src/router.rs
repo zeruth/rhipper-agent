@@ -197,6 +197,7 @@ fn prefix_of(entry: &str) -> Option<String> {
 /// summary = "local/qwen3-8b"     # the report condensed for the handoff
 /// digest = "local/qwen3-8b"      # the run's line in the project's digest
 /// classify = ""                  # whether an untagged look-back is [machine]: off
+/// fix = "local/qwen3-8b"         # the fix pass of a trivially rejected card; haiku without a server
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct RoleConfig {
@@ -206,6 +207,10 @@ pub struct RoleConfig {
     pub digest: Option<String>,
     #[serde(default)]
     pub classify: Option<String>,
+    /// The fix pass, the one role with tools: unlike the others it falls to haiku, not to no
+    /// call, when no local server answers.
+    #[serde(default)]
+    pub fix: Option<String>,
 }
 
 impl RoleConfig {

@@ -581,7 +581,14 @@ impl Store {
         anyhow::ensure!(focus.iter().all(|w| !w.is_empty() && !w.contains(char::is_whitespace)), "a focus word holds no whitespace");
         let mut roadmap = self.load().await?;
         let id = roadmap.gambits.iter().map(|g| g.id).max().unwrap_or(0) + 1;
-        roadmap.gambits.push(Gambit { id, text: text.trim().to_owned(), weight, state: GambitState::Active, focus: focus.to_vec() });
+        roadmap.gambits.push(Gambit {
+            id,
+            text: text.trim().to_owned(),
+            weight,
+            state: GambitState::Active,
+            focus: focus.to_vec(),
+            plan_next: false,
+        });
         self.write(roadmap).await?;
         Ok(id)
     }
@@ -609,6 +616,16 @@ impl Store {
         anyhow::ensure!(focus.iter().all(|w| !w.is_empty() && !w.contains(char::is_whitespace)), "a focus word holds no whitespace");
         let mut roadmap = self.load().await?;
         gambit_mut(&mut roadmap.gambits, id)?.focus = focus.to_vec();
+        self.write(roadmap).await
+    }
+
+    /// Sets whether a gambit lets the planner fill the roadmap when no card is ready.
+    ///
+    /// # Errors
+    /// When the gambit is unknown or the file cannot be written.
+    pub async fn set_gambit_plan_next(&self, id: u32, plan_next: bool) -> anyhow::Result<()> {
+        let mut roadmap = self.load().await?;
+        gambit_mut(&mut roadmap.gambits, id)?.plan_next = plan_next;
         self.write(roadmap).await
     }
 

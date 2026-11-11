@@ -72,6 +72,7 @@ fn landed(tab: usize, id: i64, at: Option<u64>) -> Landed {
         state: TaskState::Accepted,
         model: String::new(),
         cost: None,
+        tokens_per_turn: 0,
         at,
         seq: usize::try_from(id).unwrap(),
     }

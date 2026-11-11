@@ -355,6 +355,9 @@ fn handoffs(id: i64, handoffs: &[ra_context::Handoff]) -> Vec<String> {
     for handoff in handoffs {
         out.push(format!("## Handoff {} · {} · {}", handoff.when, handoff.model, handoff.outcome));
         out.push(format!("check: {}", handoff.check.trim()));
+        if let Some(verdict) = &handoff.verdict {
+            out.push(format!("verdict: {verdict}"));
+        }
         if !handoff.changed.is_empty() {
             out.push(format!("changed: {}", handoff.changed.join(" ")));
         }

@@ -6,6 +6,9 @@ use anyhow::Context;
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
+mod query;
+pub use query::CardCost;
+
 /// The usage store over one `SQLite` database.
 #[derive(Clone, Debug)]
 pub struct UsageStore {
@@ -17,6 +20,9 @@ pub struct UsageStore {
 pub struct Entry {
     /// The model id, as the provider knows it.
     pub model: String,
+    /// The role the call played when it was not the worker's own: `summary`, `digest`,
+    /// `classify`, `reviewer`, `planner`; `None` for a worker's run, a ping or a chat.
+    pub role: Option<String>,
     /// The roadmap node it served, when known.
     pub node: Option<i64>,
     pub prompt_tokens: u64,
@@ -50,6 +56,8 @@ pub struct Call {
     /// When the row was written, as `SQLite` writes it: `YYYY-MM-DD HH:MM:SS`, UTC.
     pub at: String,
     pub model: String,
+    /// The role the call played, as [`Entry::role`] has it.
+    pub role: Option<String>,
     pub turns: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -137,13 +145,15 @@ impl UsageStore {
                 cached_tokens integer not null,
                 cost_usd real,
                 turns integer not null default 1,
-                cost_computed integer not null default 0
+                cost_computed integer not null default 0,
+                role text
             )",
         )
         .execute(&self.pool)
         .await?;
         // a ledger from before the turn count reads as one turn each; one from before the
-        // computed mark reads as reported throughout
+        // computed mark reads as reported throughout; one from before the role tag reads as
+        // the worker's calls throughout
         let columns = sqlx::query("pragma table_info(usage)").fetch_all(&self.pool).await?;
         let has = |name: &str| columns.iter().any(|c| c.get::<String, _>("name") == name);
         if !has("turns") {
@@ -151,6 +161,9 @@ impl UsageStore {
         }
         if !has("cost_computed") {
             sqlx::query("alter table usage add column cost_computed integer not null default 0").execute(&self.pool).await?;
+        }
+        if !has("role") {
+            sqlx::query("alter table usage add column role text").execute(&self.pool).await?;
         }
         Ok(())
     }
@@ -161,10 +174,11 @@ impl UsageStore {
     /// When the row cannot be written.
     pub async fn record(&self, entry: &Entry) -> anyhow::Result<()> {
         sqlx::query(
-            "insert into usage (model, node, prompt_tokens, completion_tokens, cached_tokens, cost_usd, turns, cost_computed) \
-             values (?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into usage (model, role, node, prompt_tokens, completion_tokens, cached_tokens, cost_usd, turns, cost_computed) \
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&entry.model)
+        .bind(&entry.role)
         .bind(entry.node)
         .bind(i64::try_from(entry.prompt_tokens)?)
         .bind(i64::try_from(entry.completion_tokens)?)
@@ -238,6 +252,18 @@ impl UsageStore {
         Ok(rows.iter().map(|row| (row.get("model"), totals_of(row))).collect())
     }
 
+    /// The totals of every model and role that has rows, the costliest first: a cheap role's
+    /// calls listed beside the worker's, whose role is `None`.
+    ///
+    /// # Errors
+    /// When the query fails.
+    pub async fn by_role(&self) -> anyhow::Result<Vec<(String, Option<String>, Totals)>> {
+        let rows = sqlx::query(concat!("select model, role, ", sums!(), " from usage group by model, role order by cost desc, calls desc"))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|row| (row.get("model"), row.get::<Option<String>, _>("role"), totals_of(row))).collect())
+    }
+
     /// The totals of every roadmap node that has rows, by id, with `None` for the rows that
     /// served no node (a ping, a chat); a reader sums them up the tree.
     ///
@@ -255,7 +281,7 @@ impl UsageStore {
     /// When the query fails.
     pub async fn calls_of(&self, node: Option<i64>) -> anyhow::Result<Vec<Call>> {
         let rows = sqlx::query(
-            "select at, model, turns, prompt_tokens, completion_tokens, cached_tokens, cost_usd, cost_computed from usage \
+            "select at, model, role, turns, prompt_tokens, completion_tokens, cached_tokens, cost_usd, cost_computed from usage \
              where node is ? order by id desc",
         )
         .bind(node)
@@ -268,6 +294,7 @@ impl UsageStore {
                 Call {
                     at: row.get("at"),
                     model: row.get("model"),
+                    role: row.get("role"),
                     turns: count("turns"),
                     prompt_tokens: count("prompt_tokens"),
                     completion_tokens: count("completion_tokens"),

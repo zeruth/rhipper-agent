@@ -20,6 +20,7 @@ use ra_usage::{Entry, Totals, UsageStore};
 pub use ra_context::PROJECT_FILE;
 use ra_gotchas::{Catalogue, Journal};
 
+use crate::roles::{DIGEST_INSTRUCTION, Roles, SUMMARY_INSTRUCTION};
 use crate::secret;
 
 /// The catalogue of the gotchas, beside the roadmap file.
@@ -42,7 +43,7 @@ const HINT_RANGES: usize = 8;
 /// The short names of the Claude models and the ids they stand for on the Claude Code route: the
 /// ids move with the releases, the names stay, and a person types the name.
 pub const ALIASES: [(&str, &str); 4] =
-    [("fable", "claude-fable-5-1"), ("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5-5"), ("haiku", "claude-haiku-4-5-20251001")];
+    [("fable", "claude-fable-5-1"), ("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5-5"), ("haiku", ra_providers::route::HAIKU)];
 
 /// The id `model` stands for: the alias table's when it is one of the short names, `model`
 /// itself otherwise. Every place a model is typed goes through here, so the badge, the ledger and
@@ -124,33 +125,16 @@ pub struct Worker {
     script: Option<ra_tools::Script>,
     /// The cheap roles when a test set them; a run resolves its own from `rhipper.toml` and the
     /// local server otherwise.
-    roles: Option<Roles>,
+    pub(crate) roles: Option<Roles>,
     /// The directory the worker acts in and the checks run in when it is not the project's: a
     /// worktree of the card. The roadmap, the context files and `var/` stay the project's.
     workspace: Option<PathBuf>,
     /// The branch of that worktree, which the check line and the handoff name.
     branch: Option<String>,
+    /// The verdict a fix pass works from, when the worker is one: it leads the task instead of
+    /// the card being taken up afresh.
+    fix: Option<String>,
 }
-
-/// The cheap roles of a run, each with the model that takes it and the provider behind it; a
-/// role with none runs its rule-based path and calls nothing.
-#[derive(Clone, Default)]
-pub struct Roles {
-    routes: Vec<(Role, String, Arc<dyn ModelProvider>)>,
-}
-
-impl Roles {
-    /// The model and the provider of `role`, when it has one.
-    fn of(&self, role: Role) -> Option<(&str, &Arc<dyn ModelProvider>)> {
-        self.routes.iter().find(|(r, _, _)| *r == role).map(|(_, model, provider)| (model.as_str(), provider))
-    }
-}
-
-/// What the summary role is told: the report condensed for the next run of the same card.
-const SUMMARY_INSTRUCTION: &str = "Condense this worker's report for the next run of the same card, in at most eight plain lines and no heading: what changed (which files), what was verified, what is left or failed. Keep the exact names, paths and commands; drop everything else.";
-
-/// What the digest role is told: the run's line for the other projects on the machine.
-const DIGEST_INSTRUCTION: &str = "In one line of at most 120 characters and no markdown, say what this run did for the people and the agents working on other projects on the same machine: the card, the outcome, and the crates or files it touched. The first line is how the run ended; the rest are the notes of the card.";
 
 impl Worker {
     /// A worker on `model` (an id or one of the [`ALIASES`]), not yet connected and without a
@@ -174,6 +158,7 @@ impl Worker {
             roles: None,
             workspace: None,
             branch: None,
+            fix: None,
         }
     }
 
@@ -190,70 +175,8 @@ impl Worker {
     /// a scripted local one.
     #[must_use]
     pub fn with_role_provider(mut self, model: impl Into<String>, provider: Arc<dyn ModelProvider>) -> Self {
-        let model = model.into();
-        let shared = std::iter::repeat_n(provider, Role::ALL.len());
-        self.roles =
-            Some(Roles { routes: Role::ALL.into_iter().zip(shared).map(|(role, provider)| (role, model.clone(), provider)).collect() });
+        self.roles = Some(Roles::preset(model, provider));
         self
-    }
-
-    /// The cheap roles of a run in `root`: the ones a test set, else each as the `[role]` table
-    /// of `rhipper.toml` names it, with a key left out going to the local server when it answers
-    /// a ping (once per run, whatever the number of roles) and to no model at all when it does
-    /// not. A role whose model has no provider is off, with a warning.
-    async fn roles(&self, root: &Path) -> Roles {
-        if let Some(preset) = &self.roles {
-            return preset.clone();
-        }
-        let config = match crate::router::Router::load(root) {
-            Ok(router) => router.role,
-            Err(e) => {
-                tracing::warn!("the role table is off: {e:#}");
-                crate::router::RoleConfig::default()
-            }
-        };
-        // the local default, pinged the first time a role needs it; the tests never ping
-        let mut local: Option<Option<String>> = None;
-        let mut roles = Roles::default();
-        for role in Role::ALL {
-            let model = match config.model(role) {
-                Some("") => continue,
-                Some(named) => named.to_owned(),
-                None => {
-                    if local.is_none() {
-                        local = Some(if cfg!(test) { None } else { ra_providers::local::default_model().await });
-                    }
-                    match local.as_ref().and_then(Option::as_deref) {
-                        Some(model) => model.to_owned(),
-                        None => continue,
-                    }
-                }
-            };
-            match self.provider_for(&model) {
-                Ok(provider) => roles.routes.push((role, model, provider)),
-                Err(e) => tracing::warn!("the {} role is off: {e:#}", role.name()),
-            }
-        }
-        roles
-    }
-
-    /// One call of `role` on its model, booked under that model against `node`; `None` when the
-    /// role has no model, the text is empty or the call failed, and the rule-based path stands.
-    async fn ask_role(&self, roles: &Roles, role: Role, node: Option<i64>, instruction: &str, text: &str) -> Option<String> {
-        let (model, provider) = roles.of(role)?;
-        if text.trim().is_empty() {
-            return None;
-        }
-        match ra_providers::local::ask(provider.as_ref(), model, role, instruction, text).await {
-            Ok((answer, usage)) => {
-                self.record_as(model, node, &usage, 1).await;
-                (!answer.is_empty()).then_some(answer)
-            }
-            Err(e) => {
-                tracing::warn!("the {} role failed on {model}: {e}", role.name());
-                None
-            }
-        }
     }
 
     /// The same worker, in or out of debug mode.
@@ -414,6 +337,19 @@ impl Worker {
         }
     }
 
+    /// The ledger's totals by model and role, the costliest first, the worker's calls under the
+    /// role `None`; `None` as a whole without a ledger, or when it cannot be read.
+    pub async fn by_role(&self) -> Option<Vec<(String, Option<String>, Totals)>> {
+        let ledger = self.ledger.as_ref()?;
+        match ledger.by_role().await {
+            Ok(rows) => Some(rows),
+            Err(e) => {
+                tracing::warn!("cannot read the usage ledger: {e:#}");
+                None
+            }
+        }
+    }
+
     /// The ledger's totals by roadmap node, `None` for the calls that served none; `None` as a
     /// whole without a ledger, or when it cannot be read.
     pub async fn by_node(&self) -> Option<Vec<(Option<i64>, Totals)>> {
@@ -443,14 +379,16 @@ impl Worker {
     /// Books one completion of `turns` turns against the tally and the ledger. A ledger that
     /// cannot be written is a warning, not a failed run: the answer already came back.
     pub(crate) async fn record(&self, node: Option<i64>, usage: &Usage, turns: u64) {
-        self.record_as(&self.model, node, usage, turns).await;
+        self.record_as(&self.model, None, node, usage, turns).await;
     }
 
-    /// [`record`](Self::record) under `model` rather than the badge's: a cheap role's call lands
-    /// under the model that took it, so the saving shows in `rc usage`.
-    async fn record_as(&self, model: &str, node: Option<i64>, usage: &Usage, turns: u64) {
+    /// [`record`](Self::record) under `model` rather than the badge's and tagged with `role`: a
+    /// cheap role's call lands under the model that took it, so the saving shows in `rc usage`
+    /// beside the worker's calls.
+    pub(crate) async fn record_as(&self, model: &str, role: Option<&str>, node: Option<i64>, usage: &Usage, turns: u64) {
         let entry = Entry {
             model: model.to_owned(),
+            role: role.map(str::to_owned),
             node,
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
@@ -490,7 +428,7 @@ impl Worker {
 
     /// The provider of `model`, which a cheap role runs on: the badge's own when the routes
     /// agree, else a fresh connection on the model's route.
-    fn provider_for(&self, model: &str) -> anyhow::Result<Arc<dyn ModelProvider>> {
+    pub(crate) fn provider_for(&self, model: &str) -> anyhow::Result<Arc<dyn ModelProvider>> {
         let route = Route::of(model);
         if route == self.route() { self.provider() } else { connect(route) }
     }
@@ -909,7 +847,14 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     write_digest(store, &root, Some(format!("#{id} {title} · pid {} · started {}", std::process::id(), clock(started))), None, None).await;
     // the cheap roles of this run, resolved once: the local server is pinged here, not per role
     let roles = worker.roles(&root).await;
-    let outcome = run_task(store, node, worker, &roles).await;
+    let mut outcome = run_task(store, node, worker, &roles).await;
+    // the reviewer judges a run that passed its checks before the card is offered: implemented
+    // means review-ready, and a card is review-ready only with a verdict attached
+    if let Ok((lines, _, _)) = &mut outcome
+        && store.read(id).await.is_ok_and(|n| n.state == TaskState::Implemented)
+    {
+        lines.extend(review_after_run(store, id, worker).await);
+    }
     match &outcome {
         Ok((lines, cost, 0)) => {
             tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, cost_text(*cost));
@@ -978,16 +923,116 @@ pub fn verdict_of(answer: &str) -> Verdict {
     Verdict::NeedsRevision(if points.is_empty() { vec!["the reviewer gave no points".to_owned()] } else { points })
 }
 
+/// What a fix pass is told, ahead of the verdict and the card.
+const FIX_INSTRUCTION: &str = "A reviewer sent this card back for the points below, every one of them a lint warning, a format diff or a doc comment. Fix exactly those points in the files they name, run the card's checks, and report in a few lines what you changed; change nothing else, and do not take the card up afresh.";
+
+/// The outcome a review leaves on the handoff of a trivially rejected run; a second one on the
+/// same card halts the fix passes.
+const TRIVIAL_TAG: &str = "needs revision (trivial)";
+
 /// Has a second model review a card: it reads the objective and the acceptance, the last
 /// handoff and the `git diff` of the card's files (and of the ones the handoff names), and
 /// gives a verdict. The card is in review while the reviewer reads; it ends accepted, or needs
 /// revision with the points first in its notes. The reviewer's model is the `reviewer` rule of
-/// `rhipper.toml` that fits the card, else the worker's own.
+/// `rhipper.toml` that fits the card, else the worker's own. Every run whose checks pass has
+/// this judgment before the card is offered ([`review_after_run`]); this is the person's own
+/// call for it.
+///
+/// A trivial rejection (lint, format, doc comment) is not left for the person: one fix pass
+/// runs on the cheap route ([`ra_providers::route`]) with the verdict as its task, the card's
+/// checks run again, and the reviewer judges the card once more. A second trivial rejection of
+/// the same card, a fix pass whose check failed, or a `fix = ""` in the `[role]` table halts
+/// there, and the card waits for the person.
 ///
 /// # Errors
 /// A bad id or a project, an unreadable `rhipper.toml`, no provider for the model, or a failed
 /// call; the card goes back to the state it had.
 pub async fn review(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
+    review_to(store, id, worker, TaskState::Accepted).await
+}
+
+/// The reviewer on a card a run just left implemented, before it is offered for acceptance:
+/// [`review`] with an accepting verdict leaving the card implemented, the verdict on its
+/// handoff, so acceptance is the person's glance at it; a rejection sets needs revision as
+/// ever. A reviewer that does not answer leaves the card in review, without a verdict and so
+/// not offered: `review <id>` judges it once the reviewer answers. The lines of the verdict.
+async fn review_after_run(store: &Store, id: i64, worker: &Worker) -> Vec<String> {
+    let root = workspace_of(store);
+    match review_to(store, id, worker, TaskState::Implemented).await {
+        Ok(lines) => {
+            if let Some(first) = lines.first() {
+                crate::pair::event(&root, &format!("review {first}"));
+            }
+            lines
+        }
+        Err(error) => {
+            let why = first_line(&format!("{error:#}"));
+            if let Err(e) = store.set_state_by(id, TaskState::Review, Source::Run).await {
+                tracing::warn!("#{id} could not be held in review: {e:#}");
+            }
+            crate::pair::event(&root, &format!("review #{id} no verdict: {why}"));
+            vec![format!("  no verdict on #{id}: {why} · the card waits in review; `review {id}` judges it")]
+        }
+    }
+}
+
+/// [`review`], with the state an accepting verdict leaves the card in: accepted when the person
+/// asked for the judgment, implemented when a run did, so the card is offered to the person with
+/// the verdict attached rather than accepted behind their back.
+async fn review_to(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> anyhow::Result<Vec<String>> {
+    let (mut lines, verdict) = judge(store, id, worker, accepted).await?;
+    let Some(verdict) = verdict else {
+        return Ok(lines);
+    };
+    let root = workspace_of(store);
+    // the handoffs count the trivial rejections of the card: the fix pass runs on the first
+    // alone, so a pass that did not satisfy the reviewer is not repeated blind
+    let rejected = ra_context::TaskContext::open(&root, id).handoffs.iter().filter(|h| h.outcome == TRIVIAL_TAG).count();
+    if rejected >= 2 {
+        lines.push("  a second trivial rejection: no fix pass, the card waits for the person".to_owned());
+        return Ok(lines);
+    }
+    let named = crate::router::Router::load(&root).ok().and_then(|router| router.role.fix);
+    let model = match named.as_deref() {
+        Some(named) => ra_providers::route::cheap(Some(named), None),
+        // the tests neither ping the local server nor fall to haiku; a run does, once
+        None if cfg!(test) => None,
+        None => ra_providers::route::cheap_model(None).await,
+    };
+    let Some(model) = model else {
+        lines.push("  the fix role is off: the card waits for the person".to_owned());
+        return Ok(lines);
+    };
+    let fixer = Worker { model: resolve(&model), fix: Some(verdict), ..worker.clone() };
+    tracing::info!(target: crate::trace::PROGRESS, "#{id} · fix pass on {}", short(&fixer.model));
+    lines.push(format!("  fix pass on {}", short(&fixer.model)));
+    let node = store.read(id).await?;
+    let roles = worker.roles(&root).await;
+    match run_task(store, node, &fixer, &roles).await {
+        Ok((fixed, _, _)) => lines.extend(fixed),
+        Err(e) => {
+            lines.push(format!("  the fix pass failed: {}; the card waits for the person", first_line(&format!("{e:#}"))));
+            return Ok(lines);
+        }
+    }
+    // the reviewer judges the fixed card only when its checks passed; a failed check is the
+    // person's to read either way
+    if store.read(id).await?.state != TaskState::Implemented {
+        lines.push("  the fix pass did not pass the check: the card waits for the person".to_owned());
+        return Ok(lines);
+    }
+    let (judged, again) = judge(store, id, worker, accepted).await?;
+    lines.extend(judged);
+    if again.is_some() {
+        lines.push("  a second trivial rejection: the card waits for the person".to_owned());
+    }
+    Ok(lines)
+}
+
+/// One verdict of the reviewer on a card, as [`review`] describes it, without the fix pass:
+/// the lines, and the head of the notes (the verdict with its points) when the rejection was
+/// trivial. `accepted` is where an accepting verdict leaves the card ([`review_to`]).
+async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> anyhow::Result<(Vec<String>, Option<String>)> {
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; review a task");
     let root = workspace_of(store);
@@ -1023,25 +1068,47 @@ pub async fn review(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<V
             return Err(map_error(error));
         }
     };
-    worker.record_as(&model, Some(id), &answer.usage, answer.turns).await;
+    worker.record_as(&model, Some("reviewer"), Some(id), &answer.usage, answer.turns).await;
     let verdict = verdict_of(&answer.text);
+    let mut trivial = None;
     let (state, head, said) = match &verdict {
-        Verdict::Accepted => (TaskState::Accepted, format!("review by {model}: accepted"), "accepted".to_owned()),
+        Verdict::Accepted => (accepted, format!("review by {model}: accepted"), "accepted".to_owned()),
         Verdict::NeedsRevision(points) => {
+            let weight = crate::commands::review::classify(points);
             let list: Vec<String> = points.iter().map(|point| format!("- {point}")).collect();
-            (
-                TaskState::NeedsRevision,
-                format!("review by {model}: needs revision\n{}", list.join("\n")),
-                format!("needs revision · {} point(s)", points.len()),
-            )
+            let head = format!("review by {model}: needs revision ({})\n{}", weight.name(), list.join("\n"));
+            if weight == crate::commands::review::Weight::Trivial {
+                trivial = Some(head.clone());
+            }
+            (TaskState::NeedsRevision, head, format!("needs revision ({}) · {} point(s)", weight.name(), points.len()))
         }
     };
-    // the verdict leads the notes; the worker's report stays under it for the next run
-    let notes = match node.notes.as_deref().map(str::trim) {
-        Some(report) if !report.is_empty() => format!("{head}\n\n{report}"),
-        _ => head,
-    };
-    store.set_notes(id, &notes).await?;
+    // the verdict rides the run's handoff: a card is offered for acceptance only with one
+    // attached, and the weight of a rejection retags the outcome, a trivial one for a cheap
+    // pass, a substantive one for the person. A card reviewed before any run has no handoff,
+    // and the notes carry the verdict alone
+    let mut task = ra_context::TaskContext::open(&root, id);
+    if let Some(last) = task.handoffs.last_mut() {
+        last.verdict = Some(format!("{said} by {model}"));
+        if state == TaskState::NeedsRevision
+            && let Some((tag, _)) = said.split_once(" · ")
+        {
+            tag.clone_into(&mut last.outcome);
+        }
+        if let Err(e) = task.save(&root) {
+            tracing::warn!("the verdict of #{id} was not saved on its handoff: {e:#}");
+        }
+    }
+    // the verdict leads the notes when it is the next reader's task: a rejection's points for
+    // the next run, or an acceptance the person asked for. An acceptance after a run leaves the
+    // notes to the worker's report; the handoff carries it
+    if state != TaskState::Implemented {
+        let notes = match node.notes.as_deref().map(str::trim) {
+            Some(report) if !report.is_empty() => format!("{head}\n\n{report}"),
+            _ => head,
+        };
+        store.set_notes(id, &notes).await?;
+    }
     store.set_state_by(id, state, Source::Run).await?;
     let mut lines = vec![format!(
         "{} #{} {} {said} by {} · in {} out {} · {}",
@@ -1056,7 +1123,7 @@ pub async fn review(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<V
     if let Verdict::NeedsRevision(points) = &verdict {
         lines.extend(points.iter().map(|point| format!("  - {point}")));
     }
-    Ok(lines)
+    Ok((lines, trivial))
 }
 
 /// What the reviewer reads: the card, the last handoff when there is one, and the diff of the
@@ -1197,7 +1264,7 @@ pub async fn plan(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Pla
         })
         .await
         .map_err(map_error)?;
-    worker.record_as(&model, Some(id), &answer.usage, answer.turns).await;
+    worker.record_as(&model, Some("planner"), Some(id), &answer.usage, answer.turns).await;
     let mut outline = ra_roadmap::outline::parse(&answer.text).context("the planner's answer is not an outline")?;
     // a planner that answered in headings meant cards: under a milestone they nest as sections,
     // under a section every item is a task
@@ -1252,10 +1319,15 @@ const DIGEST_NOTES: usize = 6000;
 /// count of the roadmap, and the files the last run changed, or the ones of the digest before
 /// when this write has none.
 async fn write_digest(store: &Store, root: &Path, live: Option<String>, changed: Option<Vec<String>>, drafted: Option<String>) {
-    let ready = match store.all().await {
-        Ok(nodes) => tree::effective_states(&nodes).values().filter(|s| **s == TaskState::Ready).count(),
-        Err(_) => 0,
-    };
+    let nodes = store.all().await.unwrap_or_default();
+    let ready = tree::effective_states(&nodes).values().filter(|s| **s == TaskState::Ready).count();
+    // the files of the cards sent back for revision that are still dirty, so a later card
+    // knows the tree it inherits; a clean tree names none
+    let revising: Vec<i64> = nodes.iter().filter(|n| n.state == TaskState::NeedsRevision).map(|n| n.id).collect();
+    let leftovers = ra_context::digest::leftovers(root, &revising)
+        .into_iter()
+        .map(|(path, ids)| format!("{path} ({})", ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" ")))
+        .collect();
     let before = crate::hub::own_digest(root);
     let path = std::fs::canonicalize(root)
         .map_or_else(|_| root.display().to_string(), |p| p.display().to_string().trim_start_matches(r"\\?\").to_owned());
@@ -1268,6 +1340,7 @@ async fn write_digest(store: &Store, root: &Path, live: Option<String>, changed:
         last: drafted.or_else(|| crate::pair::last_end(root)),
         ready,
         changed: changed.or_else(|| before.map(|d| d.changed)).unwrap_or_default(),
+        leftovers,
     });
 }
 
@@ -1459,6 +1532,8 @@ pub async fn run_next(store: &Store, worker: &Worker) -> anyhow::Result<Vec<Stri
 
 /// Runs the ready cards one after another, reading readiness again after each, until none is
 /// ready or a run fails; with `stop_on_revision` a card that needs revision stops the batch too.
+/// When none is ready and an active gambit says `plan-next`, the planner fills the next empty
+/// milestone first ([`crate::commands::run::plan_next`]) and the walk goes on with its cards.
 /// Each run is its own bubble and its own handoff, through [`run`]. A failed run ends the batch
 /// with its reason on the last line rather than as an error, so the runs before it keep their
 /// lines.
@@ -1471,6 +1546,9 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     // the card the last run continued and how many runs in a row it has had: a card the
     // project's turn cap keeps ending is picked again fresh, up to [`RESTARTS`] times
     let mut again: Option<(i64, usize)> = None;
+    // whether the planner filled the roadmap since the last run: it plans once between runs,
+    // so a plan that leaves no card ready ends the walk rather than plan the next milestone too
+    let mut planned = false;
     // one walk per project: the lock is held for the whole of it
     let Some(_lock) = take_walk_lock(&workspace_of(store)) else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
@@ -1490,6 +1568,26 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         // the walk takes the small cards from here on
         let tight = plan_tight(&root);
         let Some(id) = batch_ready(&roadmap.nodes, &roadmap.gambits, tight).map(|n| n.id) else {
+            // a `plan-next` gambit lets the planner fill the next empty milestone; its cards
+            // are the next picks
+            if !planned && crate::commands::run::plans_next(&roadmap.gambits) {
+                planned = true;
+                match crate::commands::run::plan_next(store, &root, worker).await {
+                    Ok(Some(plan_lines)) => {
+                        lines.extend(plan_lines);
+                        continue;
+                    }
+                    Ok(None) => {
+                        done(&mut lines, format!("ran {ran} card(s) · no card is ready and no milestone is left to plan")).await;
+                        return Ok(lines);
+                    }
+                    Err(error) => {
+                        done(&mut lines, format!("ran {ran} card(s) · no card is ready · planning the next milestone failed: {error:#}"))
+                            .await;
+                        return Ok(lines);
+                    }
+                }
+            }
             done(&mut lines, format!("ran {ran} card(s) · no card is ready")).await;
             return Ok(lines);
         };
@@ -1514,6 +1612,7 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             }
         }
         ran += 1;
+        planned = false;
         if stop_on_revision && store.read(id).await?.state == TaskState::NeedsRevision {
             done(&mut lines, format!("ran {ran} card(s) · stopped: #{id} needs revision")).await;
             return Ok(lines);
@@ -1844,6 +1943,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     store.set_state_by(id, TaskState::InProgress, Source::Run).await?;
 
     let Prepared { workspace, root, mut task, project, budget, caps, effort } = prepare(store, &node, worker, true).await?;
+    // a fix pass reads the verdict first: the points are the task, the card is the setting
+    if let Some(verdict) = &worker.fix {
+        task.brief = format!("{FIX_INSTRUCTION}\n{verdict}\n\n{}", task.brief);
+    }
     let workspace_dir = workspace.clone();
     // where the changes land: the worktree when the run has one, else the project
     let acting = workspace_dir.clone().unwrap_or_else(|| root.clone());
@@ -1877,8 +1980,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 max_turns: caps.limit(),
                 effort: Some(effort.to_string()),
             })
-            .await
-            .map_err(map_error);
+            .await;
         match answer {
             Ok(answer) => {
                 worker.record(Some(id), &answer.usage, answer.turns).await;
@@ -1899,22 +2001,28 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                     reads: answer.reads,
                 })
             }
-            // the harness reports its turns running out as an error; when the project's cap
-            // is what ran out, the run ended as meant and the card continues fresh
-            Err(error) if caps.restarts_at().is_some() && format!("{error:#}").contains("error_max_turns") => {
-                let restart = caps.restarts_at().unwrap_or_default();
-                Ok(Session {
-                    text: String::new(),
-                    usage: Usage::default(),
-                    calls: 0,
-                    turns: u64::from(restart),
-                    turn_usage: Vec::new(),
-                    cap: Some(restart),
-                    capped: Some(restart),
-                    reads: Vec::new(),
-                })
+            // the harness reports its turns running out as an error, with what the run read,
+            // wrote and cost: that is booked like a finished run's, so the card's cost counts
+            // every session. When the project's cap is what ran out, the run ended as meant and
+            // the card continues fresh
+            Err(ProviderError::TurnsOut(answer)) => {
+                worker.record(Some(id), &answer.usage, answer.turns).await;
+                gotcha_hits.clone_from(&answer.gotchas);
+                match caps.restarts_at() {
+                    Some(restart) => Ok(Session {
+                        text: answer.text,
+                        usage: answer.usage,
+                        calls: 0,
+                        turns: u64::from(restart),
+                        turn_usage: answer.turn_usage,
+                        cap: Some(restart),
+                        capped: Some(restart),
+                        reads: answer.reads,
+                    }),
+                    None => Err(map_error(ProviderError::TurnsOut(answer))),
+                }
             }
-            Err(error) => Err(error),
+            Err(error) => Err(map_error(error)),
         }
     } else {
         tool_loop(provider.as_ref(), worker, id, bare_context(&task, &project, worker.debug), workspace.as_deref(), budget, caps).await
@@ -1925,6 +2033,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         model: worker.model.clone(),
         outcome: outcome.to_owned(),
         check: check.to_owned(),
+        verdict: None,
         changed,
         report: report.to_owned(),
         warnings: Vec::new(),
@@ -3577,6 +3686,10 @@ pub(crate) fn map_error(error: ProviderError) -> anyhow::Error {
         ProviderError::Auth(_) => anyhow::anyhow!("the provider refused the key: check OPENROUTER_API_KEY, or set one with key <paste>"),
         ProviderError::UnknownModel(model) => anyhow::anyhow!("the provider knows no model {model}"),
         ProviderError::Unavailable(text) => anyhow::anyhow!("the provider is unreachable: {text}"),
+        ProviderError::TurnsOut(answer) => anyhow::anyhow!(
+            "the run failed: the worker ran out of turns after {} turn(s) without finishing; raise the cap with --turns or split the task",
+            answer.turns
+        ),
         ProviderError::Other(text) => anyhow::anyhow!("the run failed: {text}"),
     }
 }
@@ -3587,7 +3700,7 @@ fn cost_text(cost: Option<f64>) -> String {
 }
 
 /// The model id without its vendor.
-fn short(model: &str) -> &str {
+pub(crate) fn short(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 

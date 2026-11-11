@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+pub mod digest;
+
 /// The project context, beside the roadmap file.
 pub const PROJECT_FILE: &str = "rhipper.context.md";
 
@@ -396,10 +398,15 @@ pub struct Handoff {
     /// When the run ended, as seconds since the Unix epoch.
     pub when: u64,
     pub model: String,
-    /// `implemented`, `needs revision` or `failed`.
+    /// `implemented`, `needs revision` or `failed`; a review that sends the card back retags it
+    /// `needs revision (trivial)` or `needs revision (substantive)`.
     pub outcome: String,
     /// The check line: the command and whether it passed.
     pub check: String,
+    /// The reviewer's verdict on the run, `accepted by <model>` or `needs revision (<weight>) ·
+    /// <n> point(s) by <model>`; `None` until the reviewer judged it. A card is offered for
+    /// acceptance only with one attached.
+    pub verdict: Option<String>,
     /// The workspace-relative paths the run changed.
     pub changed: Vec<String>,
     /// The worker's report, clipped to its first lines.
@@ -481,6 +488,7 @@ impl TaskContext {
             model: model.to_owned(),
             outcome: format!("note from #{from}"),
             check: format!("no check: a word left by the run of #{from}"),
+            verdict: None,
             changed: Vec::new(),
             report: text.to_owned(),
             warnings: Vec::new(),
@@ -531,6 +539,9 @@ impl Handoff {
     fn render(&self) -> String {
         let mut text = format!("## Handoff {} · {} · {}\n", self.when, self.model, self.outcome);
         let _ = writeln!(text, "check: {}", self.check.trim());
+        if let Some(verdict) = &self.verdict {
+            let _ = writeln!(text, "verdict: {}", verdict.trim());
+        }
         if !self.changed.is_empty() {
             let _ = writeln!(text, "changed: {}", self.changed.join(" "));
         }
@@ -594,6 +605,7 @@ fn parse_handoffs(text: &str) -> Vec<Handoff> {
                 model,
                 outcome,
                 check: String::new(),
+                verdict: None,
                 changed: Vec::new(),
                 report: String::new(),
                 warnings: Vec::new(),
@@ -621,6 +633,11 @@ fn parse_handoffs(text: &str) -> Vec<Handoff> {
             && let Some(check) = line.strip_prefix("check: ")
         {
             check.clone_into(&mut current.check);
+        } else if current.verdict.is_none()
+            && current.report.is_empty()
+            && let Some(verdict) = line.strip_prefix("verdict: ")
+        {
+            current.verdict = Some(verdict.to_owned());
         } else if current.changed.is_empty()
             && current.report.is_empty()
             && let Some(changed) = line.strip_prefix("changed: ")

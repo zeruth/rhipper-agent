@@ -370,6 +370,10 @@ pub struct Gambit {
     /// matches every card.
     #[serde(default)]
     pub focus: Vec<String>,
+    /// Whether the planner may fill the roadmap when no card is ready: it plans the next
+    /// milestone and adds its cards as defined. The file writes it as a `plan-next: true` line.
+    #[serde(default)]
+    pub plan_next: bool,
 }
 
 /// What a `rhipper.md` holds: the gambits first, then the tree.

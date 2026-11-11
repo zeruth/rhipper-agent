@@ -5,6 +5,7 @@ use super::*;
 fn entry(model: &str, node: Option<i64>, cost: Option<f64>) -> Entry {
     Entry {
         model: model.to_owned(),
+        role: None,
         node,
         prompt_tokens: 100,
         completion_tokens: 10,
@@ -40,6 +41,36 @@ async fn a_row_carries_its_turn_count_and_the_calls_of_a_node_list_it() {
     assert_eq!(calls[1].cost_usd, Some(0.25));
     assert_eq!(store.calls_of(None).await.unwrap().len(), 1);
     assert!(store.calls_of(Some(9)).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_roles_call_carries_its_tag_and_the_rows_group_by_model_and_role() {
+    let store = UsageStore::in_memory().await.unwrap();
+    store.record(&Entry { turns: 6, ..entry("claude-opus-5-5", Some(3), Some(0.25)) }).await.unwrap();
+    for role in ["summary", "classify", "digest"] {
+        store.record(&Entry { role: Some(role.to_owned()), ..entry("local/qwen3-8b", Some(3), None) }).await.unwrap();
+    }
+    store.record(&Entry { role: Some("summary".to_owned()), ..entry("local/qwen3-8b", Some(4), None) }).await.unwrap();
+    // the calls of the card name their role, the worker's none
+    let calls = store.calls_of(Some(3)).await.unwrap();
+    assert_eq!(
+        calls.iter().map(|c| (c.model.as_str(), c.role.as_deref())).collect::<Vec<_>>(),
+        [
+            ("local/qwen3-8b", Some("digest")),
+            ("local/qwen3-8b", Some("classify")),
+            ("local/qwen3-8b", Some("summary")),
+            ("claude-opus-5-5", None)
+        ]
+    );
+    // by role: the worker's row, then each role's, the two summaries as one
+    let by_role = store.by_role().await.unwrap();
+    let rows: Vec<(&str, Option<&str>, u64)> = by_role.iter().map(|(m, r, t)| (m.as_str(), r.as_deref(), t.calls)).collect();
+    assert_eq!(rows[0], ("claude-opus-5-5", None, 1));
+    assert!(rows.contains(&("local/qwen3-8b", Some("summary"), 2)));
+    assert!(rows.contains(&("local/qwen3-8b", Some("digest"), 1)));
+    assert_eq!(rows.len(), 4);
+    // by model does not tell the roles apart
+    assert_eq!(store.by_model().await.unwrap().iter().find(|(m, _)| m == "local/qwen3-8b").unwrap().1.calls, 4);
 }
 
 #[tokio::test]
@@ -96,6 +127,39 @@ async fn the_rows_after_a_mark_read_oldest_first_and_sum_apart() {
     let after = store.totals_after(mark).await.unwrap();
     assert_eq!((after.calls, after.tokens(), after.cost_usd), (2, 460, Some(0.3)));
     assert_eq!(store.totals_after(0).await.unwrap(), store.totals().await.unwrap());
+}
+
+#[tokio::test]
+async fn a_card_costs_the_sum_of_its_runs_and_averages_its_tokens_a_turn() {
+    let store = UsageStore::in_memory().await.unwrap();
+    // two runs on card 3: one of 12 turns, one of 4; a run on another card and a chat with none
+    store
+        .record(&Entry { turns: 12, prompt_tokens: 1_000, completion_tokens: 200, ..entry("claude-opus-5-5", Some(3), Some(0.25)) })
+        .await
+        .unwrap();
+    store
+        .record(&Entry { turns: 4, prompt_tokens: 300, completion_tokens: 100, ..entry("z-ai/glm-5.3-flash", Some(3), None) })
+        .await
+        .unwrap();
+    store.record(&Entry { turns: 2, ..entry("claude-opus-5-5", Some(4), Some(0.1)) }).await.unwrap();
+    store.record(&entry("claude-opus-5-5", None, Some(0.1))).await.unwrap();
+    let card = store.card_cost(3).await.unwrap();
+    assert_eq!((card.node, card.totals.calls, card.totals.turns, card.tokens()), (3, 2, 16, 1_600));
+    assert_eq!(card.totals.cost_usd, Some(0.25));
+    assert_eq!(card.tokens_per_turn(), 100);
+    // every card at once, the chat left out
+    let all = store.card_costs().await.unwrap();
+    assert_eq!(all.iter().map(|c| (c.node, c.totals.turns, c.tokens_per_turn())).collect::<Vec<_>>(), [(3, 16, 100), (4, 2, 55)]);
+    assert_eq!(all[0], card);
+}
+
+#[tokio::test]
+async fn a_card_the_ledger_has_not_seen_costs_nothing() {
+    let store = UsageStore::in_memory().await.unwrap();
+    let card = store.card_cost(9).await.unwrap();
+    assert_eq!(card, CardCost { node: 9, totals: Totals::default() });
+    assert_eq!((card.tokens_per_turn(), card.totals.cost_usd), (0, None));
+    assert!(store.card_costs().await.unwrap().is_empty());
 }
 
 #[test]

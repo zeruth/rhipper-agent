@@ -6,8 +6,15 @@
 //! the local server at `RHIPPER_LOCAL_URL` takes the role when it answers a ping, and nothing is
 //! called when it does not.
 
+use std::time::{Duration, Instant};
+
 use crate::openrouter::{OpenRouter, local_url};
 use crate::{CompletionRequest, Message, ModelProvider, ProviderError, Usage};
+
+/// How long the one-token probe and a role's call wait for the answer: a server with the model
+/// loaded answers in well under a second, one still loading it in a few; past this it is not
+/// serving.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The cheap roles a run hands off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,11 +74,60 @@ pub async fn default_model_at(base_url: &str) -> Option<String> {
     Some(format!("local/{}", models.first().map_or("default", String::as_str)))
 }
 
-/// One call of `role` on `model` through `provider`: `text` under `instruction`, at temperature
-/// zero and within the role's room, with the answer trimmed.
+/// What the one-token probe found: the model that answered, as the server lists it, and the
+/// round trip of the completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub model: String,
+    pub latency: Duration,
+}
+
+/// [`probe_at`] against the server at [`local_url`].
 ///
 /// # Errors
-/// The provider's own.
+/// The reason the server did not answer.
+pub async fn probe() -> Result<Probe, String> {
+    probe_at(&local_url()).await
+}
+
+/// Whether the server at `base_url` serves, not only lists: the first model it names is asked
+/// for one token, timed from the request to the answer. A ping says a process listens; this
+/// says a model completes, which is what the roles need. The error is the refusal's reason as
+/// the doctor prints it: nothing listening, no model loaded, or what the completion said.
+///
+/// # Errors
+/// The reason the server did not answer.
+pub async fn probe_at(base_url: &str) -> Result<Probe, String> {
+    let server = OpenRouter::at(base_url, "").map_err(|e| format!("no client for {base_url}: {e:#}"))?;
+    let models = server.models().await.map_err(|e| e.to_string())?;
+    let model = models.into_iter().next().ok_or_else(|| format!("{base_url} answers but lists no model"))?;
+    let request = CompletionRequest {
+        model: model.clone(),
+        messages: vec![Message::user("Say ok.")],
+        temperature: Some(0.0),
+        max_tokens: Some(1),
+        tools: Vec::new(),
+        workspace: None,
+        budget_usd: None,
+        resume: None,
+        max_turns: Some(1),
+        effort: None,
+    };
+    let started = Instant::now();
+    match tokio::time::timeout(ANSWER_TIMEOUT, server.complete(request)).await {
+        Ok(Ok(_)) => Ok(Probe { model, latency: started.elapsed() }),
+        Ok(Err(e)) => Err(format!("{model} refused the one-token request: {e}")),
+        Err(_) => Err(format!("{model} gave no token in {}s", ANSWER_TIMEOUT.as_secs())),
+    }
+}
+
+/// One call of `role` on `model` through `provider`: `text` under `instruction`, at temperature
+/// zero and within the role's room, with the answer trimmed. A server that neither answers nor
+/// refuses within [`ANSWER_TIMEOUT`] is unavailable, like one that is not listening: the run
+/// takes its rule-based path rather than waiting on it.
+///
+/// # Errors
+/// The provider's own, or [`ProviderError::Unavailable`] when the answer timed out.
 pub async fn ask(
     provider: &dyn ModelProvider,
     model: &str,
@@ -79,20 +135,21 @@ pub async fn ask(
     instruction: &str,
     text: &str,
 ) -> Result<(String, Usage), ProviderError> {
-    let answer = provider
-        .complete(CompletionRequest {
-            model: model.to_owned(),
-            messages: vec![Message::system(instruction), Message::user(text)],
-            temperature: Some(0.0),
-            max_tokens: Some(role.room()),
-            tools: Vec::new(),
-            workspace: None,
-            budget_usd: None,
-            resume: None,
-            max_turns: Some(1),
-            effort: Some("low".to_owned()),
-        })
-        .await?;
+    let request = CompletionRequest {
+        model: model.to_owned(),
+        messages: vec![Message::system(instruction), Message::user(text)],
+        temperature: Some(0.0),
+        max_tokens: Some(role.room()),
+        tools: Vec::new(),
+        workspace: None,
+        budget_usd: None,
+        resume: None,
+        max_turns: Some(1),
+        effort: Some("low".to_owned()),
+    };
+    let answer = tokio::time::timeout(ANSWER_TIMEOUT, provider.complete(request))
+        .await
+        .map_err(|_| ProviderError::Unavailable(format!("{model} gave no answer in {}s", ANSWER_TIMEOUT.as_secs())))??;
     Ok((answer.text.trim().to_owned(), answer.usage))
 }
 

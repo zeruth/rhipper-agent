@@ -30,7 +30,8 @@
 //!
 //! The gambits come first, since the walk reads the file in order until the gambits decide it:
 //! one line each, the weight `{w1}` to `{w5}`, the state `active`, `parked` or `done`, and an
-//! optional `focus:` line of the words a card matches on. A done gambit stays in the file.
+//! optional `focus:` line of the words a card matches on, and an optional `plan-next: true` line
+//! that lets the planner fill the roadmap when no card is ready. A done gambit stays in the file.
 //!
 //! `priority:` is the person's priority on a card, 1 to 5, apart from its complexity; a card
 //! without the line has none.
@@ -47,6 +48,8 @@
 //! `assessed:` holds what the last reassessment saw: a fingerprint of its inputs, or the word
 //! `final`, which no reassessment rewrites; after it, `-` and a hash per proposed card the person
 //! declined.
+
+use std::fmt::Write as _;
 
 use anyhow::Context;
 
@@ -110,7 +113,10 @@ pub fn render_file(roadmap: &Roadmap) -> String {
             out.push_str(&gambit_line(gambit));
             out.push('\n');
             if !gambit.focus.is_empty() {
-                out.push_str(&format!("{}focus: {}\n", " ".repeat(DETAIL_INDENT), gambit.focus.join(" ")));
+                let _ = writeln!(out, "{}focus: {}", " ".repeat(DETAIL_INDENT), gambit.focus.join(" "));
+            }
+            if gambit.plan_next {
+                let _ = writeln!(out, "{}plan-next: true", " ".repeat(DETAIL_INDENT));
             }
         }
         out.push('\n');
@@ -255,6 +261,13 @@ pub fn parse_file(text: &str) -> anyhow::Result<Roadmap> {
             let gambit = gambits.last_mut().with_context(|| format!("line {number} has no gambit above it"))?;
             match field.trim() {
                 "focus" => gambit.focus = value.split_whitespace().map(str::to_owned).collect(),
+                "plan-next" => {
+                    gambit.plan_next = match value.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        other => anyhow::bail!("line {number}: plan-next is true or false, not {other}"),
+                    };
+                }
                 other => anyhow::bail!("line {number}: unknown gambit field {other}"),
             }
             continue;
@@ -313,7 +326,7 @@ fn gambit_of_line(rest: &str) -> anyhow::Result<Gambit> {
     let weight = weight_of(weight.strip_suffix('}').unwrap_or(weight), "weight")?;
     let text = text.trim().to_owned();
     anyhow::ensure!(!text.is_empty(), "the gambit text is empty");
-    Ok(Gambit { id, text, weight, state, focus: Vec::new() })
+    Ok(Gambit { id, text, weight, state, focus: Vec::new(), plan_next: false })
 }
 
 /// One node line: the id, the kind, the title and the inline fields. The inline fields sit at the

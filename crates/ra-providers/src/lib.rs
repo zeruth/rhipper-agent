@@ -10,6 +10,7 @@ pub mod claude_code;
 pub mod limits;
 pub mod local;
 pub mod openrouter;
+pub mod route;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -186,6 +187,11 @@ pub enum ProviderError {
     /// The provider is rate-limiting or unreachable; retry later.
     #[error("provider unavailable: {0}")]
     Unavailable(String),
+    /// A harness ran out of the turns the request allowed (`error_max_turns`) before it
+    /// answered. The completion is what it reported anyway: the usage, which the caller books
+    /// like any run's, the turns and the session.
+    #[error("the harness ran out of turns (error_max_turns)")]
+    TurnsOut(Box<Completion>),
     /// Anything else.
     #[error("{0}")]
     Other(String),

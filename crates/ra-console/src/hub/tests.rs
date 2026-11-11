@@ -10,6 +10,7 @@ fn digest_of(name: &str, pid: u32, when: u64) -> Digest {
         last: Some("✓ #11 Shared notes implemented".to_owned()),
         ready: 3,
         changed: vec!["crates/ra-console/src/hub.rs".to_owned(), "crates/ra-console/src/agent.rs".to_owned()],
+        leftovers: vec![],
     }
 }
 
@@ -54,6 +55,24 @@ fn a_digest_line_is_clipped_at_the_width() {
     digest.changed.clear();
     digest.live = None;
     assert_eq!(digest_line(&digest), "gamma (C:/code/gamma) · last: ✓ #11 Shared notes implemented · 3 ready");
+}
+
+#[test]
+fn a_digest_keeps_the_leftovers_of_the_cards_under_revision_and_a_clean_tree_adds_none() {
+    let hub = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let dir = hub.path().join("digest");
+    let mut digest = digest_of(&project_name(project.path()), 1, 1);
+    digest.path = project.path().display().to_string();
+    digest.live = None;
+    digest.changed.clear();
+    write_digest_in(&dir, &digest).unwrap();
+    let text = std::fs::read_to_string(dir.join(format!("{}.txt", digest.name))).unwrap();
+    assert!(!text.contains("leftovers"), "{text}");
+    digest.leftovers = vec!["src/a.rs (#7)".to_owned(), "src/b.rs (#7 #9)".to_owned()];
+    write_digest_in(&dir, &digest).unwrap();
+    assert_eq!(own_digest_in(&dir, project.path()).unwrap(), digest);
+    assert!(digest_line(&digest).ends_with("3 ready · leftovers: src/a.rs (#7), src/b.rs (#7 #9)"), "{}", digest_line(&digest));
 }
 
 #[test]

@@ -233,6 +233,15 @@ struct ContextView {
     read_at: Option<Instant>,
 }
 
+/// What the card view says of the reviewer: the verdict's first line on the selected card's
+/// last handoff, `None` for a card never judged.
+#[derive(Default)]
+struct VerdictView {
+    /// The card the verdict was read for.
+    id: Option<i64>,
+    text: Option<String>,
+}
+
 /// What the diff tab shows: `git diff HEAD` of the files the selected card's last handoff
 /// names, one entry per file. Built when the tab shows a card it was not built for, and again
 /// when a run ends: the handoff and the working tree move then.
@@ -1274,6 +1283,7 @@ impl App {
                     state: node.state,
                     model: node.assignee.as_ref().map(|a| short(&a.model).to_owned()).unwrap_or_default(),
                     cost: workspace.costs.get(&node.id).filter(|t| t.calls > 0).and_then(|t| t.cost_usd),
+                    tokens_per_turn: workspace.costs.get(&node.id).map_or(0, |t| t.tokens().checked_div(t.turns).unwrap_or(0)),
                     at: workspace.last_changes.get(&node.id).map(|c| c.at),
                     seq,
                 });
@@ -1298,6 +1308,8 @@ struct Landed {
     model: String,
     /// The card's cost from the ledger, when it had a call.
     cost: Option<f64>,
+    /// The tokens one turn took on average over the card's runs; 0 before the first turn.
+    tokens_per_turn: u64,
     /// When its state last changed, from the history; `None` when the project has none.
     at: Option<u64>,
     /// The card's place in the store, the order a project without history falls back to.
@@ -1315,7 +1327,8 @@ fn order_landed(landed: &mut [Landed], by_project: bool) {
 }
 
 /// The bubble of one landed card: the project as a small badge, the id and the title, the
-/// state, the model, the cost and how long ago it landed. Returns true when clicked.
+/// state, the model, the cost, the tokens a turn and how long ago it landed. Returns true when
+/// clicked.
 fn landed_bubble(ui: &mut egui::Ui, item: &Landed, now: u64) -> bool {
     let lane = theme::lane(1 + item.tab % 9);
     let shown = cards::bubble(ui, lane, false, |ui| {
@@ -1336,6 +1349,11 @@ fn landed_bubble(ui: &mut egui::Ui, item: &Landed, now: u64) -> bool {
             }
             if let Some(cost) = item.cost {
                 ui.label(RichText::new(dollars(Some(cost))).small().color(theme::dim()));
+            }
+            if item.tokens_per_turn > 0 {
+                let text = format!("{} tok/turn", compact(item.tokens_per_turn));
+                ui.label(RichText::new(text).small().color(theme::dim()))
+                    .on_hover_text("the tokens a turn read and wrote, on average over the card's runs");
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let when = item.at.map_or_else(|| "—".to_owned(), |at| format!("{} ago", ra_roadmap::history::age(now.saturating_sub(at))));
@@ -1449,6 +1467,9 @@ struct Workspace {
     session_from: i64,
     context: ContextView,
     diff: DiffView,
+    /// The reviewer's verdict on the selected card's last run, read from its context when the
+    /// card is selected and again when a run ends, not every frame.
+    verdict: VerdictView,
     tab: Tab,
     /// The file open beside the card, once a name under FILES is clicked; `None` keeps the
     /// card at full width.
@@ -1607,6 +1628,7 @@ impl Workspace {
             session_from,
             context: ContextView::default(),
             diff: DiffView::default(),
+            verdict: VerdictView::default(),
             tab: layout.tab.unwrap_or(Tab::Card),
             code: None,
             limits: ra_providers::limits::Limits::load(&root.join(ra_providers::claude_code::LIMITS_FILE)),
@@ -1851,6 +1873,18 @@ impl Workspace {
             ContextView { id, text, project: ra_console::agent::project_context(&self.store), fault, read_at: Some(Instant::now()) };
     }
 
+    /// Reads the reviewer's verdict on the selected card's last run from its context; a card
+    /// never run or never judged, or none selected, leaves it empty.
+    fn refresh_verdict(&mut self) {
+        let id = self.selected;
+        let root = self.store.path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let text = id
+            .and_then(|id| ra_context::TaskContext::open(&root, id).handoffs.pop())
+            .and_then(|h| h.verdict)
+            .and_then(|v| v.lines().next().map(|line| line.trim().to_owned()));
+        self.verdict = VerdictView { id, text };
+    }
+
     /// Builds the diff tab for the selected card: `git diff HEAD` over the files its last
     /// handoff names, split by file. A card without a handoff, or none selected, leaves it empty.
     fn refresh_diff(&mut self) {
@@ -1914,6 +1948,7 @@ impl Workspace {
                 self.refresh_ledger();
                 self.context.id = None;
                 self.diff.id = None;
+                self.verdict.id = None;
             }
             self.followed = working;
         }
@@ -1922,6 +1957,7 @@ impl Workspace {
             self.refresh_ledger();
             self.context.id = None;
             self.diff.id = None;
+            self.verdict.id = None;
             if self.setup.as_ref().is_some_and(|s| s.running.is_some()) {
                 self.finish_setup();
             }
@@ -3323,6 +3359,10 @@ impl Workspace {
         };
         let depth = tree::depth(&self.roadmap, node.id);
         let lane = theme::lane(depth);
+        // read on selection, not every frame: the verdict is in a file
+        if self.verdict.id != Some(node.id) {
+            self.refresh_verdict();
+        }
         let mut command: Option<String> = None;
         let nodes = self.roadmap.clone();
         // the draft lives outside the card while it draws, so the fields can hold it mutably
@@ -3526,6 +3566,19 @@ impl Workspace {
                             });
                         });
                     }
+                });
+                ui.add_space(6.0);
+            }
+            // the reviewer's word above the handoff the notes carry: acceptance is one glance
+            if let Some(verdict) = &self.verdict.text {
+                let color = if verdict.starts_with("accepted") { theme::online() } else { theme::warn_text() };
+                cards::card(ui, color, false, |ui| {
+                    ui.set_width(ui.available_width());
+                    cards::section(ui, "VERDICT", color);
+                    ui.label(RichText::new(verdict).color(color));
+                    ui.label(
+                        RichText::new("the reviewer's verdict on the last run · `review <id>` judges it again").color(theme::dim()).small(),
+                    );
                 });
                 ui.add_space(6.0);
             }

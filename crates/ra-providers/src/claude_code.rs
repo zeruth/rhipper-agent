@@ -354,19 +354,17 @@ impl ClaudeCode {
             Some(task) => task.await.unwrap_or_default(),
             None => String::new(),
         };
-        match result {
-            // a result names the reason itself, exit code or not
-            Some(result) => parse_result(&result).map(|mut completion| {
+        // a result names the reason itself, exit code or not
+        if let Some(result) = result {
+            with_stream(parse_result(&result), |completion| {
                 completion.gotchas = gotchas;
                 completion.turn_usage = turns.into_turns();
                 completion.reads = reads;
-                completion
-            }),
-            None => {
-                let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).next_back().unwrap_or(last_line.trim());
-                let reason = if reason.is_empty() { "no output" } else { reason };
-                Err(ProviderError::Other(format!("claude exited with {status} and no result: {}", snippet(reason))))
-            }
+            })
+        } else {
+            let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).next_back().unwrap_or(last_line.trim());
+            let reason = if reason.is_empty() { "no output" } else { reason };
+            Err(ProviderError::Other(format!("claude exited with {status} and no result: {}", snippet(reason))))
         }
     }
 }
@@ -587,12 +585,31 @@ struct WireUsage {
     cache_creation_input_tokens: u64,
 }
 
+/// Adds what the event stream showed to the parsed result: to the completion, and to the one a
+/// run out of turns carries, which is booked like a finished run's; any other error has none.
+fn with_stream(parsed: Result<Completion, ProviderError>, seen: impl FnOnce(&mut Completion)) -> Result<Completion, ProviderError> {
+    match parsed {
+        Ok(mut completion) => {
+            seen(&mut completion);
+            Ok(completion)
+        }
+        Err(ProviderError::TurnsOut(mut completion)) => {
+            seen(&mut completion);
+            Err(ProviderError::TurnsOut(completion))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Reads the result JSON into a completion, or the error it reports.
 fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
     let parsed: WireResult = serde_json::from_str(stdout.trim())
         .map_err(|e| ProviderError::Other(format!("unparsable claude result: {e}; output starts with: {}", snippet(stdout))))?;
     let text = parsed.result.unwrap_or_default();
-    if parsed.is_error {
+    // the turns running out is an error to the harness, but the result still carries what the
+    // run read, wrote and cost: that goes back with the error, for the ledger
+    let turns_out = parsed.is_error && parsed.subtype.as_deref() == Some("error_max_turns");
+    if parsed.is_error && !turns_out {
         let what = format!("{} ({})", text.trim(), parsed.subtype.as_deref().unwrap_or("error"));
         return Err(match parsed.api_error_status {
             // a missing login comes with no status at all
@@ -615,7 +632,7 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
         cost_computed: false,
     });
     let session_id = parsed.session_id.filter(|s| !s.trim().is_empty());
-    Ok(Completion {
+    let completion = Completion {
         text,
         usage,
         turns: parsed.num_turns,
@@ -624,7 +641,8 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
         session_id,
         gotchas: Vec::new(),
         reads: Vec::new(),
-    })
+    };
+    if turns_out { Err(ProviderError::TurnsOut(Box::new(completion))) } else { Ok(completion) }
 }
 
 /// Writes a run's system prompt under the workspace's `var/runs`, one file per process, so two

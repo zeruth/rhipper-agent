@@ -28,7 +28,25 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
 }
 
 fn gambit(id: u32, text: &str, weight: u8, state: GambitState) -> Gambit {
-    Gambit { id, text: text.to_owned(), weight, state, focus: Vec::new() }
+    Gambit { id, text: text.to_owned(), weight, state, focus: Vec::new(), plan_next: false }
+}
+
+#[test]
+fn round_trips_the_plan_next_line_and_leaves_false_out() {
+    let mut planning = gambit(1, "Keep the roadmap full", 3, GambitState::Active);
+    planning.plan_next = true;
+    planning.focus = vec!["planner".into()];
+    let roadmap = Roadmap { gambits: vec![planning, gambit(2, "Plain", 2, GambitState::Active)], nodes: Vec::new() };
+    let text = render_file(&roadmap);
+    assert!(text.contains("- g1 ‹gambit› Keep the roadmap full {w3} [active]\n    focus: planner\n    plan-next: true\n"), "{text}");
+    assert_eq!(text.matches("plan-next:").count(), 1, "a gambit without the flag writes no line:\n{text}");
+    let parsed = parse_file(&text).unwrap();
+    assert_eq!(parsed, roadmap);
+    assert_eq!(render_file(&parsed), text);
+    // the line reads false too, and nothing else
+    assert!(!parse_file("- g1 ‹gambit› Fine {w3} [active]\n    plan-next: false\n").unwrap().gambits[0].plan_next);
+    let error = parse_file("- g1 ‹gambit› Fine {w3} [active]\n    plan-next: maybe\n").unwrap_err();
+    assert!(format!("{error:#}").contains("line 2: plan-next is true or false"), "{error:#}");
 }
 
 #[test]

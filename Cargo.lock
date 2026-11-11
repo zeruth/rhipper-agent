@@ -3497,6 +3497,7 @@ dependencies = [
  "ra-roadmap",
  "ra-usage",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

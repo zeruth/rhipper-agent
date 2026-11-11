@@ -119,7 +119,7 @@ fn next_names_the_first_ready_card() {
 }
 
 fn gambit(id: u32, weight: u8, state: GambitState, focus: &[&str]) -> Gambit {
-    Gambit { id, text: format!("gambit {id}"), weight, state, focus: focus.iter().map(|w| (*w).to_owned()).collect() }
+    Gambit { id, text: format!("gambit {id}"), weight, state, focus: focus.iter().map(|w| (*w).to_owned()).collect(), plan_next: false }
 }
 
 #[test]

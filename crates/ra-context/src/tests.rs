@@ -135,6 +135,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
             model: "claude-fable-5-1".to_owned(),
             outcome: if i == 4 { "implemented".to_owned() } else { "needs revision".to_owned() },
             check: format!("check failed: cargo test -p x · run {i}"),
+            verdict: (i == 4).then(|| "accepted by m".to_owned()),
             changed: vec!["src/lib.rs".to_owned()],
             report: format!("report {i}\nsecond line\n## Handoff 9 · fake · header in a report"),
             warnings: vec![],
@@ -145,6 +146,9 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
     assert_eq!(again.handoffs.len(), 5);
     assert_eq!(again.handoffs[4].when, 1004);
     assert_eq!(again.handoffs[4].outcome, "implemented");
+    // the verdict reads back on the one handoff that has it
+    assert_eq!(again.handoffs[4].verdict.as_deref(), Some("accepted by m"));
+    assert_eq!(again.handoffs[3].verdict, None);
     assert_eq!(again.handoffs[0].check, "check failed: cargo test -p x · run 0");
     assert_eq!(again.handoffs[0].changed, ["src/lib.rs"]);
     // a header-looking line inside a report does not start a handoff
@@ -162,6 +166,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
             model: "m".into(),
             outcome: "failed".into(),
             check: "c".into(),
+            verdict: None,
             changed: vec![],
             report: "r".into(),
             warnings: vec![],
@@ -176,6 +181,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
         model: "m".into(),
         outcome: "implemented".into(),
         check: "c".into(),
+        verdict: None,
         changed: vec![],
         report: (0..50).map(|i| format!("line {i}\n")).collect(),
         warnings: vec![],
@@ -204,6 +210,7 @@ fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_ca
         model: "m".into(),
         outcome: "needs revision".into(),
         check: "check passed: cargo test · lint: 2 warning(s)".into(),
+        verdict: None,
         changed: vec!["src/extra.rs".into()],
         // a long report: the clip does not reach the warnings, and a heading in it is dropped
         report: (0..50).map(|i| format!("line {i}\n")).collect::<String>() + "### Warnings\nnot a section",
@@ -227,6 +234,7 @@ fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_ca
         model: "m".into(),
         outcome: "implemented".into(),
         check: "c".into(),
+        verdict: None,
         changed: vec![],
         report: "r".into(),
         warnings: vec![],
@@ -267,4 +275,57 @@ fn the_changed_paths_are_the_status_lines_a_run_added() {
     assert!(changed_between(after, after).is_empty());
     // a file that was dirty and changed again shows the same line: not counted, by design
     assert!(changed_between(" M a.rs\n", " M a.rs\n").is_empty());
+}
+
+fn git_ok(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn the_leftovers_are_the_files_of_a_rejected_card_still_dirty_and_a_clean_tree_has_no_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        std::fs::write(root.join("src").join(name), "fn x() {}\n").unwrap();
+    }
+    git_ok(root, &["init", "-q"]);
+    git_ok(root, &["add", "-A"]);
+    git_ok(root, &["commit", "-q", "-m", "base"]);
+    // card 7 came back needs-revision having changed three files; c.rs was committed since
+    let mut task = TaskContext::open(root, 7);
+    task.record(Handoff {
+        when: 1000,
+        model: "m".to_owned(),
+        outcome: "needs revision".to_owned(),
+        check: "check failed: cargo test -p x".to_owned(),
+        verdict: None,
+        changed: vec!["src/a.rs".to_owned(), "src/b.rs".to_owned(), "src/c.rs".to_owned()],
+        report: "did it".to_owned(),
+        warnings: vec![],
+    });
+    task.save(root).unwrap();
+    // a clean tree names nothing, whatever the card changed
+    assert!(digest::leftovers(root, &[7]).is_empty());
+    assert_eq!(digest::section(&digest::leftovers(root, &[7])), "");
+    std::fs::write(root.join("src/a.rs"), "fn x() { changed }\n").unwrap();
+    std::fs::write(root.join("src/b.rs"), "fn y() {}\n").unwrap();
+    // an unrelated dirty file, and a card not under revision, are not leftovers
+    std::fs::write(root.join("src/d.rs"), "fn d() {}\n").unwrap();
+    let found = digest::leftovers(root, &[7]);
+    assert_eq!(found.keys().collect::<Vec<_>>(), ["src/a.rs", "src/b.rs"]);
+    assert_eq!(found["src/a.rs"], [7]);
+    assert!(digest::leftovers(root, &[]).is_empty());
+    assert_eq!(digest::section(&found), "## Uncommitted leftovers\n- src/a.rs (#7)\n- src/b.rs (#7)\n");
+    // two cards on one file name both, once each, and a renamed path reads by its new name
+    let cards = vec![(7, vec!["x.rs".to_owned()]), (9, vec!["x.rs".to_owned(), "new.rs".to_owned()]), (9, vec!["x.rs".to_owned()])];
+    let found = digest::leftovers_in(" M x.rs\nR  old.rs -> new.rs\n", &cards);
+    assert_eq!(found["x.rs"], [7, 9]);
+    assert_eq!(found["new.rs"], [9]);
 }

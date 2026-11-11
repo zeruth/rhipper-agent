@@ -330,12 +330,15 @@ async fn gambits_and_a_priority_survive_the_node_mutations() {
     assert_eq!((g1, g2), (1, 2));
     store.set_gambit_state(g2, GambitState::Done).await.unwrap();
     store.set_gambit_weight(g1, 5).await.unwrap();
+    store.set_gambit_plan_next(g1, true).await.unwrap();
     // a node mutation rewrites the file and keeps the gambits
     let id = store.insert(Some(root), NodeKind::Task, "Task", None, None, 3).await.unwrap();
     store.set_priority(id, Some(5)).await.unwrap();
     let roadmap = store.load().await.unwrap();
     assert_eq!(roadmap.gambits.len(), 2);
     assert_eq!((roadmap.gambits[0].weight, roadmap.gambits[0].focus.as_slice()), (5, &["provider".to_owned()][..]));
+    assert!(roadmap.gambits[0].plan_next, "the plan-next flag survives the rewrite");
+    assert!(!roadmap.gambits[1].plan_next);
     assert_eq!(roadmap.gambits[1].state, GambitState::Done, "a done gambit stays in the file");
     assert_eq!(store.read(id).await.unwrap().priority, Some(5));
     assert!(store.set_priority(id, Some(6)).await.is_err());

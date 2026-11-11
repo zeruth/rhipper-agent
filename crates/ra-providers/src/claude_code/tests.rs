@@ -142,8 +142,19 @@ fn an_error_result_maps_its_status() {
     assert!(matches!(parse_result(json).unwrap_err(), ProviderError::UnknownModel(_)));
     let json = r#"{"type":"result","subtype":"error","is_error":true,"result":"overloaded","api_error_status":529}"#;
     assert!(matches!(parse_result(json).unwrap_err(), ProviderError::Unavailable(_)));
-    let json = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}"#;
-    assert!(matches!(parse_result(json).unwrap_err(), ProviderError::Other(text) if text.contains("error_max_turns")));
+}
+
+#[test]
+fn a_run_out_of_turns_comes_back_with_its_usage_and_session() {
+    let json = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","num_turns":40,"total_cost_usd":1.25,
+        "usage":{"input_tokens":10,"cache_creation_input_tokens":90,"cache_read_input_tokens":900,"output_tokens":52},"session_id":"s-40"}"#;
+    let error = parse_result(json).unwrap_err();
+    let ProviderError::TurnsOut(answer) = error else { panic!("{error}") };
+    assert_eq!(answer.turns, 40);
+    assert_eq!(answer.usage.prompt_tokens, 1000);
+    assert_eq!(answer.usage.completion_tokens, 52);
+    assert_eq!(answer.usage.cost_usd, Some(1.25));
+    assert_eq!(answer.session_id.as_deref(), Some("s-40"));
 }
 
 #[test]
