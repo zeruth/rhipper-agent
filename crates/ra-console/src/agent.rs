@@ -2139,8 +2139,11 @@ fn batch_ready<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Opt
 /// complexity with `tight`, the smallest first.
 fn ready_cards<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Vec<&'a Node> {
     let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && matches!(d.state, TaskState::Accepted | TaskState::Implemented));
+    // a card sent back for revision is ready again at once: its verdict is in its notes and the
+    // rerun resumes its session; only what it waits on holds it (the person, 2026-11-12: "all
+    // needs revision cards should go right back into queue unless depends on changes")
     let candidates = nodes.iter().filter(|n| {
-        matches!(n.state, TaskState::Defined | TaskState::InProgress)
+        matches!(n.state, TaskState::Defined | TaskState::InProgress | TaskState::NeedsRevision)
             && matches!(n.kind, NodeKind::Task | NodeKind::Subtask)
             && n.depends_on.iter().all(met)
     });
