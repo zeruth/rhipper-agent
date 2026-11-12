@@ -369,6 +369,8 @@ impl ClaudeCode {
         if let Some(result) = result {
             with_stream(parse_result(&result), |completion| {
                 completion.gotchas = gotchas;
+                completion.read_in = turns.read_in();
+                completion.whole_reads = turns.whole_reads();
                 completion.turn_usage = turns.into_turns();
                 completion.reads = reads;
             })
@@ -428,7 +430,14 @@ struct TurnTally {
     cached: Vec<u64>,
     /// The text blocks of the last turn, the worker's words when the run ends without a result.
     said: Vec<String>,
+    /// The index of the turn that made the first edit or write, once one has.
+    first_edit: Option<usize>,
+    /// The files read whole, with no range, as the calls named them.
+    whole: std::collections::BTreeSet<String>,
 }
+
+/// The tools whose call is the run acting rather than reading in.
+const EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
 impl TurnTally {
     /// Books the turn one stream event belongs to; any other event is passed over.
@@ -467,6 +476,40 @@ impl TurnTally {
                 self.said = text.collect();
             }
         }
+        // the calls of the turn: a whole read is context every later turn carries, and the
+        // first edit ends the reading-in
+        let calls = event
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"));
+        for call in calls {
+            let name = call.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
+            let input = call.get("input").unwrap_or(&serde_json::Value::Null);
+            if name == "Read"
+                && input.get("offset").is_none()
+                && input.get("limit").is_none()
+                && let Some(path) = input.get("file_path").and_then(serde_json::Value::as_str)
+            {
+                self.whole.insert(path.replace('\\', "/"));
+            }
+            if EDIT_TOOLS.contains(&name) && self.first_edit.is_none() {
+                self.first_edit = Some(self.turns.len().saturating_sub(1));
+            }
+        }
+    }
+
+    /// The read-in: the input of the turns through the first edit, or of every turn when none
+    /// edited.
+    fn read_in(&self) -> u64 {
+        let through = self.first_edit.map_or(self.turns.len(), |i| i + 1);
+        self.turns.iter().take(through).map(|(_, turn)| turn.input_tokens).sum()
+    }
+
+    /// How many distinct files were read whole.
+    fn whole_reads(&self) -> u64 {
+        u64::try_from(self.whole.len()).unwrap_or(u64::MAX)
     }
 
     /// The input of the last turn, when the stream showed one.
@@ -485,6 +528,7 @@ impl TurnTally {
             cost_usd: None,
             cost_computed: false,
         };
+        let (read_in, whole_reads) = (self.read_in(), self.whole_reads());
         Completion {
             text: self.said.join("\n"),
             usage,
@@ -494,6 +538,8 @@ impl TurnTally {
             session_id: None,
             gotchas: Vec::new(),
             reads: Vec::new(),
+            read_in,
+            whole_reads,
         }
     }
 
@@ -744,6 +790,8 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
         session_id,
         gotchas: Vec::new(),
         reads: Vec::new(),
+        read_in: 0,
+        whole_reads: 0,
     };
     if turns_out { Err(ProviderError::TurnsOut(Box::new(completion))) } else { Ok(completion) }
 }

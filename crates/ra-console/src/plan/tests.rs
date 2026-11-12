@@ -215,6 +215,7 @@ async fn a_walk_after_a_cheaper_day_records_that_the_saving_held_once() {
         cost_usd: None,
         cost_computed: false,
         turns: 2,
+        read_in: 0,
     };
     ledger.record_ago(&entry(2_000), DAY + std::time::Duration::from_hours(1)).await.unwrap();
     ledger.record(&entry(400)).await.unwrap();

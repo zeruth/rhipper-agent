@@ -178,6 +178,14 @@ impl Sink {
         self.inner.runs.lock().0.iter().filter(|(_, r)| r.live()).map(|(id, _)| *id).max()
     }
 
+    /// Every run still going, oldest first: a walk of several cards at once has several.
+    #[must_use]
+    pub fn live_runs(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.inner.runs.lock().0.iter().filter(|(_, r)| r.live()).map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// The newest run of `card` that is still going; none when the card has no open run here.
     fn live_run_of(&self, card: i64) -> Option<u64> {
         let ids: Vec<u64> = self

@@ -618,7 +618,7 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
                 let cost = t.cost_usd.map_or_else(|| "—".to_owned(), |c| format!("${c:.4}"));
                 out.push(match node {
                     Some(node) => format!(
-                        "{}#{} {} · {} calls · {} turns · {} in · {} out · {} cached · {cost}",
+                        "{}#{} {} · {} calls · {} turns · {} in · {} out · {} cached · {} read-in · {cost}",
                         "  ".repeat(tree::depth(&nodes, node.id)),
                         node.id,
                         node.title,
@@ -626,11 +626,12 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
                         t.turns,
                         t.prompt_tokens,
                         t.completion_tokens,
-                        t.cached_tokens
+                        t.cached_tokens,
+                        t.read_in
                     ),
                     None => format!(
-                        "outside any card · {} calls · {} turns · {} in · {} out · {} cached · {cost}",
-                        t.calls, t.turns, t.prompt_tokens, t.completion_tokens, t.cached_tokens
+                        "outside any card · {} calls · {} turns · {} in · {} out · {} cached · {} read-in · {cost}",
+                        t.calls, t.turns, t.prompt_tokens, t.completion_tokens, t.cached_tokens, t.read_in
                     ),
                 });
             }

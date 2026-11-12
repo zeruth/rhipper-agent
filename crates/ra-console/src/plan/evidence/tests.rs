@@ -160,6 +160,7 @@ async fn the_ledger_lines_name_the_card_its_cost_and_its_average_a_turn() {
         cost_usd: cost,
         cost_computed: false,
         turns,
+        read_in: 0,
     };
     store.record(&entry(12, 8, 4_000, Some(0.4))).await.unwrap();
     store.record(&entry(12, 2, 1_000, Some(0.1))).await.unwrap();

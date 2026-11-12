@@ -390,26 +390,25 @@ impl Worker {
         self.record_as(&self.model, None, node, usage, turns).await;
     }
 
+    /// [`record`](Self::record) with the read-in of a worker's run: the prompt tokens it spent
+    /// before its first edit, which `rc usage` ranks the cards by.
+    pub(crate) async fn record_run(&self, node: Option<i64>, usage: &Usage, turns: u64, read_in: u64) {
+        self.book(entry_of(&self.model, None, node, usage, turns, read_in)).await;
+    }
+
     /// [`record`](Self::record) under `model` rather than the badge's and tagged with `role`: a
     /// cheap role's call lands under the model that took it, so the saving shows in `rc usage`
     /// beside the worker's calls.
     pub(crate) async fn record_as(&self, model: &str, role: Option<&str>, node: Option<i64>, usage: &Usage, turns: u64) {
-        let entry = Entry {
-            model: model.to_owned(),
-            role: role.map(str::to_owned),
-            node,
-            prompt_tokens: usage.prompt_tokens,
-            completion_tokens: usage.completion_tokens,
-            cached_tokens: usage.cached_tokens,
-            cost_usd: usage.cost_usd,
-            cost_computed: usage.cost_computed,
-            turns,
-        };
+        self.book(entry_of(model, role, node, usage, turns, 0)).await;
+    }
+
+    async fn book(&self, entry: Entry) {
         self.tally.lock().add(&entry);
-        if let Some(ledger) = &self.ledger {
-            if let Err(e) = ledger.record(&entry).await {
-                tracing::warn!("cannot write the usage ledger: {e:#}");
-            }
+        if let Some(ledger) = &self.ledger
+            && let Err(e) = ledger.record(&entry).await
+        {
+            tracing::warn!("cannot write the usage ledger: {e:#}");
         }
     }
 
@@ -2160,7 +2159,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             .await;
         match answer {
             Ok(mut answer) => {
-                worker.record(Some(id), &answer.usage, answer.turns).await;
+                worker.record_run(Some(id), &answer.usage, answer.turns, answer.read_in).await;
                 gotcha_hits.clone_from(&answer.gotchas);
                 if let Some(session) = answer.session_id.as_deref() {
                     // kept on the node with the card's fingerprint: the next run of it resumes
@@ -2216,6 +2215,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                     capped: None,
                     reads: answer.reads,
                     biggest: None,
+                    read_in: answer.read_in,
+                    whole_reads: answer.whole_reads,
                 })
             }
             // the harness reports its turns running out as an error, with what the run read,
@@ -2223,7 +2224,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             // every session. When the project's cap is what ran out, the run ended as meant and
             // the card continues fresh
             Err(ProviderError::TurnsOut(answer)) => {
-                worker.record(Some(id), &answer.usage, answer.turns).await;
+                worker.record_run(Some(id), &answer.usage, answer.turns, answer.read_in).await;
                 gotcha_hits.clone_from(&answer.gotchas);
                 match caps.restarts_at() {
                     Some(restart) => Ok(Session {
@@ -2236,6 +2237,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                         capped: Some(Capped::Turns(restart)),
                         reads: answer.reads,
                         biggest: None,
+                        read_in: answer.read_in,
+                        whole_reads: answer.whole_reads,
                     }),
                     None => Err(map_error(ProviderError::TurnsOut(answer))),
                 }
@@ -2243,7 +2246,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             // the project's context cap ended the run after the turn that crossed it: booked
             // and continued like one the turn cap ended
             Err(ProviderError::ContextOut { completion: answer, cap, size }) => {
-                worker.record(Some(id), &answer.usage, answer.turns).await;
+                worker.record_run(Some(id), &answer.usage, answer.turns, answer.read_in).await;
                 gotcha_hits.clone_from(&answer.gotchas);
                 Ok(Session {
                     text: answer.text,
@@ -2255,6 +2258,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                     capped: Some(Capped::Context { cap, size }),
                     reads: answer.reads,
                     biggest: None,
+                    read_in: answer.read_in,
+                    whole_reads: answer.whole_reads,
                 })
             }
             Err(error) => Err(map_error(error)),
@@ -2320,12 +2325,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         save_context(store, &root, &task).await;
         let sizes = turn_sizes(&session);
         let mut lines = vec![format!(
-            "↻ #{id} {} continues on {} · turns {turns}, {} tool call(s) · in {} out {} · {sizes} · {} · {why}",
+            "↻ #{id} {} continues on {} · turns {turns}, {} tool call(s) · {} · {sizes} · {} · {why}",
             node.title,
             short(&worker.model),
             session.calls,
-            session.usage.prompt_tokens,
-            session.usage.completion_tokens,
+            tokens_line(&session),
             cost_text(session.usage.cost_usd)
         )];
         lines.extend(fresh);
@@ -2481,15 +2485,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     };
     let mut lines = vec![
         format!(
-            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · in {} out {} · {sizes} · {} · {verdict}{}",
+            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · {} · {sizes} · {} · {verdict}{}",
             if passed { "✓" } else { "✗" },
             id,
             node.title,
             if passed { "implemented" } else { "needs revision" },
             short(&worker.model),
             session.calls,
-            session.usage.prompt_tokens,
-            session.usage.completion_tokens,
+            tokens_line(&session),
             cost_text(session.usage.cost_usd),
             if asked_twice { " · report asked twice" } else { "" }
         ),
@@ -3347,6 +3350,25 @@ struct Session {
     /// The tool call whose answer was the largest and its size in characters, when the loop
     /// ran the tools itself: a harness keeps its tool results out of sight.
     biggest: Option<(String, usize)>,
+    /// The read-in: the input tokens of the turns through the first edit, as
+    /// [`ra_providers::Completion::read_in`] has it.
+    read_in: u64,
+    /// How many distinct files the run read whole.
+    whole_reads: u64,
+}
+
+/// The tokens of a session for the end line: the input with its cached share, then the read-in
+/// and the files read whole, as `in 2900000 (91% cached) out 1200 · read-in 740k, 9 files whole`.
+fn tokens_line(session: &Session) -> String {
+    let usage = &session.usage;
+    let cached = usage.cached_tokens * 100 / usage.prompt_tokens.max(1);
+    format!(
+        "in {} ({cached}% cached) out {} · read-in {}, {} files whole",
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        kilo(session.read_in),
+        session.whole_reads
+    )
 }
 
 /// What a tool call did, for the handoff of a run its cap ended: the tool and the path or the
@@ -3534,6 +3556,10 @@ async fn tool_loop(
     let mut turn = 0u32;
     let mut reads: Vec<String> = Vec::new();
     let mut biggest: Option<(String, usize)> = None;
+    // the prompt tokens before the first write, and the files read with no window
+    let mut read_in = 0u64;
+    let mut edited = false;
+    let mut whole: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // what the worker said and did, for the handoff when the restart cap ends the run
     let mut said: Vec<String> = Vec::new();
     let mut did: Vec<String> = Vec::new();
@@ -3565,6 +3591,8 @@ async fn tool_loop(
                 capped: Some(Capped::Turns(restart)),
                 reads,
                 biggest,
+                read_in,
+                whole_reads: u64::try_from(whole.len()).unwrap_or(u64::MAX),
             });
         }
         let answer = provider
@@ -3583,8 +3611,12 @@ async fn tool_loop(
             })
             .await
             .map_err(map_error)?;
-        // every turn is a completion of its own, so each lands in the ledger as it happens
-        worker.record(Some(id), &answer.usage, 1).await;
+        // every turn is a completion of its own, so each lands in the ledger as it happens; the
+        // turns through the first write carry their prompt as the read-in
+        let turn_read_in = if edited { 0 } else { answer.usage.prompt_tokens };
+        edited = edited || answer.tool_calls.iter().any(|call| matches!(call.name.as_str(), "write_file" | "edit_file"));
+        read_in += turn_read_in;
+        worker.record_run(Some(id), &answer.usage, 1, turn_read_in).await;
         add_usage(&mut usage, &answer.usage);
         turn_usage.push(TurnUsage::of(&answer.usage));
         if answer.tool_calls.is_empty() {
@@ -3598,6 +3630,8 @@ async fn tool_loop(
                 capped: None,
                 reads,
                 biggest,
+                read_in,
+                whole_reads: u64::try_from(whole.len()).unwrap_or(u64::MAX),
             });
         }
         // the budget is checked before the tools run: the work it would pay for is not done
@@ -3612,9 +3646,12 @@ async fn tool_loop(
         for call in &answer.tool_calls {
             tracing::debug!("#{id} turn {turn}: {}({})", call.name, call.arguments);
             if call.name == "read_file"
-                && let Some(path) =
-                    serde_json::from_str::<serde_json::Value>(&call.arguments).ok().and_then(|a| a["path"].as_str().map(str::to_owned))
+                && let Some(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()
+                && let Some(path) = arguments["path"].as_str().map(str::to_owned)
             {
+                if arguments.get("offset").is_none() && arguments.get("limit").is_none() {
+                    whole.insert(path.clone());
+                }
                 reads.push(path);
             }
             let result = toolbox.execute(call).await;
@@ -3626,6 +3663,22 @@ async fn tool_loop(
             messages.push(Message::tool(&call.id, result));
             calls += 1;
         }
+    }
+}
+
+/// One ledger row of a completion's usage, under `model` and `role`, with the read-in of a run.
+fn entry_of(model: &str, role: Option<&str>, node: Option<i64>, usage: &Usage, turns: u64, read_in: u64) -> Entry {
+    Entry {
+        model: model.to_owned(),
+        role: role.map(str::to_owned),
+        node,
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        cached_tokens: usage.cached_tokens,
+        cost_usd: usage.cost_usd,
+        cost_computed: usage.cost_computed,
+        turns,
+        read_in,
     }
 }
 

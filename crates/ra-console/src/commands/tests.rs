@@ -139,6 +139,7 @@ async fn usage_prints_the_ledger_by_card_summed_up_the_tree() {
         cost_usd: Some(cost),
         cost_computed: false,
         turns: 2,
+        read_in: 60,
     };
     // two calls on A, one on C, one on a card the roadmap lost, one outside any card
     for e in [entry(Some(3), 0.10), entry(Some(3), 0.15), entry(Some(5), 0.10), entry(Some(99), 0.05), entry(None, 0.01)] {
@@ -151,11 +152,11 @@ async fn usage_prints_the_ledger_by_card_summed_up_the_tree() {
     assert_eq!(
         out,
         vec![
-            "#1 Rhipper · 4 calls · 8 turns · 400 in · 40 out · 0 cached · $0.4000",
-            "  #2 M · 2 calls · 4 turns · 200 in · 20 out · 0 cached · $0.2500",
-            "    #3 A · 2 calls · 4 turns · 200 in · 20 out · 0 cached · $0.2500",
-            "  #5 C · 1 calls · 2 turns · 100 in · 10 out · 0 cached · $0.1000",
-            "outside any card · 1 calls · 2 turns · 100 in · 10 out · 0 cached · $0.0100",
+            "#1 Rhipper · 4 calls · 8 turns · 400 in · 40 out · 0 cached · 240 read-in · $0.4000",
+            "  #2 M · 2 calls · 4 turns · 200 in · 20 out · 0 cached · 120 read-in · $0.2500",
+            "    #3 A · 2 calls · 4 turns · 200 in · 20 out · 0 cached · 120 read-in · $0.2500",
+            "  #5 C · 1 calls · 2 turns · 100 in · 10 out · 0 cached · 60 read-in · $0.1000",
+            "outside any card · 1 calls · 2 turns · 100 in · 10 out · 0 cached · 60 read-in · $0.0100",
         ]
     );
     // the subtree of the milestone: B has no calls and is left out, as the strays are
@@ -163,8 +164,8 @@ async fn usage_prints_the_ledger_by_card_summed_up_the_tree() {
     assert_eq!(
         out,
         vec![
-            "  #2 M · 2 calls · 4 turns · 200 in · 20 out · 0 cached · $0.2500",
-            "    #3 A · 2 calls · 4 turns · 200 in · 20 out · 0 cached · $0.2500",
+            "  #2 M · 2 calls · 4 turns · 200 in · 20 out · 0 cached · 120 read-in · $0.2500",
+            "    #3 A · 2 calls · 4 turns · 200 in · 20 out · 0 cached · 120 read-in · $0.2500",
         ]
     );
     let (out, _) = run("/usage 4", &store, &worker).await.unwrap();
@@ -466,6 +467,8 @@ pub(crate) fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_provide
         session_id: None,
         gotchas: Vec::new(),
         reads: Vec::new(),
+        read_in: 100,
+        whole_reads: 0,
     }
 }
 
@@ -651,21 +654,29 @@ async fn a_harness_run_the_turn_cap_ends_books_its_usage_and_the_card_sums_its_s
         ra_providers::TurnUsage { input_tokens: 400, output_tokens: 2 },
         ra_providers::TurnUsage { input_tokens: 600, output_tokens: 50 },
     ];
+    // it never wrote: the read-in is the whole input, two files read whole
+    capped.read_in = 1000;
+    capped.whole_reads = 2;
     let script = vec![Ok(says("done", vec![])), Err(ra_providers::ProviderError::TurnsOut(Box::new(capped)))];
     let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
     let runner = Worker::new("claude-opus-5-5").with_provider(CappedHarness::new(script)).with_ledger(ledger);
 
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
-    assert!(out[0].starts_with("↻ #2 Probe continues on claude-opus-5-5 · turns 2/2, 0 tool call(s) · in 1000 out 52 · avg"), "{out:?}");
+    assert!(
+        out[0].starts_with(
+            "↻ #2 Probe continues on claude-opus-5-5 · turns 2/2, 0 tool call(s) · in 1000 (90% cached) out 52 · read-in 1k, 2 files whole · avg"
+        ),
+        "{out:?}"
+    );
     assert!(out[0].contains("tokens a turn, largest 650 · $1.2500 · the turn cap of 2 ended the run"), "{out:?}");
     // the ledger has the session as a finished run's, under the worker with no role
     let calls = runner.calls_of(Some(2)).await.unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!((calls[0].prompt_tokens, calls[0].completion_tokens, calls[0].cost_usd, calls[0].turns), (1000, 52, Some(1.25), 2));
-    assert_eq!(calls[0].role, None);
+    assert_eq!((calls[0].role.as_deref(), calls[0].read_in, calls[0].cached_tokens), (None, 1000, 900));
     // the feed's end line carries the same
     let feed = crate::pair::last_end(dir.path()).unwrap();
-    assert!(feed.contains("in 1000 out 52") && feed.contains("$1.2500"), "{feed}");
+    assert!(feed.contains("in 1000 (90% cached) out 52") && feed.contains("$1.2500"), "{feed}");
     assert!(ra_context::TaskContext::open(dir.path(), 2).handoffs[0].report.contains("half way"));
 
     // the next session finishes the card, and the card's cost is both sessions together
@@ -697,6 +708,7 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
         cost_computed: false,
     };
     capped.turn_usage = (1..=5).map(|n| ra_providers::TurnUsage { input_tokens: n * 26_200, output_tokens: 100 }).collect();
+    capped.read_in = 400_000;
     let script = vec![
         Ok(says("done", vec![])),
         Err(ra_providers::ProviderError::ContextOut { completion: Box::new(capped), cap: 120_000, size: 131_000 }),
@@ -706,7 +718,12 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
         Worker::new("claude-opus-5-5").with_provider(harness.clone()).with_ledger(ra_usage::UsageStore::in_memory().await.unwrap());
 
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
-    assert!(out[0].starts_with("↻ #2 Probe continues on claude-opus-5-5 · turns 5, 0 tool call(s) · in 400000 out 500 · avg"), "{out:?}");
+    assert!(
+        out[0].starts_with(
+            "↻ #2 Probe continues on claude-opus-5-5 · turns 5, 0 tool call(s) · in 400000 (97% cached) out 500 · read-in 400k, 0 files whole · avg"
+        ),
+        "{out:?}"
+    );
     assert!(
         out[0].ends_with("the context cap of 120k tokens (a turn of 131k) ended the run; the card continues in a fresh session"),
         "{out:?}"
@@ -738,6 +755,83 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
     // the cap fell at turn 5, while the session was still reading in: the fresh session reads
     // the same files, so it runs without the cap rather than hit it again (runelite #15)
     assert_eq!(harness.requests.lock().last().unwrap().max_context, None, "no cap after a cap hit reading in");
+}
+
+#[tokio::test]
+async fn a_finished_run_end_line_carries_the_read_in_and_the_files_read_whole_and_the_ledger_keeps_them() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    git_ok(dir.path(), &["init", "-q"]);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // what the stream of two turns yields when the first reads three files, two whole, and the
+    // second edits (the_stream_tallies_the_read_in_through_the_first_edit_and_the_files_read_whole)
+    let mut done = says("done: edited `src/lib.rs`", vec![]);
+    done.turns = 2;
+    done.usage = ra_providers::Usage {
+        prompt_tokens: 3208,
+        completion_tokens: 130,
+        cached_tokens: 3000,
+        cost_usd: Some(0.05),
+        cost_computed: false,
+    };
+    done.turn_usage = vec![
+        ra_providers::TurnUsage { input_tokens: 1203, output_tokens: 40 },
+        ra_providers::TurnUsage { input_tokens: 2005, output_tokens: 90 },
+    ];
+    done.read_in = 3208;
+    done.whole_reads = 2;
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    let runner = Worker::new("claude-opus-5-5").with_provider(CappedHarness::new(vec![Ok(done)])).with_ledger(ledger);
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(
+        out[0].starts_with(
+            "✓ #2 Probe implemented on claude-opus-5-5 · turns 2, 0 tool call(s) · in 3208 (93% cached) out 130 · read-in 3.2k, 2 files whole · avg"
+        ),
+        "{out:?}"
+    );
+    let calls = runner.calls_of(Some(2)).await.unwrap();
+    assert_eq!((calls.len(), calls[0].read_in, calls[0].cached_tokens), (1, 3208, 3000));
+    let (usage, _) = run("/usage", &store, &runner).await.unwrap();
+    assert!(
+        usage.iter().any(|line| line.contains("#2 Probe · 1 calls · 2 turns · 3208 in · 130 out · 3000 cached · 3208 read-in")),
+        "{usage:?}"
+    );
+}
+
+/// The one-off that reads Phase S's baseline back: for every run of the workspace's own
+/// `var/activity.log`, the reads before the first edit, which is all the log holds of a
+/// session's reading-in before this card's end line. Ignored: it reads the machine's state.
+#[test]
+#[ignore = "a one-off over the workspace's own activity log"]
+fn phase_s_baseline_counts_the_reads_before_the_first_edit_of_each_logged_run() {
+    use crate::logs::{RUN_END, RUN_START};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let log = std::fs::read_to_string(root.join(crate::ui::ACTIVITY_FILE)).unwrap_or_default();
+    let (mut runs, mut reads, mut whole) = (0u32, 0u32, 0u32);
+    let mut open: Option<(String, u32, u32, bool)> = None;
+    for line in log.lines() {
+        if let Some(head) = line.strip_prefix(RUN_START) {
+            open = Some((head.split(" · ").next().unwrap_or(head).to_owned(), 0, 0, false));
+        } else if line.starts_with(RUN_END) {
+            if let Some((card, before, all, _)) = open.take() {
+                println!("{card}: {before} reads before the first edit, {all} in all");
+                runs += 1;
+                reads += before;
+                whole += all;
+            }
+        } else if let Some((_, before, all, edited)) = &mut open {
+            if line.starts_with("Edit ") || line.starts_with("Write ") {
+                *edited = true;
+            } else if line.starts_with("Read ") {
+                *all += 1;
+                if !*edited {
+                    *before += 1;
+                }
+            }
+        }
+    }
+    println!("baseline: {runs} runs, {reads} reads before the first edit, {whole} reads in all");
 }
 
 #[tokio::test]
@@ -919,6 +1013,7 @@ async fn a_walk_judges_a_landed_cards_saving_on_the_ledger_before_and_after_its_
         cost_usd: None,
         cost_computed: false,
         turns: 2,
+        read_in: 0,
     };
     ledger.record(&before).await.unwrap();
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(accepted_runs(&["did it"]))).with_ledger(ledger);
@@ -962,6 +1057,7 @@ async fn a_saving_line_compares_the_card_to_the_median() {
         cost_usd,
         cost_computed: false,
         turns,
+        read_in: 0,
     };
     for (other, turns, tokens) in [(11, 2, 600), (12, 4, 4000), (13, 1, 5000)] {
         ledger.record(&row(other, turns, tokens, None)).await.unwrap();

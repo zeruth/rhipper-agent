@@ -6,6 +6,12 @@
 # the context it carries, so a run restarts fresh on a handoff once a turn passes this many
 # input tokens.
 context = 160000
+# Two cards at once, each in its own worktree, sharing the project's one build.
+parallel = 2
+
+# The implementer of every card here is Opus; the reviewer and the cheap roles keep theirs.
+[[route]]
+model = "claude-opus-5-5"
 
 [role]
 # The model of each cheap role a run ends with. A key left out goes to the local server at

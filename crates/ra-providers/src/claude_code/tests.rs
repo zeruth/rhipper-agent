@@ -214,6 +214,30 @@ fn the_stream_tallies_the_tokens_of_each_turn() {
 }
 
 #[test]
+fn the_stream_tallies_the_read_in_through_the_first_edit_and_the_files_read_whole() {
+    // two turns: the first reads three files, two of them whole and one twice; the second
+    // edits. the read-in is both turns' input; a third turn after the edit is not in it
+    let stream = [
+        r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":1000,"cache_creation_input_tokens":200,"output_tokens":40},"content":[{"type":"tool_use","name":"Read","input":{"file_path":"C:\\w\\a.rs"}},{"type":"tool_use","name":"Read","input":{"file_path":"C:\\w\\b.rs","offset":10,"limit":40}},{"type":"tool_use","name":"Read","input":{"file_path":"C:\\w\\c.rs"}},{"type":"tool_use","name":"Read","input":{"file_path":"C:\\w\\a.rs"}}]}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+        r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":5,"cache_read_input_tokens":2000,"output_tokens":90},"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"C:\\w\\a.rs"}}]}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+        r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":7,"cache_read_input_tokens":2500,"output_tokens":25},"content":[{"type":"text","text":"done"}]}}"#,
+    ];
+    let mut tally = TurnTally::default();
+    for (i, line) in stream.iter().enumerate() {
+        tally.note(line);
+        if i == 0 {
+            // a run that never edits reads in the whole way
+            assert_eq!((tally.read_in(), tally.whole_reads()), (1203, 2));
+        }
+    }
+    assert_eq!((tally.read_in(), tally.whole_reads()), (1203 + 2005, 2));
+    let answer = tally.completion();
+    assert_eq!((answer.read_in, answer.whole_reads, answer.turns), (3208, 2, 3));
+}
+
+#[test]
 fn a_turn_past_the_context_cap_stops_the_run_once_its_tool_results_are_in() {
     // twelve reading-in turns at 90k, then one that reads 130k: the run goes on through its
     // tool call and stops at the result of that call, before a further turn reads it all again

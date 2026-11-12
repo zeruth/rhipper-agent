@@ -22,6 +22,8 @@ impl ModelProvider for Answers {
                 session_id: None,
                 gotchas: Vec::new(),
                 reads: Vec::new(),
+                read_in: 0,
+                whole_reads: 0,
             })
         })
     }

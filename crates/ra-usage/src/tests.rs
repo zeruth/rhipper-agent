@@ -13,7 +13,21 @@ fn entry(model: &str, node: Option<i64>, cost: Option<f64>) -> Entry {
         cost_usd: cost,
         cost_computed: false,
         turns: 1,
+        read_in: 0,
     }
+}
+
+#[tokio::test]
+async fn the_read_in_is_kept_per_call_and_summed_with_the_rest() {
+    let store = UsageStore::in_memory().await.unwrap();
+    store.record(&Entry { read_in: 700, ..entry("claude-opus-5-5", Some(3), Some(0.25)) }).await.unwrap();
+    store.record(&Entry { read_in: 300, ..entry("claude-opus-5-5", Some(3), Some(0.25)) }).await.unwrap();
+    store.record(&Entry { role: Some("summary".to_owned()), ..entry("local/qwen3-8b", Some(3), None) }).await.unwrap();
+    let calls = store.calls_of(Some(3)).await.unwrap();
+    assert_eq!(calls.iter().map(|c| c.read_in).collect::<Vec<_>>(), [0, 300, 700]);
+    assert_eq!(store.totals().await.unwrap().read_in, 1000);
+    let by_node = store.by_node().await.unwrap();
+    assert_eq!(by_node[0].1.read_in, 1000);
 }
 
 #[tokio::test]

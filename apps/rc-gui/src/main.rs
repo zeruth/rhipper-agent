@@ -4024,6 +4024,8 @@ impl Workspace {
     /// Starts the walk in this project as a detached `rc run --all`, and says so in the log;
     /// its cards' starts and ends arrive through the activity log like any run's.
     fn start_walk(&mut self, parallel: Option<u32>) {
+        // the project's `[worker] parallel` when the request names none
+        let parallel = parallel.or_else(|| ra_console::router::Router::load(&self.root).ok().and_then(|r| r.worker.parallel()));
         match ra_console::agent::spawn_walk(&self.root, self.worker.debug, parallel) {
             Ok(pid) => self.sink.push(
                 Kind::Output,

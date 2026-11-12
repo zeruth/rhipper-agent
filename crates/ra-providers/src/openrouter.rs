@@ -528,6 +528,8 @@ impl OpenRouter {
                     session_id: None,
                     gotchas: Vec::new(),
                     reads: Vec::new(),
+                    read_in: 0,
+                    whole_reads: 0,
                 })
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ProviderError::Auth(error_text(&body, status))),

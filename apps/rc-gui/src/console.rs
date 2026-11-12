@@ -65,12 +65,33 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32) -> bool {
     let runs: Vec<(usize, u64, String)> = sink.with_lines(|lines| {
         lines.iter().enumerate().filter(|(_, l)| l.kind == Kind::Run).filter_map(|(i, l)| l.run.map(|id| (i, id, l.text.clone()))).collect()
     });
-    let pick = runs.iter().rev().find(|(_, id, _)| sink.run(*id).is_some_and(|r| r.live())).or_else(|| runs.last());
-    let Some((index, id, title)) = pick else { return false };
-    let Some(run) = sink.run(*id) else { return false };
+    // every live run, oldest first (a walk of two cards at once has two), else the latest run
+    let live = sink.live_runs();
+    let picked: Vec<&(usize, u64, String)> = if live.is_empty() {
+        runs.last().into_iter().collect()
+    } else {
+        live.iter().filter_map(|id| runs.iter().rev().find(|(_, run, _)| run == id)).collect()
+    };
+    if picked.is_empty() {
+        return false;
+    }
     // a fixed room: in a scroll area the clip is the page, and a live card would take it all;
     // the queue beside the card is the most it gets, the default rows the least
-    run_card(ui, sink, *id, title, &run, *index, Some(room.max(96.0 + 24.0 * DASHBOARD_ROWS)));
+    let room = room.max(96.0 + 24.0 * DASHBOARD_ROWS);
+    // two live runs sit side by side, each in half the width
+    #[allow(clippy::cast_precision_loss)]
+    let width = (ui.available_width() - 10.0 * (picked.len() as f32 - 1.0)) / picked.len() as f32;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        for (index, id, title) in picked {
+            let Some(run) = sink.run(*id) else { continue };
+            ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(width);
+                ui.set_max_width(width);
+                run_card(ui, sink, *id, title, &run, *index, Some(room));
+            });
+        }
+    });
     true
 }
 

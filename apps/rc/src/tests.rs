@@ -175,7 +175,15 @@ fn a_status_card_line_carries_the_cost_and_the_tokens_a_turn_and_is_blank_before
     let nodes = roadmap();
     let ran = CardCost {
         node: 3,
-        totals: Totals { calls: 2, prompt_tokens: 100_000, completion_tokens: 23_000, cached_tokens: 0, cost_usd: Some(0.4249), turns: 10 },
+        totals: Totals {
+            calls: 2,
+            prompt_tokens: 100_000,
+            completion_tokens: 23_000,
+            cached_tokens: 0,
+            cost_usd: Some(0.4249),
+            turns: 10,
+            read_in: 0,
+        },
     };
     let lines = status::card_lines(&nodes, &[ran]);
     assert_eq!(lines, ["  #3 First [implemented]  $0.42 · 12.3k tok/turn"]);

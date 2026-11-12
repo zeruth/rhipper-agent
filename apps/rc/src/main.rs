@@ -649,6 +649,8 @@ async fn run_main() -> anyhow::Result<()> {
         Command::Walk { dir, stop, parallel } => {
             let dir = dir.unwrap_or_else(|| PathBuf::from("."));
             let dir = std::fs::canonicalize(&dir).map_or(dir, |p| PathBuf::from(p.display().to_string().trim_start_matches(r"\\?\")));
+            // the project's `[worker] parallel` when the command names none
+            let parallel = parallel.or_else(|| ra_console::router::Router::load(&dir).ok().and_then(|r| r.worker.parallel()));
             if stop {
                 println!("{}", ra_console::agent::stop_walk(&dir));
             } else if ra_console::agent::walk_running(&dir) {
@@ -905,29 +907,32 @@ async fn usage() -> anyhow::Result<()> {
         return Ok(());
     }
     let cost = |c: Option<f64>| c.map_or("—".to_owned(), |c| format!("${c:.4}"));
-    println!("{:<34} {:>6} {:>10} {:>10} {:>10} {:>10}", "model", "calls", "in", "out", "cached", "cost");
+    // the read-in beside the cache: what a session spent before it acted, the Phase S measure
+    println!("{:<34} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}", "model", "calls", "in", "out", "cached", "read-in", "cost");
     for (model, role, t) in &rows {
         let model = match role {
             Some(role) => format!("{model} · {role}"),
             None => model.clone(),
         };
         println!(
-            "{model:<34} {:>6} {:>10} {:>10} {:>10} {:>10}",
+            "{model:<34} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}",
             t.calls,
             t.prompt_tokens,
             t.completion_tokens,
             t.cached_tokens,
+            t.read_in,
             cost(t.cost_usd)
         );
     }
     let all = ledger.totals().await?;
     println!(
-        "{:<34} {:>6} {:>10} {:>10} {:>10} {:>10}",
+        "{:<34} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "total",
         all.calls,
         all.prompt_tokens,
         all.completion_tokens,
         all.cached_tokens,
+        all.read_in,
         cost(all.cost_usd)
     );
     Ok(())

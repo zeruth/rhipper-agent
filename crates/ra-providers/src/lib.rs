@@ -144,6 +144,13 @@ pub struct Completion {
     /// them go by: a file read many times is context every later turn carried. Empty from a
     /// provider that cannot tell.
     pub reads: Vec<String>,
+    /// The read-in: the input tokens of the turns up to and including the one that made the
+    /// first edit or write, cached or not; the whole input when no turn wrote. What a fresh
+    /// session spends before it acts, and the figure Phase S halves.
+    pub read_in: u64,
+    /// How many distinct files the run read whole, with no range: each is context every later
+    /// turn carried. Zero from a provider that cannot tell.
+    pub whole_reads: u64,
 }
 
 /// The tokens of one assistant turn: what it read, cached or not, and what it wrote.

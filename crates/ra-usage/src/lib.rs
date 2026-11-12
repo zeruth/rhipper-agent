@@ -36,6 +36,9 @@ pub struct Entry {
     /// The assistant turns the completion took: one from a bare model, what the harness
     /// reports from a run.
     pub turns: u64,
+    /// The read-in: the prompt tokens spent before the first edit or write; the whole prompt
+    /// when the call wrote nothing, zero from a role that only answers.
+    pub read_in: u64,
 }
 
 /// The sums over a set of entries.
@@ -48,6 +51,8 @@ pub struct Totals {
     /// The summed cost of the entries that reported one; `None` when none did.
     pub cost_usd: Option<f64>,
     pub turns: u64,
+    /// The summed read-in, as [`Entry::read_in`] has it: what the cards rank by in Phase S.
+    pub read_in: u64,
 }
 
 /// One row of the ledger, as the ledger tab lists the calls of a card.
@@ -65,6 +70,8 @@ pub struct Call {
     pub cost_usd: Option<f64>,
     /// Whether the cost was computed from list prices rather than reported.
     pub cost_computed: bool,
+    /// The read-in of the call, as [`Entry::read_in`] has it.
+    pub read_in: u64,
 }
 
 /// One row as the dashboard's token gauges read it: when it was written, the tokens in and
@@ -92,6 +99,7 @@ impl Totals {
         self.completion_tokens += entry.completion_tokens;
         self.cached_tokens += entry.cached_tokens;
         self.turns += entry.turns;
+        self.read_in += entry.read_in;
         if let Some(cost) = entry.cost_usd {
             self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
         }
@@ -104,6 +112,7 @@ impl Totals {
         self.completion_tokens += other.completion_tokens;
         self.cached_tokens += other.cached_tokens;
         self.turns += other.turns;
+        self.read_in += other.read_in;
         if let Some(cost) = other.cost_usd {
             self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
         }
@@ -146,14 +155,15 @@ impl UsageStore {
                 cost_usd real,
                 turns integer not null default 1,
                 cost_computed integer not null default 0,
-                role text
+                role text,
+                read_in integer not null default 0
             )",
         )
         .execute(&self.pool)
         .await?;
         // a ledger from before the turn count reads as one turn each; one from before the
         // computed mark reads as reported throughout; one from before the role tag reads as
-        // the worker's calls throughout
+        // the worker's calls throughout; one from before the read-in reads as none
         let columns = sqlx::query("pragma table_info(usage)").fetch_all(&self.pool).await?;
         let has = |name: &str| columns.iter().any(|c| c.get::<String, _>("name") == name);
         if !has("turns") {
@@ -164,6 +174,9 @@ impl UsageStore {
         }
         if !has("role") {
             sqlx::query("alter table usage add column role text").execute(&self.pool).await?;
+        }
+        if !has("read_in") {
+            sqlx::query("alter table usage add column read_in integer not null default 0").execute(&self.pool).await?;
         }
         Ok(())
     }
@@ -185,8 +198,8 @@ impl UsageStore {
         // SQLite does the date arithmetic, as the column's default does
         let at = format!("-{} seconds", ago.as_secs());
         sqlx::query(
-            "insert into usage (at, model, role, node, prompt_tokens, completion_tokens, cached_tokens, cost_usd, turns, cost_computed) \
-             values (datetime('now', ?), ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into usage (at, model, role, node, prompt_tokens, completion_tokens, cached_tokens, cost_usd, turns, cost_computed, read_in) \
+             values (datetime('now', ?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(at)
         .bind(&entry.model)
@@ -198,6 +211,7 @@ impl UsageStore {
         .bind(entry.cost_usd)
         .bind(i64::try_from(entry.turns)?)
         .bind(entry.cost_computed)
+        .bind(i64::try_from(entry.read_in)?)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -337,7 +351,7 @@ impl UsageStore {
     /// When the query fails.
     pub async fn calls_of(&self, node: Option<i64>) -> anyhow::Result<Vec<Call>> {
         let rows = sqlx::query(
-            "select at, model, role, turns, prompt_tokens, completion_tokens, cached_tokens, cost_usd, cost_computed from usage \
+            "select at, model, role, turns, prompt_tokens, completion_tokens, cached_tokens, cost_usd, cost_computed, read_in from usage \
              where node is ? order by id desc",
         )
         .bind(node)
@@ -357,6 +371,7 @@ impl UsageStore {
                     cached_tokens: count("cached_tokens"),
                     cost_usd: row.get("cost_usd"),
                     cost_computed: row.get("cost_computed"),
+                    read_in: count("read_in"),
                 }
             })
             .collect())
@@ -377,7 +392,8 @@ macro_rules! sums {
          coalesce(sum(completion_tokens), 0) as completion, \
          coalesce(sum(cached_tokens), 0) as cached, \
          sum(cost_usd) as cost, \
-         coalesce(sum(turns), 0) as turns"
+         coalesce(sum(turns), 0) as turns, \
+         coalesce(sum(read_in), 0) as read_in"
     };
 }
 use sums;
@@ -391,6 +407,7 @@ fn totals_of(row: &sqlx::sqlite::SqliteRow) -> Totals {
         cached_tokens: count("cached"),
         cost_usd: row.get::<Option<f64>, _>("cost"),
         turns: count("turns"),
+        read_in: count("read_in"),
     }
 }
 

@@ -16,9 +16,14 @@ fn the_turn_sizes_lead_with_the_average_and_name_the_largest_when_shown() {
         capped: None,
         reads: Vec::new(),
         biggest: None,
+        read_in: 12_500,
+        whole_reads: 9,
     };
     // a provider that showed only the sum: the average over the turns
     assert_eq!(turn_sizes(&session), "avg 10k tokens a turn");
+    assert_eq!(tokens_line(&session), "in 30000 (0% cached) out 600 · read-in 12k, 9 files whole");
+    session.usage.cached_tokens = 27_300;
+    assert_eq!(tokens_line(&session), "in 30000 (91% cached) out 600 · read-in 12k, 9 files whole");
     session.turn_usage = vec![
         TurnUsage { input_tokens: 5_000, output_tokens: 200 },
         TurnUsage { input_tokens: 20_000, output_tokens: 200 },

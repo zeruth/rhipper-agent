@@ -104,6 +104,7 @@ impl fmt::Display for Rule {
 /// turns = 20                            # a run ends after this many turns and the card goes on in a fresh session
 /// context = 120000                      # and after a turn whose input passes this many tokens; 120000 without it
 /// check_timeout = 1800                 # the seconds a check or the lint may run; 1200 without it
+/// parallel = 2                         # the cards a walk runs at once, in worktrees sharing one build; one without it
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -139,9 +140,20 @@ pub struct WorkerConfig {
     /// reference program outgrows that (rhipper-asm #69), and the project says so here.
     #[serde(default)]
     pub check_timeout: Option<u64>,
+    /// The cards a walk of this project runs at once, each in its own worktree, when
+    /// `rc walk` names no `--parallel`; absent, zero or one, one after another. The runs share
+    /// one build: the project's target directory and the lock on it.
+    #[serde(default)]
+    pub parallel: Option<u32>,
 }
 
 impl WorkerConfig {
+    /// The cards a walk runs at once, when the table names more than one.
+    #[must_use]
+    pub fn parallel(&self) -> Option<u32> {
+        self.parallel.filter(|n| *n > 1)
+    }
+
     /// How long a check or the lint may run: the table's seconds, else the agent's default.
     #[must_use]
     pub fn check_timeout(&self) -> std::time::Duration {
