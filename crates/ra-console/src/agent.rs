@@ -2216,6 +2216,54 @@ async fn diff_base(project: &Path, root: &Path) -> String {
     git(root, &["merge-base", "HEAD", &main]).await.unwrap_or_else(|_| String::from("HEAD"))
 }
 
+/// Merges the project's branch into the card's worktree before a run, when the project has
+/// moved on since the branch left it. A clean merge is a line; a conflicting one is left in
+/// the tree with its markers, for the worker to resolve first ([`conflicts_block`] puts the
+/// files at the head of the brief), and the checkpoint after the run completes the merge.
+/// Twenty-one runelite branches from one old base conflicted with main on 2026-11-12 and
+/// could not land; from here a branch is never more than one run behind.
+async fn catch_up_worktree(root: &Path, path: &Path, id: i64) -> Option<String> {
+    let main = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.ok()?;
+    let behind = git(path, &["rev-list", "--count", &format!("HEAD..{main}")]).await.ok()?;
+    if behind.trim() == "0" {
+        return None;
+    }
+    // a tree with changes a crash left uncommitted cannot take a merge: they go on the branch first
+    if git(path, &["status", "--porcelain"]).await.is_ok_and(|s| !s.trim().is_empty()) {
+        let _ = git(path, &["add", "-A"]).await;
+        let _ = git(path, &["commit", "-q", "-m", &format!("wip: before catching up with {main} (#{id})")]).await;
+    }
+    match git(path, &["merge", "--no-edit", &main]).await {
+        Ok(_) => Some(format!("  #{id}: {main} merged into {}, {} commit(s) behind", worktree_branch(id), behind.trim())),
+        Err(_) => {
+            let conflicts = git(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
+            if conflicts.trim().is_empty() {
+                let _ = git(path, &["merge", "--abort"]).await;
+                return Some(format!("  #{id}: {main} could not be merged into {}; the run goes on without it", worktree_branch(id)));
+            }
+            Some(format!(
+                "  #{id}: {main} merged into {} with conflicts in {}; the worker resolves them first",
+                worktree_branch(id),
+                conflicts.lines().count()
+            ))
+        }
+    }
+}
+
+/// The block at the head of a worker's brief when its tree has unmerged files: the merge of
+/// the project's branch left them, and the card goes nowhere until they are whole.
+async fn conflicts_block(acting: &Path) -> Option<String> {
+    let conflicts = git(acting, &["diff", "--name-only", "--diff-filter=U"]).await.ok()?;
+    let files: Vec<&str> = conflicts.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if files.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "FIRST: the project's branch was merged into this card's branch before this run and left merge conflicts (the `<<<<<<<`, `=======`, `>>>>>>>` markers) in these files:\n{}\nResolve every one before anything else, keeping both the project's change and this card's; then go on with the card. Do not commit: the orchestrator commits the resolution after your report.\n",
+        files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+    ))
+}
+
 /// Commits what a run left in the card's worktree on the card's branch, as a checkpoint: the
 /// work is on the branch from its first run, not only in a working tree a crash or a removed
 /// worktree would lose, and `git log card/<id>` reads as the card's story. The reviewer reads
@@ -2623,6 +2671,10 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // is the next run's; the investigator goes on, its seat is its own
                 taken.insert(id);
                 let (path, branch) = worktree_add(&root, id).await?;
+                // the project's branch comes into the card's before the run: a card that
+                // started from an older main lands without a conflict later, and a conflict
+                // there is now is the worker's first job (the brief names the files)
+                lines.extend(catch_up_worktree(&root, &path, id).await);
                 let runner = worker.clone().with_worktree(path, branch);
                 // the card's span: every progress line of the run carries the card, so six
                 // runs' steps stay apart in the activity file and on the window's cards
@@ -2919,6 +2971,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let workspace_dir = workspace.clone();
     // where the changes land: the worktree when the run has one, else the project
     let acting = workspace_dir.clone().unwrap_or_else(|| root.clone());
+    // a merge of the project's branch that left conflicts in the tree is the run's first job
+    if let Some(block) = conflicts_block(&acting).await {
+        task.brief = format!("{block}\n{}", task.brief);
+    }
     // what is dirty before the run, so the handoff names only what the run changed
     let dirty_before = git_status(&acting).await;
     let run_started = std::time::SystemTime::now();
