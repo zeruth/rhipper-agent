@@ -4219,7 +4219,13 @@ impl Workspace {
                     }
                     let shown = place.map_or_else(|| "—".to_owned(), |p| format!("#{p}"));
                     // `+` raises the project: a smaller place in the order
-                    let step = cards::stepper(ui, "priority", &shown, theme::warn_text(), "the project's place in the machine's order: + is served sooner");
+                    let step = cards::stepper(
+                        ui,
+                        "priority",
+                        &shown,
+                        theme::warn_text(),
+                        "the project's place in the machine's order: + is served sooner",
+                    );
                     if step != 0 {
                         changed |= ra_console::allocation::move_priority(&root, step > 0).is_ok();
                     }

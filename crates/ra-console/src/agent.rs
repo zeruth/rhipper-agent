@@ -3023,9 +3023,13 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                             .unwrap_or_default();
                         let held = store.set_state_by(id, TaskState::Blocked, Source::Run).await.is_ok();
                         let text = if held {
-                            format!("#{id} blocked: sent back {RERUNS_A_WALK} times in a row in this walk; a person sets it defined again. Its last answer: {why}")
+                            format!(
+                                "#{id} blocked: sent back {RERUNS_A_WALK} times in a row in this walk; a person sets it defined again. Its last answer: {why}"
+                            )
                         } else {
-                            format!("#{id} parked: sent back {RERUNS_A_WALK} times in a row in this walk; it waits for the next walk or a person")
+                            format!(
+                                "#{id} parked: sent back {RERUNS_A_WALK} times in a row in this walk; it waits for the next walk or a person"
+                            )
                         };
                         tracing::warn!("{text}");
                         crate::pair::event(&root, &text);
@@ -3304,11 +3308,13 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // #28 at 144k, $3.91 for four), where a fresh one cost a few tens of cents
     let resumed = match resume_of(&node, unix_now()) {
         // an absolute card keeps its session whatever its weight: its work is one run
-        Ok(Some(_)) if rerun.is_some() && !node.is_absolute() && last_largest_turn(&task).is_some_and(|t| t > RERUN_RESUME_LIMIT) => Err(format!(
-            "the last session ran to {}k tokens a turn, past the {}k a rerun resumes",
-            last_largest_turn(&task).unwrap_or(0) / 1000,
-            RERUN_RESUME_LIMIT / 1000
-        )),
+        Ok(Some(_)) if rerun.is_some() && !node.is_absolute() && last_largest_turn(&task).is_some_and(|t| t > RERUN_RESUME_LIMIT) => {
+            Err(format!(
+                "the last session ran to {}k tokens a turn, past the {}k a rerun resumes",
+                last_largest_turn(&task).unwrap_or(0) / 1000,
+                RERUN_RESUME_LIMIT / 1000
+            ))
+        }
         other => other,
     };
     let (resume, fresh) = match resumed {

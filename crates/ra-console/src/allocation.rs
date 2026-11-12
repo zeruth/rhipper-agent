@@ -152,7 +152,8 @@ mod tests {
     #[test]
     fn the_model_is_read_from_the_first_route() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nmodel = \"no\"\n[[route]]\nmodel = \"claude-fable-5-1\"\n").unwrap();
+        std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nmodel = \"no\"\n[[route]]\nmodel = \"claude-fable-5-1\"\n")
+            .unwrap();
         assert_eq!(model(dir.path()).as_deref(), Some(FABLE));
         set_model(dir.path(), OPUS).unwrap();
         assert_eq!(model(dir.path()).as_deref(), Some(OPUS));
