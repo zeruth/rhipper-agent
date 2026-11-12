@@ -1132,7 +1132,7 @@ async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_depend
     // so the verdict is read from the walk's own lines)
     assert_eq!(script.seen.lock().len(), 6);
     for id in [2, 3, 4] {
-        assert!(out.iter().any(|l| l.starts_with(&format!("✓ #{id} ")) && l.contains("accepted by z-ai/glm-5.3-flash")), "#{id}: {out:?}");
+        assert!(out.iter().any(|l| l.starts_with(&format!("✓ #{id} ")) && l.contains("accepted by glm-5.3-flash")), "#{id}: {out:?}");
         assert_eq!(store.read(id).await.unwrap().state, ra_roadmap::model::TaskState::Accepted, "#{id}");
     }
 }
