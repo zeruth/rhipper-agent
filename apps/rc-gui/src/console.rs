@@ -65,11 +65,11 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
     let runs: Vec<(usize, u64, String)> = sink.with_lines(|lines| {
         lines.iter().enumerate().filter(|(_, l)| l.kind == Kind::Run).filter_map(|(i, l)| l.run.map(|id| (i, id, l.text.clone()))).collect()
     });
-    // the live runs, oldest first, the newest four at most (a project runs four cards at
-    // once at most; a run whose process was killed under it stays open in the log until the
-    // orphan scan closes it), else the latest run
+    // the live runs, oldest first, the newest six at most (the whole Opus pool; a run whose
+    // process was killed under it stays open in the log until the orphan scan closes it),
+    // else the latest run
     let live = sink.live_runs();
-    let newest: Vec<u64> = live.iter().rev().take(4).rev().copied().collect();
+    let newest: Vec<u64> = live.iter().rev().take(6).rev().copied().collect();
     let picked: Vec<&(usize, u64, String)> = if newest.is_empty() {
         runs.last().into_iter().collect()
     } else {
@@ -81,10 +81,10 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
     // a fixed room: in a scroll area the clip is the page, and a live card would take it all;
     // the queue beside the card is the most it gets, the default rows the least
     let room = room.max(96.0 + 24.0 * DASHBOARD_ROWS);
-    // the live cards in a grid of two columns: two side by side, three or four two by two,
-    // each half the column's width and, in two rows, half its height, less the space between;
-    // a project running flat out still fills its share. The column's width comes from the
-    // caller, since what egui called available here ran past the column
+    // the live cards in a grid of two columns: two side by side, four two by two, six two by
+    // three, each half the column's width and a row's part of its height, less the space
+    // between; a project running flat out still fills its share. The column's width comes
+    // from the caller, since what egui called available here ran past the column
     let gap = 10.0;
     let cols = picked.len().min(2);
     let rows = picked.len().div_ceil(cols.max(1));

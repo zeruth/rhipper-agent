@@ -4048,11 +4048,11 @@ impl Workspace {
     /// `budget` is the height the card grows to: the queue adds rows past its six while they
     /// fit and then takes the rest of the share as its band, and the run card beside it is
     /// exactly as tall; the two fill the share together, equally.
-    /// Whether the project's card stays at its natural height on the dashboard: no card is
-    /// ready and no run is live, so there is nothing for a taller card to show.
+    /// Whether the project's card stays at its natural height on the dashboard: no run is
+    /// live, so the card is its header line and the room goes to the projects at work (the
+    /// person: a paused project "taking up a bunch of space but inactive").
     fn dashboard_small(&self) -> bool {
         self.sink.live_run().is_none()
-            && ra_console::agent::walk_order(&self.roadmap, &self.gambits, ra_console::agent::limits_tight(&self.limits)).is_empty()
     }
 
     fn dashboard_card(&mut self, ui: &mut egui::Ui, lane: Color32, page: f32, budget: f32) -> bool {
@@ -4132,9 +4132,16 @@ impl Workspace {
                     }
                 });
             });
+            // a project with nothing running is its header line: the queue and the run card
+            // wait for a run, and the room is the working projects'
+            if live.is_none() {
+                return;
+            }
             ui.add_space(6.0);
             let total = inner;
-            let left = (total * 0.42).clamp(280.0, 620.0);
+            // the queue takes less than a third: the run cards, two wide and up to three
+            // tall, are what the person watches
+            let left = (total * 0.3).clamp(260.0, 460.0);
             // the right column takes what is left of the page, never more: a run card sets its
             // width to what it is given, and an open-ended column would grow past the edge
             let right = (total - left - 12.0).max(200.0);
