@@ -2027,6 +2027,9 @@ impl Workspace {
         // under the project's root: the relative path read against the window's working
         // directory, which is no project's, and the pill never moved after the first read
         if self.limits_read.elapsed() >= Duration::from_secs(5) {
+            // a run whose process is gone (a walk killed under it) closes as an orphan rather
+            // than stay a live card beside the real ones
+            self.sink.close_dead_runs(ra_console::hub::pid_alive);
             self.limits = ra_providers::limits::Limits::load(&self.root.join(ra_providers::claude_code::LIMITS_FILE));
             self.limits_read = Instant::now();
             self.week = ra_providers::limits::Week::load(&self.root.join(ra_providers::claude_code::LIMITS_LOG));

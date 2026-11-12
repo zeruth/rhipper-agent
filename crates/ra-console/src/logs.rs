@@ -68,6 +68,9 @@ pub struct Run {
     /// Whether the person folded the card to its header, or unfolded it; `None` leaves it to
     /// the clock, which folds a finished run after [`FOLD_AFTER`].
     pub folded: Option<bool>,
+    /// The process of the run, from its start marker, so a run whose process is gone can be
+    /// closed as an orphan rather than stay live in the log; `None` for a run without one.
+    pub pid: Option<u32>,
 }
 
 impl Run {
@@ -118,8 +121,15 @@ impl Sink {
     /// opens untitled.
     pub fn progress(&self, text: &str) {
         if let Some(title) = text.strip_prefix(RUN_START) {
-            // the pid on the marker is for the window's orphan scan, not for the bubble
-            self.open_run(title.rsplit_once(" · pid ").map_or(title, |(title, _)| title));
+            // the pid on the marker is for the orphan scan, not for the bubble
+            let (shown, pid) = match title.rsplit_once(" · pid ") {
+                Some((title, pid)) => (title, pid.trim().parse().ok()),
+                None => (title, None),
+            };
+            let id = self.open_run(shown);
+            if let Some(run) = self.inner.runs.lock().0.get_mut(&id) {
+                run.pid = pid;
+            }
         } else if let Some(outcome) = text.strip_prefix(RUN_END) {
             // an orphan's end names its card: it closes that run and no other, so a window
             // reporting an older run never closes the card still going
@@ -145,13 +155,43 @@ impl Sink {
             let mut runs = self.inner.runs.lock();
             let id = runs.1;
             runs.1 += 1;
-            let run =
-                Run { steps: Vec::new(), started: std::time::Instant::now(), took: None, outcome: None, height: RUN_HEIGHT, folded: None };
+            let run = Run {
+                steps: Vec::new(),
+                started: std::time::Instant::now(),
+                took: None,
+                outcome: None,
+                height: RUN_HEIGHT,
+                folded: None,
+                pid: None,
+            };
             runs.0.insert(id, run);
             id
         };
         self.push_line(Line { kind: Kind::Run, text: title.to_owned(), run: Some(id), folded: false });
         id
+    }
+
+    /// Closes every live run whose process is gone, as an orphan: a walk killed under a card
+    /// writes no end marker, and its run stayed live in the log beside the real ones (four
+    /// cards on a two-job project). `alive` says whether a pid still runs.
+    pub fn close_dead_runs(&self, alive: impl Fn(u32) -> bool) {
+        let dead: Vec<(u64, u32, String)> = {
+            let runs = self.inner.runs.lock();
+            let lines = self.inner.lines.lock();
+            runs.0
+                .iter()
+                .filter(|(_, run)| run.live())
+                .filter_map(|(id, run)| run.pid.filter(|pid| !alive(*pid)).map(|pid| (*id, pid)))
+                .map(|(id, pid)| {
+                    let title = lines.iter().find(|l| l.kind == Kind::Run && l.run == Some(id)).map(|l| l.text.clone()).unwrap_or_default();
+                    (id, pid, title)
+                })
+                .collect()
+        };
+        for (id, pid, title) in dead {
+            let card = card_of(&title).map_or(String::new(), |card| format!(" #{card}"));
+            self.close_run(id, &format!("✗ orphaned{card}: process {pid} is gone"));
+        }
     }
 
     /// Closes a run with its outcome. The run's line moves to the end of the log: a live card
@@ -366,6 +406,20 @@ mod tests {
         assert_eq!(card_of("worker"), None);
         assert_eq!(orphaned_card("✗ orphaned #12: process 4242 is gone"), Some(12));
         assert_eq!(orphaned_card("✗ failed: #12"), None);
+    }
+
+    #[test]
+    fn a_run_whose_process_is_gone_closes_as_an_orphan() {
+        let sink = Sink::new();
+        sink.progress(&format!("{RUN_START}#3 Killed · opus · pid 222"));
+        sink.progress(&format!("{RUN_START}#4 Going · opus · pid 333"));
+        sink.progress(&format!("{RUN_START}#5 No pid · opus"));
+        assert_eq!(sink.live_runs().len(), 3);
+        sink.close_dead_runs(|pid| pid == 333);
+        let live = sink.live_runs();
+        assert_eq!(live.len(), 2, "the dead pid's run closed, the live one and the one without a pid stay");
+        let closed = sink.with_lines(|lines| lines.iter().find(|l| l.text == "#3 Killed · opus").and_then(|l| l.run).unwrap());
+        assert_eq!(sink.run(closed).unwrap().outcome.as_deref(), Some("✗ orphaned #3: process 222 is gone"));
     }
 
     #[test]

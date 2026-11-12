@@ -65,6 +65,7 @@ fn a_run_bubble_keeps_its_height_live_and_shrinks_when_done() {
         outcome: None,
         height: 4,
         folded: None,
+        pid: None,
     };
     let rows = run_rows("#18 Bubbles · opus-5-5", &run, 60, 0, 7);
     // the top border, four rows of steps, the bottom border, all one width

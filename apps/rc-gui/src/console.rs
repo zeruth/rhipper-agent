@@ -65,12 +65,15 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
     let runs: Vec<(usize, u64, String)> = sink.with_lines(|lines| {
         lines.iter().enumerate().filter(|(_, l)| l.kind == Kind::Run).filter_map(|(i, l)| l.run.map(|id| (i, id, l.text.clone()))).collect()
     });
-    // every live run, oldest first (a walk of two cards at once has two), else the latest run
+    // the live runs, oldest first, the newest two at most (a walk runs two cards at once at
+    // most; a run whose process was killed under it stays open in the log and would make a
+    // third and a fourth), else the latest run
     let live = sink.live_runs();
-    let picked: Vec<&(usize, u64, String)> = if live.is_empty() {
+    let newest: Vec<u64> = live.iter().rev().take(2).rev().copied().collect();
+    let picked: Vec<&(usize, u64, String)> = if newest.is_empty() {
         runs.last().into_iter().collect()
     } else {
-        live.iter().filter_map(|id| runs.iter().rev().find(|(_, run, _)| run == id)).collect()
+        newest.iter().filter_map(|id| runs.iter().rev().find(|(_, run, _)| run == id)).collect()
     };
     if picked.is_empty() {
         return false;
