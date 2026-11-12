@@ -1975,6 +1975,22 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
     } else {
         git(root, &["worktree", "add", "-b", &branch, &target, "HEAD"]).await?;
     }
+    // the untracked files the project's build needs, which a checkout does not bring
+    // (`[worker] carry`): copied into the new worktree, each one as it is in the project
+    if let Ok(router) = crate::router::Router::load(root) {
+        for file in &router.worker.carry {
+            let from = root.join(file);
+            if from.is_file() {
+                let to = path.join(file);
+                if let Some(dir) = to.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if let Err(e) = std::fs::copy(&from, &to) {
+                    tracing::warn!("cannot carry {file} into the worktree of #{id}: {e}");
+                }
+            }
+        }
+    }
     Ok((path, branch))
 }
 
@@ -2187,9 +2203,13 @@ impl Pool {
         };
         let allowed = match kind {
             PoolKind::Fable => 1,
-            // the share, and past it whatever the pool holds beyond every other walking
-            // project's share
-            PoolKind::Opus => width.max(1).max(size.saturating_sub(others * Self::OPUS_SHARE)),
+            // the share, and an equal part of what the pool holds beyond every walking
+            // project's share: one project alone has the six, two have three each, three have
+            // two. First come first served let one take four and leave another its two
+            PoolKind::Opus => {
+                let walking = others + 1;
+                width.max(1) + size.saturating_sub(Self::OPUS_SHARE * walking) / walking
+            }
         };
         if held >= allowed {
             return None;

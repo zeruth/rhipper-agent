@@ -105,6 +105,7 @@ impl fmt::Display for Rule {
 /// context = 120000                      # and after a turn whose input passes this many tokens; 120000 without it
 /// check_timeout = 1800                 # the seconds a check or the lint may run; 1200 without it
 /// parallel = 2                         # the cards a walk runs at once, in worktrees sharing one build; one without it
+/// carry = ["local.properties"]         # untracked files a new worktree gets a copy of
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -145,6 +146,11 @@ pub struct WorkerConfig {
     /// one build: the project's target directory and the lock on it.
     #[serde(default)]
     pub parallel: Option<u32>,
+    /// Files of the project a new worktree gets a copy of: the ones git does not track that a
+    /// build needs all the same, such as `local.properties` with the Android SDK's location.
+    /// Without it every worktree run of runelite failed its compile at once.
+    #[serde(default)]
+    pub carry: Vec<String>,
 }
 
 impl WorkerConfig {
