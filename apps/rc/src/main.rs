@@ -698,6 +698,17 @@ async fn run_main() -> anyhow::Result<()> {
                 // the window has the project: it starts the walk, so the tab shows it from its
                 // first line and the walk is nobody's child but the system's
                 println!("{}", ra_console::agent::request_walk(&dir, parallel));
+                // a minimized window draws no frames and never reads the request (both walks
+                // sat unstarted, 2026-11-12): not taken in a few seconds, it is taken back
+                // here and the walk starts on its own; the window attaches to it when it draws
+                let asked = std::time::Instant::now();
+                while asked.elapsed() < std::time::Duration::from_secs(5) && dir.join("var/walk.start").exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                if let Some(parallel) = ra_console::agent::walk_requested(&dir) {
+                    let pid = ra_console::agent::spawn_walk(&dir, true, parallel)?;
+                    println!("the window did not take it (minimized?): walk started in {} (pid {pid})", dir.display());
+                }
             } else {
                 let pid = ra_console::agent::spawn_walk(&dir, true, parallel)?;
                 println!("walk started in {} (pid {pid}); `rc pair` and var/activity.log follow it", dir.display());

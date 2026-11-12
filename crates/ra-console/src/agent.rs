@@ -2741,7 +2741,10 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     // a restart never strands accepted work (runelite #21 and #35, 2026-11-12)
     for node in store.all().await? {
         if node.state == TaskState::Implemented && matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
-            lines.extend(land_or_say(store, node.id, worker).await);
+            // under the card's span, so its check reads on the card's own console card rather
+            // than an untagged one the window shows as "worker" (asm #39, 2026-11-12)
+            let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id = node.id);
+            lines.extend(land_or_say(store, node.id, worker).instrument(span).await);
         }
     }
     let mut ran = 0;
@@ -2858,7 +2861,12 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 continue;
             }
-            lines.push(format!("ran {ran} card(s) · {}", stopped.unwrap_or_else(|| "no card is ready".to_owned())));
+            let text = format!("ran {ran} card(s) · {}", stopped.unwrap_or_else(|| "no card is ready".to_owned()));
+            // on the feed as well: a detached walk's own lines go nowhere, and walks stopped by
+            // the plan's week read as dying with no word (asm and runelite, 2026-11-12)
+            crate::pair::event(&root, &format!("walk {text}"));
+            write_digest(store, &root, None, None, None).await;
+            lines.push(text);
             return Ok(lines);
         }
         // a run ends, or half a minute passes: a card re-queued or made ready while the pool
