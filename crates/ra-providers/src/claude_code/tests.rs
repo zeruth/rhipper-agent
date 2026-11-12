@@ -325,6 +325,20 @@ fn a_turn_past_the_context_cap_stops_the_run_once_its_tool_results_are_in() {
             assert_eq!(early.note(line, &tally), None, "line {i} is within the reading-in turns");
         }
     }
+    // a resumed session gets two turns, not twelve: one already past the cap hands off after
+    // its verdict instead of paying a fresh read-in's grace at twice the cap
+    let mut tally = TurnTally::default();
+    let mut resumed = ContextWatch::new(Some(80_000)).resumed(true);
+    let mut stopped_at = None;
+    for (i, line) in stream.iter().enumerate() {
+        tally.note(line);
+        if resumed.note(line, &tally).is_some() {
+            stopped_at = Some(i);
+            break;
+        }
+    }
+    let stopped_at = stopped_at.expect("a resumed run past the cap stops");
+    assert!(stopped_at < reading_in, "it stopped at line {stopped_at}, within what a fresh run's grace would have allowed");
 }
 
 #[test]

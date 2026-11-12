@@ -322,7 +322,8 @@ impl ClaudeCode {
         // the project's context cap, and the size of the turn that crossed it once one did;
         // a Fable run has none whatever the project sets: its window is the point of it
         let fable = request.model.to_ascii_lowercase().contains("fable");
-        let mut watch = ContextWatch::new(request.max_context.filter(|_| !fable));
+        let resumed = request.resume.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let mut watch = ContextWatch::new(request.max_context.filter(|_| !fable)).resumed(resumed);
         let mut crossed: Option<u64> = None;
         // which tool each call id belongs to, so only a shell's output is read for gotchas
         let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -622,19 +623,35 @@ impl TurnTally {
 /// resumed rerun at turn 1).
 pub const READING_IN_TURNS: usize = 12;
 
+/// The turns of a resumed run the cap leaves alone: enough to read its verdict and answer it,
+/// not the twelve of a fresh read-in. A resumed session already past the cap paid twelve turns
+/// at twice the cap before (runelite #21: thirteen turns at 300k tokens each, $3.75, 2026-11-12);
+/// now it hands off after two and a fresh session opens on the handoff.
+pub const RESUMED_TURNS: usize = 2;
+
 /// Watches a stream for the turn whose input passes the context cap, past the reading-in
 /// turns. The run stops after that turn, once its tool results are in, so an edit in flight
 /// lands and the handoff can name it; a result that comes first means the run finished on its
 /// own and stands.
 struct ContextWatch {
     cap: Option<u64>,
+    /// The turns before the cap applies: [`READING_IN_TURNS`] fresh, [`RESUMED_TURNS`] resumed.
+    grace: usize,
     /// The input of the turn that crossed the cap, once one has.
     crossed: Option<u64>,
 }
 
 impl ContextWatch {
     fn new(cap: Option<u64>) -> Self {
-        Self { cap, crossed: None }
+        Self { cap, grace: READING_IN_TURNS, crossed: None }
+    }
+
+    /// The watch of a resumed run: the cap applies after [`RESUMED_TURNS`].
+    fn resumed(mut self, resumed: bool) -> Self {
+        if resumed {
+            self.grace = RESUMED_TURNS;
+        }
+        self
     }
 
     /// Reads one event after the tally has: the size of the crossing turn once the run may
@@ -642,7 +659,7 @@ impl ContextWatch {
     fn note(&mut self, line: &str, turns: &TurnTally) -> Option<u64> {
         let cap = self.cap?;
         if line.contains(r#""type":"assistant""#) {
-            if turns.turns.len() > READING_IN_TURNS
+            if turns.turns.len() > self.grace
                 && let Some(input) = turns.last_input().filter(|input| *input > cap)
             {
                 self.crossed = Some(input);
