@@ -2994,7 +2994,22 @@ impl Pool {
             }
             PoolKind::Opus => {
                 let size = Self::OPUS;
-                let allowed = if borrow {
+                let project = crate::hub::project_name(root);
+                let allowed = if crate::hub::rank_of(root).is_some() {
+                    // a priority order: the projects ahead of this one take what they need,
+                    // the slots they hold and the cards they have ready, and this one has the
+                    // rest; the first project with work has the whole pool
+                    let demand: usize = higher_walking(root)
+                        .iter()
+                        .map(|dir| {
+                            let name = crate::hub::project_name(dir);
+                            let ready =
+                                crate::hub::digests().into_iter().find(|d| d.name.eq_ignore_ascii_case(&name)).map_or(0, |d| d.ready);
+                            crate::hub::held_by("pool-opus", size, &name) + ready
+                        })
+                        .sum();
+                    size.saturating_sub(demand)
+                } else if borrow {
                     // the share, and an equal part of what the pool holds beyond every walking
                     // project's share: one project alone has the four, two have two each
                     let walking = others + 1;
@@ -3005,10 +3020,24 @@ impl Pool {
                 if held >= allowed {
                     return None;
                 }
-                (0..size).find_map(|slot| crate::hub::try_guard(&format!("pool-opus-{slot}")).ok().flatten())
+                (0..size).find_map(|slot| crate::hub::try_guard_as(&format!("pool-opus-{slot}"), &project).ok().flatten())
             }
         }
     }
+}
+
+/// The projects ahead of `root` in the hub's priority order that are walking now on Opus
+/// slots: their demand comes first. Empty without an order, or for the first project.
+pub(crate) fn higher_walking(root: &Path) -> Vec<PathBuf> {
+    let Some(mine) = crate::hub::rank_of(root) else { return Vec::new() };
+    let here = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    crate::hub::recent()
+        .into_iter()
+        .filter(|dir| std::path::absolute(dir).map_or(true, |d| d != here))
+        .filter(|dir| crate::hub::rank_of(dir).is_some_and(|rank| rank < mine))
+        .filter(|dir| walk_running(dir))
+        .filter(|dir| project_kind(dir) == PoolKind::Opus)
+        .collect()
 }
 
 /// How many other projects the window knows are walking now on Opus slots: the pool's Opus

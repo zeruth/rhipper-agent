@@ -544,11 +544,85 @@ pub fn guard(name: &str) -> Option<Guard> {
 /// aside twice.
 pub const INSTALL_LOCK: &str = "install";
 
-/// The builds a project runs at once, across its workers and its own checks: six writers,
-/// two builders a project, four builders on the machine with two projects walking. The
-/// person's rule of 2026-11-12: "rhipper asm is supposed to get 6 of those workers and 2
-/// builders" ("12 opus researchers, and 4 runners overall").
-pub const BUILD_SLOTS: usize = 2;
+/// The file under the hub that orders the projects by priority, one directory name a line,
+/// the first served first: the whole pool of writers and builders goes to the first project
+/// with work, the next takes what that one leaves, and so on down. The person's rule of
+/// 2026-11-12: "agent -> runelite -> asm … all 12 going to whichever project has priority
+/// first … knock out the last of runelite then automatically move all resources to asm".
+const PRIORITY_FILE: &str = "priority.txt";
+
+/// The projects in priority order, by directory name; empty when none was set, and then
+/// the pool is shared by shares as before.
+#[must_use]
+pub fn priority() -> Vec<String> {
+    std::fs::read_to_string(dir().join(PRIORITY_FILE))
+        .map(|text| text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// Sets the priority order; an empty list clears it.
+///
+/// # Errors
+/// When the hub's file cannot be written.
+pub fn set_priority(names: &[String]) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir()).with_context(|| format!("cannot make {}", dir().display()))?;
+    let path = dir().join(PRIORITY_FILE);
+    if names.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+    std::fs::write(&path, format!("{}\n", names.join("\n"))).with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// A project's rank in the priority order: 0 first; a project not in the list comes after
+/// every listed one; `None` when no order is set.
+#[must_use]
+pub fn rank_of(root: &Path) -> Option<usize> {
+    let order = priority();
+    if order.is_empty() {
+        return None;
+    }
+    let name = project_name(&project_root_of(root));
+    Some(order.iter().position(|n| n.eq_ignore_ascii_case(&name)).unwrap_or(order.len()))
+}
+
+/// Takes the hub's lock `name` once, as [`try_guard`], and notes who holds it in a file
+/// beside the lock, so the other projects can count a project's slots ([`held_by`]).
+///
+/// # Errors
+/// When the lock file cannot be made or opened.
+pub fn try_guard_as(name: &str, who: &str) -> anyhow::Result<Option<Guard>> {
+    let guard = try_guard(name)?;
+    if guard.is_some() {
+        let _ = std::fs::write(locks_dir().join(format!("{name}.who")), who);
+    }
+    Ok(guard)
+}
+
+/// How many of the locks named `prefix-<n>`, `n` under `count`, are held right now by `who`:
+/// a held lock whose note names them. A note beside a free lock is stale and counts for nothing.
+#[must_use]
+pub fn held_by(prefix: &str, count: usize, who: &str) -> usize {
+    (0..count)
+        .filter(|slot| {
+            let name = format!("{prefix}-{slot}");
+            let held = matches!(try_guard(&name), Ok(None));
+            held && std::fs::read_to_string(locks_dir().join(format!("{name}.who"))).is_ok_and(|w| w.trim().eq_ignore_ascii_case(who))
+        })
+        .count()
+}
+
+/// The builds the machine runs at once, across every project's workers and checks: four
+/// builders beside the twelve writers. With a priority order set, the first project walking
+/// with work may use all four and a project below it the last two; without one, a project
+/// has two of its own and the two spare when it walks alone. The person's rules of
+/// 2026-11-12: "12 opus researchers, and 4 runners overall", "all 12 … and 4 builders [to]
+/// whichever project has priority first".
+pub const BUILD_SLOTS: usize = 4;
+
+/// The build slots a project keeps for itself without a priority order, and the slots a
+/// project below the first in the order may use.
+pub const BUILD_SHARE: usize = 2;
 
 /// The project a directory works in: itself, or the project above a card's worktree
 /// (`<root>/var/worktrees/<id>`), whose build slots the worktree's builds take.
@@ -563,32 +637,38 @@ pub fn project_root_of(dir: &Path) -> PathBuf {
     dir
 }
 
-/// The name of the hub's lock on one of a project's build slots.
+/// The name of the hub's lock on one of the machine's build slots.
 #[must_use]
-pub fn build_lock_name(project: &str, slot: usize) -> String {
-    format!("build-{project}-{slot}")
+pub fn build_lock_name(slot: usize) -> String {
+    format!("build-{slot}")
 }
 
-/// Takes one of the project's [`BUILD_SLOTS`] once, or one of the machine's two spare slots
-/// when no other Opus project is walking: `Ok(None)` while every slot it may take is held.
-/// Two projects walking build two each and neither starves the other; a project alone builds
-/// four (the person: "when runelite is empty asm should take them all, builders included").
+/// Takes one of the machine's [`BUILD_SLOTS`] once: `Ok(None)` while every slot the project
+/// may take is held. With a priority order, the first project walking may take any of the
+/// four and a project behind a walking one only the last [`BUILD_SHARE`]; without an order,
+/// a project takes its own two (the first two for the project first in the hub's open list,
+/// the last two for the next) and any of the four when it walks alone.
 ///
 /// # Errors
 /// When a lock file cannot be made or opened.
 pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
     let project_root = project_root_of(root);
     let project = project_name(&project_root);
-    for slot in 0..BUILD_SLOTS {
-        if let Some(guard) = try_guard(&build_lock_name(&project, slot))? {
-            return Ok(Some(guard));
+    let higher = crate::agent::higher_walking(&project_root);
+    let alone = crate::agent::other_walks(&project_root) == 0;
+    let slots: Vec<usize> = match rank_of(&project_root) {
+        _ if alone => (0..BUILD_SLOTS).collect(),
+        Some(_) if higher.is_empty() => (0..BUILD_SLOTS).collect(),
+        Some(_) => (BUILD_SLOTS - BUILD_SHARE..BUILD_SLOTS).collect(),
+        None => {
+            // no order: the first project of the hub's open list has the first two slots
+            let mine = recent().iter().position(|d| project_name(d).eq_ignore_ascii_case(&project)).unwrap_or(0);
+            if mine == 0 { (0..BUILD_SHARE).collect() } else { (BUILD_SLOTS - BUILD_SHARE..BUILD_SLOTS).collect() }
         }
-    }
-    if crate::agent::other_walks(&project_root) == 0 {
-        for slot in 0..BUILD_SLOTS {
-            if let Some(guard) = try_guard(&build_lock_name("spare", slot))? {
-                return Ok(Some(guard));
-            }
+    };
+    for slot in slots {
+        if let Some(guard) = try_guard_as(&build_lock_name(slot), &project)? {
+            return Ok(Some(guard));
         }
     }
     Ok(None)

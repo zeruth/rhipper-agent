@@ -127,6 +127,13 @@ enum Command {
     },
     /// Lands a card the reviewer accepted: commits its worktree on `card/<id>`, merges the branch into HEAD, runs the project's check on the merged tree, marks the card accepted, and clears its worktree, branch, target directory and the project's old temp entries.
     Land { id: i64 },
+    /// Orders the projects by priority across the machine, first served first: the whole pool of writers and builders goes to the first project with work, the next takes what it leaves. With no names, prints the order; `--clear` removes it.
+    Order {
+        /// The projects' directory names, first first.
+        names: Vec<String>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// The state changes so far, oldest first: when, the card, from what to what, and by whom
     /// (console, window, cli, mcp or run); of one card with an id.
     History {
@@ -512,6 +519,23 @@ async fn run_main() -> anyhow::Result<()> {
         Command::Land { id } => {
             plain_tracing()?;
             land(id).await
+        }
+        Command::Order { names, clear } => {
+            if clear {
+                ra_console::hub::set_priority(&[])?;
+                println!("the priority order is cleared; the pool is shared by shares again");
+            } else if !names.is_empty() {
+                ra_console::hub::set_priority(&names)?;
+                println!("priority: {}", names.join(" → "));
+            } else {
+                let order = ra_console::hub::priority();
+                if order.is_empty() {
+                    println!("no priority order; the pool is shared by shares (`rc order <first> <second> …` sets one)");
+                } else {
+                    println!("priority: {}", order.join(" → "));
+                }
+            }
+            Ok(())
         }
         Command::History { id } => {
             plain_tracing()?;
