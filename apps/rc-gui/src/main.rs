@@ -1167,7 +1167,9 @@ impl App {
             // A project with nothing queued and nothing running keeps its natural height (as
             // it drew last frame) and the share goes to the projects with work: an idle
             // agent's card is a header and a finished run, not a third of the window
-            let left = ctx.content_rect().bottom() - ui.next_widget_position().y - 12.0 - 4.0;
+            // the panel's bottom margin (8), the space under the last card (4) and a little
+            // slack: a share a few points over the window is a scroll bar for nothing
+            let left = ctx.content_rect().bottom() - ui.next_widget_position().y - 8.0 - 4.0 - 10.0;
             let small: Vec<bool> = self.tabs.iter().map(Workspace::dashboard_small).collect();
             // the idle projects are off the dashboard while one works, and cost it nothing
             let any_working = small.iter().any(|s| !*s);
@@ -4212,7 +4214,10 @@ impl Workspace {
                             if rank == shown.len() {
                                 let used = ui.min_rect().height();
                                 let row = used / rank as f32;
-                                if used + row <= columns
+                                // with a margin: a row a little taller than the average so
+                                // far pushed the queue past the share, and the bubble with
+                                // it, by a scroll bar's worth
+                                if used + row * 1.2 <= columns
                                     && let Some(next) = extra.next()
                                 {
                                     shown.push(next);
@@ -4226,7 +4231,9 @@ impl Workspace {
                     // of run cards takes the whole share: six cards in a short column showed a
                     // line each, and a queue short of ready cards is not what bounds them
                     let queue_height = queue.response.rect.height();
-                    let room = if self.sink.live_runs().len() > 1 { queue_height.max(columns) } else { queue_height };
+                    // a grid of several runs takes the share and no more: the queue beside it
+                    // never pushes it past the window (the person: "auto expanding too far")
+                    let room = if self.sink.live_runs().len() > 1 && columns > 0.0 { columns } else { queue_height };
                     ui.allocate_ui_with_layout(egui::vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
                         ui.set_width(right);
                         ui.set_max_width(right);
