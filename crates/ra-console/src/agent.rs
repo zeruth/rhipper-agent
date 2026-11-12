@@ -2971,7 +2971,21 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                     *count += 1;
                     if *count >= RERUNS_A_WALK {
                         parked.insert(id);
-                        let text = format!("#{id} parked: sent back {RERUNS_A_WALK} times in a row in this walk; it waits for the next walk or a person");
+                        // blocked, not only parked: a card sent back three times in a row is
+                        // one its worker cannot move (a missing toolchain or fixture, asm #53
+                        // and #80 ran nine times saying so); the next walk would run it three
+                        // more times. Its last answer says why, and a person sets it defined
+                        let why = ra_context::TaskContext::open(&root, id)
+                            .handoffs
+                            .last()
+                            .map(|h| first_line(&h.report).chars().take(200).collect::<String>())
+                            .unwrap_or_default();
+                        let held = store.set_state_by(id, TaskState::Blocked, Source::Run).await.is_ok();
+                        let text = if held {
+                            format!("#{id} blocked: sent back {RERUNS_A_WALK} times in a row in this walk; a person sets it defined again. Its last answer: {why}")
+                        } else {
+                            format!("#{id} parked: sent back {RERUNS_A_WALK} times in a row in this walk; it waits for the next walk or a person")
+                        };
                         tracing::warn!("{text}");
                         crate::pair::event(&root, &text);
                         lines.push(text);
