@@ -2,6 +2,34 @@
 
 use super::*;
 
+/// A probe over a real activity file, by hand: `RA_ACTIVITY=<path> cargo test -p ra-console
+/// probe_real_activity -- --ignored --nocapture` prints where a window would attach and the
+/// runs it would then hold live.
+#[test]
+#[ignore]
+fn probe_real_activity() {
+    let Ok(path) = std::env::var("RA_ACTIVITY") else { return };
+    let path = std::path::PathBuf::from(path);
+    let offset = attach_offset(&path);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let total = text.len();
+    eprintln!("attach at byte {offset} of {total}");
+    let sink = crate::logs::Sink::new();
+    let mut at = 0u64;
+    for line in text.split_inclusive('\n') {
+        if at >= offset {
+            sink.progress(line.trim_end_matches(['\r', '\n']));
+        }
+        at += line.len() as u64;
+    }
+    for id in sink.live_runs() {
+        let run = sink.run(id).unwrap();
+        let title =
+            sink.with_lines(|lines| lines.iter().find(|l| l.run == Some(id) && l.kind == crate::logs::Kind::Run).map(|l| l.text.clone()));
+        eprintln!("live run {id}: {:?} pid {:?} steps {}", title, run.pid, run.steps.len());
+    }
+}
+
 #[test]
 fn wrap_breaks_on_spaces_and_hard_splits_long_words_on_characters() {
     assert_eq!(wrap("one two three", 7), ["one two", "three"]);

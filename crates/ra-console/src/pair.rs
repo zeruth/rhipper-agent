@@ -180,20 +180,16 @@ pub fn window_down(root: &Path, reason: &str) {
 fn orphans(activity: &str, alive: impl Fn(u32) -> bool) -> Vec<(i64, u32)> {
     let mut open: Vec<(i64, Option<u32>)> = Vec::new();
     for line in activity.lines() {
+        // a walk of several cards tags each line with its card; the markers sit after the tag
+        let (tag, line) = crate::logs::untag_card(line);
         if let Some(title) = line.strip_prefix(crate::logs::RUN_START) {
             let pid = title.rsplit_once(" · pid ").and_then(|(_, pid)| pid.trim().parse().ok());
             if let Some(id) = crate::logs::card_of(title) {
                 open.push((id, pid));
             }
         } else if let Some(outcome) = line.strip_prefix(crate::logs::RUN_END) {
-            let named = crate::logs::orphaned_card(outcome);
-            match named.and_then(|id| open.iter().rposition(|(open_id, _)| *open_id == id)) {
-                Some(at) => {
-                    open.remove(at);
-                }
-                None => {
-                    open.pop();
-                }
+            if let Some(at) = crate::logs::end_closes(&open, outcome, tag, |(id, pid)| (Some(*id), *pid)) {
+                open.remove(at);
             }
         }
     }

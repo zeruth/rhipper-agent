@@ -436,19 +436,14 @@ pub fn attach_offset_with(path: &std::path::Path, alive: impl Fn(u32) -> bool) -
     let mut at = 0;
     for raw in bytes.split_inclusive(|b| *b == b'\n') {
         let line = String::from_utf8_lossy(raw);
-        let line = line.trim_end_matches(['\r', '\n']);
+        // a walk of several cards tags each line with its card; the markers sit after the tag
+        let (tag, line) = crate::logs::untag_card(line.trim_end_matches(['\r', '\n']));
         if let Some(title) = line.strip_prefix(crate::logs::RUN_START) {
             let pid = title.rsplit_once(" · pid ").and_then(|(_, pid)| pid.trim().parse().ok());
             open.push((at, crate::logs::card_of(title), pid));
         } else if let Some(outcome) = line.strip_prefix(crate::logs::RUN_END) {
-            let named = crate::logs::orphaned_card(outcome);
-            match named.and_then(|card| open.iter().rposition(|(_, of, _)| *of == Some(card))) {
-                Some(i) => {
-                    open.remove(i);
-                }
-                None => {
-                    open.pop();
-                }
+            if let Some(i) = crate::logs::end_closes(&open, outcome, tag, |(_, card, pid)| (*card, *pid)) {
+                open.remove(i);
             }
         }
         at += raw.len();

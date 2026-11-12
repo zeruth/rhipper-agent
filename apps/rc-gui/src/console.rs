@@ -90,8 +90,11 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
     let rows = picked.len().div_ceil(cols.max(1));
     #[allow(clippy::cast_precision_loss)]
     let width = ((column - gap * (cols as f32 - 1.0)) / cols as f32).floor();
+    // a card is never shorter than its title, the fold line and two steps: the frame (19),
+    // the title row with the space under it (30) and three rows of 26; a grid that would
+    // squeeze the cards below that grows past its share and the page scrolls
     #[allow(clippy::cast_precision_loss)]
-    let height = ((room - gap * (rows as f32 - 1.0)) / rows as f32).floor();
+    let height = ((room - gap * (rows as f32 - 1.0)) / rows as f32).floor().max(19.0 + 30.0 + 3.0 * 26.0);
     for row in picked.chunks(cols.max(1)) {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
@@ -404,9 +407,12 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
         let ppp = ui.pixels_per_point();
         ui.spacing_mut().item_spacing.y += (extra * ppp).floor() / ppp;
     }
-    // the entries that fell off the top fold into one line, which takes a row of its own
-    let skip = if hidden > 0 { hidden + 1 } else { 0 };
-    if hidden > 0 {
+    // the entries that fell off the top fold into one line, which takes a row of its own;
+    // a card with one row shows its latest step, not the fold alone (six cards in a short
+    // grid read "earlier steps" and nothing else)
+    let fold = hidden > 0 && body >= 2;
+    let skip = if fold { hidden + 1 } else { hidden };
+    if fold {
         let earlier: usize = folded.iter().take(skip).map(|(_, n)| n).sum();
         ui.label(RichText::new(format!("⋯ {earlier} earlier steps")).font(font.clone()).color(theme::dim()).italics()).on_hover_ui(|ui| {
             for (step, count) in folded.iter().take(skip) {

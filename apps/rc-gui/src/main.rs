@@ -1185,13 +1185,23 @@ impl App {
             let left = ctx.content_rect().bottom() - ui.next_widget_position().y - 12.0 - 4.0;
             let small: Vec<bool> = self.tabs.iter().map(Workspace::dashboard_small).collect();
             let kept: f32 = self.tabs.iter().zip(&small).filter(|(_, s)| **s).map(|(t, _)| t.dash_height).sum();
-            let growing = small.iter().filter(|s| !**s).count().max(1) as f32;
+            // the share of a working project weighs its run grid: a row of run cards (two
+            // across) counts one, the queue beside them one more, so a project running six
+            // cards gets twice the height of one running one, and its three rows of cards
+            // show steps rather than a title each
+            let weights: Vec<f32> = self
+                .tabs
+                .iter()
+                .zip(&small)
+                .map(|(t, s)| if *s { 0.0 } else { 1.0 + t.sink.live_runs().len().div_ceil(2).max(1) as f32 })
+                .collect();
+            let weight: f32 = weights.iter().sum::<f32>().max(1.0);
             // what every card costs beyond its own height: the spacing egui puts after a
             // widget and the space added under it. Computed, not measured and fed back: a
             // correction loop integrated a sub-pixel residual every frame, the shares crept,
             // and a row flipped in or out about once a second
             let between = ui.spacing().item_spacing.y + 10.0;
-            let budget = ((left - kept - between * count) / growing).floor().max(0.0);
+            let pool = (left - kept - between * count).max(0.0);
             egui::ScrollArea::vertical().id_salt("dashboard").auto_shrink([false, false]).show(ui, |ui| {
                 // the page's width, handed down: a card holds itself to it, so nothing in it
                 // takes the room a scroll area's content would otherwise be allowed
@@ -1199,7 +1209,8 @@ impl App {
                 ui.set_max_width(page);
                 for i in 0..self.tabs.len() {
                     let lane = theme::lane(1 + i % 9);
-                    if self.tabs[i].dashboard_card(ui, lane, page, if small[i] { 0.0 } else { budget }) {
+                    let budget = (pool * weights[i] / weight).floor();
+                    if self.tabs[i].dashboard_card(ui, lane, page, budget) {
                         open = Some(i);
                     }
                     ui.add_space(10.0);
@@ -4098,123 +4109,128 @@ impl Workspace {
         let mut out = Walked::default();
         let mut open = false;
         let drawn = cards::bubble(ui, lane, live.is_some(), |ui| {
-            // the bubble's inner width: the page less its margins and its stroke, two of each
-            let inner = (page - 18.0).max(300.0);
-            ui.set_width(inner);
-            ui.set_max_width(inner);
-            ui.horizontal(|ui| {
+            // the card's widgets are the project's: a queue row's id is its card number, and
+            // two projects whose queues both show a #39 drew the same id twice (egui's red
+            // "second use of widget ID" on both rows)
+            ui.push_id(("dashboard-card", &self.root), |ui| {
+                // the bubble's inner width: the page less its margins and its stroke, two of each
+                let inner = (page - 18.0).max(300.0);
                 ui.set_width(inner);
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(RichText::new(&name).size(15.5).strong().color(theme::text()));
-                ui.label(RichText::new(&dir).small().color(theme::dim()));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let button = egui::Button::new(RichText::new("open ›").color(theme::text()))
-                        .fill(cards::alpha(lane, 40))
-                        .stroke(Stroke::new(1.0, cards::alpha(lane, 160)))
-                        .corner_radius(CornerRadius::same(7));
-                    if ui.add(button).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("the project's tab").clicked() {
-                        open = true;
-                    }
-                    cards::badge(ui, &model, theme::accent());
-                    let ready = format!("{} ready", order.len());
-                    cards::badge(ui, &ready, if order.is_empty() { theme::dim() } else { theme::online() });
-                    match (running, &job) {
-                        (Some(id), _) => {
-                            cards::badge(ui, &format!("running #{id}"), theme::warn_text());
+                ui.set_max_width(inner);
+                ui.horizontal(|ui| {
+                    ui.set_width(inner);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(RichText::new(&name).size(15.5).strong().color(theme::text()));
+                    ui.label(RichText::new(&dir).small().color(theme::dim()));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let button = egui::Button::new(RichText::new("open ›").color(theme::text()))
+                            .fill(cards::alpha(lane, 40))
+                            .stroke(Stroke::new(1.0, cards::alpha(lane, 160)))
+                            .corner_radius(CornerRadius::same(7));
+                        if ui.add(button).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("the project's tab").clicked() {
+                            open = true;
                         }
-                        (None, Some(job)) => {
-                            cards::badge(ui, job, theme::warn_text());
-                        }
-                        (None, None) => {
-                            cards::badge(ui, "idle", theme::dim());
-                        }
-                    }
-                });
-            });
-            // a project with nothing running is its header line: the queue and the run card
-            // wait for a run, and the room is the working projects'
-            if live.is_none() {
-                return;
-            }
-            ui.add_space(6.0);
-            let total = inner;
-            // the queue takes less than a third: the run cards, two wide and up to three
-            // tall, are what the person watches
-            let left = (total * 0.3).clamp(260.0, 460.0);
-            // the right column takes what is left of the page, never more: a run card sets its
-            // width to what it is given, and an open-ended column would grow past the edge
-            let right = (total - left - 12.0).max(200.0);
-            // the height the two columns may take: the card's share of the window less what
-            // the header above them used and the bubble's own margins and stroke (6 and 3
-            // above and below, 1 of stroke: 20); the spacing under the card is already off
-            // the share. Zero when the window has no spare room, and then the columns are
-            // what they always were
-            let columns = (budget - ui.min_rect().height() - 20.0).max(0.0);
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                let queue = ui.allocate_ui_with_layout(egui::vec2(left, 0.0), Layout::top_down(Align::Min), |ui| {
-                    ui.set_width(left);
-                    if rows.is_empty() {
-                        ui.label(RichText::new("no card is ready").color(theme::dim()).italics());
-                    }
-                    // the rows: the running card and three ready ones whatever the room, then
-                    // more while a row fits the card's share, six ready ones at most. Three
-                    // projects fit a maximized window at any height this way: a small window
-                    // shows three cards a project, a tall one six
-                    let must = usize::from(running.is_some()) + 3;
-                    let mut shown: Vec<i64> = rows.iter().copied().take(must).collect();
-                    let mut extra = rows.iter().copied().skip(must).chain(extra.iter().copied());
-                    let mut rank = 0;
-                    while rank < shown.len() {
-                        let id = shown[rank];
-                        let Some(node) = nodes.iter().find(|n| n.id == id) else {
-                            rank += 1;
-                            continue;
-                        };
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            let mark = if Some(id) == running {
-                                "▶".to_owned()
-                            } else {
-                                format!("{:>2}", rank + usize::from(running.is_none()))
-                            };
-                            ui.label(RichText::new(mark).monospace().color(theme::warn_text()).strong());
-                            ui.vertical(|ui| {
-                                // the row is held to the column, so a long title truncates
-                                // instead of running under the badges
-                                ui.set_max_width(ui.available_width());
-                                let row_lane = theme::lane(walk.depths.get(&node.id).copied().unwrap_or(0));
-                                header_row(ui, &nodes, node, &[], row_lane, &walk, &mut out);
-                            });
-                        });
-                        rank += 1;
-                        // past the three, one more ready card while a row of the height the
-                        // rows so far averaged still fits the card's share
-                        if rank == shown.len() {
-                            let used = ui.min_rect().height();
-                            let row = used / rank as f32;
-                            if used + row <= columns
-                                && let Some(next) = extra.next()
-                            {
-                                shown.push(next);
+                        cards::badge(ui, &model, theme::accent());
+                        let ready = format!("{} ready", order.len());
+                        cards::badge(ui, &ready, if order.is_empty() { theme::dim() } else { theme::online() });
+                        match (running, &job) {
+                            (Some(id), _) => {
+                                cards::badge(ui, &format!("running #{id}"), theme::warn_text());
+                            }
+                            (None, Some(job)) => {
+                                cards::badge(ui, job, theme::warn_text());
+                            }
+                            (None, None) => {
+                                cards::badge(ui, "idle", theme::dim());
                             }
                         }
-                    }
+                    });
                 });
-                // one run card is exactly as tall as the queue's rows: the rows grow into the
-                // card's share of the window while they fit, and the card follows them, never
-                // past the last row (the person: no band of nothing under the sixth). A grid
-                // of run cards takes the whole share: six cards in a short column showed a
-                // line each, and a queue short of ready cards is not what bounds them
-                let queue_height = queue.response.rect.height();
-                let room = if self.sink.live_runs().len() > 1 { queue_height.max(columns) } else { queue_height };
-                ui.allocate_ui_with_layout(egui::vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
-                    ui.set_width(right);
-                    ui.set_max_width(right);
-                    if !console::draw_latest_run(ui, &self.sink, room, right) {
-                        ui.label(RichText::new("no run in this session yet").color(theme::dim()).italics());
-                    }
+                // a project with nothing running is its header line: the queue and the run card
+                // wait for a run, and the room is the working projects'
+                if live.is_none() {
+                    return;
+                }
+                ui.add_space(6.0);
+                let total = inner;
+                // the queue takes less than a third: the run cards, two wide and up to three
+                // tall, are what the person watches
+                let left = (total * 0.3).clamp(260.0, 460.0);
+                // the right column takes what is left of the page, never more: a run card sets its
+                // width to what it is given, and an open-ended column would grow past the edge
+                let right = (total - left - 12.0).max(200.0);
+                // the height the two columns may take: the card's share of the window less what
+                // the header above them used and the bubble's own margins and stroke (6 and 3
+                // above and below, 1 of stroke: 20); the spacing under the card is already off
+                // the share. Zero when the window has no spare room, and then the columns are
+                // what they always were
+                let columns = (budget - ui.min_rect().height() - 20.0).max(0.0);
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    let queue = ui.allocate_ui_with_layout(egui::vec2(left, 0.0), Layout::top_down(Align::Min), |ui| {
+                        ui.set_width(left);
+                        if rows.is_empty() {
+                            ui.label(RichText::new("no card is ready").color(theme::dim()).italics());
+                        }
+                        // the rows: the running card and three ready ones whatever the room, then
+                        // more while a row fits the card's share, six ready ones at most. Three
+                        // projects fit a maximized window at any height this way: a small window
+                        // shows three cards a project, a tall one six
+                        let must = usize::from(running.is_some()) + 3;
+                        let mut shown: Vec<i64> = rows.iter().copied().take(must).collect();
+                        let mut extra = rows.iter().copied().skip(must).chain(extra.iter().copied());
+                        let mut rank = 0;
+                        while rank < shown.len() {
+                            let id = shown[rank];
+                            let Some(node) = nodes.iter().find(|n| n.id == id) else {
+                                rank += 1;
+                                continue;
+                            };
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let mark = if Some(id) == running {
+                                    "▶".to_owned()
+                                } else {
+                                    format!("{:>2}", rank + usize::from(running.is_none()))
+                                };
+                                ui.label(RichText::new(mark).monospace().color(theme::warn_text()).strong());
+                                ui.vertical(|ui| {
+                                    // the row is held to the column, so a long title truncates
+                                    // instead of running under the badges
+                                    ui.set_max_width(ui.available_width());
+                                    let row_lane = theme::lane(walk.depths.get(&node.id).copied().unwrap_or(0));
+                                    header_row(ui, &nodes, node, &[], row_lane, &walk, &mut out);
+                                });
+                            });
+                            rank += 1;
+                            // past the three, one more ready card while a row of the height the
+                            // rows so far averaged still fits the card's share
+                            if rank == shown.len() {
+                                let used = ui.min_rect().height();
+                                let row = used / rank as f32;
+                                if used + row <= columns
+                                    && let Some(next) = extra.next()
+                                {
+                                    shown.push(next);
+                                }
+                            }
+                        }
+                    });
+                    // one run card is exactly as tall as the queue's rows: the rows grow into the
+                    // card's share of the window while they fit, and the card follows them, never
+                    // past the last row (the person: no band of nothing under the sixth). A grid
+                    // of run cards takes the whole share: six cards in a short column showed a
+                    // line each, and a queue short of ready cards is not what bounds them
+                    let queue_height = queue.response.rect.height();
+                    let room = if self.sink.live_runs().len() > 1 { queue_height.max(columns) } else { queue_height };
+                    ui.allocate_ui_with_layout(egui::vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
+                        ui.set_width(right);
+                        ui.set_max_width(right);
+                        if !console::draw_latest_run(ui, &self.sink, room, right) {
+                            ui.label(RichText::new("no run in this session yet").color(theme::dim()).italics());
+                        }
+                    });
                 });
             });
         });
