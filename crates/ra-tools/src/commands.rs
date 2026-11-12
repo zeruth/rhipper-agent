@@ -2,7 +2,7 @@
 //! keeps a long output from carrying whole into a turn.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
@@ -63,15 +63,22 @@ impl Toolbox {
                 }
                 None => program,
             };
-            let mut child = tokio::process::Command::new(program)
+            let mut command = tokio::process::Command::new(program);
+            command
                 .args(&args)
                 .current_dir(&self.root)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .with_context(|| format!("cannot start {program}"))?;
+                .kill_on_drop(true);
+            // a check in a card's worktree builds in the project's target, as the worker did:
+            // one build directory for the cards running at once, under the one lock
+            if std::env::var_os("CARGO_TARGET_DIR").is_none()
+                && let Some(target) = shared_target(&self.root)
+            {
+                command.env("CARGO_TARGET_DIR", target);
+            }
+            let mut child = command.spawn().with_context(|| format!("cannot start {program}"))?;
             // the output is read into buffers the run keeps when the limit ends it, so a check
             // that outlives its budget still leaves its last lines
             let stdout = drain(child.stdout.take());
@@ -196,6 +203,20 @@ pub(crate) fn split(command: &str) -> anyhow::Result<Vec<String>> {
         words.push(word);
     }
     Ok(words)
+}
+
+/// The project's target directory for a workspace that is one of its worktrees
+/// (`<root>/var/worktrees/<id>`); `None` for any other workspace.
+fn shared_target(workspace: &Path) -> Option<PathBuf> {
+    let id = workspace.parent()?;
+    if id.file_name()? != "worktrees" {
+        return None;
+    }
+    let var = id.parent()?;
+    if var.file_name()? != "var" {
+        return None;
+    }
+    std::path::absolute(var.parent()?.join("target")).ok()
 }
 
 /// The interpreter a script program starts through, and the arguments before the script's

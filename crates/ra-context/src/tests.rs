@@ -194,6 +194,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
             changed: vec!["src/lib.rs".to_owned()],
             report: format!("report {i}\nsecond line\n## Handoff 9 · fake · header in a report"),
             warnings: vec![],
+            read: vec![],
         });
     }
     task.save(root).unwrap();
@@ -225,6 +226,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
             changed: vec![],
             report: "r".into(),
             warnings: vec![],
+            read: vec![],
         });
     }
     assert_eq!(task.handoffs.len(), 10);
@@ -240,6 +242,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
         changed: vec![],
         report: (0..50).map(|i| format!("line {i}\n")).collect(),
         warnings: vec![],
+        read: vec![],
     });
     long.save(root).unwrap();
     let back = TaskContext::open(root, 8);
@@ -287,6 +290,7 @@ fn a_rerun_after_a_reject_quotes_the_review_block_and_a_fresh_card_has_none() {
         changed: vec!["hello.txt".into()],
         report: "wrote hello.txt".into(),
         warnings: vec![],
+        read: vec![],
     });
     task.save(root).unwrap();
     let file = std::fs::read_to_string(TaskContext::path(root, 9)).unwrap();
@@ -317,6 +321,7 @@ fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_ca
         // a long report: the clip does not reach the warnings, and a heading in it is dropped
         report: (0..50).map(|i| format!("line {i}\n")).collect::<String>() + "### Warnings\nnot a section",
         warnings: vec![unused.to_owned(), docs.to_owned()],
+        read: vec![],
     });
     task.save(root).unwrap();
     let text = std::fs::read_to_string(TaskContext::path(root, 9)).unwrap();
@@ -340,6 +345,7 @@ fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_ca
         changed: vec![],
         report: "r".into(),
         warnings: vec![],
+        read: vec![],
     });
     assert!(task.last_warnings().is_empty());
     task.save(root).unwrap();
@@ -347,6 +353,64 @@ fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_ca
     assert_eq!(again.handoffs[0].warnings.len(), 2);
     assert!(again.handoffs[1].warnings.is_empty());
     assert_eq!(again.handoffs[1].report, "r");
+}
+
+#[test]
+fn a_read_set_merges_each_file_s_ranges_and_a_whole_read_stands_for_the_file() {
+    let reads: Vec<String> =
+        ["a.rs:10-40", "D:/x.rs", "a.rs:30-60", "b.rs:5-9", "a.rs:61-70", "a.rs:200-210", "b.rs", "D:/x.rs:1-5"].map(str::to_owned).into();
+    assert_eq!(read_set(&reads), ["a.rs:10-70", "a.rs:200-210", "D:/x.rs", "b.rs"]);
+    assert_eq!(read_entry("D:/x.rs"), ("D:/x.rs", None));
+    assert_eq!(read_entry("D:/x.rs:3-9"), ("D:/x.rs", Some((3, 9))));
+}
+
+#[test]
+fn the_handoff_names_the_read_set_and_the_next_prompt_opens_with_its_regions_clipped_to_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    // three functions of 100 lines each: a read of 1-300 is clipped after the second
+    let body: String =
+        (0..3).map(|f| format!("fn f{f}() {{\n{}}}\n", (0..98).map(|i| format!("    let _ = {i};\n")).collect::<String>())).collect();
+    std::fs::write(root.join("src/big.rs"), &body).unwrap();
+    std::fs::write(root.join("src/small.rs"), "pub fn one() {}\npub fn two() {}\n").unwrap();
+    let mut task = TaskContext::open(root, 11);
+    task.brief = "Task #11: a thing\n".to_owned();
+    task.record(Handoff {
+        when: 1,
+        model: "m".into(),
+        outcome: "continues".into(),
+        check: "no check: the context cap ended the run".into(),
+        verdict: None,
+        changed: vec![],
+        report: "half way".into(),
+        warnings: vec![],
+        read: read_set(&["src/big.rs:1-300".to_owned(), "src/small.rs".to_owned(), "src/gone.rs:1-9".to_owned()]),
+    });
+    task.save(root).unwrap();
+    let text = std::fs::read_to_string(TaskContext::path(root, 11)).unwrap();
+    assert!(text.contains("read: src/big.rs:1-300 src/small.rs src/gone.rs:1-9\n"), "{text}");
+    let mut again = TaskContext::open(root, 11);
+    assert_eq!(again.handoffs[0].read, ["src/big.rs:1-300", "src/small.rs", "src/gone.rs:1-9"]);
+    assert_eq!(again.handoffs[0].report, "half way");
+    again.brief = "Task #11: a thing\n".to_owned();
+    again.regions = regions(root, &again.handoffs[0].read);
+    let prompt = again.prompt();
+    assert!(prompt.starts_with(REGIONS_HEADING), "{prompt}");
+    assert!(prompt.find(REGIONS_HEADING).unwrap() < prompt.find("Task #11").unwrap());
+    // the outline of the region, then its lines up to the end of f1, then what is left out
+    assert!(
+        prompt.contains("src/big.rs lines 1-300 (of 300)\n      1-100   fn f0()\n    101-200   fn f1()\n    201-300   fn f2()\n"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("     1  fn f0() {\n"), "{prompt}");
+    assert!(prompt.contains("   200  }\n     … lines 201-300 left out; read them by range: f2 201-300\n"), "{prompt}");
+    assert!(!prompt.contains("   201  fn f2"), "{prompt}");
+    assert!(prompt.contains("src/small.rs lines 1-2 (of 2)\n") && prompt.contains("     2  pub fn two() {}\n"), "{prompt}");
+    // a file no longer there is passed over; only the handoff still names it
+    assert!(!again.regions.contains("gone.rs"), "{}", again.regions);
+    // a run with no read set opens on its brief
+    assert!(TaskContext::open(root, 12).prompt().is_empty());
 }
 
 #[test]
@@ -411,6 +475,7 @@ fn the_leftovers_are_the_files_of_a_rejected_card_still_dirty_and_a_clean_tree_h
         changed: vec!["src/a.rs".to_owned(), "src/b.rs".to_owned(), "src/c.rs".to_owned()],
         report: "did it".to_owned(),
         warnings: vec![],
+        read: vec![],
     });
     task.save(root).unwrap();
     // a clean tree names nothing, whatever the card changed

@@ -348,6 +348,8 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let root = Path::new(r"C:\work\repo");
     let two = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"C:\\work\\repo\\crates\\c.rs"}},{"type":"tool_use","name":"Grep","input":{"pattern":"fn"}},{"type":"tool_use","name":"Read","input":{"file_path":"D:\\elsewhere\\x.rs"}}]}}"#;
     assert_eq!(reads_of(two, Some(root)), ["crates/c.rs", "D:/elsewhere/x.rs"]);
+    let ranged = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"C:\\work\\repo\\crates\\c.rs","offset":120,"limit":40}},{"type":"tool_use","name":"Read","input":{"file_path":"C:\\work\\repo\\a.rs","offset":30}}]}}"#;
+    assert_eq!(reads_of(ranged, Some(root)), ["crates/c.rs:120-159", "a.rs:30-2029"]);
     assert!(reads_of(fine, Some(root)).is_empty());
     let locked = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"error: failed to remove file `rc.exe`\nAccess is denied. (os error 5)"}]}}"#;
     assert_eq!(gotchas_of_event(&catalogue, locked, quiet, &mut tools)[0].id, "binary-locked-result");

@@ -261,6 +261,13 @@ impl ClaudeCode {
         // a nested session refuses to start; the console may itself run under Claude Code
         command.env_remove("CLAUDECODE");
         command.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        // a run in a worktree builds in the project's target, like the run beside it: one
+        // build directory under one lock, not one per worktree; a project's own setting wins
+        if !self.env.iter().any(|(k, _)| k == "CARGO_TARGET_DIR")
+            && let Some(target) = request.workspace.as_deref().and_then(shared_target)
+        {
+            command.env("CARGO_TARGET_DIR", target);
+        }
         let mut child = command.spawn().map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!("{} is not installed or not on the path", self.binary.display()))
@@ -288,8 +295,10 @@ impl ClaudeCode {
         let mut reads: Vec<String> = Vec::new();
         // the tokens of each assistant turn, as the events show them
         let mut turns = TurnTally::default();
-        // the project's context cap, and the size of the turn that crossed it once one did
-        let mut watch = ContextWatch::new(request.max_context);
+        // the project's context cap, and the size of the turn that crossed it once one did;
+        // a Fable run has none whatever the project sets: its window is the point of it
+        let fable = request.model.to_ascii_lowercase().contains("fable");
+        let mut watch = ContextWatch::new(request.max_context.filter(|_| !fable));
         let mut crossed: Option<u64> = None;
         // which tool each call id belongs to, so only a shell's output is read for gotchas
         let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -611,7 +620,9 @@ fn progress_of(line: &str, workspace: Option<&Path>) -> Vec<String> {
 }
 
 /// The files one stream event reads: the `file_path` of each `Read` call in an assistant event,
-/// relative to the workspace. Nothing from any other event.
+/// relative to the workspace, with `:<from>-<to>` after it for a ranged read (the 1-based lines
+/// the call asked for, the harness's 2000 when it named no limit), so a handoff can name the
+/// regions the session read. Nothing from any other event.
 fn reads_of(line: &str, workspace: Option<&Path>) -> Vec<String> {
     use serde_json::Value;
     if !line.contains(r#""name":"Read""#) {
@@ -629,8 +640,18 @@ fn reads_of(line: &str, workspace: Option<&Path>) -> Vec<String> {
         .filter(|block| {
             block.get("type").and_then(Value::as_str) == Some("tool_use") && block.get("name").and_then(Value::as_str) == Some("Read")
         })
-        .filter_map(|block| block.pointer("/input/file_path").and_then(Value::as_str))
-        .map(|path| relative(path, workspace))
+        .filter_map(|block| {
+            let input = block.get("input")?;
+            let path = relative(input.get("file_path").and_then(Value::as_str)?, workspace);
+            let offset = input.get("offset").and_then(Value::as_u64);
+            let limit = input.get("limit").and_then(Value::as_u64);
+            if offset.is_none() && limit.is_none() {
+                return Some(path);
+            }
+            let from = offset.unwrap_or(1).max(1);
+            let to = from + limit.unwrap_or(2000).max(1) - 1;
+            Some(format!("{path}:{from}-{to}"))
+        })
         .collect()
 }
 
@@ -803,7 +824,26 @@ fn write_system_prompt(workspace: &Path, text: &str) -> std::io::Result<PathBuf>
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("system-{}.md", std::process::id()));
     std::fs::write(&path, text)?;
-    Ok(path)
+    // absolute: the harness runs in the workspace, and a relative path (a worktree's,
+    // `var/worktrees/47`) read against it doubled into `var/worktrees/47/var/worktrees/47/…`
+    std::path::absolute(&path).or(Ok(path))
+}
+
+/// The project's target directory for a run in one of its worktrees (`<root>/var/worktrees/<id>`),
+/// so two cards at once build in one place under one lock rather than each in its own; `None`
+/// for a workspace that is not a worktree.
+#[must_use]
+pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
+    let id = workspace.parent()?;
+    if id.file_name()? != "worktrees" {
+        return None;
+    }
+    let var = id.parent()?;
+    if var.file_name()? != "var" {
+        return None;
+    }
+    let root = var.parent()?;
+    std::path::absolute(root.join("target")).ok()
 }
 
 /// The program a permission rule names: `python` of `Bash(python *)`, `gw.ps1` of

@@ -592,6 +592,10 @@ pub struct Handoff {
     /// The clippy diagnostics the lint of the run found in the changed files, whole; empty when
     /// the lint was clean or did not run. Kept apart from the report so the clip never eats them.
     pub warnings: Vec<String>,
+    /// The read set of a session that ended on its cap or a failed check, as [`read_set`] has
+    /// it: `path` for a file read whole, `path:<from>-<to>` for a region. The next session opens
+    /// on those regions instead of reading them in again; empty for any other run.
+    pub read: Vec<String>,
 }
 
 /// The heading of a handoff's warnings in the file.
@@ -611,6 +615,138 @@ pub struct TaskContext {
     /// a reject; `None` for a fresh card. The notes are in the roadmap, which the worker does not
     /// read, so the prompt quotes them.
     pub review: Option<String>,
+    /// The regions the last session read, as [`regions`] renders them, built afresh each run;
+    /// the prompt opens with them. Not kept in the file: they are the files' current lines.
+    pub regions: String,
+}
+
+/// The heading under which the last session's regions open the prompt.
+pub const REGIONS_HEADING: &str = "## Read by the last session";
+
+/// How many lines one region shows before it is clipped to an item boundary.
+const REGION_LINES: usize = 200;
+
+/// How many lines the regions show in all; the regions past it are named by their outline.
+const REGIONS_ROOM: usize = 800;
+
+/// How many items a clipped region names of the lines it leaves out.
+const LEFT_OUT_SHOWN: usize = 8;
+
+/// One entry of a read set: the path and the lines read of it, `None` for the whole file. A
+/// path with a colon of its own (`D:/x.rs`) keeps it; only a `:<from>-<to>` tail is a range.
+#[must_use]
+pub fn read_entry(entry: &str) -> (&str, Option<(usize, usize)>) {
+    let range = entry.rsplit_once(':').and_then(|(path, range)| {
+        let (from, to) = range.split_once('-')?;
+        Some((path, (from.parse().ok()?, to.parse().ok()?)))
+    });
+    match range {
+        Some((path, range)) => (path, Some(range)),
+        None => (entry, None),
+    }
+}
+
+/// A file and its ranges, or `None` for a whole-file read, during the merge of read entries.
+type FileRanges<'a> = (&'a str, Option<Vec<(usize, usize)>>);
+
+/// The read set of a session from its reads in order, as the stream named them: one file after
+/// another in the order first read, each file's ranges merged where they touch, a whole read
+/// standing for the file.
+#[must_use]
+pub fn read_set(reads: &[String]) -> Vec<String> {
+    let mut files: Vec<FileRanges> = Vec::new();
+    for entry in reads {
+        let (path, range) = read_entry(entry);
+        let at = files.iter().position(|(p, _)| *p == path).unwrap_or_else(|| {
+            files.push((path, Some(Vec::new())));
+            files.len() - 1
+        });
+        match (&mut files[at].1, range) {
+            (Some(ranges), Some(range)) => ranges.push(range),
+            (held, None) => *held = None,
+            (None, Some(_)) => {}
+        }
+    }
+    let mut set = Vec::new();
+    for (path, ranges) in files {
+        let Some(mut ranges) = ranges else {
+            set.push(path.to_owned());
+            continue;
+        };
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (from, to) in ranges {
+            match merged.last_mut() {
+                Some(last) if from <= last.1 + 1 => last.1 = last.1.max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+        set.extend(merged.into_iter().map(|(from, to)| format!("{path}:{from}-{to}")));
+    }
+    set
+}
+
+/// The regions of a read set as the next session reads them: per region its path and lines, the
+/// outline of the items in it, and the lines themselves, numbered. A region over
+/// [`REGION_LINES`] lines is clipped at the last item boundary the outline knows inside that
+/// room, and the items it leaves out are named with their ranges; past [`REGIONS_ROOM`] lines
+/// in all a region is named by its outline alone. A file no longer there is passed over.
+#[must_use]
+pub fn regions(workspace: &Path, read: &[String]) -> String {
+    let mut out = String::new();
+    let mut room = REGIONS_ROOM;
+    for entry in read {
+        let (file, range) = read_entry(entry);
+        let path = if Path::new(file).is_absolute() { PathBuf::from(file) } else { workspace.join(file) };
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+        let (from, to) = range.unwrap_or((1, lines.len()));
+        let (from, to) = (from.max(1), to.min(lines.len()));
+        if from > to {
+            continue;
+        }
+        let items = items(Path::new(file), &text);
+        let shown_to = clip_region(&items, from, to, REGION_LINES.min(room));
+        let _ = writeln!(out, "{file} lines {from}-{to} (of {})", lines.len());
+        for (start, end, item) in items.iter().filter(|(start, end, _)| *start <= to && *end >= from) {
+            let _ = writeln!(out, "  {start:>5}-{end:<5} {}", clip(item, 110));
+        }
+        if let Some(shown_to) = shown_to {
+            for (number, line) in lines.iter().enumerate().take(shown_to).skip(from - 1) {
+                let _ = writeln!(out, "{:>6}  {line}", number + 1);
+            }
+            room -= shown_to + 1 - from;
+            if shown_to < to {
+                let left: Vec<String> = items
+                    .iter()
+                    .filter(|(start, end, _)| *start <= to && *end > shown_to)
+                    .take(LEFT_OUT_SHOWN)
+                    .map(|(start, end, item)| format!("{} {start}-{end}", item_name(item).unwrap_or(item)))
+                    .collect();
+                let _ = write!(out, "     … lines {}-{to} left out", shown_to + 1);
+                if !left.is_empty() {
+                    let _ = write!(out, "; read them by range: {}", left.join(", "));
+                }
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The last line a region of `from..=to` shows in `room` lines: the whole region when it fits,
+/// else the end of the last item that ends inside the room, else the room's last line; `None`
+/// when there is no room left.
+fn clip_region(items: &[(usize, usize, String)], from: usize, to: usize, room: usize) -> Option<usize> {
+    if room == 0 {
+        return None;
+    }
+    let last = from + room - 1;
+    if to <= last {
+        return Some(to);
+    }
+    Some(items.iter().map(|(_, end, _)| *end).filter(|end| (from..=last).contains(end)).max().unwrap_or(last))
 }
 
 /// The heading of the review in the file and the prompt.
@@ -640,12 +776,22 @@ impl TaskContext {
     #[must_use]
     pub fn open(workspace: &Path, id: i64) -> Self {
         let handoffs = std::fs::read_to_string(Self::path(workspace, id)).map(|text| parse_handoffs(&text)).unwrap_or_default();
-        Self { id, brief: String::new(), outlines: String::new(), handoffs, review: None }
+        Self { id, brief: String::new(), outlines: String::new(), handoffs, review: None, regions: String::new() }
     }
 
-    /// The text a run sends the worker: the brief, the outlines, and the last handoffs.
+    /// The text a run sends the worker: the regions the last session read, when it left any,
+    /// then the brief, the outlines, and the last handoffs.
+    #[must_use]
     pub fn prompt(&self) -> String {
-        let mut text = self.brief.clone();
+        let mut text = String::new();
+        if !self.regions.is_empty() {
+            let _ = write!(
+                text,
+                "{REGIONS_HEADING}\nThe last session of this task read these regions; they are the files' current lines, so read only what they leave out.\n\n{}\n",
+                self.regions.trim_end()
+            );
+        }
+        text.push_str(&self.brief);
         if !self.outlines.is_empty() {
             text.push_str("\nFiles: read the regions the outline points at, not whole files.\n");
             text.push_str(&self.outlines);
@@ -695,6 +841,7 @@ impl TaskContext {
             changed: Vec::new(),
             report: text.to_owned(),
             warnings: Vec::new(),
+            read: Vec::new(),
         });
         task.save(workspace)
     }
@@ -751,6 +898,9 @@ impl Handoff {
         }
         if !self.changed.is_empty() {
             let _ = writeln!(text, "changed: {}", self.changed.join(" "));
+        }
+        if !self.read.is_empty() {
+            let _ = writeln!(text, "read: {}", self.read.join(" "));
         }
         let report: Vec<&str> = self.report.lines().filter(|l| !l.starts_with("## Handoff ") && l.trim_end() != WARNINGS_HEADING).collect();
         let shown = &report[..report.len().min(REPORT_LINES)];
@@ -816,6 +966,7 @@ fn parse_handoffs(text: &str) -> Vec<Handoff> {
                 changed: Vec::new(),
                 report: String::new(),
                 warnings: Vec::new(),
+                read: Vec::new(),
             });
             continue;
         }
@@ -850,6 +1001,11 @@ fn parse_handoffs(text: &str) -> Vec<Handoff> {
             && let Some(changed) = line.strip_prefix("changed: ")
         {
             current.changed = changed.split_whitespace().map(str::to_owned).collect();
+        } else if current.read.is_empty()
+            && current.report.is_empty()
+            && let Some(read) = line.strip_prefix("read: ")
+        {
+            current.read = read.split_whitespace().map(str::to_owned).collect();
         } else if line.starts_with("… ") && line.ends_with("in the notes of the card") {
             // the count of the clipped lines is not part of the report
         } else {

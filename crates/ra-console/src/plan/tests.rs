@@ -201,6 +201,7 @@ async fn a_walk_after_a_cheaper_day_records_that_the_saving_held_once() {
         changed: vec!["src/lib.rs".to_owned()],
         report: "done".to_owned(),
         warnings: vec![],
+        read: vec![],
     });
     task.save(dir.path()).unwrap();
     // the day before carried 1000 tokens a turn, the last day 200

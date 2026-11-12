@@ -2278,6 +2278,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         changed,
         report: report.to_owned(),
         warnings: Vec::new(),
+        read: Vec::new(),
     };
     let mut session = match session {
         Ok(session) => session,
@@ -2321,6 +2322,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         if let Some(branch) = &worker.branch {
             last.check = format!("{} · branch {branch}", last.check);
         }
+        // the regions this session read, which the fresh one opens on instead of reading them
+        // in again (#103's three sessions each began with the same twenty turns of reading)
+        last.read = ra_context::read_set(&session.reads);
         task.record(last);
         save_context(store, &root, &task).await;
         let sizes = turn_sizes(&session);
@@ -2477,6 +2481,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let handed = if lint_warnings.is_empty() { format!("{lead}{answer}") } else { answer.to_owned() };
     let mut last = handoff(if passed { "implemented" } else { "needs revision" }, check_line.trim(), &handed, changed);
     last.warnings = lint_warnings;
+    // a run sent back by its check hands on what it read, as a capped one does
+    if !passed {
+        last.read = ra_context::read_set(&session.reads);
+    }
     task.record(last);
     save_context(store, &root, &task).await;
     let turns = match session.cap {
@@ -2628,6 +2636,11 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // a card sent back by its reviewer carries the verdict's points in its context: the notes
     // that hold them are in the roadmap, which the worker does not read
     task.review = if is_rerun(node, worker) { ra_context::review_of(node.notes.as_deref().unwrap_or_default()) } else { None };
+    // the regions the last session read open this one, read from the tree it acts in, so the
+    // worker reads the ranges it still needs and not the same files again
+    if let Some(last) = task.handoffs.last().filter(|last| !last.read.is_empty()) {
+        task.regions = ra_context::regions(workspace.as_deref().unwrap_or(&root), &last.read);
+    }
     let project =
         if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
     // the context rides cut to the card's crates (whole on rhipper-asm it is 12k tokens a run);
@@ -3432,8 +3445,9 @@ const REREAD_SHOWN: usize = 3;
 /// them, as `c.rs ×12, x86.rs ×9, abi.rs ×7`; nothing when every file was read once.
 fn reread(reads: &[String]) -> Option<String> {
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for path in reads {
-        *counts.entry(path.as_str()).or_default() += 1;
+    // a ranged read is a read of its file
+    for entry in reads {
+        *counts.entry(ra_context::read_entry(entry).0).or_default() += 1;
     }
     let mut again: Vec<(&str, usize)> = counts.into_iter().filter(|(_, n)| *n > 1).collect();
     if again.is_empty() {

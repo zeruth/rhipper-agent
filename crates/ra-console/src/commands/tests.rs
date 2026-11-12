@@ -709,6 +709,8 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
     };
     capped.turn_usage = (1..=5).map(|n| ra_providers::TurnUsage { input_tokens: n * 26_200, output_tokens: 100 }).collect();
     capped.read_in = 400_000;
+    // it read the manifest whole and the lib by two touching ranges
+    capped.reads = ["src/lib.rs:1-1", "Cargo.toml", "src/lib.rs:2-2"].map(str::to_owned).into();
     let script = vec![
         Ok(says("done", vec![])),
         Err(ra_providers::ProviderError::ContextOut { completion: Box::new(capped), cap: 120_000, size: 131_000 }),
@@ -746,12 +748,22 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
         task.handoffs[0].report
     );
     assert!(task.handoffs[0].report.ends_with("editing the store"), "{}", task.handoffs[0].report);
+    // the handoff names the read set, and the fresh session's prompt opens with its regions
+    assert_eq!(task.handoffs[0].read, ["src/lib.rs:1-2", "Cargo.toml"]);
+    let text = std::fs::read_to_string(ra_context::TaskContext::path(dir.path(), 2)).unwrap();
+    assert!(text.contains("read: src/lib.rs:1-2 Cargo.toml\n"), "{text}");
     // the session is booked, and the walk finishes the card in a fresh one
     let calls = runner.calls_of(Some(2)).await.unwrap();
     assert_eq!((calls.len(), calls[0].prompt_tokens, calls[0].turns), (1, 400_000, 5));
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
     assert!(out[0].starts_with("✓ #2 Probe implemented on claude-opus-5-5"), "{out:?}");
     assert!(harness.requests.lock().last().unwrap().resume.is_none());
+    // the second request is the fresh session's; a review may follow it
+    let opened = harness.requests.lock()[1].messages.last().unwrap().content.clone();
+    assert!(opened.starts_with(ra_context::REGIONS_HEADING), "{opened}");
+    assert!(opened.contains("src/lib.rs lines 1-2 (of 2)\n") && opened.contains("     1  #[test]\n"), "{opened}");
+    assert!(opened.contains("Cargo.toml lines 1-6 (of 6)\n      1-5     [package]\n      6-6     [workspace]\n"), "{opened}");
+    assert!(opened.find("Cargo.toml lines").unwrap() < opened.find("Task #2").unwrap(), "{opened}");
     // the cap fell at turn 5, while the session was still reading in: the fresh session reads
     // the same files, so it runs without the cap rather than hit it again (runelite #15)
     assert_eq!(harness.requests.lock().last().unwrap().max_context, None, "no cap after a cap hit reading in");
@@ -1539,6 +1551,7 @@ async fn reviewed_after_a_run(answer: &str) -> (Vec<String>, String, String) {
         changed: vec!["hello.txt".to_owned()],
         report: "wrote hello.txt".to_owned(),
         warnings: Vec::new(),
+        read: Vec::new(),
     });
     task.save(dir.path()).unwrap();
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(answer, vec![])]));
@@ -1651,6 +1664,7 @@ async fn reviewed_with_a_fix_role(answers: Vec<&str>) -> (Vec<String>, Store, st
         changed: vec!["hello.txt".to_owned()],
         report: "wrote hello.txt".to_owned(),
         warnings: Vec::new(),
+        read: Vec::new(),
     });
     task.save(dir.path()).unwrap();
     let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));

@@ -34,6 +34,7 @@ fn run(outcome: &str, verdict: Option<&str>) -> Handoff {
         changed: vec!["src/lib.rs".to_owned()],
         report: "done".to_owned(),
         warnings: vec![],
+        read: vec![],
     }
 }
 

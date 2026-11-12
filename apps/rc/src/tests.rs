@@ -107,6 +107,7 @@ fn judged(root: &Path, id: i64, verdict: &str) {
         changed: vec!["src/a.rs".to_owned()],
         report: "done".to_owned(),
         warnings: Vec::new(),
+        read: Vec::new(),
     });
     context.save(root).expect("the context saves");
 }
