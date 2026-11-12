@@ -1873,9 +1873,18 @@ pub fn spawn_walk(root: &Path, debug: bool, parallel: Option<u32>) -> anyhow::Re
         command.arg("--no-debug");
     }
     crate::hub::detach(&mut command);
+    // the walk's own complaints and panics land in var/walk.log: detached, it has no console,
+    // and a walk that died at its start left no word of why (2026-11-11)
+    let _ = std::fs::create_dir_all(root.join("var"));
+    if let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(root.join(WALK_LOG)) {
+        command.stderr(log);
+    }
     let child = command.spawn().map_err(|e| anyhow::anyhow!("cannot start {}: {e}", rc.display()))?;
     Ok(child.id())
 }
+
+/// The file a detached walk writes its stderr to: what it printed and why it died.
+const WALK_LOG: &str = "var/walk.log";
 
 /// Asks the walk to stop after the task it is in: leaves the file it reads between runs. A
 /// walk that is not running finds the file at its next start and stops after one card, so the
