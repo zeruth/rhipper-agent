@@ -274,6 +274,40 @@ pub(crate) fn builder(ui: &mut Ui, index: usize, held: Option<(&str, u64)>, shar
     });
 }
 
+/// The machine's worker-slot count as a bubble of the worker row, the same height as a slot:
+/// `BUILDERS`, `−`, the count and `+`; answers -1 or +1 on a click of an end, 0 otherwise.
+pub(crate) fn builders(ui: &mut Ui, count: usize, width: f32) -> i32 {
+    let color = theme::accent();
+    let mut step = 0;
+    bubble(ui, color, false, |ui| {
+        let inner = (width - 18.0).max(60.0);
+        ui.set_width(inner);
+        ui.set_max_width(inner);
+        ui.horizontal(|ui| {
+            ui.set_width(inner);
+            ui.label(RichText::new("BUILDERS").small().strong().color(theme::dim()));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let end = |ui: &mut Ui, text: &str| {
+                    ui.add(egui::Label::new(RichText::new(text).color(color).strong()).sense(egui::Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("the machine's worker slots, shared by every project")
+                        .clicked()
+                };
+                // right to left: the `+` is drawn first
+                if end(ui, "+") {
+                    step = 1;
+                }
+                ui.label(RichText::new(count.to_string()).small().strong().color(theme::text()));
+                if end(ui, "−") {
+                    step = -1;
+                }
+            });
+        });
+    });
+    step
+}
+
 pub(crate) fn gauge(ui: &mut Ui, name: &str, value: &str, samples: &[f32], color: Color32, width: f32) {
     use egui::epaint::{Mesh, Vertex, WHITE_UV};
     let fill = theme::mix(theme::bg(), color, 0.07);
@@ -348,6 +382,59 @@ pub(crate) fn chip(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
         .response
         .interact(egui::Sense::click());
     response.on_hover_text(if on { "shown · click to hide" } else { "hidden · click to show" }).clicked()
+}
+
+/// A `−` `name value` `+` stepper in one slim pill: answers -1 or +1 on a click of its ends,
+/// 0 otherwise. `hint` is the hover text of the whole.
+pub(crate) fn stepper(ui: &mut Ui, name: &str, value: &str, color: Color32, hint: &str) -> i32 {
+    let mut step = 0;
+    Frame::new()
+        .fill(alpha(color, 18))
+        .stroke(Stroke::new(1.0, alpha(color, 120)))
+        .corner_radius(CornerRadius::same(9))
+        .inner_margin(Margin::symmetric(4, 1))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let end = |ui: &mut Ui, text: &str| {
+                ui.add(egui::Label::new(RichText::new(text).color(color).strong()).sense(egui::Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+            };
+            if end(ui, "−") {
+                step = -1;
+            }
+            ui.label(RichText::new(format!("{name} {value}")).small().strong().color(theme::text())).on_hover_text(hint);
+            if end(ui, "+") {
+                step = 1;
+            }
+        });
+    step
+}
+
+/// A choice of two in one pill: the lit side is `first` while `on_first`; answers `Some(true)`
+/// for a click on the first, `Some(false)` on the second.
+pub(crate) fn toggle(ui: &mut Ui, first: &str, second: &str, on_first: bool, color: Color32) -> Option<bool> {
+    let mut picked = None;
+    ui.spacing_mut().item_spacing.x = 2.0;
+    for (text, is_first) in [(first, true), (second, false)] {
+        let on = on_first == is_first;
+        let response = Frame::new()
+            .fill(alpha(color, if on { 44 } else { 6 }))
+            .stroke(Stroke::new(1.0, alpha(color, if on { 180 } else { 50 })))
+            .corner_radius(CornerRadius::same(9))
+            .inner_margin(Margin::symmetric(7, 1))
+            .show(ui, |ui| {
+                ui.label(RichText::new(text).small().strong().color(if on { color } else { alpha(theme::dim(), 170) }));
+            })
+            .response
+            .interact(egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.clicked() && !on {
+            picked = Some(is_first);
+        }
+    }
+    ui.spacing_mut().item_spacing.x = 6.0;
+    picked
 }
 
 /// A tab of the card area: lit while `on`, dim and clickable while not; reports a click.

@@ -620,6 +620,33 @@ pub fn held_by(prefix: &str, count: usize, who: &str) -> usize {
 /// have a request and aren't in the pool already)".
 pub const BUILD_SLOTS: usize = 4;
 
+/// The most worker slots the window's `+` sets.
+pub const MAX_BUILD_SLOTS: usize = 8;
+
+/// The hub's file with the number of worker slots the person set, over [`BUILD_SLOTS`].
+const BUILD_SLOTS_FILE: &str = "build-slots.txt";
+
+/// How many worker (build) slots the machine has right now: the person's number from the
+/// window's `+`/`-`, else [`BUILD_SLOTS`]; read on every take, so a change applies to the next.
+#[must_use]
+pub fn build_slot_count() -> usize {
+    std::fs::read_to_string(dir().join(BUILD_SLOTS_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .map_or(BUILD_SLOTS, |n| n.clamp(1, MAX_BUILD_SLOTS))
+}
+
+/// Sets the number of worker slots, 1 to [`MAX_BUILD_SLOTS`]. A build in a slot past the new
+/// count runs on; no new build takes that slot.
+///
+/// # Errors
+/// When the hub's file cannot be written.
+pub fn set_build_slot_count(count: usize) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir()).with_context(|| format!("cannot make {}", dir().display()))?;
+    let path = dir().join(BUILD_SLOTS_FILE);
+    std::fs::write(&path, count.clamp(1, MAX_BUILD_SLOTS).to_string()).with_context(|| format!("cannot write {}", path.display()))
+}
+
 /// How long a project's wish for a build slot stands without being renewed: a waiter renews it
 /// on every try, so one that stopped waiting stops counting after this.
 const BUILD_WANT_FRESH: std::time::Duration = std::time::Duration::from_secs(10);
@@ -695,13 +722,13 @@ pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
         None => project.clone(),
     };
     let held: Vec<String> = build_slots().into_iter().flatten().map(|(w, _)| holder_project(&w).to_ascii_lowercase()).collect();
-    let free = BUILD_SLOTS.saturating_sub(held.len());
+    let free = build_slot_count().saturating_sub(held.len());
     let me = project.to_ascii_lowercase();
     let want = build_want_path(&project);
     // a project that runs a build already leaves the free slots to the ones that run none
     let first_in_line = build_wanting().into_iter().filter(|p| *p != me && !held.contains(p)).count();
     if free > 0 && (!held.contains(&me) || free > first_in_line) {
-        for slot in 0..BUILD_SLOTS {
+        for slot in 0..build_slot_count() {
             if let Some(guard) = try_guard_as(&build_lock_name(slot), &who)? {
                 let _ = std::fs::remove_file(&want);
                 return Ok(Some(guard));
@@ -718,7 +745,7 @@ pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
 /// and letting it go at once; a builder that tries in that instant tries again on its next poll.
 #[must_use]
 pub fn build_slots() -> Vec<Option<(String, u64)>> {
-    (0..BUILD_SLOTS)
+    (0..build_slot_count())
         .map(|slot| {
             let name = build_lock_name(slot);
             if !matches!(try_guard(&name), Ok(None)) {

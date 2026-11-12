@@ -4,6 +4,7 @@
 //! logs plainly instead.
 
 pub mod agent;
+pub mod allocation;
 pub mod commands;
 pub mod hub;
 pub mod install;

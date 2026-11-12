@@ -1597,7 +1597,7 @@ async fn hold_build(root: &Path) -> Option<crate::hub::Guard> {
             let text = format!(
                 "wait: the check waits for a worker slot, {} of the machine's {} are running",
                 crate::hub::builds_running(),
-                crate::hub::BUILD_SLOTS
+                crate::hub::build_slot_count()
             );
             tracing::info!(target: crate::trace::PROGRESS, "  {text}");
             crate::pair::event(root, &text);
@@ -1681,7 +1681,7 @@ pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
             eprintln!(
                 "rc hold: waiting for a worker slot, {} of the machine's {} are running",
                 crate::hub::builds_running(),
-                crate::hub::BUILD_SLOTS
+                crate::hub::build_slot_count()
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -2879,6 +2879,9 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
         if stopped.is_none() {
             let roadmap = store.load().await?;
             let router = crate::router::Router::load(&root).unwrap_or_default();
+            // the runners as the table says now: the dashboard's `+`/`-` changes them while the
+            // walk runs, and a lower number lets the runs in flight end without starting more
+            let width = router.worker.parallel.and_then(|n| usize::try_from(n.max(1)).ok()).unwrap_or(width);
             let in_flight: std::collections::HashSet<i64> = flight.iter().map(|(id, _, _)| *id).collect();
             let others = other_walks(&root);
             let ready: Vec<Node> = ready_cards(&roadmap.nodes, &roadmap.gambits, plan_tight(&root))

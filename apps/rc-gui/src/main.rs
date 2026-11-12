@@ -1181,13 +1181,21 @@ impl App {
             }
             let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
             let slots = self.builders.len().max(1);
+            // the builders' `−`/`+` before the row takes its own room
+            const STEPPER: f32 = 150.0;
             #[allow(clippy::cast_precision_loss)]
-            let builder_width = ((page - 10.0 * (slots as f32 - 1.0)) / slots as f32).floor();
+            let builder_width = ((page - STEPPER - 10.0 * slots as f32) / slots as f32).floor();
             // each held slot's share of the processor: the builds' budget split among them
             let held = u32::try_from(self.builders.iter().flatten().count()).unwrap_or(1).max(1);
             let share = ra_console::agent::BUILD_CPU / 100 / held;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
+                // the machine's worker slots, one more or one fewer: the next take reads the count
+                let count = ra_console::hub::build_slot_count();
+                let step = cards::builders(ui, count, STEPPER);
+                if step != 0 && ra_console::hub::set_build_slot_count(count.saturating_add_signed(step as isize).max(1)).is_ok() {
+                    self.builders_at = None;
+                }
                 for (i, slot) in self.builders.iter().enumerate() {
                     let holder = slot.as_ref().map(|(who, since)| (who.as_str(), now.saturating_sub(*since)));
                     cards::builder(ui, i, holder, share, builder_width);
@@ -1517,6 +1525,10 @@ fn house_tab(ui: &mut egui::Ui, mark: &str, name: &str, on: bool, hover: &str) -
 /// One project in the window: its store, its log, its panels. The window holds one per tab.
 struct Workspace {
     rt: tokio::runtime::Runtime,
+    /// The project's allocation as the dashboard shows it (implementer, runners, place in the
+    /// priority order) and when it was read; read again once a second.
+    allocation: (Option<String>, u32, Option<usize>),
+    allocation_at: Option<Instant>,
     store: Store,
     worker: Worker,
     sink: Sink,
@@ -1731,6 +1743,8 @@ impl Workspace {
             // a run going when the tab opens is re-attached from its start, so it shows live
             activity_offset: ra_console::ui::attach_offset(&root.join(ra_console::ui::ACTIVITY_FILE)),
             job: None,
+            allocation: (None, 1, None),
+            allocation_at: None,
             job_tx,
             job_done,
             ledger: Ledger::default(),
@@ -4134,6 +4148,21 @@ impl Workspace {
         let dir = self.root.display().to_string();
         let model = short(&self.worker.model).to_owned();
         let job = self.job.clone();
+        // the project's allocation, read once a second: the header's controls change it
+        if self.allocation_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+            self.allocation = (
+                ra_console::allocation::model(&self.root),
+                ra_console::allocation::runners(&self.root),
+                ra_console::allocation::priority_place(&self.root),
+            );
+            self.allocation_at = Some(Instant::now());
+        }
+        let (implementer, runners, place) = self.allocation.clone();
+        // the header's model badge is the project's implementer, as the toggle sets it, not the
+        // window's default model
+        let model = implementer.as_deref().map_or(model, |m| short(m).to_owned());
+        let root = self.root.clone();
+        let mut changed = false;
         // the rows read as in the column: the running card first, then the next ready ones
         let mut rows: Vec<i64> = running.into_iter().collect();
         rows.extend(order.iter().copied().filter(|id| Some(*id) != running).take(6));
@@ -4174,6 +4203,26 @@ impl Workspace {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.label(RichText::new(&name).size(15.5).strong().color(theme::text()));
                     ui.label(RichText::new(&dir).small().color(theme::dim()));
+                    // the project's allocation, changed here: its implementer, its runners and
+                    // its place in the machine's order (the person, 2026-11-12: "change projects
+                    // allocation in the gui"); a walk picks each up before its next card
+                    let fable = implementer.as_deref() == Some(ra_console::allocation::FABLE);
+                    if let Some(pick_fable) = cards::toggle(ui, "fable", "opus", fable, theme::accent()) {
+                        let model = if pick_fable { ra_console::allocation::FABLE } else { ra_console::allocation::OPUS };
+                        changed |= ra_console::allocation::set_model(&root, model).is_ok();
+                    }
+                    ui.add_space(10.0);
+                    let step = cards::stepper(ui, "runners", &runners.to_string(), lane, "cards this project's walk runs at once");
+                    if step != 0 {
+                        let to = runners.saturating_add_signed(step).max(1);
+                        changed |= ra_console::allocation::set_runners(&root, to).is_ok();
+                    }
+                    let shown = place.map_or_else(|| "—".to_owned(), |p| format!("#{p}"));
+                    // `+` raises the project: a smaller place in the order
+                    let step = cards::stepper(ui, "priority", &shown, theme::warn_text(), "the project's place in the machine's order: + is served sooner");
+                    if step != 0 {
+                        changed |= ra_console::allocation::move_priority(&root, step > 0).is_ok();
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let button = egui::Button::new(RichText::new("open ›").color(theme::text()))
@@ -4293,6 +4342,10 @@ impl Workspace {
         });
         // the card's height, outer margins included, for next frame's sharing of the window
         self.dash_height = drawn.response.rect.height() + 6.0;
+        // a control the person used shows its new value on the next frame, not a second later
+        if changed {
+            self.allocation_at = None;
+        }
         if let Some(id) = out.clicked {
             self.select(Some(id));
             open = true;
