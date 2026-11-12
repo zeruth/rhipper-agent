@@ -158,4 +158,8 @@ fn a_tab_opened_during_a_run_attaches_at_its_start_and_shows_it_live() {
     assert_eq!(sink.live_run(), Some(id));
     // a dead pid is an orphan, not a run to attach to
     assert_eq!(attach_offset_with(&path, |_| false), std::fs::metadata(&path).unwrap().len());
+    // two cards at once: the tab attaches at the older live start, so both show after a restart
+    let two = format!("{done}{RUN_START}#6 First · opus · pid 444\nread c.rs\n{RUN_START}#7 Second · opus · pid 555\nread d.rs\n");
+    std::fs::write(&path, &two).unwrap();
+    assert_eq!(attach_offset_with(&path, |pid| pid == 444 || pid == 555), done.len() as u64);
 }

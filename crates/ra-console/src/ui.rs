@@ -418,10 +418,10 @@ pub fn tail_activity_at(path: &std::path::Path, offset: &mut u64, sink: &Sink) -
     true
 }
 
-/// Where a tab opened on a project starts tailing its activity file: at the newest `◆start`
-/// with no end whose process is alive, so a run `rc run` has going shows as its titled card,
-/// live from its first step, rather than as untitled steps; at the file's end when nothing
-/// runs, the earlier runs being history.
+/// Where a tab opened on a project starts tailing its activity file: at the oldest `◆start`
+/// with no end whose process is alive, so every run going shows as its titled card, live
+/// from its first step, rather than as untitled steps; two cards at once are two cards after
+/// a restart, not one. At the file's end when nothing runs, the earlier runs being history.
 #[must_use]
 pub fn attach_offset(path: &std::path::Path) -> u64 {
     attach_offset_with(path, crate::hub::pid_alive)
@@ -453,7 +453,7 @@ pub fn attach_offset_with(path: &std::path::Path, alive: impl Fn(u32) -> bool) -
         }
         at += raw.len();
     }
-    open.into_iter().rev().find(|(_, _, pid)| pid.is_some_and(&alive)).map_or(bytes.len(), |(at, ..)| at) as u64
+    open.into_iter().find(|(_, _, pid)| pid.is_some_and(&alive)).map_or(bytes.len(), |(at, ..)| at) as u64
 }
 
 /// Whether screen row `y` lies inside `area`.
