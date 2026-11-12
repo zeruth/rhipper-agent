@@ -2159,7 +2159,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             for node in ready {
                 let kind = Pool::kind_of(&router.choose(&node, crate::router::IMPLEMENTER, &worker.model).model);
                 let held = flight.iter().filter(|(_, _, k)| *k == kind).count();
-                let Some(slot) = Pool::take(kind, held, width, others, router.worker.borrow()) else {
+                let Some(slot) = Pool::take(&root, kind, held, width, others, router.worker.borrow()) else {
                     starved = starved || held == 0;
                     continue;
                 };
@@ -2185,7 +2185,11 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             lines.push(format!("ran {ran} card(s) · {}", stopped.unwrap_or_else(|| "no card is ready".to_owned())));
             return Ok(lines);
         }
-        let (at, outcome) = poll_one(&mut flight).await;
+        // a run ends, or half a minute passes: a card re-queued or made ready while the pool
+        // has a free slot is taken then, not when the next run happens to end
+        let Ok((at, outcome)) = tokio::time::timeout(std::time::Duration::from_secs(30), poll_one(&mut flight)).await else {
+            continue;
+        };
         let (id, _, _) = flight.remove(at);
         match outcome {
             Ok(run_lines) => {
@@ -2225,21 +2229,18 @@ pub enum PoolKind {
     Fable,
 }
 
-/// The machine's pool of runs across every project's walk: six Opus slots and two Fable
-/// slots. A project's share is its `[worker] parallel` of Opus slots (two by default) or one
-/// Fable slot; an Opus project borrows the Opus slots no other walking project needs, so one
-/// Opus project alone runs six, and gives them back as its runs end once another project
-/// walks; a Fable project never borrows and never takes more than one. The slots are the
-/// hub's locks, held by the run and released with it, dead or done. The person's rule of
-/// 2026-11-11: "a default pool of 6 opus 2 fable, 2 per task, 1 fable per task, with tasks
-/// borrowing from the pool if no other project is using them".
+/// The machine's pool of runs across every project's walk: four Opus slots, shared. A
+/// project's share is its `[worker] parallel` of them (two by default); an Opus project
+/// borrows the slots no other walking project needs and gives them back as its runs end
+/// once another project walks. A Fable project runs one card at a time, its own slot, in no
+/// pool: as many Fable projects as walk. The slots are the hub's locks, held by the run and
+/// released with it, dead or done. The person's rule of 2026-11-12: "a pool of 4x opus,
+/// fable is 1x per project no pool" (six Opus was too heavy for the machine).
 pub struct Pool;
 
 impl Pool {
     /// The Opus slots on the machine.
-    pub const OPUS: usize = 6;
-    /// The Fable slots on the machine.
-    pub const FABLE: usize = 2;
+    pub const OPUS: usize = 4;
     /// The Opus slots a walking project is owed, which another project's borrowing leaves it.
     pub const OPUS_SHARE: usize = 2;
 
@@ -2249,31 +2250,38 @@ impl Pool {
         if model.to_ascii_lowercase().contains("fable") { PoolKind::Fable } else { PoolKind::Opus }
     }
 
-    /// Takes a slot of `kind` for a walk that holds `held` of them, is owed `width` Opus
-    /// slots as its own share, and shares the machine with `others` walking projects; `None`
-    /// when the share or the pool is out. A Fable walk takes one and only one. With `borrow`
-    /// off the walk holds to `width` exactly.
+    /// Takes a slot of `kind` for the walk of the project at `root`, which holds `held` of
+    /// them, is owed `width` Opus slots as its own share, and shares the machine with `others`
+    /// walking Opus projects; `None` when the share or the pool is out. A Fable walk takes its
+    /// project's one slot and no other. With `borrow` off an Opus walk holds to `width`
+    /// exactly.
     #[must_use]
-    pub fn take(kind: PoolKind, held: usize, width: usize, others: usize, borrow: bool) -> Option<crate::hub::Guard> {
-        let (size, name) = match kind {
-            PoolKind::Opus => (Self::OPUS, "opus"),
-            PoolKind::Fable => (Self::FABLE, "fable"),
-        };
-        let allowed = match kind {
-            PoolKind::Fable => 1,
-            PoolKind::Opus if !borrow => width.max(1).min(size),
-            // the share, and an equal part of what the pool holds beyond every walking
-            // project's share: one project alone has the six, two have three each, three have
-            // two. First come first served let one take four and leave another its two
-            PoolKind::Opus => {
-                let walking = others + 1;
-                (width.max(1) + size.saturating_sub(Self::OPUS_SHARE * walking) / walking).min(size)
+    pub fn take(root: &Path, kind: PoolKind, held: usize, width: usize, others: usize, borrow: bool) -> Option<crate::hub::Guard> {
+        match kind {
+            PoolKind::Fable => {
+                if held >= 1 {
+                    return None;
+                }
+                // one a project, named by the project: no pool across them
+                let name = root.file_name().map_or_else(|| "project".to_owned(), |n| n.to_string_lossy().to_ascii_lowercase());
+                crate::hub::try_guard(&format!("fable-{name}")).ok().flatten()
             }
-        };
-        if held >= allowed {
-            return None;
+            PoolKind::Opus => {
+                let size = Self::OPUS;
+                let allowed = if borrow {
+                    // the share, and an equal part of what the pool holds beyond every walking
+                    // project's share: one project alone has the four, two have two each
+                    let walking = others + 1;
+                    (width.max(1) + size.saturating_sub(Self::OPUS_SHARE * walking) / walking).min(size)
+                } else {
+                    width.max(1).min(size)
+                };
+                if held >= allowed {
+                    return None;
+                }
+                (0..size).find_map(|slot| crate::hub::try_guard(&format!("pool-opus-{slot}")).ok().flatten())
+            }
         }
-        (0..size).find_map(|slot| crate::hub::try_guard(&format!("pool-{name}-{slot}")).ok().flatten())
     }
 }
 
