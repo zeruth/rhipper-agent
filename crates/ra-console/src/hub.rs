@@ -544,9 +544,10 @@ pub fn guard(name: &str) -> Option<Guard> {
 /// aside twice.
 pub const INSTALL_LOCK: &str = "install";
 
-/// The builds a project runs at once, across its workers and its own checks: six workers write
-/// code, two of them compile. The person's rule of 2026-11-12: "maybe 2 max on the gradle pool,
-/// they should be WRITING CODE".
+/// The builds a project runs at once, across its workers and its own checks: six writers,
+/// two builders a project, four builders on the machine with two projects walking. The
+/// person's rule of 2026-11-12: "rhipper asm is supposed to get 6 of those workers and 2
+/// builders" ("12 opus researchers, and 4 runners overall").
 pub const BUILD_SLOTS: usize = 2;
 
 /// The project a directory works in: itself, or the project above a card's worktree
@@ -568,15 +569,26 @@ pub fn build_lock_name(project: &str, slot: usize) -> String {
     format!("build-{project}-{slot}")
 }
 
-/// Takes one of the project's [`BUILD_SLOTS`] once: `Ok(None)` while every slot is held.
+/// Takes one of the project's [`BUILD_SLOTS`] once, or one of the machine's two spare slots
+/// when no other Opus project is walking: `Ok(None)` while every slot it may take is held.
+/// Two projects walking build two each and neither starves the other; a project alone builds
+/// four (the person: "when runelite is empty asm should take them all, builders included").
 ///
 /// # Errors
 /// When a lock file cannot be made or opened.
 pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
-    let project = project_name(&project_root_of(root));
+    let project_root = project_root_of(root);
+    let project = project_name(&project_root);
     for slot in 0..BUILD_SLOTS {
         if let Some(guard) = try_guard(&build_lock_name(&project, slot))? {
             return Ok(Some(guard));
+        }
+    }
+    if crate::agent::other_walks(&project_root) == 0 {
+        for slot in 0..BUILD_SLOTS {
+            if let Some(guard) = try_guard(&build_lock_name("spare", slot))? {
+                return Ok(Some(guard));
+            }
         }
     }
     Ok(None)

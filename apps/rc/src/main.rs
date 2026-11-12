@@ -119,12 +119,14 @@ enum Command {
         /// The nodes it waits for.
         waits_for: Vec<i64>,
     },
-    /// Sets the state of a node; cancelled removes the card, since a cancelled card does not stay on the roadmap.
+    /// Sets the state of a node; cancelled removes the card, since a cancelled card does not stay on the roadmap. `accepted` lands the card first when it has a branch (see `land`).
     Set {
         id: i64,
         /// The state: one of the twelve lifecycle names.
         state: TaskState,
     },
+    /// Lands a card the reviewer accepted: commits its worktree on `card/<id>`, merges the branch into HEAD, runs the project's check on the merged tree, marks the card accepted, and clears its worktree, branch, target directory and the project's old temp entries.
+    Land { id: i64 },
     /// The state changes so far, oldest first: when, the card, from what to what, and by whom
     /// (console, window, cli, mcp or run); of one card with an id.
     History {
@@ -506,6 +508,10 @@ async fn run_main() -> anyhow::Result<()> {
         Command::Set { id, state } => {
             plain_tracing()?;
             set(id, state).await
+        }
+        Command::Land { id } => {
+            plain_tracing()?;
+            land(id).await
         }
         Command::History { id } => {
             plain_tracing()?;
@@ -1319,12 +1325,38 @@ async fn show_history(id: Option<i64>) -> anyhow::Result<()> {
 
 async fn set(id: i64, state: TaskState) -> anyhow::Result<()> {
     let store = open_store().await?;
+    // an acceptance is a landing when the card has a branch to land: the merge is made and
+    // proved, not assumed (the person: "checks for making sure if a card was accepted, its
+    // merge was successful")
+    if state == TaskState::Accepted {
+        let root = ra_console::agent::workspace_of(&store);
+        let branch = ra_console::agent::worktree_branch(id);
+        let has_branch = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+            .current_dir(&root)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if has_branch {
+            return land(id).await;
+        }
+    }
     store.set_state(id, state).await?;
     if state == TaskState::Cancelled {
         println!("#{id} removed: a cancelled card does not stay on the roadmap");
     } else {
         println!("#{id} is now {state}");
     }
+    Ok(())
+}
+
+/// Lands one card and prints each step; the project's check runs through the worker's toolbox.
+async fn land(id: i64) -> anyhow::Result<()> {
+    let store = open_store().await?;
+    let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
+    for line in ra_console::agent::land(&store, id, &worker).await? {
+        println!("{line}");
+    }
+    println!("#{id} is now accepted");
     Ok(())
 }
 

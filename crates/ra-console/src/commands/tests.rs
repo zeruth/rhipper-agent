@@ -598,8 +598,9 @@ async fn a_project_turn_cap_ends_the_run_with_a_handoff_and_the_walk_takes_the_c
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
     assert!(out[0].starts_with("✓ #2 Probe implemented on glm-5.3-flash · turns 1/2, 0 tool call(s)"), "{out:?}");
     assert_eq!(out.last().unwrap(), "ran 1 card(s) · no card is ready");
+    // the walk lands a card the reviewer accepted: it ends accepted, not waiting
     let node = store.read(2).await.unwrap();
-    assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented);
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Accepted);
     assert_eq!(node.notes.as_deref(), Some("wrote hello.txt and read it back"));
     assert_eq!(ra_context::TaskContext::open(dir.path(), 2).handoffs.len(), 2);
     // the second run opened on a small context: no tool result of the first run, only its handoff
@@ -1126,11 +1127,13 @@ async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_depend
     // each card got its own answer in its notes, so each run was a run of its own
     assert_eq!(store.read(2).await.unwrap().notes.as_deref(), Some("did A"));
     assert_eq!(store.read(4).await.unwrap().notes.as_deref(), Some("did C"));
-    // each run was judged before its card was offered: no implemented card without a verdict
+    // each run was judged before its card was offered, and the walk landed each on the
+    // verdict: the cards end accepted (a landed card's context is swept with the next save,
+    // so the verdict is read from the walk's own lines)
     assert_eq!(script.seen.lock().len(), 6);
     for id in [2, 3, 4] {
-        let handoff = ra_context::TaskContext::open(dir.path(), id).handoffs.pop().unwrap();
-        assert_eq!(handoff.verdict.as_deref(), Some("accepted by z-ai/glm-5.3-flash"), "#{id}");
+        assert!(out.iter().any(|l| l.starts_with(&format!("✓ #{id} ")) && l.contains("accepted by z-ai/glm-5.3-flash")), "#{id}: {out:?}");
+        assert_eq!(store.read(id).await.unwrap().state, ra_roadmap::model::TaskState::Accepted, "#{id}");
     }
 }
 

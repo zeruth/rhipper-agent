@@ -589,6 +589,8 @@ pub async fn doctor(root: &Path) -> Vec<Check> {
         Check::new("OpenRouter key", false, key_check()),
         Check::new("roadmap", true, roadmap_check(root)),
         Check::new("ledger", true, ledger_check(root).await),
+        Check::new("landing", false, landing_check(root).await),
+        Check::new("temp", false, temp_check(root)),
     ]
 }
 
@@ -1930,6 +1932,10 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             lines.extend(crate::retro::landed(&root, &node, ledger, mark).await);
         }
         let node = store.read(id).await?;
+        // a card the reviewer accepted lands now: committed, proved and cleared
+        if node.state == TaskState::Implemented {
+            lines.extend(land_or_say(store, id, worker).await);
+        }
         if node.state == TaskState::NeedsRevision {
             // the first rejection and the first two check failures are rerun on the card's
             // session, the verdict and the failing check as the prompt; past that it is the person's
@@ -2191,6 +2197,268 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
     Ok((path, branch))
 }
 
+/// How old an entry under the system temp directory is before a landing's sweep removes it:
+/// a test running now keeps its own.
+const TEMP_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Lands card `id`: its work goes onto the project's branch, the project's check proves the
+/// merged tree, the card is accepted, and what the run left behind is cleared. In order: the
+/// worktree's changes are committed on `card/<id>` (the title as the message), the branch is
+/// merged into the project's HEAD (a conflict aborts the merge and names the files; the
+/// person lands that one by hand), the project's check runs on the merged tree on a build
+/// slot (a failure undoes the merge commit with `git reset --merge` and the card stays
+/// implemented), the card is set accepted, and the cleanup follows: the worktree and the
+/// branch, the card's own target directory, its research brief, and under the system temp
+/// directory the entries of the names `[worker] temp` lists that are older than an hour. A
+/// card without a worktree or a branch (a run in the project's own tree) is accepted as it
+/// stands, its work being in the tree already. The person's rule of 2026-11-12: "checks for
+/// making sure if a card was accepted, its merge was successful … and tasks cleanup when they
+/// are done, including temp stuff".
+///
+/// # Errors
+/// When the card is not there, is not implemented or accepted, a git step fails, the merge
+/// conflicts, or the check fails on the merged tree.
+pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
+    let node = store.read(id).await?;
+    anyhow::ensure!(
+        matches!(node.state, TaskState::Implemented | TaskState::Accepted),
+        "#{id} is {}: a card lands once the reviewer accepted it (implemented), not before",
+        node.state
+    );
+    let root = workspace_of(store);
+    let branch = worktree_branch(id);
+    let path = root.join(WORKTREES_DIR).join(id.to_string());
+    let mut lines = Vec::new();
+    // the worktree's changes, committed on the card's branch
+    if path.join(".git").exists() {
+        let dirty = git(&path, &["status", "--porcelain"]).await?;
+        if !dirty.trim().is_empty() {
+            git(&path, &["add", "-A"]).await?;
+            git(&path, &["commit", "-q", "-m", &format!("{} (#{id})", node.title)]).await?;
+            lines.push(format!("committed {} file(s) on {branch}", dirty.lines().count()));
+        }
+    }
+    let has_branch = git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).await.is_ok();
+    if !has_branch && !path.join(".git").exists() {
+        // a run in the project's own tree: its work is in the tree, uncommitted; the files
+        // its handoff names are committed by name, the other cards' dirty files left alone
+        let task = ra_context::TaskContext::open(&root, id);
+        let files: Vec<String> = task.handoffs.last().map(|h| h.changed.clone()).unwrap_or_default();
+        let dirty = git(&root, &["status", "--porcelain", "--", "."]).await.unwrap_or_default();
+        let own: Vec<&str> = files
+            .iter()
+            .map(String::as_str)
+            .filter(|f| dirty.lines().any(|l| l.get(3..).is_some_and(|p| p.trim_matches('"') == *f)))
+            .collect();
+        if !own.is_empty() {
+            let mut args = vec!["add", "--"];
+            args.extend(own.iter().copied());
+            git(&root, &args).await?;
+            git(&root, &["commit", "-q", "-m", &format!("{} (#{id})", node.title)]).await?;
+            lines.push(format!(
+                "committed {} file(s) of the handoff on {}",
+                own.len(),
+                git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()
+            ));
+        }
+    }
+    if has_branch {
+        let merged = git(&root, &["merge-base", "--is-ancestor", &branch, "HEAD"]).await.is_ok();
+        if merged {
+            lines.push(format!("{branch} is in HEAD already"));
+        } else {
+            if let Err(e) = git(&root, &["merge", "--no-edit", &branch]).await {
+                let conflicts = git(&root, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
+                let _ = git(&root, &["merge", "--abort"]).await;
+                anyhow::bail!(
+                    "the merge of {branch} conflicts in {}; the merge was aborted, land #{id} by hand ({e:#})",
+                    if conflicts.is_empty() { "files git did not name".to_owned() } else { conflicts.replace('\n', ", ") }
+                );
+            }
+            lines.push(format!("merged {branch} into {}", git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()));
+            // the project's check on the merged tree: two cards right on their own are not
+            // always right together (#176 and #181 compiled apart and not merged)
+            let Checks { commands, timeout, .. } = checks_of(&root, &node);
+            if !commands.is_empty() {
+                let toolbox = worker.toolbox(&root).map(|t| t.with_timeout(timeout));
+                let _slot = hold_build(&root).await;
+                let runs = run_checks(&toolbox, &commands).await;
+                if let Some(failed) = runs.iter().find(|r| !r.passed) {
+                    let _ = git(&root, &["reset", "--merge", "ORIG_HEAD"]).await;
+                    anyhow::bail!(
+                        "the merged tree fails the check `{}` ({}); the merge was undone and #{id} stays implemented:\n{}",
+                        failed.command,
+                        failed.exit,
+                        failed.text
+                    );
+                }
+                lines.push(format!("check passed on the merged tree: {}", commands.join(" · ")));
+            }
+        }
+    }
+    if node.state != TaskState::Accepted {
+        store.set_state_by(id, TaskState::Accepted, Source::Run).await?;
+    }
+    lines.extend(clean_after(&root, id, has_branch).await);
+    let line = format!("landed #{id} {} · {}", node.title, lines.join(" · "));
+    crate::pair::event(&root, &line);
+    Ok(lines)
+}
+
+/// [`land`] for a walk: the lines it answers, or the one line of why it did not, on the feed
+/// too; never an error, since a card the person must land by hand is not the walk's end.
+async fn land_or_say(store: &Store, id: i64, worker: &Worker) -> Vec<String> {
+    match land(store, id, worker).await {
+        Ok(lines) => lines,
+        Err(e) => {
+            let text = format!("#{id} not landed: {}", first_line(&format!("{e:#}")));
+            tracing::warn!("{text}");
+            crate::pair::event(&workspace_of(store), &text);
+            vec![text]
+        }
+    }
+}
+
+/// What a landed card leaves behind, removed: its worktree and branch, its target directory
+/// under the project's, its research brief, and the old entries of the project's temp names.
+/// Each step says what it did or could not; none of them fails the landing.
+async fn clean_after(root: &Path, id: i64, has_branch: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    let path = root.join(WORKTREES_DIR).join(id.to_string());
+    if path.join(".git").exists() {
+        match git(root, &["worktree", "remove", "--force", &path.to_string_lossy()]).await {
+            Ok(_) => lines.push("worktree removed".to_owned()),
+            Err(e) => lines.push(format!("worktree kept: {e:#}")),
+        }
+    }
+    if has_branch {
+        match git(root, &["branch", "-d", &worktree_branch(id)]).await {
+            Ok(_) => lines.push("branch removed".to_owned()),
+            Err(e) => lines.push(format!("branch kept: {}", first_line(&format!("{e:#}")))),
+        }
+    }
+    let target = root.join("target").join(format!("wt-{id}"));
+    if target.is_dir() {
+        match std::fs::remove_dir_all(&target) {
+            Ok(()) => lines.push("target removed".to_owned()),
+            Err(e) => lines.push(format!("target kept: {e}")),
+        }
+    }
+    let _ = std::fs::remove_file(brief_path(root, id));
+    let names = crate::router::Router::load(root).map(|r| r.worker.temp).unwrap_or_default();
+    if !names.is_empty() {
+        let (count, bytes) = sweep_temp(&names, TEMP_SWEEP_AGE);
+        if count > 0 {
+            lines.push(format!("temp: {count} old entr{} removed, {:.1} GB", if count == 1 { "y" } else { "ies" }, bytes as f64 / 1e9));
+        }
+    }
+    lines
+}
+
+/// Removes the entries older than `age` under each of `names` in the system temp directory,
+/// and answers with how many and how many bytes. A name is a directory a project's tests make
+/// (`%TEMP%\ra-asm-emit-tests`), listed in `[worker] temp`; nothing outside those is touched.
+#[must_use]
+pub fn sweep_temp(names: &[String], age: std::time::Duration) -> (usize, u64) {
+    let temp = std::env::temp_dir();
+    let cutoff = std::time::SystemTime::now().checked_sub(age);
+    let (mut count, mut bytes) = (0usize, 0u64);
+    for name in names {
+        let dir = temp.join(name);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            let old = meta.modified().ok().zip(cutoff).is_some_and(|(m, c)| m < c);
+            if !old {
+                continue;
+            }
+            let size = dir_size(&entry.path());
+            let removed = if meta.is_dir() { std::fs::remove_dir_all(entry.path()) } else { std::fs::remove_file(entry.path()) };
+            if removed.is_ok() {
+                count += 1;
+                bytes += size;
+            }
+        }
+    }
+    (count, bytes)
+}
+
+/// The bytes under a path, a file's own or a directory's whole.
+fn dir_size(path: &Path) -> u64 {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => meta.len(),
+        Ok(meta) if meta.is_dir() => std::fs::read_dir(path).map(|rd| rd.flatten().map(|e| dir_size(&e.path())).sum()).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// The landing check of the doctor: the accepted cards whose branch is not in HEAD, and the
+/// worktrees of cards that are accepted or gone. Nothing to say is the good answer.
+async fn landing_check(root: &Path) -> Result<String, String> {
+    let path = root.join(crate::setup::ROADMAP_FILE);
+    let text = std::fs::read_to_string(&path).map_err(|_| format!("no {}", path.display()))?;
+    let nodes = ra_roadmap::markdown::parse(&text).map_err(|e| format!("{} does not parse: {e:#}", path.display()))?;
+    let branches = git(root, &["for-each-ref", "--format=%(refname:short)", "refs/heads/card/"]).await.unwrap_or_default();
+    let mut unmerged = Vec::new();
+    for branch in branches.lines() {
+        let Some(id) = branch.strip_prefix("card/").and_then(|s| s.parse::<i64>().ok()) else { continue };
+        let accepted = nodes.iter().any(|n| n.id == id && n.state == TaskState::Accepted);
+        let merged = git(root, &["merge-base", "--is-ancestor", branch, "HEAD"]).await.is_ok();
+        if accepted && !merged {
+            unmerged.push(format!("#{id}"));
+        }
+    }
+    let mut leftover = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root.join(WORKTREES_DIR)) {
+        for entry in entries.flatten() {
+            let Some(id) = entry.file_name().to_string_lossy().parse::<i64>().ok() else { continue };
+            let open = nodes.iter().any(|n| n.id == id && n.state != TaskState::Accepted);
+            if !open && entry.path().join(".git").exists() {
+                leftover.push(format!("#{id}"));
+            }
+        }
+    }
+    let mut notes = Vec::new();
+    if !unmerged.is_empty() {
+        notes.push(format!("accepted but not merged: {} (`rc land <id>`)", unmerged.join(" ")));
+    }
+    if !leftover.is_empty() {
+        notes.push(format!("worktrees of landed or gone cards: {}", leftover.join(" ")));
+    }
+    if notes.is_empty() { Ok("every accepted card's branch is in HEAD; no worktree left over".to_owned()) } else { Err(notes.join("; ")) }
+}
+
+/// The temp check of the doctor: what the project's `[worker] temp` names hold under the
+/// system temp directory, and how much of it a landing would sweep.
+fn temp_check(root: &Path) -> Result<String, String> {
+    let names = crate::router::Router::load(root).map(|r| r.worker.temp).unwrap_or_default();
+    if names.is_empty() {
+        return Ok("no `[worker] temp` names; nothing is swept".to_owned());
+    }
+    let temp = std::env::temp_dir();
+    let cutoff = std::time::SystemTime::now().checked_sub(TEMP_SWEEP_AGE);
+    let (mut total, mut old) = (0u64, 0u64);
+    for name in &names {
+        let dir = temp.join(name);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let size = dir_size(&entry.path());
+            total += size;
+            if entry.metadata().ok().and_then(|m| m.modified().ok()).zip(cutoff).is_some_and(|(m, c)| m < c) {
+                old += size;
+            }
+        }
+    }
+    let text = format!(
+        "{} under {}: {:.1} GB, {:.1} GB older than an hour",
+        names.join(", "),
+        temp.display(),
+        total as f64 / 1e9,
+        old as f64 / 1e9
+    );
+    if old > 1_000_000_000 { Err(format!("{text}; a landing sweeps it, or `rc land` any accepted card")) } else { Ok(text) }
+}
+
 /// The worktrees of the cards, one line each: the id, the branch and the path; a line says so
 /// when there are none.
 ///
@@ -2378,8 +2646,16 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             (Seat::Build(_), Ok(run_lines)) => {
                 lines.extend(run_lines);
                 ran += 1;
-                if stop_on_revision && stopped.is_none() && store.read(id).await?.state == TaskState::NeedsRevision {
+                let state = store.read(id).await?.state;
+                if stop_on_revision && stopped.is_none() && state == TaskState::NeedsRevision {
                     stopped = Some(format!("stopped: #{id} needs revision"));
+                }
+                // a card the reviewer accepted lands now: merged, proved and cleared, so
+                // the tree keeps up with the walk (the person: "merging / committing as
+                // tasks are complete for all projects"); a landing that fails leaves the
+                // card implemented, for the person, and says why
+                if state == TaskState::Implemented {
+                    lines.extend(land_or_say(store, id, worker).await);
                 }
             }
             (Seat::Build(_), Err(error)) => {
@@ -2511,8 +2787,10 @@ pub enum PoolKind {
 pub struct Pool;
 
 impl Pool {
-    /// The Opus slots on the machine.
-    pub const OPUS: usize = 6;
+    /// The Opus slots on the machine: twelve writers across the projects, four of whom may
+    /// build at once ([`crate::hub::BUILD_SLOTS`]). The person's rule of 2026-11-12: "the
+    /// pool to be 12 opus researchers, and 4 runners overall".
+    pub const OPUS: usize = 12;
     /// The Opus slots a walking project is owed, which another project's borrowing leaves it.
     pub const OPUS_SHARE: usize = 2;
 
@@ -2560,7 +2838,7 @@ impl Pool {
 /// How many other projects the window knows are walking now on Opus slots: the pool's Opus
 /// shares are theirs. A Fable project's walk takes nothing from the Opus pool and counts for
 /// nothing here.
-fn other_walks(root: &Path) -> usize {
+pub(crate) fn other_walks(root: &Path) -> usize {
     let here = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     crate::hub::recent()
         .into_iter()

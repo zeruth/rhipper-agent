@@ -167,6 +167,12 @@ pub struct WorkerConfig {
     /// compiles each report on one of the two build slots, so six workers never build at once.
     #[serde(default)]
     pub builds: Option<u32>,
+    /// The directories the project's tests make under the system temp directory, by name
+    /// (`ra-asm-emit-tests` for `%TEMP%\ra-asm-emit-tests`): a landing removes their entries
+    /// older than an hour, and the doctor says how much they hold. Nothing else under temp is
+    /// touched. (58 GB of asm's test fixtures had piled up by 2026-11-12.)
+    #[serde(default)]
+    pub temp: Vec<String>,
 }
 
 impl WorkerConfig {
