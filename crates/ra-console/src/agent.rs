@@ -681,6 +681,19 @@ pub fn read_hint(root: &Path, call: &serde_json::Value) -> Option<String> {
     hint_of(root, call, card_of_run(root))
 }
 
+/// The reason the pre hook refuses a Read with: a whole-file Read of a long file the outline of
+/// the run's card knows, the file's items in it, as the project's catalogue says. Nothing for any
+/// other Read, or when there is no card, context file or catalogue to judge by.
+#[must_use]
+pub fn read_refusal(root: &Path, call: &serde_json::Value) -> Option<String> {
+    let context = std::fs::read_to_string(ra_context::TaskContext::path(root, card_of_run(root)?)).ok()?;
+    let (catalogue, _) = Catalogue::refresh(&root.join(GOTCHAS_FILE)).ok()?;
+    match ra_providers::claude_code::read_verdict(&catalogue, root, &context, call) {
+        ra_gotchas::Verdict::Deny { reason, .. } => Some(reason),
+        _ => None,
+    }
+}
+
 /// [`read_hint`] for a known card, so a test is not at the mercy of the [`CARD_VAR`] a run
 /// around it set; `None` for the card is no hint at all.
 fn hint_of(root: &Path, call: &serde_json::Value, card: Option<i64>) -> Option<String> {

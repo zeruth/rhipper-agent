@@ -7,6 +7,8 @@
 #          edit     — what an edit tool answered
 #          text     — the worker's own words between its tool calls
 #          answer   — the worker's final report
+#          read     — a whole-file Read of a file over 400 lines the card's outline knows; the
+#                     pattern is matched against the file's path
 # remedy:  hint     — the message goes to the worker: as the reason of a denied command, as
 #                     context after a result, and in the machine notes of later runs
 #          rewrite  — the command runs changed: `insert` goes after the first `after` words (one
@@ -107,4 +109,13 @@ id = "untested-claim"
 where = "answer"
 pattern = "(?i)couldn't run (any )?tests|could not run (the )?tests|unable to run (the )?tests|did not run the tests|tests? (were|was) not run"
 message = "the worker reported the card done without running its tests; the acceptance check decides, not the report"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+# a fresh session that reads a long file whole spends its context before its first edit; the
+# outline the card carries already names where each item is
+id = "whole-file-read"
+where = "read"
+pattern = '.'
+message = "a long file the card outlines is read by region: Read it again with an offset and a limit around the item you need"
 remedy = { kind = "hint" }

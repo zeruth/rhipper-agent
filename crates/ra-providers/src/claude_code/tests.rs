@@ -301,7 +301,7 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let args = provider.args(&request(Some(PathBuf::from("."))));
     let at = args.iter().position(|a| a == "--settings").expect("--settings");
     let settings: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
-    assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Bash|PowerShell");
+    assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Bash|PowerShell|Read");
     assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read");
     assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "\"C:\\tools\\rc.exe\" hook pre");
     assert_eq!(settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "\"C:\\tools\\rc.exe\" hook post");
@@ -367,6 +367,52 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let refused = r#"{"type":"result","result":"done","permission_denials":[{"tool_name":"PowerShell","tool_input":{"command":"cargo clippy -p rc-gui"}}]}"#;
     let ids: Vec<String> = gotchas_of_event(&catalogue, refused, quiet, &mut tools).into_iter().map(|h| h.id).collect();
     assert_eq!(ids, ["unmatched-denied"]);
+}
+
+#[test]
+fn the_pre_hook_refuses_a_whole_read_of_a_long_outlined_file_with_its_items_and_the_stream_counts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let long: String =
+        (1..=1200).map(|n| if n % 300 == 1 { format!("pub fn item_{n}() {{\n") } else { "    let _ = 1;\n".to_owned() }).collect();
+    std::fs::write(root.join("src/long.rs"), &long).unwrap();
+    std::fs::write(root.join("src/short.rs"), "fn a() {}\n".repeat(300)).unwrap();
+    std::fs::write(root.join("src/other.rs"), &long).unwrap();
+    let context = format!(
+        "# Task #1 context\n\n## Brief\n\nb\n\n## Files\n\n{}{}src/gone.rs (not in the workspace yet)\n\n## Handoff 1 · m · done\nsrc/other.rs (1200 lines)\n",
+        ra_context::outline(Path::new("src/long.rs"), &long),
+        ra_context::outline(Path::new("src/short.rs"), &"fn a() {}\n".repeat(300)),
+    );
+    let catalogue = Catalogue::seed();
+    let read =
+        |input: serde_json::Value| read_verdict(&catalogue, root, &context, &serde_json::json!({"tool_name": "Read", "tool_input": input}));
+    let absolute = root.join("src/long.rs").display().to_string();
+    let reason = match read(serde_json::json!({"file_path": absolute})) {
+        Verdict::Deny { id, reason } => {
+            assert_eq!(id, "whole-file-read");
+            reason
+        }
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        reason.contains("src/long.rs is 1200 lines; its items: item_1 1-300, item_301 301-600, item_601 601-900, item_901 901-1200"),
+        "{reason}"
+    );
+    // a ranged Read, a short file, and a file the outline does not know pass
+    assert_eq!(read(serde_json::json!({"file_path": absolute, "offset": 300, "limit": 80})), Verdict::Pass);
+    assert_eq!(read(serde_json::json!({"file_path": "src/short.rs"})), Verdict::Pass);
+    assert_eq!(read(serde_json::json!({"file_path": "src/other.rs"})), Verdict::Pass);
+
+    // the refusal comes back as the Read's error, and that is the hit the end line counts
+    let mut tools = std::collections::HashMap::new();
+    let call =
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"src/long.rs"}}]}}"#;
+    assert!(gotchas_of_event(&catalogue, call, Conditions::default(), &mut tools).is_empty());
+    let refused = serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "r1", "is_error": true, "content": reason}]}});
+    let ids: Vec<String> =
+        gotchas_of_event(&catalogue, &refused.to_string(), Conditions::default(), &mut tools).into_iter().map(|h| h.id).collect();
+    assert_eq!(ids, ["whole-file-read"]);
 }
 
 #[test]
