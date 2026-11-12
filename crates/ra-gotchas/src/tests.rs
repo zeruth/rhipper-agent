@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// A build command as the hook sends it on: under `rc hold`, the last of the rewrites.
+fn held(command: &str) -> String {
+    format!("rc hold -- {command}")
+}
+
+/// Whether a verdict is the build-slot rewrite alone of `command`: what a build command that
+/// no other gotcha touches comes to.
+fn only_held(verdict: &Verdict, command: &str) -> bool {
+    matches!(verdict, Verdict::Rewrite { id, command: rewritten, .. } if id == "build-slot" && *rewritten == held(command))
+}
+
 #[test]
 fn the_seed_parses_and_names_every_entry_once() {
     let catalogue = Catalogue::seed();
@@ -29,8 +40,10 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
         }
     }
     assert_eq!(catalogue.command("git status --short", Conditions::default()), Verdict::Pass);
-    // a pipe through tail keeps the output short; the harness judges its parts
-    assert_eq!(catalogue.command("cargo test -p ra-gotchas 2>&1 | tail -15", Conditions::default()), Verdict::Pass);
+    // a pipe through tail keeps the output short; the harness judges its parts; the build
+    // still takes its slot
+    let piped = "cargo test -p ra-gotchas 2>&1 | tail -15";
+    assert!(only_held(&catalogue.command(piped, Conditions::default()), piped));
     assert!(matches!(catalogue.command("cargo test -p ra-gotchas", Conditions::default()), Verdict::Rewrite { .. }));
     // a shell inside a shell is no way around the allowlist
     for command in ["powershell.exe -NoProfile -File x.ps1", "sh var/check.sh", "bash -c 'cargo test'"] {
@@ -95,24 +108,24 @@ fn a_workspace_build_is_rewritten_only_while_a_console_runs() {
     match catalogue.command("cargo test -q", running) {
         Verdict::Rewrite { id, command, reason } => {
             assert_eq!(id, "binary-locked");
-            assert_eq!(command, "cargo test --workspace --exclude rc --exclude rc-gui -q 2>&1 | tail -n 80");
+            assert_eq!(command, held("cargo test --workspace --exclude rc --exclude rc-gui -q 2>&1 | tail -n 80"));
             assert!(reason.contains("holds its binary") && reason.contains("; a cargo test"), "{reason}");
         }
         other => panic!("{other:?}"),
     }
-    match catalogue.command("cargo test -p ra-roadmap 2>&1 | tail -20", running) {
-        Verdict::Pass => {}
-        other => panic!("{other:?}"),
-    }
+    let narrow = "cargo test -p ra-roadmap 2>&1 | tail -20";
+    assert!(only_held(&catalogue.command(narrow, running), narrow));
     match catalogue.command("cargo test -q", Conditions::default()) {
         Verdict::Rewrite { id, command, .. } => {
             assert_eq!(id, "long-output");
-            assert_eq!(command, "cargo test -q 2>&1 | tail -n 80");
+            assert_eq!(command, held("cargo test -q 2>&1 | tail -n 80"));
         }
         other => panic!("{other:?}"),
     }
     match catalogue.command("cargo build", running) {
-        Verdict::Rewrite { command, .. } => assert_eq!(command, "cargo build --workspace --exclude rc --exclude rc-gui 2>&1 | tail -n 80"),
+        Verdict::Rewrite { command, .. } => {
+            assert_eq!(command, held("cargo build --workspace --exclude rc --exclude rc-gui 2>&1 | tail -n 80"))
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -133,7 +146,7 @@ fn a_full_suite_runs_the_changed_crates_only_while_the_check_is_the_suite() {
         match catalogue.command(command, suite) {
             Verdict::Rewrite { id, command, reason } => {
                 assert_eq!(id, "worker-full-suite");
-                assert_eq!(command, expected);
+                assert_eq!(command, held(expected));
                 assert!(reason.contains("runs after the report"), "{reason}");
             }
             other => panic!("{command}: {other:?}"),
@@ -142,15 +155,17 @@ fn a_full_suite_runs_the_changed_crates_only_while_the_check_is_the_suite() {
     // a console running brings no workspace flags back onto the narrowed command
     let running = Conditions { console_running: true, ..suite };
     assert!(
-        matches!(catalogue.command("cargo test -q", running), Verdict::Rewrite { command, .. } if command == "cargo test -p ra-asm-emit -p ra-gotchas -q 2>&1 | tail -n 80")
+        matches!(catalogue.command("cargo test -q", running), Verdict::Rewrite { command, .. } if command == held("cargo test -p ra-asm-emit -p ra-gotchas -q 2>&1 | tail -n 80"))
     );
-    // a command that names its crate passes as it is
-    assert_eq!(catalogue.command("cargo test -p ra-asm-emit -q 2>&1 | tail -n 80", suite), Verdict::Pass);
+    // a command that names its crate runs as it is, on its slot
+    let named = "cargo test -p ra-asm-emit -q 2>&1 | tail -n 80";
+    assert!(only_held(&catalogue.command(named, suite), named));
     // a project whose check is not the suite, or a run that changed no crate, keeps the command
     for conditions in
         [Conditions { changed_crates: &changed, ..Conditions::default() }, Conditions { suite_check: true, ..Conditions::default() }]
     {
-        assert_eq!(catalogue.command("cargo test -q 2>&1 | tail -n 80", conditions), Verdict::Pass);
+        let tailed = "cargo test -q 2>&1 | tail -n 80";
+        assert!(only_held(&catalogue.command(tailed, conditions), tailed));
     }
     assert!(is_suite("cargo test -q") && is_suite("cargo test --workspace -q"));
     assert!(!is_suite("cargo test -p ra-gotchas -q") && !is_suite(".\\gw.ps1 :core:test") && !is_suite("cargo build"));
@@ -181,13 +196,15 @@ fn the_hooks_full_suite_in_a_work_tree_runs_the_crate_its_changes_fall_in() {
     match catalogue.command_in(dir.path(), "cargo test -q 2>&1 | tail -n 80", false, true) {
         Verdict::Rewrite { id, command, .. } => {
             assert_eq!(id, "worker-full-suite");
-            assert_eq!(command, "cargo test -p a-crate -q 2>&1 | tail -n 80");
+            assert_eq!(command, held("cargo test -p a-crate -q 2>&1 | tail -n 80"));
         }
         other => panic!("{other:?}"),
     }
-    // a per-crate command, or a project whose check is not the suite, runs as written
-    assert_eq!(catalogue.command_in(dir.path(), "cargo test -p b -q 2>&1 | tail -n 80", false, true), Verdict::Pass);
-    assert_eq!(catalogue.command_in(dir.path(), "cargo test -q 2>&1 | tail -n 80", false, false), Verdict::Pass);
+    // a per-crate command, or a project whose check is not the suite, runs as written, on its slot
+    let per_crate = "cargo test -p b -q 2>&1 | tail -n 80";
+    assert!(only_held(&catalogue.command_in(dir.path(), per_crate, false, true), per_crate));
+    let tailed = "cargo test -q 2>&1 | tail -n 80";
+    assert!(only_held(&catalogue.command_in(dir.path(), tailed, false, false), tailed));
 }
 
 #[test]
@@ -203,23 +220,43 @@ fn a_cargo_command_without_a_tail_gets_one_on_its_end() {
         match catalogue.command(command, quiet) {
             Verdict::Rewrite { id, command, reason } => {
                 assert_eq!(id, "long-output");
-                assert_eq!(command, expected);
+                assert_eq!(command, held(expected));
                 assert!(reason.contains("tail"), "{reason}");
             }
             other => panic!("{command}: {other:?}"),
         }
     }
-    // a command that already pipes, or redirects to a file, is left as it is; so is cargo run
+    // a command that already pipes, or redirects to a file, gets no tail; so does cargo run;
+    // each still builds, so each takes its slot
     for command in [
         "cargo test -p ra-gotchas 2>&1 | tail -n 40",
         "cargo test -p ra-gotchas | Select-Object -Last 30",
         "cargo build 2>&1 | grep -E 'error|warning'",
         "cargo test > var/test.log 2>&1",
         "cargo run -p rc -- doctor",
-        "cargo fmt -p ra-gotchas",
     ] {
-        assert_eq!(catalogue.command(command, quiet), Verdict::Pass, "{command}");
+        assert!(only_held(&catalogue.command(command, quiet), command), "{command}");
     }
+    // a format builds nothing
+    assert_eq!(catalogue.command("cargo fmt -p ra-gotchas", quiet), Verdict::Pass);
+}
+
+#[test]
+fn a_build_runs_on_a_build_slot_and_a_held_one_is_left_alone() {
+    let catalogue = Catalogue::seed();
+    let quiet = Conditions::default();
+    for command in [
+        ".\\gw.ps1 :android-awt:compileDebugJavaWithJavac",
+        "./gw.ps1 :core:test 2>&1 | tail -n 40",
+        "./gradlew build",
+        "gradlew.bat :app:assembleDebug",
+    ] {
+        assert!(only_held(&catalogue.command(command, quiet), command), "{command}");
+    }
+    // the gradle wrapper under a bash-ish `&` too; a command already under `rc hold` stays
+    assert!(only_held(&catalogue.command("& .\\gw.ps1 :core:test", quiet), "& .\\gw.ps1 :core:test"));
+    assert_eq!(catalogue.command("rc hold --shell bash -- cargo build -p rc", quiet), Verdict::Pass);
+    assert_eq!(insert_after("cargo build", 0, "rc hold --"), "rc hold -- cargo build");
 }
 
 #[test]

@@ -1531,6 +1531,95 @@ async fn guard_target(root: &Path) -> Option<crate::hub::Guard> {
     }
 }
 
+/// The longest a build waits for a slot before it runs without one: a slot's holder may be a
+/// gradle that hung, or an `rc hold` orphaned when its tool call was killed, and two of those
+/// would otherwise stop every build of the project for good. The two slots run in parallel;
+/// the wait only keeps a third build from joining them.
+const HOLD_WAIT: std::time::Duration = std::time::Duration::from_mins(15);
+
+/// Takes one of the project's build slots for the check, waiting on the builds of the workers
+/// and the other checks; the wait is said once, on the progress channel and the paired feed.
+/// `None` when the locks cannot be opened: the check goes unguarded.
+async fn hold_build(root: &Path) -> Option<crate::hub::Guard> {
+    let mut said = false;
+    let started = std::time::Instant::now();
+    loop {
+        match crate::hub::try_build_slot(root) {
+            Ok(Some(guard)) => return Some(guard),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("the check runs without a build slot: {e:#}");
+                return None;
+            }
+        }
+        if started.elapsed() >= HOLD_WAIT {
+            tracing::warn!("no build slot came free in {} minutes; the check runs without one", HOLD_WAIT.as_secs() / 60);
+            return None;
+        }
+        if !said {
+            said = true;
+            let text = format!("wait: the check waits for a build slot, {} builds of the project are running", crate::hub::BUILD_SLOTS);
+            tracing::info!(target: crate::trace::PROGRESS, "  {text}");
+            crate::pair::event(root, &text);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Runs a build command in `dir` on one of its project's build slots, for `rc hold`: waits for
+/// a slot, says so once on stderr, then runs the command through `shell` (`bash`, `sh` or
+/// `powershell`) with the terminal's own streams, and answers with the command's exit code. The
+/// hook rewrites a worker's gradle and cargo commands to this, so a project's six workers
+/// compile two at a time. A slot that cannot be locked at all is nobody's failure: the command
+/// runs unguarded.
+#[must_use]
+pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
+    let mut said = false;
+    let started = std::time::Instant::now();
+    let _slot = loop {
+        match crate::hub::try_build_slot(dir) {
+            Ok(Some(guard)) => break Some(guard),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("rc hold: the command runs without a build slot: {e:#}");
+                break None;
+            }
+        }
+        if started.elapsed() >= HOLD_WAIT {
+            eprintln!("rc hold: no build slot came free in {} minutes; the command runs without one", HOLD_WAIT.as_secs() / 60);
+            break None;
+        }
+        if !said {
+            said = true;
+            eprintln!("rc hold: waiting for a build slot, {} builds of the project are running", crate::hub::BUILD_SLOTS);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
+    let mut process = match shell {
+        "powershell" | "pwsh" => {
+            let mut p = std::process::Command::new(shell);
+            p.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command]);
+            p
+        }
+        _ => {
+            // `bash` on a Windows PATH may be WSL's, which has none of the worker's tools: the
+            // one Git installs is the Bash tool's own
+            let git_bash = Path::new(r"C:\Program Files\Git\bin\bash.exe");
+            let program = if shell == "bash" && git_bash.exists() { git_bash.as_os_str().to_owned() } else { shell.into() };
+            let mut p = std::process::Command::new(program);
+            p.args(["-c", command]);
+            p
+        }
+    };
+    match process.current_dir(dir).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("rc hold: cannot start {shell}: {e}");
+            127
+        }
+    }
+}
+
 /// The share of the plan's five-hour window one run of a card is taken to use: the margin a run
 /// keeps from the cap, and what a run live in another project counts for before the limits
 /// show it.
@@ -2229,18 +2318,20 @@ pub enum PoolKind {
     Fable,
 }
 
-/// The machine's pool of runs across every project's walk: four Opus slots, shared. A
+/// The machine's pool of runs across every project's walk: six Opus slots, shared. A
 /// project's share is its `[worker] parallel` of them (two by default); an Opus project
 /// borrows the slots no other walking project needs and gives them back as its runs end
 /// once another project walks. A Fable project runs one card at a time, its own slot, in no
 /// pool: as many Fable projects as walk. The slots are the hub's locks, held by the run and
-/// released with it, dead or done. The person's rule of 2026-11-12: "a pool of 4x opus,
-/// fable is 1x per project no pool" (six Opus was too heavy for the machine).
+/// released with it, dead or done. Six runs write code; what made six too heavy was six
+/// builds at once, which the project's two build slots ([`crate::hub::BUILD_SLOTS`]) now
+/// keep to two. The person's rule of 2026-11-12: "i want the 6x, just don't do stupid shit
+/// like having them all building with gradle".
 pub struct Pool;
 
 impl Pool {
     /// The Opus slots on the machine.
-    pub const OPUS: usize = 4;
+    pub const OPUS: usize = 6;
     /// The Opus slots a walking project is owed, which another project's borrowing leaves it.
     pub const OPUS_SHARE: usize = 2;
 
@@ -2562,8 +2653,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let Checks { commands, lint: project_lint, timeout } = checks_of(&root, &node);
     let command = commands.join(" · ");
     let toolbox = worker.toolbox(workspace_dir.as_deref().unwrap_or(Path::new("."))).map(|toolbox| toolbox.with_timeout(timeout));
-    // a cargo check builds in a target another project may share: the hub's lock on it, so
-    // two builds do not fight over the directory
+    // a check is a build: it takes one of the project's build slots, as the workers' own
+    // builds do, so six runs do not compile at once; a cargo check also takes the hub's lock
+    // on a target another project may share, so two builds do not fight over the directory
+    let _slot = if commands.is_empty() { None } else { hold_build(&root).await };
     let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root).await } else { None };
     let checks = run_checks(&toolbox, &commands).await;
     let status_after = git_status(&acting).await;

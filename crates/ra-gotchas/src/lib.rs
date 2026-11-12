@@ -103,7 +103,8 @@ pub enum Remedy {
     /// unless it matches `unless`; `when` limits the rewrite to a condition of the machine.
     Rewrite {
         insert: String,
-        /// How many words of the command come before the insert; one unless said otherwise.
+        /// How many words of the command come before the insert; one unless said otherwise,
+        /// zero for a wrapper the whole command runs under.
         #[serde(default = "one")]
         after: usize,
         /// The insert goes on the end of the command, after everything: a pipe, a redirect.
@@ -403,12 +404,15 @@ impl Catalogue {
     }
 }
 
-/// The command with `insert` after its first `after` words, and the rest as it was.
+/// The command with `insert` after its first `after` words, and the rest as it was; `after`
+/// of zero puts the insert before the command, a wrapper it runs under.
 fn insert_after(command: &str, after: usize, insert: &str) -> String {
     let words: Vec<&str> = command.split_whitespace().collect();
-    let at = after.clamp(1, words.len());
+    let at = after.min(words.len());
     let mut out = words[..at].join(" ");
-    out.push(' ');
+    if at > 0 {
+        out.push(' ');
+    }
     out.push_str(insert);
     if at < words.len() {
         out.push(' ');

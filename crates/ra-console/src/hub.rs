@@ -310,7 +310,8 @@ fn digest_line(digest: &Digest) -> String {
 }
 
 /// How a project is named in the hub: its directory's name.
-pub(crate) fn project_name(root: &Path) -> String {
+#[must_use]
+pub fn project_name(root: &Path) -> String {
     std::fs::canonicalize(root)
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -542,6 +543,44 @@ pub fn guard(name: &str) -> Option<Guard> {
 /// The lock `rc install` and `rc restart` take: two of them at once would set the same binary
 /// aside twice.
 pub const INSTALL_LOCK: &str = "install";
+
+/// The builds a project runs at once, across its workers and its own checks: six workers write
+/// code, two of them compile. The person's rule of 2026-11-12: "maybe 2 max on the gradle pool,
+/// they should be WRITING CODE".
+pub const BUILD_SLOTS: usize = 2;
+
+/// The project a directory works in: itself, or the project above a card's worktree
+/// (`<root>/var/worktrees/<id>`), whose build slots the worktree's builds take.
+#[must_use]
+pub fn project_root_of(dir: &Path) -> PathBuf {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let under_worktrees = dir.parent().and_then(Path::file_name).is_some_and(|n| n == "worktrees")
+        && dir.parent().and_then(Path::parent).and_then(Path::file_name).is_some_and(|n| n == "var");
+    if under_worktrees && let Some(root) = dir.ancestors().nth(3) {
+        return root.to_path_buf();
+    }
+    dir
+}
+
+/// The name of the hub's lock on one of a project's build slots.
+#[must_use]
+pub fn build_lock_name(project: &str, slot: usize) -> String {
+    format!("build-{project}-{slot}")
+}
+
+/// Takes one of the project's [`BUILD_SLOTS`] once: `Ok(None)` while every slot is held.
+///
+/// # Errors
+/// When a lock file cannot be made or opened.
+pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
+    let project = project_name(&project_root_of(root));
+    for slot in 0..BUILD_SLOTS {
+        if let Some(guard) = try_guard(&build_lock_name(&project, slot))? {
+            return Ok(Some(guard));
+        }
+    }
+    Ok(None)
+}
 
 /// The cargo target a check in `root` builds in: `CARGO_TARGET_DIR` when set (a relative one
 /// under `root`), else `target` under the outermost workspace above `root`, or `root` itself.

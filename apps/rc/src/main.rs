@@ -325,6 +325,15 @@ enum Command {
         /// The note, one line.
         text: Vec<String>,
     },
+    /// Runs a build command on one of the project's two build slots, waiting its turn while two other builds of the project run; the hook puts a worker's gradle and cargo commands under it.
+    Hold {
+        /// The shell the command runs through: bash, sh or powershell; PowerShell on Windows and sh elsewhere when left out.
+        #[arg(long)]
+        shell: Option<String>,
+        /// The command, after `--`, as it was written.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// Makes this directory a project: drafts rhipper.md with a strong model from what the directory shows, imports a roadmap-shaped file, or starts empty.
     Init {
         /// A roadmap-shaped file (ROADMAP.md, TODO.md, a plan) the model converts, keeping every item.
@@ -692,6 +701,11 @@ async fn run_main() -> anyhow::Result<()> {
             println!("noted; the next runs read it with the workers' own look-backs");
             Ok(())
         }
+        Command::Hold { shell, command } => {
+            let shell = shell.unwrap_or_else(|| String::from(if cfg!(windows) { "powershell" } else { "sh" }));
+            let dir = std::env::current_dir()?;
+            std::process::exit(ra_console::agent::hold(&dir, &shell, &command.join(" ")));
+        }
         Command::Init { import, empty, model } => {
             plain_tracing()?;
             let mode = match (import, empty) {
@@ -820,14 +834,26 @@ fn hook(event: &str) -> anyhow::Result<()> {
                 ra_gotchas::Verdict::Deny { reason, .. } => Some(serde_json::json!({
                     "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
                 })),
-                ra_gotchas::Verdict::Rewrite { command, reason, .. } => Some(serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow",
-                        "permissionDecisionReason": reason,
-                        "updatedInput": {"command": command}
-                    }
-                })),
+                ra_gotchas::Verdict::Rewrite { command, reason, .. } => {
+                    // a command put under `rc hold` runs through the shell of the tool that
+                    // called it: the Bash tool's bash, the PowerShell tool's powershell
+                    let shell = match call.get("tool_name").and_then(serde_json::Value::as_str) {
+                        Some("Bash") => "bash",
+                        _ => "powershell",
+                    };
+                    let command = match command.strip_prefix("rc hold -- ") {
+                        Some(rest) => format!("rc hold --shell {shell} -- {rest}"),
+                        None => command,
+                    };
+                    Some(serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                            "permissionDecisionReason": reason,
+                            "updatedInput": {"command": command}
+                        }
+                    }))
+                }
             }
         }
         "post" => {

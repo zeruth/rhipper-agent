@@ -74,6 +74,16 @@ message = "a cargo test, build or clippy prints more than a turn should carry, a
 remedy = { kind = "rewrite", insert = "2>&1 | tail -n 80", append = true, unless = '\|\s*\S|>\s*[^&\s]' }
 
 [[gotcha]]
+# the last of the command rewrites: the ones before it read the command's own first words.
+# A project's workers write code six at a time and compile two at a time: a gradle or cargo
+# build runs under `rc hold`, which waits for one of the project's two build slots
+id = "build-slot"
+where = "command"
+pattern = '^\s*(&\s+)?(\.[\\/])?(gw\.ps1|gradlew(\.bat)?)\b|^\s*cargo\s+(build|test|check|clippy|run|bench|doc|nextest)\b'
+message = "a build takes one of the project's two build slots: the command runs under `rc hold --`, which waits its turn while two other builds of the project run, then runs it as written"
+remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
+
+[[gotcha]]
 id = "binary-locked-result"
 where = "result"
 pattern = 'failed to remove file .*rc\.exe|Access is denied\. \(os error 5\)'
