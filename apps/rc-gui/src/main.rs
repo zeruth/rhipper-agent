@@ -489,19 +489,15 @@ impl Gauges {
         }
     }
 
-    /// The row of the three gauges across `page`: equal widths down to a minimum.
-    fn row(&self, ui: &mut egui::Ui, page: f32) {
+    /// The three gauges, each `width` wide, laid in the row the caller opened.
+    fn row(&self, ui: &mut egui::Ui, width: f32) {
         let r = self.latest;
-        let width = ((page - 20.0) / 3.0).max(180.0);
         let cpu = format!("{:.0} %", r.cpu * 100.0);
         let memory = format!("{} / {} GB", gib(r.memory_used), gib(r.memory_total));
         let disk = format!("{} of {} GB free", gib(r.disk_free), gib(r.disk_total));
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            cards::gauge(ui, "CPU", &cpu, &self.cpu.samples(), theme::lane(1), width);
-            cards::gauge(ui, "MEMORY", &memory, &self.memory.samples(), theme::lane(2), width);
-            cards::gauge(ui, "DISK", &disk, &self.disk.samples(), theme::lane(3), width);
-        });
+        cards::gauge(ui, "CPU", &cpu, &self.cpu.samples(), theme::lane(1), width);
+        cards::gauge(ui, "MEMORY", &memory, &self.memory.samples(), theme::lane(2), width);
+        cards::gauge(ui, "DISK", &disk, &self.disk.samples(), theme::lane(3), width);
     }
 }
 
@@ -566,15 +562,11 @@ impl TokenGauges {
         self.read_for = Some(key);
     }
 
-    /// The row of the three token gauges across `page`, the same widths as the machine's.
-    fn row(&self, ui: &mut egui::Ui, page: f32) {
-        let width = ((page - 20.0) / 3.0).max(180.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            cards::gauge(ui, "TOKENS / TASK", &self.task.value, &self.task.samples, theme::lane(4), width);
-            cards::gauge(ui, "TODAY", &self.session.value, &self.session.samples, theme::lane(5), width);
-            cards::gauge(ui, "ALL TIME", &self.all.value, &self.all.samples, theme::lane(6), width);
-        });
+    /// The three token gauges, each `width` wide, laid in the row the caller opened.
+    fn row(&self, ui: &mut egui::Ui, width: f32) {
+        cards::gauge(ui, "TOKENS / TASK", &self.task.value, &self.task.samples, theme::lane(4), width);
+        cards::gauge(ui, "TODAY", &self.session.value, &self.session.samples, theme::lane(5), width);
+        cards::gauge(ui, "ALL TIME", &self.all.value, &self.all.samples, theme::lane(6), width);
     }
 }
 
@@ -1154,25 +1146,19 @@ impl App {
         egui::Panel::top("dashboard-status")
             .frame(Frame::new().fill(theme::panel()).inner_margin(Margin::symmetric(8, 6)))
             .show(root, |ui| self.dashboard_status(ui));
-        egui::CentralPanel::default().frame(Frame::new().fill(theme::bg()).inner_margin(Margin::symmetric(18, 12))).show(root, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("DASHBOARD").small().strong().color(theme::dim()));
-                let live = self.tabs.iter().filter(|t| t.sink.live_run().is_some()).count();
-                let text = match live {
-                    0 => format!("{} open · nothing running", self.tabs.len()),
-                    1 => format!("{} open · 1 running", self.tabs.len()),
-                    n => format!("{} open · {n} running", self.tabs.len()),
-                };
-                ui.label(RichText::new(text).small().color(theme::dim()));
-            });
-            ui.add_space(6.0);
+        egui::CentralPanel::default().frame(Frame::new().fill(theme::bg()).inner_margin(Margin::symmetric(18, 8))).show(root, |ui| {
             // the page's width is the window's, not what the panel reports: the panel's ui
             // answers with far more than the window shows, and everything laid out to it
             // ran off the right edge. The margins and the scroll bar come off the content rect.
             let page = (ctx.content_rect().width() - 36.0 - 14.0).min(ui.available_width()).max(400.0);
-            self.gauges.row(ui, page);
-            ui.add_space(4.0);
-            self.tokens.row(ui, page);
+            // the six gauges in one row: the row they save is a row of run cards (the person:
+            // "condense the 2 rows of cpu / tokens etc into 1 row")
+            let width = ((page - 50.0) / 6.0).floor().max(120.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                self.gauges.row(ui, width);
+                self.tokens.row(ui, width);
+            });
             ui.add_space(4.0);
             // the height left under the gauges, shared out among the project cards: a card
             // whose queue and run would leave it empty grows into its share, so a tall window
@@ -1181,10 +1167,14 @@ impl App {
             // A project with nothing queued and nothing running keeps its natural height (as
             // it drew last frame) and the share goes to the projects with work: an idle
             // agent's card is a header and a finished run, not a third of the window
-            let count = self.tabs.len().max(1) as f32;
             let left = ctx.content_rect().bottom() - ui.next_widget_position().y - 12.0 - 4.0;
             let small: Vec<bool> = self.tabs.iter().map(Workspace::dashboard_small).collect();
-            let kept: f32 = self.tabs.iter().zip(&small).filter(|(_, s)| **s).map(|(t, _)| t.dash_height).sum();
+            // the idle projects are off the dashboard while one works, and cost it nothing
+            let any_working = small.iter().any(|s| !*s);
+            let shown = if any_working { small.iter().filter(|s| !**s).count() } else { self.tabs.len() };
+            let count = shown.max(1) as f32;
+            let kept: f32 =
+                if any_working { 0.0 } else { self.tabs.iter().zip(&small).filter(|(_, s)| **s).map(|(t, _)| t.dash_height).sum() };
             // the share of a working project weighs its run grid: a row of run cards (two
             // across) counts one, the queue beside them one more, so a project running six
             // cards gets twice the height of one running one, and its three rows of cards
@@ -1193,7 +1183,14 @@ impl App {
                 .tabs
                 .iter()
                 .zip(&small)
-                .map(|(t, s)| if *s { 0.0 } else { 1.0 + t.sink.live_runs().len().div_ceil(2).max(1) as f32 })
+                .map(|(t, s)| {
+                    if *s {
+                        0.0
+                    } else {
+                        let live = t.sink.live_runs().len().min(console::LIVE_CARDS);
+                        1.0 + live.div_ceil(console::grid_columns(live)).max(1) as f32
+                    }
+                })
                 .collect();
             let weight: f32 = weights.iter().sum::<f32>().max(1.0);
             // what every card costs beyond its own height: the spacing egui puts after a
@@ -1207,7 +1204,13 @@ impl App {
                 // takes the room a scroll area's content would otherwise be allowed
                 ui.set_width(page);
                 ui.set_max_width(page);
+                // a project with nothing running stays off the dashboard while another works
+                // (the person: "hide the inactive projects in dashboard"); with nothing
+                // running anywhere, every project shows its header line
                 for i in 0..self.tabs.len() {
+                    if any_working && small[i] {
+                        continue;
+                    }
                     let lane = theme::lane(1 + i % 9);
                     let budget = (pool * weights[i] / weight).floor();
                     if self.tabs[i].dashboard_card(ui, lane, page, budget) {

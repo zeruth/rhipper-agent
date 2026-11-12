@@ -264,9 +264,9 @@ pub(crate) fn gauge(ui: &mut Ui, name: &str, value: &str, samples: &[f32], color
                 badge(ui, value, color);
             });
         });
-        ui.add_space(2.0);
-        // a short plot: the gauges are a glance, the room under them is the projects'
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(inner, 24.0), egui::Sense::hover());
+        // a short plot: the gauges are a glance, the room under them is the projects' (six
+        // in one row, slim enough that two by six run cards fit under them)
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(inner, 14.0), egui::Sense::hover());
         let painter = ui.painter();
         let plot = rect.shrink2(egui::vec2(0.0, 2.0));
         painter.hline(plot.x_range(), plot.top(), Stroke::new(1.0, alpha(color, 60)));

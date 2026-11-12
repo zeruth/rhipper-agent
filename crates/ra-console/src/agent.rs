@@ -2922,7 +2922,7 @@ pub async fn investigate(store: &Store, id: i64, worker: &Worker) -> anyhow::Res
         answer.turns,
         answer.usage.prompt_tokens,
         answer.usage.completion_tokens,
-        cost_text(answer.usage.cost_usd)
+        cost_text(&answer.usage)
     );
     crate::pair::event(&root, &line);
     Ok(vec![line])
