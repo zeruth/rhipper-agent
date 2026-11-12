@@ -850,9 +850,12 @@ fn write_system_prompt(workspace: &Path, text: &str) -> std::io::Result<PathBuf>
     std::path::absolute(&path).or(Ok(path))
 }
 
-/// The project's target directory for a run in one of its worktrees (`<root>/var/worktrees/<id>`),
-/// so two cards at once build in one place under one lock rather than each in its own; `None`
-/// for a workspace that is not a worktree.
+/// The target directory for a run in one of the project's worktrees
+/// (`<root>/var/worktrees/<id>`): `<root>/target/wt-<id>`, the worktree's own under the
+/// project's target, so a build of one card never reads another's artifacts (two worktrees
+/// editing one crate shared a target and each compiled against the other's copy, #176 and
+/// #181), while the project's target stays the one place the builds live. `None` for a
+/// workspace that is not a worktree.
 #[must_use]
 pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
     let id = workspace.parent()?;
@@ -864,7 +867,8 @@ pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
         return None;
     }
     let root = var.parent()?;
-    std::path::absolute(root.join("target")).ok()
+    let card = workspace.file_name()?.to_string_lossy().into_owned();
+    std::path::absolute(root.join("target").join(format!("wt-{card}"))).ok()
 }
 
 /// The program a permission rule names: `python` of `Bash(python *)`, `gw.ps1` of

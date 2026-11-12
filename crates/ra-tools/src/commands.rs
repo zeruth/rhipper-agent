@@ -205,8 +205,9 @@ pub(crate) fn split(command: &str) -> anyhow::Result<Vec<String>> {
     Ok(words)
 }
 
-/// The project's target directory for a workspace that is one of its worktrees
-/// (`<root>/var/worktrees/<id>`); `None` for any other workspace.
+/// The target directory for a workspace that is one of the project's worktrees
+/// (`<root>/var/worktrees/<id>`): `<root>/target/wt-<id>`, the worktree's own under the
+/// project's target, the same the worker built in; `None` for any other workspace.
 fn shared_target(workspace: &Path) -> Option<PathBuf> {
     let id = workspace.parent()?;
     if id.file_name()? != "worktrees" {
@@ -216,7 +217,8 @@ fn shared_target(workspace: &Path) -> Option<PathBuf> {
     if var.file_name()? != "var" {
         return None;
     }
-    std::path::absolute(var.parent()?.join("target")).ok()
+    let card = workspace.file_name()?.to_string_lossy().into_owned();
+    std::path::absolute(var.parent()?.join("target").join(format!("wt-{card}"))).ok()
 }
 
 /// The interpreter a script program starts through, and the arguments before the script's
