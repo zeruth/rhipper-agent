@@ -543,6 +543,34 @@ pub fn guard(name: &str) -> Option<Guard> {
 /// aside twice.
 pub const INSTALL_LOCK: &str = "install";
 
+/// The file `rc install` leaves beside the binaries: the installed version and the time it went
+/// in, which a walk reads between cards to learn a newer `rc` is there.
+pub const INSTALLED_FILE: &str = "rc.version";
+
+/// What the install in `dir` says it is, `<version> <unix time>`; `None` before an install wrote it.
+#[must_use]
+pub fn installed(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(INSTALLED_FILE)).ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
+}
+
+/// The version a walk built as `own` moves to, given what the install said at the walk's start
+/// (`seen`) and says now: the install's when its version is newer than `own`, or when the
+/// install changed since the start and is not older (a rebuild on the same commit count). An
+/// older install is never moved to: the walk runs a newer build than the one on the path.
+#[must_use]
+pub fn moved_to(own: &str, seen: Option<&str>, now: Option<&str>) -> Option<String> {
+    let now = now?;
+    let version = now.split_whitespace().next()?;
+    let number = |v: &str| v.trim_end_matches('+').split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
+    let theirs = number(version)?;
+    let moved = match number(own) {
+        Some(ours) if theirs < ours => false,
+        Some(ours) if theirs > ours => true,
+        _ => seen != Some(now),
+    };
+    moved.then(|| version.to_owned())
+}
+
 /// The cargo target a check in `root` builds in: `CARGO_TARGET_DIR` when set (a relative one
 /// under `root`), else `target` under the outermost workspace above `root`, or `root` itself.
 #[must_use]

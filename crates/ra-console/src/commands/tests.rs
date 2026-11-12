@@ -1122,6 +1122,38 @@ async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_depend
     }
 }
 
+/// A relaunch that starts nothing and names a pid, for the walks that move to a newer install.
+fn relaunched(_dir: &std::path::Path, _root: &std::path::Path) -> anyhow::Result<u32> {
+    Ok(4242)
+}
+
+#[tokio::test]
+async fn a_walk_moves_to_a_newer_installed_rc_after_its_card_and_goes_on_when_the_install_did_not_move() {
+    let install = tempfile::tempdir().unwrap();
+    let walk = |dir: &std::path::Path, script| {
+        Worker::new("z-ai/glm-5.3-flash").with_provider(script).with_install(Some(dir.to_path_buf())).with_relaunch(relaunched)
+    };
+    // the install is newer than this build: the walk ends after its first card, never inside it
+    std::fs::write(install.path().join(crate::hub::INSTALLED_FILE), "99.0.0 1\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = three_cards(dir.path(), true).await;
+    let out = crate::agent::run_all(&store, &walk(install.path(), Scripted::new(accepted_runs(&["did A"]))), false).await.unwrap();
+    assert_eq!(implemented(&out).len(), 1, "{out:?}");
+    assert_eq!(out.last().unwrap(), "moved to 99.0.0 · ran 1 card(s) · pid 4242");
+    let feed = std::fs::read_to_string(dir.path().join("var/pair.log")).unwrap();
+    assert!(feed.contains("walk moved to 99.0.0"), "{feed}");
+    // the lock went with the walk: the successor takes it
+    assert!(!crate::agent::walk_running(dir.path()));
+    // the install is this build: the walk runs every card
+    std::fs::write(install.path().join(crate::hub::INSTALLED_FILE), format!("{} 1\n", crate::VERSION)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = three_cards(dir.path(), true).await;
+    let script = Scripted::new(accepted_runs(&["did A", "did B", "did C"]));
+    let out = crate::agent::run_all(&store, &walk(install.path(), script), false).await.unwrap();
+    assert_eq!(implemented(&out).len(), 3, "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 3 card(s) · no card is ready");
+}
+
 #[tokio::test]
 async fn a_matching_gambit_pulls_a_later_card_ahead_in_the_walk_and_a_priority_ahead_of_that() {
     let dir = tempfile::tempdir().unwrap();

@@ -579,7 +579,11 @@ async fn run_main() -> anyhow::Result<()> {
                 Some(id) => ra_console::agent::run(&store, id, &worker).await?,
                 None if all => match parallel {
                     Some(width) => ra_console::agent::run_parallel(&store, &worker, width, stop_on_revision).await?,
-                    None => ra_console::agent::run_all(&store, &worker, stop_on_revision).await?,
+                    // the walk moves to a newer rc that `rc install` put on the path, between cards
+                    None => {
+                        let worker = worker.with_install(Some(ra_console::install::default_dir()));
+                        ra_console::agent::run_all(&store, &worker, stop_on_revision).await?
+                    }
                 },
                 None => ra_console::agent::run_next(&store, &worker).await?,
             };
