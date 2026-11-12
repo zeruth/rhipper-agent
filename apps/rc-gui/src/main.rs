@@ -4199,7 +4199,7 @@ impl Workspace {
                 ui.allocate_ui_with_layout(egui::vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(right);
                     ui.set_max_width(right);
-                    if !console::draw_latest_run(ui, &self.sink, room) {
+                    if !console::draw_latest_run(ui, &self.sink, room, right) {
                         ui.label(RichText::new("no run in this session yet").color(theme::dim()).italics());
                     }
                 });

@@ -61,7 +61,7 @@ const DASHBOARD_ROWS: f32 = 3.0;
 /// The latest run's card alone, the live one before a finished one, for the dashboard, in
 /// `room` points of height at most (the queue beside it sets it); `false` when the session
 /// has run nothing yet.
-pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32) -> bool {
+pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) -> bool {
     let runs: Vec<(usize, u64, String)> = sink.with_lines(|lines| {
         lines.iter().enumerate().filter(|(_, l)| l.kind == Kind::Run).filter_map(|(i, l)| l.run.map(|id| (i, id, l.text.clone()))).collect()
     });
@@ -78,11 +78,15 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32) -> bool {
     // a fixed room: in a scroll area the clip is the page, and a live card would take it all;
     // the queue beside the card is the most it gets, the default rows the least
     let room = room.max(96.0 + 24.0 * DASHBOARD_ROWS);
-    // two live runs sit side by side, each in half the width
+    // two live runs sit side by side, each in half the column less the space between them;
+    // the column's width comes from the caller, since what egui called available here ran
+    // past the column and the second card bled off the page
+    let gap = 10.0;
     #[allow(clippy::cast_precision_loss)]
-    let width = (ui.available_width() - 10.0 * (picked.len() as f32 - 1.0)) / picked.len() as f32;
+    let count = picked.len() as f32;
+    let width = ((column - gap * (count - 1.0)) / count).floor();
     ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.spacing_mut().item_spacing.x = gap;
         for (index, id, title) in picked {
             let Some(run) = sink.run(*id) else { continue };
             ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
