@@ -3757,9 +3757,11 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; run a task");
     let worker = &worker.for_card(&workspace_of(store), &node)?;
-    let provider = worker.provider()?;
+    // a dry run calls no model, so it needs no key: without one (CI has none) the route alone
+    // says whether the run is a harness, and the harness's command line is left out
+    let provider = worker.provider().ok();
     let Prepared { workspace, root, task, project, budget, caps, effort } = prepare(store, &node, worker, false).await?;
-    let harness = provider.has_own_tools();
+    let harness = provider.as_ref().map_or(worker.route() == Route::ClaudeCode, |p| p.has_own_tools());
     let checks = checks_of(&root, &node);
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
     let resume = resume_of(&node, unix_now());
@@ -3812,7 +3814,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             }
         }
     }
-    let command = provider.command_line(&request);
+    let command = provider.as_ref().and_then(|p| p.command_line(&request));
     if let Some(command) = &command {
         // the effort and the allowed tools, named before the argument list buries them
         let effort = argument(command, "--effort").unwrap_or("the harness default");
