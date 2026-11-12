@@ -2498,10 +2498,11 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
             if let Err(e) = git(&root, &["merge", "--no-ff", "-m", &message, &branch]).await {
                 let conflicts = git(&root, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
                 let _ = git(&root, &["merge", "--abort"]).await;
-                anyhow::bail!(
-                    "the merge of {branch} conflicts in {}; the merge was aborted, land #{id} by hand ({e:#})",
-                    if conflicts.is_empty() { "files git did not name".to_owned() } else { conflicts.replace('\n', ", ") }
-                );
+                tracing::debug!("the merge of {branch} failed: {e:#}");
+                return Err(anyhow::Error::new(LandConflict {
+                    branch,
+                    files: if conflicts.is_empty() { "files git did not name".to_owned() } else { conflicts.replace('\n', ", ") },
+                }));
             }
             lines.push(format!("merged {branch} into {}", git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()));
             // a Rust tree is formatted as it lands, into the merge commit: a build on push
@@ -2545,11 +2546,38 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
     Ok(lines)
 }
 
+/// A landing whose merge into the project's branch conflicted; the merge was aborted.
+#[derive(Debug)]
+pub struct LandConflict {
+    branch: String,
+    files: String,
+}
+
+impl std::fmt::Display for LandConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the merge of {} conflicts in {}; the merge was aborted", self.branch, self.files)
+    }
+}
+
+impl std::error::Error for LandConflict {}
+
 /// [`land`] for a walk: the lines it answers, or the one line of why it did not, on the feed
 /// too; never an error, since a card the person must land by hand is not the walk's end.
 async fn land_or_say(store: &Store, id: i64, worker: &Worker) -> Vec<String> {
     match land(store, id, worker).await {
         Ok(lines) => lines,
+        // the project moved on under the card: it goes back to its worker, whose rerun merges
+        // the project's branch into the card's first and resolves the conflicts the brief names,
+        // rather than waiting on a person (asm #73 and #78, 2026-11-12)
+        Err(e) if e.downcast_ref::<LandConflict>().is_some() => {
+            let text = match store.set_state(id, TaskState::NeedsRevision).await {
+                Ok(_) => format!("#{id} not landed: {e}; sent back to its worker to merge the project's branch in and resolve them"),
+                Err(set) => format!("#{id} not landed: {e}; it could not be sent back ({set:#}), land it by hand"),
+            };
+            tracing::warn!("{text}");
+            crate::pair::event(&workspace_of(store), &text);
+            vec![text]
+        }
         Err(e) => {
             let text = format!("#{id} not landed: {}", first_line(&format!("{e:#}")));
             tracing::warn!("{text}");
