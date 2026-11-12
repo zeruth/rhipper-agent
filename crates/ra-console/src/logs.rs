@@ -118,8 +118,11 @@ impl Sink {
 
     /// Takes one progress line: a start marker opens a run, an end marker closes the newest
     /// live one, and any other line is a step of the newest live run, which a step without one
-    /// opens untitled.
+    /// opens untitled. A line tagged with its card ([`tag_card`]), as a walk of several cards
+    /// at once writes them, goes to that card's live run instead of the newest: six runs
+    /// interleave their steps in one file, and untagged they all landed on the last to start.
     pub fn progress(&self, text: &str) {
+        let (card, text) = untag_card(text);
         if let Some(title) = text.strip_prefix(RUN_START) {
             // the pid on the marker is for the orphan scan, not for the bubble
             let (shown, pid) = match title.rsplit_once(" · pid ") {
@@ -133,15 +136,16 @@ impl Sink {
         } else if let Some(outcome) = text.strip_prefix(RUN_END) {
             // an orphan's end names its card: it closes that run and no other, so a window
             // reporting an older run never closes the card still going
-            let id = match orphaned_card(outcome) {
-                Some(card) => self.live_run_of(card),
-                None => self.live_run(),
+            let id = match (orphaned_card(outcome), card) {
+                (Some(orphan), _) => self.live_run_of(orphan),
+                (None, Some(card)) => self.live_run_of(card).or_else(|| self.live_run()),
+                (None, None) => self.live_run(),
             };
             if let Some(id) = id {
                 self.close_run(id, outcome);
             }
         } else {
-            let id = self.live_run().unwrap_or_else(|| self.open_run("worker"));
+            let id = card.and_then(|card| self.live_run_of(card)).or_else(|| self.live_run()).unwrap_or_else(|| self.open_run("worker"));
             if let Some(run) = self.inner.runs.lock().0.get_mut(&id) {
                 run.steps.push(text.to_owned());
             }
@@ -342,6 +346,28 @@ pub fn orphaned_card(outcome: &str) -> Option<i64> {
     card_of(outcome.strip_prefix("✗ orphaned ")?)
 }
 
+/// The mark a progress line carries in front when it belongs to one card of several running
+/// at once: `@#12<TAB>`, which no step begins with on its own.
+const CARD_TAG: &str = "@#";
+
+/// A progress line marked as card `card`'s.
+#[must_use]
+pub fn tag_card(card: i64, text: &str) -> String {
+    format!("{CARD_TAG}{card}\t{text}")
+}
+
+/// The card a progress line is marked with, and the line without the mark; an unmarked line
+/// comes back whole with no card.
+#[must_use]
+pub fn untag_card(text: &str) -> (Option<i64>, &str) {
+    let Some(rest) = text.strip_prefix(CARD_TAG) else { return (None, text) };
+    let Some((card, line)) = rest.split_once('\t') else { return (None, text) };
+    match card.parse() {
+        Ok(card) => (Some(card), line),
+        Err(_) => (None, text),
+    }
+}
+
 impl Default for Sink {
     fn default() -> Self {
         Self::new()
@@ -406,6 +432,30 @@ mod tests {
         assert_eq!(card_of("worker"), None);
         assert_eq!(orphaned_card("✗ orphaned #12: process 4242 is gone"), Some(12));
         assert_eq!(orphaned_card("✗ failed: #12"), None);
+    }
+
+    #[test]
+    fn a_tagged_step_goes_to_its_own_card_among_several_running() {
+        let sink = Sink::new();
+        sink.progress(&tag_card(33, &format!("{RUN_START}#33 Focus · opus · pid 1")));
+        let focus = sink.live_run().unwrap();
+        sink.progress(&tag_card(41, &format!("{RUN_START}#41 Data · opus · pid 1")));
+        let data = sink.live_run().unwrap();
+        // the older card's step lands on the older card, not on the newest run
+        sink.progress(&tag_card(33, "Write FocusTraversalPolicy.java"));
+        sink.progress(&tag_card(41, "Read DataFlavor.java"));
+        sink.progress("Grep untagged");
+        assert_eq!(sink.run(focus).unwrap().steps, ["Write FocusTraversalPolicy.java"]);
+        assert_eq!(sink.run(data).unwrap().steps, ["Read DataFlavor.java", "Grep untagged"]);
+        // a tagged end closes its own card; a tag for a card with no run here falls to the newest
+        sink.progress(&tag_card(33, &format!("{RUN_END}✓ $0.10")));
+        assert!(!sink.run(focus).unwrap().live());
+        assert!(sink.run(data).unwrap().live());
+        sink.progress(&tag_card(99, "a stray step"));
+        assert_eq!(sink.run(data).unwrap().steps.last().map(String::as_str), Some("a stray step"));
+        assert_eq!(untag_card("@#12\tRead x"), (Some(12), "Read x"));
+        assert_eq!(untag_card("@#nope\tRead x"), (None, "@#nope\tRead x"));
+        assert_eq!(untag_card("Read x"), (None, "Read x"));
     }
 
     #[test]

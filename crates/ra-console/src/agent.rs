@@ -15,6 +15,7 @@ use ra_roadmap::model::{Effort, Estimate, Gambit, GambitState, Node, NodeKind, T
 use ra_roadmap::store::Store;
 use ra_roadmap::tree;
 use ra_usage::{Entry, Totals, UsageStore};
+use tracing::Instrument as _;
 
 /// The project context file, named where the window and the console speak of it.
 pub use ra_context::PROJECT_FILE;
@@ -2317,12 +2318,18 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 taken.insert(id);
                 let (path, branch) = worktree_add(&root, id).await?;
                 let runner = worker.clone().with_worktree(path, branch);
+                // the card's span: every progress line of the run carries the card, so six
+                // runs' steps stay apart in the activity file and on the window's cards
+                let span = tracing::info_span!(crate::trace::CARD_SPAN, id);
                 flight.push((
                     id,
-                    Box::pin(async move {
-                        let _slot = slot;
-                        run(store, id, &runner).await
-                    }),
+                    Box::pin(
+                        async move {
+                            let _slot = slot;
+                            run(store, id, &runner).await
+                        }
+                        .instrument(span),
+                    ),
                     Seat::Build(kind),
                 ));
             }
@@ -2338,7 +2345,8 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 reading += 1;
                 let id = node.id;
                 let reader = worker.clone();
-                flight.push((id, Box::pin(async move { investigate(store, id, &reader).await }), Seat::Investigate));
+                let span = tracing::info_span!(crate::trace::CARD_SPAN, id);
+                flight.push((id, Box::pin(async move { investigate(store, id, &reader).await }.instrument(span)), Seat::Investigate));
             }
         }
         if flight.is_empty() {
