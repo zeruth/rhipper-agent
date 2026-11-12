@@ -192,7 +192,7 @@ const PRICED_MODELS: &str = r#"{"data":[{"id":"z-ai/glm-5.3-flash","pricing":{"p
 
 fn prices_fixture(read_at: u64) -> Prices {
     let mut models = BTreeMap::new();
-    models.insert(model().to_owned(), Price { prompt: 0.000_001, completion: 0.000_002 });
+    models.insert(model().to_owned(), Price { prompt: 0.000_001, completion: 0.000_002, ..Price::default() });
     Prices { read_at, models }
 }
 
@@ -250,6 +250,34 @@ fn a_model_the_prices_do_not_list_keeps_no_cost() {
     assert_eq!(prices.cost("other/model", &usage), None);
     assert!(prices.cost(model(), &usage).is_some());
     assert!(!prices_fixture(0).fresh_at(now()), "a list from the epoch is stale");
+}
+
+#[test]
+fn cached_tokens_are_priced_at_the_cache_rate_and_a_claude_model_from_the_one_table() {
+    // a listed cache rate prices the cached share; a model without one prices it as input
+    let mut prices = prices_fixture(now());
+    prices.models.insert("cached/model".to_owned(), Price { prompt: 1e-6, completion: 0.0, cache_read: Some(1e-7), cache_write: None });
+    let usage = Usage { prompt_tokens: 1000, cached_tokens: 900, ..Usage::default() };
+    assert!((prices.cost("cached/model", &usage).unwrap() - (100e-6 + 900e-7)).abs() < 1e-12);
+    assert!((prices.cost(model(), &usage).unwrap() - 1000e-6).abs() < 1e-12);
+    // a Claude model the list leaves out takes the Anthropic list, alias or id
+    let opus = prices.price_of("anthropic/claude-opus-4.5").expect("the Anthropic list");
+    assert!((opus.prompt - 5e-6).abs() < 1e-15 && (opus.cache_read.unwrap() - 5e-7).abs() < 1e-15);
+    assert_eq!(anthropic_price("opus"), Some(opus));
+    assert!((anthropic_price("claude-opus-4-1-20250805").unwrap().prompt - 15e-6).abs() < 1e-15);
+    assert!((anthropic_price("claude-sonnet-4-6").unwrap().completion - 15e-6).abs() < 1e-15);
+    assert_eq!(anthropic_price("z-ai/glm-5.3-flash"), None);
+}
+
+#[test]
+fn the_endpoint_cache_rates_are_read_with_the_prices() {
+    let models: WireModels = serde_json::from_str(
+        r#"{"data":[{"id":"anthropic/claude-sonnet-4.6","pricing":{"prompt":"0.000003","completion":"0.000015","input_cache_read":"0.0000003","input_cache_write":"0.00000375"}}]}"#,
+    )
+    .unwrap();
+    let prices = Prices::from_wire(models.data, 1);
+    let price = prices.models["anthropic/claude-sonnet-4.6"];
+    assert_eq!((price.cache_read, price.cache_write), (Some(0.000_000_3), Some(0.000_003_75)));
 }
 
 #[tokio::test]

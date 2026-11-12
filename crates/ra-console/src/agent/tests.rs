@@ -4,6 +4,17 @@
 use super::*;
 
 #[test]
+fn the_end_line_marks_a_computed_cost_as_an_estimate_and_names_the_cached_share() {
+    let computed =
+        Usage { prompt_tokens: 1_000_000, completion_tokens: 0, cached_tokens: 900_000, cost_usd: Some(4.12), cost_computed: true };
+    assert_eq!(end_cost(&computed), "$4.12 est. · 90% cached");
+    let reported = Usage { cost_computed: false, ..computed };
+    assert_eq!(end_cost(&reported), "$4.1200 · 90% cached");
+    let none = Usage { cost_usd: None, cost_computed: false, ..computed };
+    assert_eq!(end_cost(&none), "cost unreported · 90% cached");
+}
+
+#[test]
 fn the_turn_sizes_lead_with_the_average_and_name_the_largest_when_shown() {
     let usage = Usage { prompt_tokens: 30_000, completion_tokens: 600, cached_tokens: 0, cost_usd: None, cost_computed: false };
     let mut session = Session {

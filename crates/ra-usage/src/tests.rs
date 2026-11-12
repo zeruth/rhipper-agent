@@ -42,6 +42,27 @@ async fn a_computed_cost_is_marked_as_such_and_a_reported_one_is_not() {
 }
 
 #[tokio::test]
+async fn the_sums_carry_reported_and_computed_costs_in_one_figure_and_mark_the_estimated_share() {
+    let store = UsageStore::in_memory().await.unwrap();
+    store.record(&entry("claude-opus-5-5", Some(3), Some(3.0))).await.unwrap();
+    store.record(&Entry { cost_computed: true, ..entry("claude-opus-5-5", Some(3), Some(1.12)) }).await.unwrap();
+    store.record(&entry("local/qwen3-8b", Some(4), None)).await.unwrap();
+    let totals = store.totals().await.unwrap();
+    assert!((totals.estimated_usd - 1.12).abs() < 1e-9);
+    assert_eq!(totals.cost_text(), "$4.1200 ($1.12 est.)");
+    let by_node = store.by_node().await.unwrap();
+    let mut merged = Totals::default();
+    for (_, t) in &by_node {
+        merged.merge(t);
+    }
+    assert_eq!(merged.cost_text(), "$4.1200 ($1.12 est.)");
+    let mut added = Totals::default();
+    added.add(&entry("claude-opus-5-5", None, Some(0.5)));
+    assert_eq!(added.cost_text(), "$0.5000");
+    assert_eq!(Totals::default().cost_text(), "—");
+}
+
+#[tokio::test]
 async fn a_row_carries_its_turn_count_and_the_calls_of_a_node_list_it() {
     let store = UsageStore::in_memory().await.unwrap();
     store.record(&Entry { turns: 12, ..entry("claude-opus-5-5", Some(3), Some(0.25)) }).await.unwrap();

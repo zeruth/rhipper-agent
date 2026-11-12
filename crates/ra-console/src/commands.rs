@@ -615,7 +615,7 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             }
             // one line per card, so the log gives each its own lane color
             for (node, t) in rows {
-                let cost = t.cost_usd.map_or_else(|| "—".to_owned(), |c| format!("${c:.4}"));
+                let cost = t.cost_text();
                 out.push(match node {
                     Some(node) => format!(
                         "{}#{} {} · {} calls · {} turns · {} in · {} out · {} cached · {} read-in · {cost}",

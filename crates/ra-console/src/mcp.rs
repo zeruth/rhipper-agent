@@ -294,7 +294,7 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
                 session.prompt_tokens,
                 session.completion_tokens,
                 session.cached_tokens,
-                session.cost_usd.map_or("—".to_owned(), |c| format!("${c:.4}"))
+                session.cost_text()
             ));
             if let Some(all) = worker.all_time().await {
                 out.push(format!(
@@ -303,7 +303,7 @@ async fn dispatch(name: &str, args: &Value, store: &Store, worker: &mut Worker) 
                     all.prompt_tokens,
                     all.completion_tokens,
                     all.cached_tokens,
-                    all.cost_usd.map_or("—".to_owned(), |c| format!("${c:.4}"))
+                    all.cost_text()
                 ));
             }
             Ok(out)

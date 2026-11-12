@@ -233,8 +233,25 @@ fn the_stream_tallies_the_read_in_through_the_first_edit_and_the_files_read_whol
         }
     }
     assert_eq!((tally.read_in(), tally.whole_reads()), (1203 + 2005, 2));
-    let answer = tally.completion();
+    let answer = tally.completion("claude-opus-5-5");
     assert_eq!((answer.read_in, answer.whole_reads, answer.turns), (3208, 2, 3));
+}
+
+#[test]
+fn a_capped_completion_with_most_of_its_input_cached_is_priced_at_the_cache_rate() {
+    // one turn of a million in, 90% read from the cache, on sonnet: $3/M fresh, $0.30/M cached
+    let mut tally = TurnTally::default();
+    tally.note(r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":100000,"cache_read_input_tokens":900000,"output_tokens":0},"content":[]}}"#);
+    let answer = tally.completion("sonnet");
+    let cost = answer.usage.cost_usd.expect("priced");
+    assert!((cost - (0.3 + 0.27)).abs() < 1e-9, "{cost}, not the $3.00 of every token at the input rate");
+    assert!(answer.usage.cost_computed);
+    assert_eq!(answer.usage.cached_tokens * 10, answer.usage.prompt_tokens * 9);
+    // a model the table does not know keeps no cost rather than a wrong one
+    let mut tally = TurnTally::default();
+    tally.note(r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":1},"content":[]}}"#);
+    let answer = tally.completion("z-ai/glm-5.3-flash");
+    assert_eq!((answer.usage.cost_usd, answer.usage.cost_computed), (None, false));
 }
 
 #[test]
@@ -269,13 +286,17 @@ fn a_turn_past_the_context_cap_stops_the_run_once_its_tool_results_are_in() {
     }
     let reading_in = 1 + 2 * READING_IN_TURNS;
     assert_eq!((stopped, read), (Some(130_005), reading_in + 3), "the run stops at the tool result of the crossing turn");
-    let answer = tally.completion();
+    let answer = tally.completion("claude-opus-5-5");
     let turns = READING_IN_TURNS as u64;
     assert_eq!(answer.turns, turns + 1);
     assert_eq!(answer.usage.prompt_tokens, turns * 90_003 + 130_005);
     assert_eq!(answer.usage.completion_tokens, turns * 40 + 90);
     assert_eq!(answer.usage.cached_tokens, turns * 90_000 + 120_000);
-    assert_eq!(answer.usage.cost_usd, None);
+    // the capped run has a cost of its own, computed: 41 fresh tokens at $5/M, 1.2M cache
+    // reads at $0.50/M, 10k cache writes at $6.25/M, 570 out at $25/M
+    let cost = answer.usage.cost_usd.expect("a capped run is priced from its turns");
+    assert!((cost - 0.676_955).abs() < 1e-9, "{cost}");
+    assert!(answer.usage.cost_computed);
     assert_eq!(answer.text, "editing");
     assert_eq!(answer.turn_usage.len(), READING_IN_TURNS + 1);
     // without a cap nothing stops, and under it neither; and a crossing within the reading-in

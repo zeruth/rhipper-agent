@@ -14,6 +14,7 @@ use ra_gotchas::{Catalogue, Conditions, Hit, Journal, Verdict, Where};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+use crate::openrouter::Tokens;
 use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvider, ProviderError, TurnUsage, Usage};
 
 /// Where the plan's limits are kept, beside the roadmap.
@@ -376,7 +377,13 @@ impl ClaudeCode {
         };
         // a result names the reason itself, exit code or not
         if let Some(result) = result {
+            let listed = turns.cost(&request.model);
             with_stream(parse_result(&result), |completion| {
+                // a result without a cost, as a run out of turns can end, is priced from its turns
+                if completion.usage.cost_usd.is_none() && listed.is_some() {
+                    completion.usage.cost_usd = listed;
+                    completion.usage.cost_computed = true;
+                }
                 completion.gotchas = gotchas;
                 completion.read_in = turns.read_in();
                 completion.whole_reads = turns.whole_reads();
@@ -384,7 +391,7 @@ impl ClaudeCode {
                 completion.reads = reads;
             })
         } else if let Some((size, cap)) = crossed.zip(request.max_context) {
-            let mut completion = turns.completion();
+            let mut completion = turns.completion(&request.model);
             completion.gotchas = gotchas;
             completion.reads = reads;
             Err(ProviderError::ContextOut { completion: Box::new(completion), cap, size })
@@ -437,6 +444,8 @@ struct TurnTally {
     turns: Vec<(Option<String>, TurnUsage)>,
     /// The cached share of each turn's input, for the usage of a run that ends without a result.
     cached: Vec<u64>,
+    /// The share of each turn's input written to the cache, which is priced at its own rate.
+    written: Vec<u64>,
     /// The text blocks of the last turn, the worker's words when the run ends without a result.
     said: Vec<String>,
     /// The index of the turn that made the first edit or write, once one has.
@@ -477,11 +486,15 @@ impl TurnTally {
                 if let Some(cached) = self.cached.last_mut() {
                     *cached = count("cache_read_input_tokens");
                 }
+                if let Some(written) = self.written.last_mut() {
+                    *written = count("cache_creation_input_tokens");
+                }
                 self.said.extend(text);
             }
             _ => {
                 self.turns.push((id, turn));
                 self.cached.push(count("cache_read_input_tokens"));
+                self.written.push(count("cache_creation_input_tokens"));
                 self.said = text.collect();
             }
         }
@@ -526,16 +539,33 @@ impl TurnTally {
         self.turns.last().map(|(_, turn)| turn.input_tokens)
     }
 
+    /// The list price of the turns the stream showed on `model`, each side of the input at its
+    /// own rate; `None` for a model the price table does not know or a stream without turns.
+    fn cost(&self, model: &str) -> Option<f64> {
+        let price = crate::openrouter::anthropic_price(model).filter(|_| !self.turns.is_empty())?;
+        let tokens =
+            self.turns.iter().zip(&self.cached).zip(&self.written).fold(Tokens::default(), |mut sum, (((_, turn), &cached), &written)| {
+                sum.fresh += turn.input_tokens.saturating_sub(cached + written);
+                sum.cache_read += cached;
+                sum.cache_write += written;
+                sum.output += turn.output_tokens;
+                sum
+            });
+        Some(price.of(&tokens))
+    }
+
     /// The completion of a run stopped before its result: the usage summed over the turns the
-    /// stream showed, at no reported cost, and the last turn's words.
-    fn completion(self) -> Completion {
+    /// stream showed, at the list price of `model` the ledger marks as computed, and the last
+    /// turn's words.
+    fn completion(self, model: &str) -> Completion {
         let turns = u64::try_from(self.turns.len()).unwrap_or(u64::MAX);
+        let cost_usd = self.cost(model);
         let usage = Usage {
             prompt_tokens: self.turns.iter().map(|(_, turn)| turn.input_tokens).sum(),
             completion_tokens: self.turns.iter().map(|(_, turn)| turn.output_tokens).sum(),
             cached_tokens: self.cached.iter().sum(),
-            cost_usd: None,
-            cost_computed: false,
+            cost_usd,
+            cost_computed: cost_usd.is_some(),
         };
         let (read_in, whole_reads) = (self.read_in(), self.whole_reads());
         Completion {
