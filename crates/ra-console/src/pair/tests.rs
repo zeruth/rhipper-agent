@@ -66,10 +66,11 @@ fn a_follower_catches_up_then_sees_new_lines_and_survives_a_rotation() {
     assert_eq!(follower.poll(), ["300\tafter the rotation"]);
 }
 
-#[test]
-fn the_window_says_when_it_comes_up_and_goes_down() {
+#[tokio::test]
+async fn the_window_says_when_it_comes_up_and_goes_down() {
     let dir = tempfile::tempdir().unwrap();
-    window_up_with(dir.path(), "0.9.1+abc", 3, |_| true);
+    let store = ra_roadmap::store::Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    window_up_with(&store, dir.path(), "0.9.1+abc", 3, |_| true).await;
     window_down(dir.path(), "restart");
     let pid = std::process::id();
     assert_eq!(recent(dir.path(), 10), [format!("window up 0.9.1+abc pid {pid} tabs 3"), "window down restart".to_owned()]);
@@ -86,20 +87,20 @@ fn a_run_whose_process_is_gone_is_orphaned_once_and_a_finished_one_never() {
             "{RUN_START}#2 Finished · opus · pid 111\nread a.rs\n{RUN_END}✓ $0.01\n\
              {RUN_START}#3 Killed with the window · opus · pid 222\nedit b.rs\n\
              {RUN_START}#4 Still going · opus · pid 333\n\
+             {RUN_START}#3 Killed again by the next walk · opus · pid 444\n\
              {RUN_START}#5 Of an older build, no pid · opus\n"
         ),
     )
     .unwrap();
-    // 111 finished, 222 is gone, 333 lives, #5 cannot be judged
-    window_up_with(dir.path(), "b", 1, |pid| pid == 333);
-    let lines = recent(dir.path(), 10);
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert_eq!(lines[1], "run orphaned #3");
-    // the orphan got its end in the activity log, so the next start does not report it again
+    // 111 finished, 222 and 444 are gone, 333 lives, #5 cannot be judged: #3 once
+    assert_eq!(orphaned(dir.path(), |pid| pid == 333), [3]);
+    // both orphans got their end in the activity log, so the next start does not report them
     let text = std::fs::read_to_string(&activity).unwrap();
-    assert!(text.ends_with(&format!("{RUN_END}✗ orphaned #3: process 222 is gone\n")), "{text}");
-    window_up_with(dir.path(), "b", 1, |pid| pid == 333);
-    assert_eq!(recent(dir.path(), 10).len(), 3);
+    assert!(
+        text.ends_with(&format!("{RUN_END}✗ orphaned #3: process 222 is gone\n{RUN_END}✗ orphaned #3: process 444 is gone\n")),
+        "{text}"
+    );
+    assert!(orphaned(dir.path(), |pid| pid == 333).is_empty());
 }
 
 #[test]

@@ -136,6 +136,11 @@ pub struct Worker {
     /// verdict or the lint's warnings, leading the task instead of the card being taken up
     /// afresh.
     fix: Option<String>,
+    /// The install directory a walk watches between cards, moving to a newer `rc` found there;
+    /// `None`, the default and the tests', watches none.
+    install: Option<PathBuf>,
+    /// What starts the walk again on the installed `rc`; the tests hand in one that starts nothing.
+    relaunch: fn(&Path, &Path) -> anyhow::Result<u32>,
 }
 
 impl Worker {
@@ -161,7 +166,23 @@ impl Worker {
             workspace: None,
             branch: None,
             fix: None,
+            install: None,
+            relaunch,
         }
+    }
+
+    /// The same worker, its walks moving to a newer `rc` installed in `dir` between cards.
+    #[must_use]
+    pub fn with_install(mut self, dir: Option<PathBuf>) -> Self {
+        self.install = dir;
+        self
+    }
+
+    /// The same worker, its walks started again on a newer install by `relaunch`.
+    #[must_use]
+    pub fn with_relaunch(mut self, relaunch: fn(&Path, &Path) -> anyhow::Result<u32>) -> Self {
+        self.relaunch = relaunch;
+        self
     }
 
     /// The same worker, acting in the worktree at `path` on `branch` instead of the project
@@ -1983,10 +2004,19 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     // the cards past their reruns in this walk
     let mut parked: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut sent: std::collections::HashMap<i64, (usize, usize)> = std::collections::HashMap::new();
-    // one walk per project: the lock is held for the whole of it
-    let Some(_lock) = take_walk_lock(&workspace_of(store)) else {
+    // one walk per project: the lock is held for the whole of it, and a walk moving to a newer
+    // install hands it to its successor as it exits
+    let lock = match take_walk_lock(&workspace_of(store)) {
+        Some(lock) => Some(lock),
+        None => handed_walk_lock(&workspace_of(store)).await,
+    };
+    let Some(_lock) = lock else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
     };
+    // what the install said at the start: a change since is a newer rc to move to
+    let seen = worker.install.as_deref().and_then(crate::hub::installed);
+    // set when the move failed: the walk finishes on its own rc rather than try at every card
+    let mut stays = false;
     // the other projects see the walk from its start
     let root = workspace_of(store);
     write_digest(store, &root, Some(format!("walk · pid {} · started {}", std::process::id(), clock(unix_now()))), None, None).await;
@@ -2108,6 +2138,27 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             let _ = std::fs::remove_file(&stop);
             done(&mut lines, format!("ran {ran} card(s) · stopped after #{id}, as asked")).await;
             return Ok(lines);
+        }
+        // a newer rc installed: it takes the walk up from the next card, so `rc install` is
+        // enough and no run in flight is cut; a card being rerun keeps the walk that counts its
+        // retries
+        if !stays
+            && retry.is_none()
+            && let Some(dir) = &worker.install
+            && let Some(version) = crate::hub::moved_to(crate::VERSION, seen.as_deref(), crate::hub::installed(dir).as_deref())
+        {
+            match (worker.relaunch)(dir, &root) {
+                Ok(pid) => {
+                    done(&mut lines, format!("moved to {version} · ran {ran} card(s) · pid {pid}")).await;
+                    return Ok(lines);
+                }
+                Err(error) => {
+                    // the walk stays on its own rc; the line says why, and it does not try again
+                    lines.push(format!("the walk stays on {}: {error:#}", crate::VERSION));
+                    crate::pair::event(&root, &format!("walk stays on {}: {error:#}", crate::VERSION));
+                    stays = true;
+                }
+            }
         }
     }
 }
@@ -2233,6 +2284,49 @@ pub fn spawn_walk(root: &Path, debug: bool, parallel: Option<u32>) -> anyhow::Re
 
 /// The file a detached walk writes its stderr to: what it printed and why it died.
 const WALK_LOG: &str = "var/walk.log";
+
+/// The variable a walk moving to a newer install leaves its successor: its own pid, whose walk
+/// lock the successor waits for.
+const WALK_FROM_VAR: &str = "RHIPPER_WALK_FROM";
+
+/// How long a successor waits for the walk it takes over to let the lock go.
+const HANDOVER: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The walk lock of the walk this process takes over, when it was started by one moving to a
+/// newer install: taken as that walk exits, so the project has one walk lock throughout.
+async fn handed_walk_lock(root: &Path) -> Option<WalkLock> {
+    let from = std::env::var(WALK_FROM_VAR).ok()?.parse::<u32>().ok()?;
+    let start = std::time::Instant::now();
+    while start.elapsed() < HANDOVER {
+        if let Some(lock) = take_walk_lock(root) {
+            return Some(lock);
+        }
+        if !crate::hub::pid_alive(from) {
+            // gone and the lock still held: another walk has it
+            return take_walk_lock(root);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    None
+}
+
+/// Starts this walk again on the `rc` installed in `dir`, in `root`, with this process's
+/// arguments, detached as [`spawn_walk`] starts one; the new walk takes the lock as this one
+/// exits. Returns the process id.
+///
+/// # Errors
+/// When the installed `rc` cannot start.
+pub fn relaunch(dir: &Path, root: &Path) -> anyhow::Result<u32> {
+    let rc = dir.join(format!("rc{}", std::env::consts::EXE_SUFFIX));
+    let mut command = std::process::Command::new(&rc);
+    command.args(std::env::args_os().skip(1)).current_dir(root).env(WALK_FROM_VAR, std::process::id().to_string());
+    crate::hub::detach(&mut command);
+    if let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(root.join(WALK_LOG)) {
+        command.stderr(log);
+    }
+    let child = command.spawn().map_err(|e| anyhow::anyhow!("cannot start {}: {e}", rc.display()))?;
+    Ok(child.id())
+}
 
 /// Asks the walk to stop after the task it is in: leaves the file it reads between runs. A
 /// walk that is not running finds the file at its next start and stops after one card, so the

@@ -747,7 +747,7 @@ impl App {
         }
         // every project's feed hears the window is up, once the tab count is known
         for tab in &app.tabs {
-            ra_console::pair::window_up(&tab.root, ra_console::VERSION, app.tabs.len());
+            tab.rt.block_on(ra_console::pair::window_up(&tab.store, &tab.root, ra_console::VERSION, app.tabs.len()));
         }
         // the project asked for is in front; without one, many projects open on all of them
         match front.and_then(|f| app.tabs.iter().position(|t| t.root == f)) {
@@ -958,8 +958,11 @@ impl eframe::App for App {
         if self.mailbox_read.elapsed() >= Duration::from_millis(500) {
             self.mailbox_read = Instant::now();
             for project in ra_console::hub::take_requests() {
-                if self.open(&ctx, &project) {
-                    ra_console::pair::window_up(&plain_path(&project), ra_console::VERSION, self.tabs.len());
+                let root = plain_path(&project);
+                if self.open(&ctx, &project)
+                    && let Some(tab) = self.tabs.iter().find(|t| t.root == root)
+                {
+                    tab.rt.block_on(ra_console::pair::window_up(&tab.store, &tab.root, ra_console::VERSION, self.tabs.len()));
                 }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }

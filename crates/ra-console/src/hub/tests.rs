@@ -15,6 +15,22 @@ fn digest_of(name: &str, pid: u32, when: u64) -> Digest {
 }
 
 #[test]
+fn a_walk_moves_to_a_newer_install_or_a_rebuild_of_its_own_and_never_to_an_older_one() {
+    // newer by its number, whatever the walk saw at its start
+    assert_eq!(moved_to("0.2.10", Some("0.2.11 5"), Some("0.2.11 5")), Some("0.2.11".to_owned()));
+    // the same number, installed again since the start: a rebuild
+    assert_eq!(moved_to("0.2.10+", Some("0.2.10+ 5"), Some("0.2.10+ 9")), Some("0.2.10+".to_owned()));
+    // unchanged since the start, older, or never installed
+    assert_eq!(moved_to("0.2.10+", Some("0.2.10+ 5"), Some("0.2.10+ 5")), None);
+    assert_eq!(moved_to("0.2.10", None, Some("0.2.9 9")), None);
+    assert_eq!(moved_to("0.2.10", None, None), None);
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(installed(dir.path()), None);
+    std::fs::write(dir.path().join(INSTALLED_FILE), "0.2.11 5\n").unwrap();
+    assert_eq!(installed(dir.path()).as_deref(), Some("0.2.11 5"));
+}
+
+#[test]
 fn a_digest_written_from_one_project_is_read_from_another_as_one_line_and_never_its_own() {
     let hub = tempfile::tempdir().unwrap();
     let alpha = tempfile::tempdir().unwrap();

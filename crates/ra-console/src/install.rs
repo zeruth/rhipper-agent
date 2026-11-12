@@ -88,7 +88,19 @@ pub fn install(dir: Option<&Path>) -> anyhow::Result<Vec<String>> {
             }
             return Err(anyhow::anyhow!(e).context(format!("cannot copy {} to {}", from.display(), to.display())));
         }
-        lines.push(format!("{name} {} → {}", crate::VERSION, to.display()));
+        // the copy's own version, which is the build's and not this binary's when they differ;
+        // only rc is asked, the window would open
+        let version = (stem == "rc")
+            .then(|| std::process::Command::new(&to).arg("--version").output().ok())
+            .flatten()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8_lossy(&out.stdout).split_whitespace().last().map(str::to_owned))
+            .unwrap_or_else(|| crate::VERSION.to_owned());
+        lines.push(format!("{name} {version} → {}", to.display()));
+        // a running walk reads it between cards and moves to the new rc
+        if stem == "rc" {
+            let _ = std::fs::write(dir.join(crate::hub::INSTALLED_FILE), format!("{version} {}\n", unix_now()));
+        }
     }
     lines.push(on_path(&dir));
     Ok(lines)
