@@ -2122,8 +2122,8 @@ pub fn stop_walk(root: &Path) -> String {
 }
 
 /// The order a walk would take the cards in, as `rc run --all` picks them one after another,
-/// each pick counted as implemented for the next: the projected order of the work, for the
-/// window's walk view. With `tight` the picks are the smallest ready card first, as a walk picks
+/// each pick counted as landed (accepted) for the next: the projected order of the work, for
+/// the window's walk view. With `tight` the picks are the smallest ready card first, as a walk picks
 /// when the plan's window is tight ([`plan_tight`]). Nothing is written.
 #[must_use]
 pub fn walk_order(nodes: &[Node], gambits: &[Gambit], tight: bool) -> Vec<i64> {
@@ -2132,17 +2132,18 @@ pub fn walk_order(nodes: &[Node], gambits: &[Gambit], tight: bool) -> Vec<i64> {
     while let Some(id) = batch_ready(&nodes, gambits, tight).map(|n| n.id) {
         order.push(id);
         if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
-            node.state = TaskState::Implemented;
+            node.state = TaskState::Accepted;
         }
     }
     order
 }
 
-/// The first card a batch runs: a defined task whose waits-on are each accepted or implemented,
-/// scored as `rc next` scores ([`tree::rank`]): priority, then the gambits, then tree order.
-/// Implemented counts beside accepted here, unlike in [`tree::next_ready`]: the cards the batch
-/// implements are not accepted until the person reviews, and their dependents are what the batch
-/// is meant to run ahead of that review. A card whose waits-on failed, left the roadmap or are
+/// The first card a batch runs: a defined task whose waits-on are each accepted, scored as
+/// `rc next` scores ([`tree::rank`]): priority, then the gambits, then tree order. Implemented
+/// does not count: the walk reviews and lands its own cards, so a card still implemented is
+/// either before its review or one whose landing failed, and in neither case is its code on the
+/// project's branch for a dependent to build on (runelite #140 started on #80's implemented,
+/// and #80 was sent back seconds later, 2026-11-12). A card whose waits-on failed, left the roadmap or are
 /// still open is not picked, so every pick moves a card out of defined and the loop ends; a
 /// card still in progress is picked too, since a walk holds the project and such a card is one
 /// a run left to continue, as the project's turn cap does. With `tight` the pick is the ready
@@ -2155,7 +2156,7 @@ fn batch_ready<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Opt
 /// Every card a batch may run, in the order [`batch_ready`] would pick them: by score, or by
 /// complexity with `tight`, the smallest first.
 fn ready_cards<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Vec<&'a Node> {
-    let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && matches!(d.state, TaskState::Accepted | TaskState::Implemented));
+    let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && d.state == TaskState::Accepted);
     // a card sent back for revision is ready again at once: its verdict is in its notes and the
     // rerun resumes its session; only what it waits on holds it (the person, 2026-11-12: "all
     // needs revision cards should go right back into queue unless depends on changes")
