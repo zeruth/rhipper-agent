@@ -90,7 +90,11 @@ impl Toolbox {
                 kill_tree(&mut child).await;
                 Err(())
             };
-            let (out, err) = (stdout.await, stderr.await);
+            // the command has exited, but a process it started may hold the pipes open for
+            // ever: a gradle daemon spawned by the check inherits them, and a read to the end
+            // never ended (the runelite walk hung on #82's landing for half an hour). What
+            // came in the grace period after the exit is the output
+            let (out, err) = (stdout.finish(PIPE_GRACE).await, stderr.finish(PIPE_GRACE).await);
             let mut text = String::new();
             text.push_str(&String::from_utf8_lossy(&out));
             if !err.is_empty() {
@@ -120,25 +124,50 @@ impl Toolbox {
     }
 }
 
-/// Reads a child's pipe to its end on its own task, and answers with what came, even when the
-/// child was stopped before the end. A pipe the child did not open reads as empty.
-fn drain<R>(pipe: Option<R>) -> impl std::future::Future<Output = Vec<u8>>
+/// How long a check's pipes are read after its command has exited: what a process it left
+/// behind writes later is not the check's.
+const PIPE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A child's pipe read on its own task into a buffer the caller can take at any time.
+struct Drain {
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drain {
+    /// What the pipe gave: to its end, or what had come when `grace` ran out; the reading
+    /// task is stopped then, so a pipe held open by another process costs nothing more.
+    async fn finish(self, grace: std::time::Duration) -> Vec<u8> {
+        if let Some(task) = self.task {
+            let abort = task.abort_handle();
+            if tokio::time::timeout(grace, task).await.is_err() {
+                abort.abort();
+            }
+        }
+        std::mem::take(&mut *self.buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+}
+
+/// Reads a child's pipe on its own task into a shared buffer, so what came is kept when the
+/// child is stopped or the pipe never ends. A pipe the child did not open reads as empty.
+fn drain<R>(pipe: Option<R>) -> Drain
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let task = pipe.map(|mut pipe| {
+        let buffer = buffer.clone();
         tokio::spawn(async move {
-            let mut buffer = Vec::new();
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buffer).await;
-            buffer
+            let mut chunk = [0u8; 8192];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut pipe, &mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend_from_slice(&chunk[..n]),
+                }
+            }
         })
     });
-    async move {
-        match task {
-            Some(task) => task.await.unwrap_or_default(),
-            None => Vec::new(),
-        }
-    }
+    Drain { buffer, task }
 }
 
 /// Stops a child that ran past its limit, and with it the processes it started: a `cargo test`

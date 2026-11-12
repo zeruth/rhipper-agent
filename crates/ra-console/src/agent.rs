@@ -2718,6 +2718,10 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     // saw one card going on a two-job project for the length of a long card). Every slot
     // is polled on this one task, so two runs never interleave a read-modify-write of the
     // roadmap, which a spawned task per run could not promise
+    // the project's git, one landing or checkpoint at a time across the runs in flight; and
+    // the project's root, which the runs' futures borrow
+    let git_lock_owned = tokio::sync::Mutex::new(());
+    let root_owned = root.clone();
     let mut flight: Vec<(i64, std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + '_>>, Seat)> = Vec::new();
     let mut stopped: Option<String> = None;
     loop {
@@ -2774,12 +2778,26 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // on the progress target: the filter lets that target through and no other,
                 // and a span the filter drops is no span at all
                 let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id);
+                let (git_lock, root_ref) = (&git_lock_owned, &root_owned);
                 flight.push((
                     id,
                     Box::pin(
                         async move {
                             let _slot = slot;
-                            run(store, id, &runner).await
+                            let mut out = run(store, id, &runner).await?;
+                            // what follows the run happens inside its own future, so the
+                            // other runs are read while it merges and compiles: a landing
+                            // awaited in the walk's loop stalled every worker behind it (the
+                            // runelite walk, half an hour, 2026-11-12). The landings and the
+                            // checkpoints take the project's git lock one at a time
+                            let node = store.read(id).await?;
+                            let _git = git_lock.lock().await;
+                            if node.state == TaskState::Implemented {
+                                out.extend(land_or_say(store, id, &runner).await);
+                            } else {
+                                out.extend(checkpoint_worktree(&root_ref, &node).await);
+                            }
+                            Ok(out)
                         }
                         .instrument(span),
                     ),
@@ -2827,23 +2845,11 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 lines.push(text);
             }
             (Seat::Build(_), Ok(run_lines)) => {
+                // the checkpoint or the landing already happened inside the run's future
                 lines.extend(run_lines);
                 ran += 1;
-                let node = store.read(id).await?;
-                let state = node.state;
-                // the run's work goes on the card's branch now, whatever the verdict
-                if state != TaskState::Implemented {
-                    lines.extend(checkpoint_worktree(&root, &node).await);
-                }
-                if stop_on_revision && stopped.is_none() && state == TaskState::NeedsRevision {
+                if stop_on_revision && stopped.is_none() && store.read(id).await?.state == TaskState::NeedsRevision {
                     stopped = Some(format!("stopped: #{id} needs revision"));
-                }
-                // a card the reviewer accepted lands now: merged, proved and cleared, so
-                // the tree keeps up with the walk (the person: "merging / committing as
-                // tasks are complete for all projects"); a landing that fails leaves the
-                // card implemented, for the person, and says why
-                if state == TaskState::Implemented {
-                    lines.extend(land_or_say(store, id, worker).await);
                 }
             }
             (Seat::Build(_), Err(error)) => {
