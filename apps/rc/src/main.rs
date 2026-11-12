@@ -1034,6 +1034,14 @@ async fn usage() -> anyhow::Result<()> {
 
 /// The default roadmap file; the commands open it in the working directory.
 fn store_path() -> PathBuf {
+    // in a card's worktree the roadmap is the project's, not the branch's copy: a worker that
+    // prunes or adds cards edits the roadmap the walk reads, where a landing would otherwise
+    // give the branch's copy back and drop its edits (2026-11-12, roadmap regeneration cards)
+    let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project = ra_console::hub::project_root_of(&here);
+    if project != std::fs::canonicalize(&here).unwrap_or(here) {
+        return project.join("rhipper.md");
+    }
     PathBuf::from("rhipper.md")
 }
 

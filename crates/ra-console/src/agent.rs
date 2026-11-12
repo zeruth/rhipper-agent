@@ -1046,7 +1046,11 @@ async fn lint_fix(store: &Store, id: i64, worker: &Worker, roles: &Roles, lines:
 /// A bad id or a project, an unreadable `rhipper.toml`, no provider for the model, or a failed
 /// call; the card goes back to the state it had.
 pub async fn review(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
-    review_to(store, id, worker, TaskState::Accepted).await
+    // under the card's span, so its lines carry the card: untagged, the window took a review
+    // from the command line for a run of its own and kept a "worker" card open for it (runelite
+    // and asm, 2026-11-12); a tagged line of a card with no live run is dropped there
+    let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id);
+    review_to(store, id, worker, TaskState::Accepted).instrument(span).await
 }
 
 /// The reviewer on a card a run just left implemented, before it is offered for acceptance:
