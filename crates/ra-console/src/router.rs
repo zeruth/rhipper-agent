@@ -156,6 +156,23 @@ pub struct WorkerConfig {
     /// `parallel`; absent, it may. `false` holds a project to its own count exactly.
     #[serde(default)]
     pub borrow: Option<bool>,
+    /// The investigators a walk runs beside its builders: read-only runs, one a ready card
+    /// ahead of the builders, each leaving a research brief (`var/briefs/<id>.md`) the
+    /// builder of the card opens on: where the code is, what to change, what to leave. They
+    /// build nothing and edit nothing, so they cost the machine little; absent or zero, none.
+    #[serde(default)]
+    pub investigators: Option<u32>,
+    /// The builds one session of a worker may run itself; absent, two. Zero makes the
+    /// builds the orchestrator's alone: the workers write and report, and the project's check
+    /// compiles each report on one of the two build slots, so six workers never build at once.
+    #[serde(default)]
+    pub builds: Option<u32>,
+    /// The directories the project's tests make under the system temp directory, by name
+    /// (`ra-asm-emit-tests` for `%TEMP%\ra-asm-emit-tests`): a landing removes their entries
+    /// older than an hour, and the doctor says how much they hold. Nothing else under temp is
+    /// touched. (58 GB of asm's test fixtures had piled up by 2026-11-12.)
+    #[serde(default)]
+    pub temp: Vec<String>,
 }
 
 impl WorkerConfig {
@@ -163,6 +180,18 @@ impl WorkerConfig {
     #[must_use]
     pub fn parallel(&self) -> Option<u32> {
         self.parallel.filter(|n| *n > 1)
+    }
+
+    /// The investigators a walk runs beside its builders.
+    #[must_use]
+    pub fn investigators(&self) -> usize {
+        self.investigators.unwrap_or(0) as usize
+    }
+
+    /// The builds one session of a worker may run itself.
+    #[must_use]
+    pub fn builds(&self) -> u32 {
+        self.builds.unwrap_or(crate::agent::BUILDS_A_SESSION)
     }
 
     /// Whether a walk may borrow the pool's spare Opus slots past its own count.
@@ -181,6 +210,14 @@ impl WorkerConfig {
     #[must_use]
     pub fn check(&self) -> Option<&str> {
         self.check.as_deref().map(str::trim).filter(|c| !c.is_empty())
+    }
+
+    /// Whether the project's check is the full suite: none named, which is the workspace tests,
+    /// or a `cargo test` over no package. A worker's own run of it is then narrowed to the crates
+    /// it changed, as the orchestrator runs the suite after the report.
+    #[must_use]
+    pub fn checks_the_suite(&self) -> bool {
+        self.check().is_none_or(ra_gotchas::is_suite)
     }
 
     /// The turns after which a run ends and the card continues fresh, when the table names a

@@ -17,7 +17,19 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
         max_turns: None,
         max_context: None,
         effort: None,
+        read_only: false,
     }
+}
+
+#[test]
+fn a_read_only_request_gets_the_reading_tools_alone_and_keeps_no_session() {
+    let mut request = request(Some(PathBuf::from(".")));
+    request.read_only = true;
+    let args = ClaudeCode::new().args(&request);
+    assert!(args.windows(2).any(|w| w == ["--tools", READER_TOOLS]), "{args:?}");
+    assert!(args.contains(&"--no-session-persistence".to_owned()), "{args:?}");
+    assert!(!args.contains(&"--allowedTools".to_owned()), "{args:?}");
+    assert!(!args.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]), "{args:?}");
 }
 
 #[test]
@@ -301,7 +313,7 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let args = provider.args(&request(Some(PathBuf::from("."))));
     let at = args.iter().position(|a| a == "--settings").expect("--settings");
     let settings: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
-    assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Bash|PowerShell");
+    assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Bash|PowerShell|Read");
     assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read");
     assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "\"C:\\tools\\rc.exe\" hook pre");
     assert_eq!(settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "\"C:\\tools\\rc.exe\" hook post");
@@ -338,12 +350,26 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     assert!(gotchas_of_event(&catalogue, reading, quiet, &mut tools).is_empty());
     let quoted = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"notes: Not logged in · Please run /login"}]}}"#;
     assert!(gotchas_of_event(&catalogue, quoted, quiet, &mut tools).is_empty());
+    // a tailed, per-crate cargo test is right as written; it still builds, so it is put on a
+    // build slot, and that rewrite alone counts
     let fine = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap 2>&1 | tail -n 40"}}]}}"#;
-    assert!(gotchas_of_event(&catalogue, fine, quiet, &mut tools).is_empty());
+    assert_eq!(gotchas_of_event(&catalogue, fine, quiet, &mut tools).iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["build-slot"]);
     // a cargo test without a tail is rewritten, and the rewrite counts
     let untailed =
         r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap"}}]}}"#;
     assert_eq!(gotchas_of_event(&catalogue, untailed, quiet, &mut tools)[0].id, "long-output");
+    // the full suite, while the project's check is the suite, counts as the worker's own run
+    // narrowed to the changed crates; a project whose check is not the suite counts nothing
+    let changed = ["ra-gotchas".to_owned()];
+    let suite = Conditions { suite_check: true, changed_crates: &changed, ..Conditions::default() };
+    let whole = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -q 2>&1 | tail -n 80"}}]}}"#;
+    let hits = gotchas_of_event(&catalogue, whole, suite, &mut tools);
+    // the first rewrite names the hit; the build slot composes on it unnamed
+    assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["worker-full-suite"]);
+    assert!(hits[0].message.contains("runs after the report"), "{}", hits[0].message);
+    let ids = |hits: Vec<ra_gotchas::Hit>| hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+    assert_eq!(ids(gotchas_of_event(&catalogue, whole, Conditions { changed_crates: &changed, ..quiet }, &mut tools)), ["build-slot"]);
+    assert_eq!(ids(gotchas_of_event(&catalogue, fine, suite, &mut tools)), ["build-slot"]);
     // the reads of an event, relative to the workspace; a Bash call or a Grep is not one
     let root = Path::new(r"C:\work\repo");
     let two = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"C:\\work\\repo\\crates\\c.rs"}},{"type":"tool_use","name":"Grep","input":{"pattern":"fn"}},{"type":"tool_use","name":"Read","input":{"file_path":"D:\\elsewhere\\x.rs"}}]}}"#;
@@ -367,6 +393,52 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let refused = r#"{"type":"result","result":"done","permission_denials":[{"tool_name":"PowerShell","tool_input":{"command":"cargo clippy -p rc-gui"}}]}"#;
     let ids: Vec<String> = gotchas_of_event(&catalogue, refused, quiet, &mut tools).into_iter().map(|h| h.id).collect();
     assert_eq!(ids, ["unmatched-denied"]);
+}
+
+#[test]
+fn the_pre_hook_refuses_a_whole_read_of_a_long_outlined_file_with_its_items_and_the_stream_counts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let long: String =
+        (1..=1200).map(|n| if n % 300 == 1 { format!("pub fn item_{n}() {{\n") } else { "    let _ = 1;\n".to_owned() }).collect();
+    std::fs::write(root.join("src/long.rs"), &long).unwrap();
+    std::fs::write(root.join("src/short.rs"), "fn a() {}\n".repeat(300)).unwrap();
+    std::fs::write(root.join("src/other.rs"), &long).unwrap();
+    let context = format!(
+        "# Task #1 context\n\n## Brief\n\nb\n\n## Files\n\n{}{}src/gone.rs (not in the workspace yet)\n\n## Handoff 1 · m · done\nsrc/other.rs (1200 lines)\n",
+        ra_context::outline(Path::new("src/long.rs"), &long),
+        ra_context::outline(Path::new("src/short.rs"), &"fn a() {}\n".repeat(300)),
+    );
+    let catalogue = Catalogue::seed();
+    let read =
+        |input: serde_json::Value| read_verdict(&catalogue, root, &context, &serde_json::json!({"tool_name": "Read", "tool_input": input}));
+    let absolute = root.join("src/long.rs").display().to_string();
+    let reason = match read(serde_json::json!({"file_path": absolute})) {
+        Verdict::Deny { id, reason } => {
+            assert_eq!(id, "whole-file-read");
+            reason
+        }
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        reason.contains("src/long.rs is 1200 lines; its items: item_1 1-300, item_301 301-600, item_601 601-900, item_901 901-1200"),
+        "{reason}"
+    );
+    // a ranged Read, a short file, and a file the outline does not know pass
+    assert_eq!(read(serde_json::json!({"file_path": absolute, "offset": 300, "limit": 80})), Verdict::Pass);
+    assert_eq!(read(serde_json::json!({"file_path": "src/short.rs"})), Verdict::Pass);
+    assert_eq!(read(serde_json::json!({"file_path": "src/other.rs"})), Verdict::Pass);
+
+    // the refusal comes back as the Read's error, and that is the hit the end line counts
+    let mut tools = std::collections::HashMap::new();
+    let call =
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"src/long.rs"}}]}}"#;
+    assert!(gotchas_of_event(&catalogue, call, Conditions::default(), &mut tools).is_empty());
+    let refused = serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "r1", "is_error": true, "content": reason}]}});
+    let ids: Vec<String> =
+        gotchas_of_event(&catalogue, &refused.to_string(), Conditions::default(), &mut tools).into_iter().map(|h| h.id).collect();
+    assert_eq!(ids, ["whole-file-read"]);
 }
 
 #[test]

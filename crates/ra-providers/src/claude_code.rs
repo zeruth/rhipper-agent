@@ -29,6 +29,10 @@ pub const STREAM_FILE: &str = "var/runs/last.jsonl";
 /// it reads.
 const WORKER_TOOLS: &str = "Bash,PowerShell,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,WebSearch,NotebookEdit";
 
+/// The built-in tools of a read-only run, an investigator: it reads and searches the tree and
+/// the web, and has no shell to build with and no tool to edit with.
+pub const READER_TOOLS: &str = "Read,Glob,Grep,WebFetch,WebSearch";
+
 /// The settings a worker loads: the project's and the local ones, not the user's. The user's
 /// hooks are written for their interactive sessions (on this machine one denies Bash outright
 /// and another wraps every PowerShell command in a logging prelude no rule can read), and a
@@ -56,6 +60,9 @@ pub struct ClaudeCode {
     /// The programs of the project's own `[worker] allow` rules, which the allowlist gotcha
     /// does not count against a run.
     own_prefixes: Vec<String>,
+    /// The project's check is the full suite, so the count reads a worker's own run of it as
+    /// the hook narrows it: to the crates the run has changed.
+    suite_check: bool,
 }
 
 impl Default for ClaudeCode {
@@ -124,7 +131,15 @@ impl ClaudeCode {
             catalogue: None,
             env: Vec::new(),
             own_prefixes: Vec::new(),
+            suite_check: false,
         }
+    }
+
+    /// Whether the project's check is the full suite, the orchestrator's after the report.
+    #[must_use]
+    pub fn with_suite_check(mut self, suite: bool) -> Self {
+        self.suite_check = suite;
+        self
     }
 
     /// More permission rules for the worker, a project's own commands, on top of the defaults.
@@ -199,9 +214,9 @@ impl ClaudeCode {
         // subscription route runs on (card #11 found out)
         // stream-json: the events arrive as the harness works, so the console can show the work
         let mut args = ["-p", "--output-format", "stream-json", "--verbose"].map(str::to_owned).to_vec();
-        if request.workspace.is_none() {
-            // a chat completion leaves no session behind; a worker keeps its own, for the next
-            // run of the task to resume
+        if request.workspace.is_none() || request.read_only {
+            // a chat completion leaves no session behind, nor does a read-only run; a worker
+            // keeps its own, for the next run of the task to resume
             args.push("--no-session-persistence".to_owned());
         }
         // the card's effort when the request carries one, else the provider's
@@ -221,7 +236,15 @@ impl ClaudeCode {
                 None => args.extend(["--system-prompt".to_owned(), system]),
             }
         }
-        if request.workspace.is_some() {
+        if request.read_only && request.workspace.is_some() {
+            // an investigator: the reading tools alone, which ask no permission, inside the
+            // workspace; no shell, no edits, no session
+            args.push("--strict-mcp-config".to_owned());
+            if let Some(cap) = request.max_turns.or(self.max_turns) {
+                args.extend(["--max-turns".to_owned(), cap.to_string()]);
+            }
+            args.extend(["--tools".to_owned(), READER_TOOLS.to_owned(), "--setting-sources".to_owned(), WORKER_SETTING_SOURCES.to_owned()]);
+        } else if request.workspace.is_some() {
             // a worker: the file tools and the allowed shell commands, inside the workspace, and
             // no MCP servers: the project's .mcp.json would hand it the agent itself, holding
             // target/debug/rc.exe for the run and a `run` tool of its own
@@ -303,7 +326,7 @@ impl ClaudeCode {
         // which tool each call id belongs to, so only a shell's output is read for gotchas
         let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         // a console holds the binary while var/console.pid is in the workspace
-        let conditions = Conditions { console_running: request.workspace.as_deref().is_some_and(|w| w.join("var/console.pid").exists()) };
+        let console_running = request.workspace.as_deref().is_some_and(|w| w.join("var/console.pid").exists());
         let mut stream = Stream::open(request.workspace.as_deref());
         if let Some(pipe) = child.stdout.take() {
             let mut lines = tokio::io::BufReader::new(pipe).lines();
@@ -331,6 +354,12 @@ impl ClaudeCode {
                     } else {
                         Where::Answer
                     };
+                    // the changed crates cost a git status: asked only of an event that runs cargo test
+                    let changed = match &request.workspace {
+                        Some(workspace) if self.suite_check && line.contains("cargo test") => ra_gotchas::changed_crates(workspace),
+                        _ => Vec::new(),
+                    };
+                    let conditions = Conditions { console_running, suite_check: self.suite_check, changed_crates: &changed };
                     for hit in gotchas_of_event(catalogue, &line, conditions, &mut tools) {
                         // the project's own commands are past the allowlist by design: the
                         // hook lets them run, and the count leaves them alone too
@@ -833,9 +862,12 @@ fn write_system_prompt(workspace: &Path, text: &str) -> std::io::Result<PathBuf>
     std::path::absolute(&path).or(Ok(path))
 }
 
-/// The project's target directory for a run in one of its worktrees (`<root>/var/worktrees/<id>`),
-/// so two cards at once build in one place under one lock rather than each in its own; `None`
-/// for a workspace that is not a worktree.
+/// The target directory for a run in one of the project's worktrees
+/// (`<root>/var/worktrees/<id>`): `<root>/target/wt-<id>`, the worktree's own under the
+/// project's target, so a build of one card never reads another's artifacts (two worktrees
+/// editing one crate shared a target and each compiled against the other's copy, #176 and
+/// #181), while the project's target stays the one place the builds live. `None` for a
+/// workspace that is not a worktree.
 #[must_use]
 pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
     let id = workspace.parent()?;
@@ -847,7 +879,8 @@ pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
         return None;
     }
     let root = var.parent()?;
-    std::path::absolute(root.join("target")).ok()
+    let card = workspace.file_name()?.to_string_lossy().into_owned();
+    std::path::absolute(root.join("target").join(format!("wt-{card}"))).ok()
 }
 
 /// The program a permission rule names: `python` of `Bash(python *)`, `gw.ps1` of
@@ -869,7 +902,7 @@ fn rule_prefix(rule: &str) -> Option<String> {
 fn gotchas_of_event(
     catalogue: &Catalogue,
     line: &str,
-    conditions: Conditions,
+    conditions: Conditions<'_>,
     tools: &mut std::collections::HashMap<String, String>,
 ) -> Vec<Hit> {
     use serde_json::Value;
@@ -916,12 +949,19 @@ fn gotchas_of_event(
                 // what a shell said, and what an edit tool said; a file the worker read is not
                 // the machine talking
                 let tool = block.get("tool_use_id").and_then(Value::as_str).and_then(|id| tools.get(id)).map(String::as_str);
+                let content = text_of(block.get("content").unwrap_or(&Value::Null));
                 let place = match tool {
                     Some("Bash" | "PowerShell") => Where::Result,
                     Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit") => Where::Edit,
+                    // a Read the pre hook refused comes back an error with the reason; a file's
+                    // own text never does
+                    Some("Read") if block.get("is_error").and_then(Value::as_bool) == Some(true) => {
+                        hits.extend(catalogue.refused_read(&content));
+                        continue;
+                    }
                     _ => continue,
                 };
-                hits.extend(catalogue.scan(place, &text_of(block.get("content").unwrap_or(&Value::Null))));
+                hits.extend(catalogue.scan(place, &content));
             }
         }
         Some("result") => {
@@ -943,16 +983,41 @@ fn gotchas_of_event(
     hits
 }
 
+/// What the pre hook does with a Read `call` of the harness's hook input, in `root`: the
+/// catalogue's [`Catalogue::read`] on the file, its line count, whether the call names a range,
+/// and the items of the file when `context`, the card's context file, outlines it. A call that
+/// is no Read, or a file that cannot be read, passes.
+#[must_use]
+pub fn read_verdict(catalogue: &Catalogue, root: &Path, context: &str, call: &serde_json::Value) -> Verdict {
+    use serde_json::Value;
+    if call.get("tool_name").and_then(Value::as_str) != Some("Read") {
+        return Verdict::Pass;
+    }
+    let Some(input) = call.get("tool_input") else { return Verdict::Pass };
+    let Some(file) = input.get("file_path").and_then(Value::as_str) else { return Verdict::Pass };
+    let ranged = ["offset", "limit"].iter().any(|key| input.get(key).is_some_and(|v| !v.is_null()));
+    let path = if Path::new(file).is_absolute() { PathBuf::from(file) } else { root.join(file) };
+    let shown = relative(file, Some(root));
+    // the outline names a file as the card does, relative and with forward slashes
+    if ranged || !ra_context::outlined(context).contains(&shown) {
+        return Verdict::Pass;
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else { return Verdict::Pass };
+    let items = ra_context::item_ranges(Path::new(&shown), &text);
+    catalogue.read(ra_gotchas::ReadCall { file: &shown, ranged, lines: text.lines().count(), items: Some(&items) })
+}
+
 /// The `--settings` JSON that routes the harness's tool hooks to `rc hook pre` and `rc hook
-/// post`, so a command the catalogue knows is refused or rewritten before it runs, a result
-/// it knows gets its hint right after, and a whole-file Read is answered with the outline,
-/// with no model call.
+/// post`, so a command the catalogue knows is refused or rewritten before it runs, a whole-file
+/// Read of a long file the card outlines is refused with its items, a result it knows gets its
+/// hint right after, and any other whole-file Read is answered with the outline, with no model
+/// call.
 fn hook_settings(rc: &Path) -> String {
     // the JSON encoder escapes the backslashes of a Windows path itself
     let command = |event: &str| format!("\"{}\" hook {event}", rc.display());
     serde_json::json!({
         "hooks": {
-            "PreToolUse": [{"matcher": "Bash|PowerShell", "hooks": [{"type": "command", "command": command("pre"), "timeout": 10}]}],
+            "PreToolUse": [{"matcher": "Bash|PowerShell|Read", "hooks": [{"type": "command", "command": command("pre"), "timeout": 10}]}],
             "PostToolUse": [{"matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read", "hooks": [{"type": "command", "command": command("post"), "timeout": 10}]}]
         }
     })

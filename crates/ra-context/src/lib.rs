@@ -388,6 +388,36 @@ pub fn items(path: &Path, text: &str) -> Vec<(usize, usize, String)> {
     items.into_iter().zip(ends).map(|((start, item), end)| (start, end, item)).collect()
 }
 
+/// The items of a file as a Read hint names them, `parse 149-151` each, the name an item
+/// declares or the item itself, as many as an outline shows and a count of the rest.
+#[must_use]
+pub fn item_ranges(path: &Path, text: &str) -> Vec<String> {
+    let items = items(path, text);
+    let mut ranges: Vec<String> =
+        items.iter().take(OUTLINE_ROOM).map(|(start, end, item)| format!("{} {start}-{end}", item_name(item).unwrap_or(item))).collect();
+    if items.len() > OUTLINE_ROOM {
+        ranges.push(format!("… and {} more", items.len() - OUTLINE_ROOM));
+    }
+    ranges
+}
+
+/// The files the outlines of a task's context file name, as the card names them: the head line
+/// of each outline under its `## Files` heading, a file not in the workspace yet left out.
+#[must_use]
+pub fn outlined(context: &str) -> Vec<String> {
+    context
+        .lines()
+        .skip_while(|l| l.trim_end() != "## Files")
+        .skip(1)
+        .take_while(|l| !l.starts_with("## "))
+        .filter(|l| !l.starts_with([' ', '*']))
+        .filter_map(|l| {
+            let (file, rest) = l.split_once(" (")?;
+            rest.split_once(" lines)").filter(|(count, _)| count.parse::<usize>().is_ok()).map(|_| file.to_owned())
+        })
+        .collect()
+}
+
 /// The name an item declares: the word after its keyword, `hook` of `pub fn hook(event: &str)`,
 /// `Worker` of `impl Worker`; `None` for an item with no word after the keyword.
 #[must_use]

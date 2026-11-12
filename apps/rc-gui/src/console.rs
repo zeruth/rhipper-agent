@@ -65,11 +65,11 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
     let runs: Vec<(usize, u64, String)> = sink.with_lines(|lines| {
         lines.iter().enumerate().filter(|(_, l)| l.kind == Kind::Run).filter_map(|(i, l)| l.run.map(|id| (i, id, l.text.clone()))).collect()
     });
-    // the live runs, oldest first, the newest four at most (a project runs four cards at
-    // once at most; a run whose process was killed under it stays open in the log until the
-    // orphan scan closes it), else the latest run
+    // the live runs, oldest first, the newest six at most (the whole Opus pool; a run whose
+    // process was killed under it stays open in the log until the orphan scan closes it),
+    // else the latest run
     let live = sink.live_runs();
-    let newest: Vec<u64> = live.iter().rev().take(4).rev().copied().collect();
+    let newest: Vec<u64> = live.iter().rev().take(6).rev().copied().collect();
     let picked: Vec<&(usize, u64, String)> = if newest.is_empty() {
         runs.last().into_iter().collect()
     } else {
@@ -81,17 +81,20 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
     // a fixed room: in a scroll area the clip is the page, and a live card would take it all;
     // the queue beside the card is the most it gets, the default rows the least
     let room = room.max(96.0 + 24.0 * DASHBOARD_ROWS);
-    // the live cards in a grid of two columns: two side by side, three or four two by two,
-    // each half the column's width and, in two rows, half its height, less the space between;
-    // a project running flat out still fills its share. The column's width comes from the
-    // caller, since what egui called available here ran past the column
+    // the live cards in a grid of two columns: two side by side, four two by two, six two by
+    // three, each half the column's width and a row's part of its height, less the space
+    // between; a project running flat out still fills its share. The column's width comes
+    // from the caller, since what egui called available here ran past the column
     let gap = 10.0;
     let cols = picked.len().min(2);
     let rows = picked.len().div_ceil(cols.max(1));
     #[allow(clippy::cast_precision_loss)]
     let width = ((column - gap * (cols as f32 - 1.0)) / cols as f32).floor();
+    // a card is never shorter than its title, the fold line and two steps: the frame (19),
+    // the title row with the space under it (30) and three rows of 26; a grid that would
+    // squeeze the cards below that grows past its share and the page scrolls
     #[allow(clippy::cast_precision_loss)]
-    let height = ((room - gap * (rows as f32 - 1.0)) / rows as f32).floor();
+    let height = ((room - gap * (rows as f32 - 1.0)) / rows as f32).floor().max(19.0 + 30.0 + 3.0 * 26.0);
     for row in picked.chunks(cols.max(1)) {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
@@ -404,9 +407,12 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
         let ppp = ui.pixels_per_point();
         ui.spacing_mut().item_spacing.y += (extra * ppp).floor() / ppp;
     }
-    // the entries that fell off the top fold into one line, which takes a row of its own
-    let skip = if hidden > 0 { hidden + 1 } else { 0 };
-    if hidden > 0 {
+    // the entries that fell off the top fold into one line, which takes a row of its own;
+    // a card with one row shows its latest step, not the fold alone (six cards in a short
+    // grid read "earlier steps" and nothing else)
+    let fold = hidden > 0 && body >= 2;
+    let skip = if fold { hidden + 1 } else { hidden };
+    if fold {
         let earlier: usize = folded.iter().take(skip).map(|(_, n)| n).sum();
         ui.label(RichText::new(format!("⋯ {earlier} earlier steps")).font(font.clone()).color(theme::dim()).italics()).on_hover_ui(|ui| {
             for (step, count) in folded.iter().take(skip) {

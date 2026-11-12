@@ -102,6 +102,10 @@ pub struct CompletionRequest {
     /// The effort the run asks of the model, `low`, `medium` or `high`; `None` leaves the
     /// provider's own setting. A harness with the knob passes it on; a bare model ignores it.
     pub effort: Option<String>,
+    /// A run that reads the workspace and changes nothing: an investigator, which gets the
+    /// reading tools alone, no shell, no edits, no build, and keeps no session. A harness
+    /// without the distinction runs it as any worker.
+    pub read_only: bool,
 }
 
 /// The turn cap of a run on a node of `complexity`, when nothing names one: c1 15, c2 25, c3 40,
