@@ -1115,7 +1115,13 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
         None => worker.model.clone(),
     };
     let provider = worker.provider_for(&model)?;
-    let brief = review_brief(&root, &node).await;
+    // the diff is read where the run acted: a card run in its worktree left nothing in the
+    // project's tree, and the reviewer judged an empty diff (#173, the first parallel walk)
+    let acting = worker.workspace.clone().unwrap_or_else(|| {
+        let worktree = root.join(WORKTREES_DIR).join(id.to_string());
+        if worktree.join(".git").exists() { worktree } else { root.clone() }
+    });
+    let brief = review_brief(&root, &acting, &node).await;
     let before = node.state;
     store.set_state_by(id, TaskState::Review, Source::Run).await?;
     tracing::info!(target: crate::trace::PROGRESS, "#{id} {} · review by {}", node.title, short(&model));
@@ -1203,7 +1209,9 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
 /// What the reviewer reads: the card, the last handoff when there is one, and the diff of the
 /// card's files and the handoff's changed ones (what the run touched and the dirty files its
 /// report named, [`reported_files`]) against `HEAD`, clipped.
-async fn review_brief(root: &Path, node: &Node) -> String {
+/// `project` holds the card's context (the handoffs live under the project's `var`); `root`
+/// is where the run acted and the diff is read: the project, or the card's worktree.
+async fn review_brief(project: &Path, root: &Path, node: &Node) -> String {
     let mut text = format!("# #{} {}\n", node.id, node.title);
     if let Some(objective) = &node.objective {
         let _ = writeln!(text, "\nObjective: {objective}");
@@ -1211,7 +1219,7 @@ async fn review_brief(root: &Path, node: &Node) -> String {
     let _ = writeln!(text, "\nAcceptance: {}", node.acceptance.as_deref().unwrap_or("none written; the workspace tests are the check"));
     let mut files = node.files.clone();
     let mut changed = Vec::new();
-    match ra_context::TaskContext::open(root, node.id).handoffs.last() {
+    match ra_context::TaskContext::open(project, node.id).handoffs.last() {
         Some(last) => {
             let _ = writeln!(text, "\n## Handoff of the last run\n{} on {} · {}\n{}", last.outcome, last.model, last.check, last.report);
             changed.clone_from(&last.changed);
