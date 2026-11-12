@@ -2182,14 +2182,29 @@ impl Pool {
     }
 }
 
-/// How many other projects the window knows are walking now: the pool's shares are theirs.
+/// How many other projects the window knows are walking now on Opus slots: the pool's Opus
+/// shares are theirs. A Fable project's walk takes nothing from the Opus pool and counts for
+/// nothing here.
 fn other_walks(root: &Path) -> usize {
     let here = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     crate::hub::recent()
         .into_iter()
         .filter(|dir| std::path::absolute(dir).map_or(true, |d| d != here))
         .filter(|dir| walk_running(dir))
+        .filter(|dir| project_kind(dir) == PoolKind::Opus)
         .count()
+}
+
+/// The pool kind a project's cards run on by default: the model of its `[[route]]` rule that
+/// fits every card as implementer, else the agent's default model.
+fn project_kind(root: &Path) -> PoolKind {
+    let router = crate::router::Router::load(root).unwrap_or_default();
+    let model = router
+        .rules
+        .iter()
+        .find(|rule| rule.complexity.is_none() && rule.kind.is_none() && rule.role.eq_ignore_ascii_case(crate::router::IMPLEMENTER))
+        .map_or(crate::ui::DEFAULT_MODEL, |rule| rule.model.as_str());
+    Pool::kind_of(model)
 }
 
 /// The work of [`run`], with the cost of the session and the count of the gotchas it hit beside
