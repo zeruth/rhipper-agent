@@ -4202,10 +4202,13 @@ impl Workspace {
                         }
                     }
                 });
-                // the run card is exactly as tall as the queue's rows: the rows grow into the
-                // card's share of the window while they fit, and the run card follows them,
-                // never past the last row (the person: no band of nothing under the sixth)
-                let room = queue.response.rect.height();
+                // one run card is exactly as tall as the queue's rows: the rows grow into the
+                // card's share of the window while they fit, and the card follows them, never
+                // past the last row (the person: no band of nothing under the sixth). A grid
+                // of run cards takes the whole share: six cards in a short column showed a
+                // line each, and a queue short of ready cards is not what bounds them
+                let queue_height = queue.response.rect.height();
+                let room = if self.sink.live_runs().len() > 1 { queue_height.max(columns) } else { queue_height };
                 ui.allocate_ui_with_layout(egui::vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(right);
                     ui.set_max_width(right);
