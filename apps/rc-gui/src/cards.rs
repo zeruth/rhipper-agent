@@ -249,6 +249,30 @@ pub(crate) const GAUGE_SPAN: usize = 120;
 /// under a line in `color`, the oldest end fading into the bubble's fill; a thin rule marks the
 /// top of the range.
 #[allow(clippy::cast_possible_truncation)]
+/// One build slot of the machine as a slim bubble `width` wide: `BUILDER n` and, while a build
+/// holds it, who (`runelite #42`) and for how long, lit in the lane of the slot; dim and `idle`
+/// when it is free.
+pub(crate) fn builder(ui: &mut Ui, index: usize, held: Option<(&str, u64)>, width: f32) {
+    let color = if held.is_some() { theme::lane(7 + index % 3) } else { theme::dim() };
+    bubble(ui, color, held.is_some(), |ui| {
+        let inner = (width - 18.0).max(60.0);
+        ui.set_width(inner);
+        ui.set_max_width(inner);
+        ui.horizontal(|ui| {
+            ui.set_width(inner);
+            ui.label(RichText::new(format!("BUILDER {}", index + 1)).small().strong().color(theme::dim()));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| match held {
+                Some((who, secs)) => {
+                    badge(ui, &format!("{who} · {}:{:02}", secs / 60, secs % 60), color);
+                }
+                None => {
+                    ui.label(RichText::new("idle").small().color(theme::dim()));
+                }
+            });
+        });
+    });
+}
+
 pub(crate) fn gauge(ui: &mut Ui, name: &str, value: &str, samples: &[f32], color: Color32, width: f32) {
     use egui::epaint::{Mesh, Vertex, WHITE_UV};
     let fill = theme::mix(theme::bg(), color, 0.07);

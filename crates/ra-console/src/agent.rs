@@ -2715,6 +2715,13 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
     };
     let mut lines = Vec::new();
+    // the cards the reviewer accepted that a walk stopped before they landed: landed first, so
+    // a restart never strands accepted work (runelite #21 and #35, 2026-11-12)
+    for node in store.all().await? {
+        if node.state == TaskState::Implemented && matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
+            lines.extend(land_or_say(store, node.id, worker).await);
+        }
+    }
     let mut ran = 0;
     // the runs in flight, as a pool of `width`: when one ends the next ready card starts in
     // its slot at once, rather than the pool waiting for the slowest of a wave (the person

@@ -654,6 +654,16 @@ pub fn build_lock_name(slot: usize) -> String {
 pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
     let project_root = project_root_of(root);
     let project = project_name(&project_root);
+    // the slot's note names the card too when the build is a worktree's, for the window's
+    // builders row: `runelite #42`
+    let card = std::fs::canonicalize(root)
+        .ok()
+        .filter(|dir| dir.parent().and_then(Path::file_name).is_some_and(|n| n == "worktrees"))
+        .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().into_owned()));
+    let who = match &card {
+        Some(card) => format!("{project} #{card}"),
+        None => project.clone(),
+    };
     let higher = crate::agent::higher_walking(&project_root);
     let alone = crate::agent::other_walks(&project_root) == 0;
     let slots: Vec<usize> = match rank_of(&project_root) {
@@ -667,11 +677,34 @@ pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
         }
     };
     for slot in slots {
-        if let Some(guard) = try_guard_as(&build_lock_name(slot), &project)? {
+        if let Some(guard) = try_guard_as(&build_lock_name(slot), &who)? {
             return Ok(Some(guard));
         }
     }
     Ok(None)
+}
+
+/// The machine's build slots as the window shows them: for each, who holds it (`runelite #42`)
+/// and since when (unix seconds), or `None` when it is free. A slot is asked by taking its lock
+/// and letting it go at once; a builder that tries in that instant tries again on its next poll.
+#[must_use]
+pub fn build_slots() -> Vec<Option<(String, u64)>> {
+    (0..BUILD_SLOTS)
+        .map(|slot| {
+            let name = build_lock_name(slot);
+            if !matches!(try_guard(&name), Ok(None)) {
+                return None;
+            }
+            let note = locks_dir().join(format!("{name}.who"));
+            let who = std::fs::read_to_string(&note).map(|w| w.trim().to_owned()).unwrap_or_default();
+            let since = std::fs::metadata(&note)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            Some((if who.is_empty() { "a build".to_owned() } else { who }, since))
+        })
+        .collect()
 }
 
 /// The cargo target a check in `root` builds in: `CARGO_TARGET_DIR` when set (a relative one

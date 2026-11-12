@@ -370,6 +370,9 @@ struct App {
     dash_slack: f32,
     /// The window size the slack was measured for.
     dash_slack_for: egui::Vec2,
+    /// The machine's build slots as last read, and when: who holds each and since when.
+    builders: Vec<Option<(String, u64)>>,
+    builders_at: Option<std::time::Instant>,
     /// When the window started, for the dashboard's uptime.
     started: Instant,
     /// Whether the report is in front: the cards that landed across every project.
@@ -729,6 +732,8 @@ impl App {
             dashboard: false,
             dash_slack: 0.0,
             dash_slack_for: egui::Vec2::ZERO,
+            builders: Vec::new(),
+            builders_at: None,
             started: Instant::now(),
             report: false,
             landed: Vec::new(),
@@ -1166,6 +1171,23 @@ impl App {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 self.gauges.row(ui, width);
                 self.tokens.row(ui, width);
+            });
+            ui.add_space(4.0);
+            // the builders: the machine's build slots, who holds each and for how long, read
+            // once a second (the person: "a builders gauge row below the 6 gauges")
+            if self.builders_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                self.builders = ra_console::hub::build_slots();
+                self.builders_at = Some(std::time::Instant::now());
+            }
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let slots = self.builders.len().max(1);
+            #[allow(clippy::cast_precision_loss)]
+            let builder_width = ((page - 10.0 * (slots as f32 - 1.0)) / slots as f32).floor();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                for (i, slot) in self.builders.iter().enumerate() {
+                    cards::builder(ui, i, slot.as_ref().map(|(who, since)| (who.as_str(), now.saturating_sub(*since))), builder_width);
+                }
             });
             ui.add_space(4.0);
             // the height left under the gauges, shared out among the project cards: a card
