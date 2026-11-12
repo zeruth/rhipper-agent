@@ -1854,6 +1854,8 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     // the card the walk takes up again by itself, and per card the check failures and the
     // rejections this walk has seen: a person re-queued those by hand before (#103, #47, #134)
     let mut retry: Option<i64> = None;
+    // the cards past their reruns in this walk
+    let mut parked: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut sent: std::collections::HashMap<i64, (usize, usize)> = std::collections::HashMap::new();
     // one walk per project: the lock is held for the whole of it
     let Some(_lock) = take_walk_lock(&workspace_of(store)) else {
@@ -1879,7 +1881,11 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         // a rerun the walk queued goes first, while the card still waits on it: a person who
         // took the card meanwhile has the say
         let retried = retry.take().filter(|id| roadmap.nodes.iter().any(|n| n.id == *id && n.state == TaskState::NeedsRevision));
-        let Some(id) = retried.or_else(|| batch_ready(&roadmap.nodes, &roadmap.gambits, tight).map(|n| n.id)) else {
+        // a card past its reruns in this walk waits for the next walk: the queue counts a card
+        // sent back as ready, and without this the one-at-a-time walk took the same card again
+        let Some(id) = retried
+            .or_else(|| ready_cards(&roadmap.nodes, &roadmap.gambits, tight).into_iter().find(|n| !parked.contains(&n.id)).map(|n| n.id))
+        else {
             // a `plan-next` gambit lets the planner fill the next empty milestone; its cards
             // are the next picks
             if !planned && crate::commands::run::plans_next(&roadmap.gambits) {
@@ -1955,7 +1961,10 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             lines.push(crate::pair::sent_back(&root, id, &node.title, &why, rerun));
             if rerun.is_some() {
                 retry = Some(id);
-            } else if stop_on_revision {
+            } else {
+                parked.insert(id);
+            }
+            if rerun.is_none() && stop_on_revision {
                 done(&mut lines, format!("ran {ran} card(s) · stopped: #{id} needs revision")).await;
                 return Ok(lines);
             }
@@ -3125,7 +3134,19 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the topic changes). The session is dropped only when it is stale: then the brief and the
     // handoffs carry it, and the run says so first
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
-    let (resume, fresh) = match resume_of(&node, unix_now()) {
+    // a rerun after a rejection or a failed check resumes only a lean session: the verdict and
+    // the handoff carry what it needs, and a session already heavy paid its whole weight every
+    // turn of every rerun (runelite #23 resumed at 132k tokens a turn, $7.39 for eleven turns;
+    // #28 at 144k, $3.91 for four), where a fresh one cost a few tens of cents
+    let resumed = match resume_of(&node, unix_now()) {
+        Ok(Some(_)) if rerun.is_some() && last_largest_turn(&task).is_some_and(|t| t > RERUN_RESUME_LIMIT) => Err(format!(
+            "the last session ran to {}k tokens a turn, past the {}k a rerun resumes",
+            last_largest_turn(&task).unwrap_or(0) / 1000,
+            RERUN_RESUME_LIMIT / 1000
+        )),
+        other => other,
+    };
+    let (resume, fresh) = match resumed {
         Ok(Some(session)) => {
             let noted =
                 rerun.as_ref().map(|_| "  rerun on the session: the verdict and the failing check ride as the new prompt".to_owned());
@@ -5209,6 +5230,21 @@ fn hash_fields<'a>(fields: impl IntoIterator<Item = &'a str>) -> String {
 
 /// How long a session is resumed: past a day its context is older than the work around it.
 const SESSION_LIFE: u64 = 24 * 60 * 60;
+
+/// The largest turn a session may have run to and still be resumed by a rerun.
+const RERUN_RESUME_LIMIT: u64 = 80_000;
+
+/// The largest turn of the card's last run, in tokens, read off its handoff's check line
+/// (`… largest 134k …`); `None` when the line does not say.
+fn last_largest_turn(task: &ra_context::TaskContext) -> Option<u64> {
+    let check = &task.handoffs.last()?.check;
+    let rest = check.split("largest ").nth(1)?;
+    let word: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == 'k').collect();
+    match word.strip_suffix('k') {
+        Some(thousands) => thousands.parse::<f64>().ok().map(|k| (k * 1000.0) as u64),
+        None => word.parse().ok(),
+    }
+}
 
 /// The session a run of `node` resumes at `now`: `Ok(None)` when the node has none, `Err` with
 /// the reason when it has one the run must not resume, since a session older than a day or made
