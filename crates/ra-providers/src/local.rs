@@ -113,6 +113,7 @@ pub async fn probe_at(base_url: &str) -> Result<Probe, String> {
         max_turns: Some(1),
         max_context: None,
         effort: None,
+        read_only: false,
     };
     let started = Instant::now();
     match tokio::time::timeout(ANSWER_TIMEOUT, server.complete(request)).await {
@@ -148,6 +149,7 @@ pub async fn ask(
         max_turns: Some(1),
         max_context: None,
         effort: Some("low".to_owned()),
+        read_only: false,
     };
     let answer = tokio::time::timeout(ANSWER_TIMEOUT, provider.complete(request))
         .await

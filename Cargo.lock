@@ -3292,6 +3292,7 @@ name = "ra-providers"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "ra-context",
  "ra-gotchas",
  "reqwest",
  "serde",

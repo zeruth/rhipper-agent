@@ -7,12 +7,17 @@
 #          edit     — what an edit tool answered
 #          text     — the worker's own words between its tool calls
 #          answer   — the worker's final report
+#          read     — a whole-file Read of a file over 400 lines the card's outline knows; the
+#                     pattern is matched against the file's path
 # remedy:  hint     — the message goes to the worker: as the reason of a denied command, as
 #                     context after a result, and in the machine notes of later runs
 #          rewrite  — the command runs changed: `insert` goes after the first `after` words (one
 #                     unless said), or on the end with `append = true`, unless the command
 #                     already matches `unless`; `when = "console-running"` limits it to the time
 #                     a console holds the binary; the rewrites compose, in the order written
+#          crates   — the command runs over the crates the run has changed (`cargo test -p a
+#                     -p b`), its workspace flags dropped, unless it matches `unless`; only
+#                     while the project's check is the full suite and a crate has changed
 #          allow    — the command runs as it is; the hit is only counted
 
 [[gotcha]]
@@ -28,6 +33,14 @@ where = "command"
 pattern = '(^|&&|\|\||;)\s*git\s+(stash|checkout|switch|restore|reset|clean|add|commit|rebase|merge|push|pull|cherry-pick|revert|branch\s+-[dD])\b'
 message = "the git state is the person's: only the read-only git commands run here (status, diff, log, show); leave the working tree as you changed it and report, the person reviews and commits"
 remedy = { kind = "hint" }
+
+# before binary-locked and long-output: the `-p` it brings is what they stand aside for
+[[gotcha]]
+id = "worker-full-suite"
+where = "command"
+pattern = '^\s*cargo\s+test\b'
+message = "the full suite is the orchestrator's: it runs after the report, so a worker that runs it only waits; the command runs the tests of the crates the run has changed (`cargo test -p <crate>`), and the report goes in when they pass"
+remedy = { kind = "crates", unless = '(\s-p\s*\S|\s--package\b|\s--manifest-path\b)' }
 
 [[gotcha]]
 id = "binary-locked"
@@ -59,6 +72,16 @@ where = "command"
 pattern = '^\s*cargo\s+(test|build|clippy|check)\b'
 message = "a cargo test, build or clippy prints more than a turn should carry, and every later turn carries it again; the tail is what matters, so the command runs with `2>&1 | tail -n 80` on its end"
 remedy = { kind = "rewrite", insert = "2>&1 | tail -n 80", append = true, unless = '\|\s*\S|>\s*[^&\s]' }
+
+[[gotcha]]
+# the last of the command rewrites: the ones before it read the command's own first words.
+# A project's workers write code six at a time and compile two at a time: a gradle or cargo
+# build runs under `rc hold`, which waits for one of the project's two build slots
+id = "build-slot"
+where = "command"
+pattern = '^\s*(&\s+)?(\.[\\/])?(gw\.ps1|gradlew(\.bat)?)\b|^\s*cargo\s+(build|test|check|clippy|run|bench|doc|nextest)\b'
+message = "a build takes one of the project's two build slots: the command runs under `rc hold --`, which waits its turn while two other builds of the project run, then runs it as written"
+remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 
 [[gotcha]]
 id = "binary-locked-result"
@@ -107,4 +130,13 @@ id = "untested-claim"
 where = "answer"
 pattern = "(?i)couldn't run (any )?tests|could not run (the )?tests|unable to run (the )?tests|did not run the tests|tests? (were|was) not run"
 message = "the worker reported the card done without running its tests; the acceptance check decides, not the report"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+# a fresh session that reads a long file whole spends its context before its first edit; the
+# outline the card carries already names where each item is
+id = "whole-file-read"
+where = "read"
+pattern = '.'
+message = "a long file the card outlines is read by region: Read it again with an offset and a limit around the item you need"
 remedy = { kind = "hint" }

@@ -98,6 +98,7 @@ pub async fn propose(root: &Path, worker: &Worker, lines: &[Line]) -> anyhow::Re
             max_turns: Some(1),
             max_context: None,
             effort: Some(ra_roadmap::model::Effort::default().to_string()),
+            read_only: false,
         })
         .await
         .map_err(agent::map_error)?;

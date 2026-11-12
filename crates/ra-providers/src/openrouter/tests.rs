@@ -366,5 +366,6 @@ fn request() -> CompletionRequest {
         max_turns: None,
         max_context: None,
         effort: None,
+        read_only: false,
     }
 }

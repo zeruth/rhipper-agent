@@ -118,8 +118,11 @@ impl Sink {
 
     /// Takes one progress line: a start marker opens a run, an end marker closes the newest
     /// live one, and any other line is a step of the newest live run, which a step without one
-    /// opens untitled.
+    /// opens untitled. A line tagged with its card ([`tag_card`]), as a walk of several cards
+    /// at once writes them, goes to that card's live run instead of the newest: six runs
+    /// interleave their steps in one file, and untagged they all landed on the last to start.
     pub fn progress(&self, text: &str) {
+        let (card, text) = untag_card(text);
         if let Some(title) = text.strip_prefix(RUN_START) {
             // the pid on the marker is for the orphan scan, not for the bubble
             let (shown, pid) = match title.rsplit_once(" · pid ") {
@@ -133,15 +136,26 @@ impl Sink {
         } else if let Some(outcome) = text.strip_prefix(RUN_END) {
             // an orphan's end names its card: it closes that run and no other, so a window
             // reporting an older run never closes the card still going
-            let id = match orphaned_card(outcome) {
-                Some(card) => self.live_run_of(card),
-                None => self.live_run(),
+            // an orphan's end closes the run of its card with its pid: a card started by a
+            // killed walk and again by the next has two, and the newest is the live one
+            // a tagged end whose card has no run here is a run that started before this view
+            // attached: it closes nothing, least of all the newest run of another card
+            let id = match (orphaned_card(outcome), card) {
+                (Some(orphan), _) => self.live_run_of_pid(orphan, orphaned_pid(outcome)),
+                (None, Some(card)) => self.live_run_of(card),
+                (None, None) => self.live_run(),
             };
             if let Some(id) = id {
                 self.close_run(id, outcome);
             }
         } else {
-            let id = self.live_run().unwrap_or_else(|| self.open_run("worker"));
+            // a tagged step belongs to its card's run and to no other; one whose card has no
+            // run here is dropped rather than put on a stranger's card or an untitled one
+            let id = match card {
+                Some(card) => self.live_run_of(card),
+                None => Some(self.live_run().unwrap_or_else(|| self.open_run("worker"))),
+            };
+            let Some(id) = id else { return };
             if let Some(run) = self.inner.runs.lock().0.get_mut(&id) {
                 run.steps.push(text.to_owned());
             }
@@ -228,6 +242,12 @@ impl Sink {
 
     /// The newest run of `card` that is still going; none when the card has no open run here.
     fn live_run_of(&self, card: i64) -> Option<u64> {
+        self.live_run_of_pid(card, None)
+    }
+
+    /// The newest run of `card` still going whose process is `pid`, when one is named and a
+    /// run of the card carries it; else the newest live run of the card.
+    fn live_run_of_pid(&self, card: i64, pid: Option<u32>) -> Option<u64> {
         let ids: Vec<u64> = self
             .inner
             .lines
@@ -237,7 +257,14 @@ impl Sink {
             .filter_map(|l| l.run)
             .collect();
         let runs = self.inner.runs.lock();
-        ids.into_iter().filter(|id| runs.0.get(id).is_some_and(Run::live)).max()
+        let live: Vec<u64> = ids.into_iter().filter(|id| runs.0.get(id).is_some_and(Run::live)).collect();
+        // a pid named and carried by no run of the card is another walk's orphan, not one of
+        // these: nothing closes (the replayed orphan ends of a killed walk closed the live
+        // runs of the next one)
+        match pid {
+            Some(pid) => live.into_iter().filter(|id| runs.0.get(id).is_some_and(|r| r.pid == Some(pid))).max(),
+            None => live.into_iter().max(),
+        }
     }
 
     /// A copy of one run, for the draw.
@@ -342,6 +369,48 @@ pub fn orphaned_card(outcome: &str) -> Option<i64> {
     card_of(outcome.strip_prefix("✗ orphaned ")?)
 }
 
+/// The pid an orphan's end names, `✗ orphaned #12: process 4242 is gone`: which of the card's
+/// starts it closes, when the card started more than once (a walk killed and started again).
+#[must_use]
+pub fn orphaned_pid(outcome: &str) -> Option<u32> {
+    outcome.rsplit_once(": process ")?.1.split_whitespace().next()?.parse().ok()
+}
+
+/// Which of the `open` starts an end line closes, by index, reading each start's card and pid
+/// through `of`: an orphan's end closes the start of its card with its pid and nothing when
+/// none carries it (the orphan was another walk's, not in this list); an end tagged with its
+/// card closes that card's newest start; a bare end closes the newest start of all. Six runs
+/// at once interleave their ends, and "the newest" alone scrambled the list.
+pub fn end_closes<T>(open: &[T], outcome: &str, tag: Option<i64>, of: impl Fn(&T) -> (Option<i64>, Option<u32>)) -> Option<usize> {
+    match (orphaned_card(outcome), orphaned_pid(outcome), tag) {
+        (Some(card), Some(pid), _) => open.iter().rposition(|t| of(t) == (Some(card), Some(pid))),
+        (Some(card), None, _) | (None, _, Some(card)) => open.iter().rposition(|t| of(t).0 == Some(card)),
+        (None, _, None) => open.len().checked_sub(1),
+    }
+}
+
+/// The mark a progress line carries in front when it belongs to one card of several running
+/// at once: `@#12<TAB>`, which no step begins with on its own.
+const CARD_TAG: &str = "@#";
+
+/// A progress line marked as card `card`'s.
+#[must_use]
+pub fn tag_card(card: i64, text: &str) -> String {
+    format!("{CARD_TAG}{card}\t{text}")
+}
+
+/// The card a progress line is marked with, and the line without the mark; an unmarked line
+/// comes back whole with no card.
+#[must_use]
+pub fn untag_card(text: &str) -> (Option<i64>, &str) {
+    let Some(rest) = text.strip_prefix(CARD_TAG) else { return (None, text) };
+    let Some((card, line)) = rest.split_once('\t') else { return (None, text) };
+    match card.parse() {
+        Ok(card) => (Some(card), line),
+        Err(_) => (None, text),
+    }
+}
+
 impl Default for Sink {
     fn default() -> Self {
         Self::new()
@@ -406,6 +475,57 @@ mod tests {
         assert_eq!(card_of("worker"), None);
         assert_eq!(orphaned_card("✗ orphaned #12: process 4242 is gone"), Some(12));
         assert_eq!(orphaned_card("✗ failed: #12"), None);
+    }
+
+    #[test]
+    fn a_tagged_step_goes_to_its_own_card_among_several_running() {
+        let sink = Sink::new();
+        sink.progress(&tag_card(33, &format!("{RUN_START}#33 Focus · opus · pid 1")));
+        let focus = sink.live_run().unwrap();
+        sink.progress(&tag_card(41, &format!("{RUN_START}#41 Data · opus · pid 1")));
+        let data = sink.live_run().unwrap();
+        // the older card's step lands on the older card, not on the newest run
+        sink.progress(&tag_card(33, "Write FocusTraversalPolicy.java"));
+        sink.progress(&tag_card(41, "Read DataFlavor.java"));
+        sink.progress("Grep untagged");
+        assert_eq!(sink.run(focus).unwrap().steps, ["Write FocusTraversalPolicy.java"]);
+        assert_eq!(sink.run(data).unwrap().steps, ["Read DataFlavor.java", "Grep untagged"]);
+        // a tagged end closes its own card; a tag for a card with no run here touches nothing:
+        // not a step on a stranger's card, not the newest run closed (a replay from the attach
+        // point meets the ends of runs that started before it)
+        sink.progress(&tag_card(33, &format!("{RUN_END}✓ $0.10")));
+        assert!(!sink.run(focus).unwrap().live());
+        assert!(sink.run(data).unwrap().live());
+        sink.progress(&tag_card(99, "a stray step"));
+        sink.progress(&tag_card(99, &format!("{RUN_END}✓ $0.10")));
+        assert_eq!(sink.run(data).unwrap().steps.last().map(String::as_str), Some("Grep untagged"));
+        assert!(sink.run(data).unwrap().live());
+        assert_eq!(sink.live_runs(), [data]);
+        assert_eq!(orphaned_pid("✗ orphaned #12: process 4242 is gone"), Some(4242));
+        // the same card started twice, by a killed walk and the next: the orphan's end with
+        // the dead pid closes the dead start, and the live one keeps its steps
+        let sink = Sink::new();
+        sink.progress(&format!("{RUN_START}#7 Twice · opus · pid 100"));
+        let dead = sink.live_run().unwrap();
+        sink.progress(&tag_card(7, &format!("{RUN_START}#7 Twice · opus · pid 200")));
+        let alive = sink.live_run().unwrap();
+        sink.progress(&format!("{RUN_END}✗ orphaned #7: process 100 is gone"));
+        assert!(!sink.run(dead).unwrap().live());
+        assert!(sink.run(alive).unwrap().live());
+        // an orphan of a walk this view never opened closes nothing of the card's
+        sink.progress(&format!("{RUN_END}✗ orphaned #7: process 300 is gone"));
+        assert!(sink.run(alive).unwrap().live());
+        // the scan of a file: a tagged end closes its own card's start, an orphan's end the
+        // start with its pid, a bare end the newest
+        let open = vec![(Some(7), Some(100)), (Some(8), Some(200)), (Some(7), Some(200))];
+        let of = |t: &(Option<i64>, Option<u32>)| *t;
+        assert_eq!(end_closes(&open, "✗ orphaned #7: process 100 is gone", None, of), Some(0));
+        assert_eq!(end_closes(&open, "✗ orphaned #7: process 999 is gone", None, of), None);
+        assert_eq!(end_closes(&open, "✓ $0.10", Some(8), of), Some(1));
+        assert_eq!(end_closes(&open, "✓ $0.10", None, of), Some(2));
+        assert_eq!(untag_card("@#12\tRead x"), (Some(12), "Read x"));
+        assert_eq!(untag_card("@#nope\tRead x"), (None, "@#nope\tRead x"));
+        assert_eq!(untag_card("Read x"), (None, "Read x"));
     }
 
     #[test]
