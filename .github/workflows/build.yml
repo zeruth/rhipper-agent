@@ -36,6 +36,12 @@ jobs:
         with:
           shared-key: windows-build
 
+      # the tests commit in temporary repositories, which needs an identity the runner lacks
+      - name: git identity
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@rhipper.local"
+
       - name: format
         run: cargo fmt --all -- --check
 
@@ -43,7 +49,7 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: test
-        run: cargo test --workspace --locked -q
+        run: cargo test --workspace --locked --no-fail-fast
 
       # the lint reports and does not fail the build: the pedantic set still names a few
       # standing warnings the walk's own lint pass is working off

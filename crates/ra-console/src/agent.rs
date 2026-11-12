@@ -2044,62 +2044,152 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     };
     let mut lines = Vec::new();
     let mut ran = 0;
+    // the runs in flight, as a pool of `width`: when one ends the next ready card starts in
+    // its slot at once, rather than the pool waiting for the slowest of a wave (the person
+    // saw one card going on a two-job project for the length of a long card). Every slot
+    // is polled on this one task, so two runs never interleave a read-modify-write of the
+    // roadmap, which a spawned task per run could not promise
+    let mut flight: Vec<(i64, std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + '_>>, PoolKind)> = Vec::new();
+    let mut stopped: Option<String> = None;
     loop {
-        let roadmap = store.load().await?;
-        let nodes = roadmap.nodes;
-        let ids: Vec<i64> = ready_cards(&nodes, &roadmap.gambits, plan_tight(&root)).iter().take(width).map(|n| n.id).collect();
-        if ids.is_empty() {
-            lines.push(format!("ran {ran} card(s) · no card is ready"));
-            return Ok(lines);
+        // `stop` from the console or the window: nothing new starts, and the walk ends when
+        // the runs it is in have ended
+        let stop = root.join(WALK_STOP);
+        if stopped.is_none() && stop.exists() {
+            let _ = std::fs::remove_file(&stop);
+            stopped = Some("stopped as asked, after the cards it was in".to_owned());
         }
-        let mut runs: Vec<(i64, Worker)> = Vec::with_capacity(ids.len());
-        for id in &ids {
-            let (path, branch) = worktree_add(&root, *id).await?;
-            runs.push((*id, worker.clone().with_worktree(path, branch)));
-        }
-        let wave = join_all(runs.iter().map(|(id, worker)| run(store, *id, worker))).await;
-        let mut stopped = None;
-        for (id, outcome) in ids.iter().zip(wave) {
-            match outcome {
-                Ok(run_lines) => {
-                    lines.extend(run_lines);
-                    ran += 1;
-                    if stop_on_revision && stopped.is_none() && store.read(*id).await?.state == TaskState::NeedsRevision {
-                        stopped = Some(format!("stopped: #{id} needs revision"));
-                    }
-                }
-                Err(error) => {
-                    stopped.get_or_insert(format!("stopped: the run of #{id} failed: {error:#}"));
-                }
+        // the slots: the machine's pool, shared by every project's walk (see [`Pool`]). A
+        // card takes a slot of its model's kind before it starts, holds it for the run, and
+        // the walk starts no more than its share allows; a walk with nothing in flight and
+        // no slot to take waits for one rather than end
+        let mut starved = false;
+        if stopped.is_none() {
+            let roadmap = store.load().await?;
+            let router = crate::router::Router::load(&root).unwrap_or_default();
+            let in_flight: std::collections::HashSet<i64> = flight.iter().map(|(id, _, _)| *id).collect();
+            let others = other_walks(&root);
+            let ready: Vec<Node> = ready_cards(&roadmap.nodes, &roadmap.gambits, plan_tight(&root))
+                .into_iter()
+                .filter(|n| !in_flight.contains(&n.id))
+                .cloned()
+                .collect();
+            for node in ready {
+                let kind = Pool::kind_of(&router.choose(&node, crate::router::IMPLEMENTER, &worker.model).model);
+                let held = flight.iter().filter(|(_, _, k)| *k == kind).count();
+                let Some(slot) = Pool::take(kind, held, width, others) else {
+                    starved = starved || held == 0;
+                    continue;
+                };
+                let id = node.id;
+                let (path, branch) = worktree_add(&root, id).await?;
+                let runner = worker.clone().with_worktree(path, branch);
+                flight.push((id, Box::pin(async move { let _slot = slot; run(store, id, &runner).await }), kind));
             }
         }
-        if let Some(why) = stopped {
-            lines.push(format!("ran {ran} card(s) · {why}"));
+        if flight.is_empty() {
+            if starved && stopped.is_none() {
+                // every slot of the kind is another project's: wait for one
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                continue;
+            }
+            lines.push(format!("ran {ran} card(s) · {}", stopped.unwrap_or_else(|| "no card is ready".to_owned())));
             return Ok(lines);
+        }
+        let (at, outcome) = poll_one(&mut flight).await;
+        let (id, _, _) = flight.remove(at);
+        match outcome {
+            Ok(run_lines) => {
+                lines.extend(run_lines);
+                ran += 1;
+                if stop_on_revision && stopped.is_none() && store.read(id).await?.state == TaskState::NeedsRevision {
+                    stopped = Some(format!("stopped: #{id} needs revision"));
+                }
+            }
+            Err(error) => {
+                stopped.get_or_insert(format!("stopped: the run of #{id} failed: {error:#}"));
+            }
         }
     }
 }
 
-/// Drives `futures` together on the one task and collects their outputs in their order. The
-/// runs of a wave overlap in their waits, the model and the checks, not in their bookkeeping:
-/// the store reads and writes `rhipper.md` without yielding, so two runs never interleave a
-/// read-modify-write of it, which a spawned task per run could not promise.
-async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
-    let mut pending: Vec<Option<std::pin::Pin<Box<F>>>> = futures.into_iter().map(|f| Some(Box::pin(f))).collect();
-    let mut outputs: Vec<Option<F::Output>> = (0..pending.len()).map(|_| None).collect();
+/// Drives the runs in flight together on the one task until one of them ends, and answers
+/// which and with what. The runs overlap in their waits, the model and the checks, not in
+/// their bookkeeping.
+async fn poll_one<T>(flight: &mut [(i64, std::pin::Pin<Box<dyn Future<Output = T> + '_>>, PoolKind)]) -> (usize, T) {
     std::future::poll_fn(|cx| {
-        for (slot, out) in pending.iter_mut().zip(outputs.iter_mut()) {
-            if let Some(future) = slot
-                && let std::task::Poll::Ready(value) = future.as_mut().poll(cx)
-            {
-                *out = Some(value);
-                *slot = None;
+        for (at, (_, future, _)) in flight.iter_mut().enumerate() {
+            if let std::task::Poll::Ready(value) = future.as_mut().poll(cx) {
+                return std::task::Poll::Ready((at, value));
             }
         }
-        if pending.iter().all(Option::is_none) { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }
+        std::task::Poll::Pending
     })
-    .await;
-    outputs.into_iter().flatten().collect()
+    .await
+}
+
+/// The kind of slot a run takes from the machine's pool: Fable runs on Fable slots, every
+/// other model on the Opus slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolKind {
+    Opus,
+    Fable,
+}
+
+/// The machine's pool of runs across every project's walk: six Opus slots and two Fable
+/// slots. A project's share is its `[worker] parallel` of Opus slots (two by default) or one
+/// Fable slot; an Opus project borrows the Opus slots no other walking project needs, so one
+/// Opus project alone runs six, and gives them back as its runs end once another project
+/// walks; a Fable project never borrows and never takes more than one. The slots are the
+/// hub's locks, held by the run and released with it, dead or done. The person's rule of
+/// 2026-11-11: "a default pool of 6 opus 2 fable, 2 per task, 1 fable per task, with tasks
+/// borrowing from the pool if no other project is using them".
+pub struct Pool;
+
+impl Pool {
+    /// The Opus slots on the machine.
+    pub const OPUS: usize = 6;
+    /// The Fable slots on the machine.
+    pub const FABLE: usize = 2;
+    /// The Opus slots a walking project is owed, which another project's borrowing leaves it.
+    pub const OPUS_SHARE: usize = 2;
+
+    /// The kind of slot a model runs on.
+    #[must_use]
+    pub fn kind_of(model: &str) -> PoolKind {
+        if model.to_ascii_lowercase().contains("fable") { PoolKind::Fable } else { PoolKind::Opus }
+    }
+
+    /// Takes a slot of `kind` for a walk that holds `held` of them, is owed `width` Opus
+    /// slots as its own share, and shares the machine with `others` walking projects; `None`
+    /// when the share or the pool is out. A Fable walk takes one and only one.
+    #[must_use]
+    pub fn take(kind: PoolKind, held: usize, width: usize, others: usize) -> Option<crate::hub::Guard> {
+        let (size, name) = match kind {
+            PoolKind::Opus => (Self::OPUS, "opus"),
+            PoolKind::Fable => (Self::FABLE, "fable"),
+        };
+        let allowed = match kind {
+            PoolKind::Fable => 1,
+            // the share, and past it whatever the pool holds beyond every other walking
+            // project's share
+            PoolKind::Opus => width.max(1).max(size.saturating_sub(others * Self::OPUS_SHARE)),
+        };
+        if held >= allowed {
+            return None;
+        }
+        (0..size).find_map(|slot| crate::hub::try_guard(&format!("pool-{name}-{slot}")).ok().flatten())
+    }
+}
+
+/// How many other projects the window knows are walking now: the pool's shares are theirs.
+fn other_walks(root: &Path) -> usize {
+    let here = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    crate::hub::recent()
+        .into_iter()
+        .filter(|dir| std::path::absolute(dir).map_or(true, |d| d != here))
+        .filter(|dir| walk_running(dir))
+        .count()
 }
 
 /// The work of [`run`], with the cost of the session and the count of the gotchas it hit beside

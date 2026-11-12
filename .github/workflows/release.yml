@@ -49,11 +49,16 @@ jobs:
           git tag -a "${{ steps.version.outputs.tag }}" -m "Rhipper Agent ${{ steps.version.outputs.version }}"
           git push origin "${{ steps.version.outputs.tag }}"
 
+      - name: git identity
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@rhipper.local"
+
       - name: build
         run: cargo build --release --locked -p rc -p rc-gui
 
       - name: test
-        run: cargo test --workspace --locked -q
+        run: cargo test --workspace --locked --no-fail-fast
 
       - name: bundle
         shell: pwsh
