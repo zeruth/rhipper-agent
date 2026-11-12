@@ -354,7 +354,8 @@ impl Catalogue {
                     return Verdict::Deny { id: gotcha.id.clone(), reason };
                 }
                 Remedy::Allow => break,
-                Remedy::Rewrite { .. } => {}
+                // a command's rewrites say nothing about a Read
+                Remedy::Rewrite { .. } | Remedy::Crates { .. } => {}
             }
         }
         Verdict::Pass
