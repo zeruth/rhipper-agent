@@ -1567,7 +1567,11 @@ async fn hold_build(root: &Path) -> Option<crate::hub::Guard> {
         }
         if !said {
             said = true;
-            let text = format!("wait: the check waits for a build slot, {} builds of the project are running", crate::hub::BUILD_SLOTS);
+            let text = format!(
+                "wait: the check waits for a build slot, {} of the machine's {} are running",
+                crate::hub::builds_running(),
+                crate::hub::BUILD_SLOTS
+            );
             tracing::info!(target: crate::trace::PROGRESS, "  {text}");
             crate::pair::event(root, &text);
         }
@@ -1647,7 +1651,11 @@ pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
         }
         if !said {
             said = true;
-            eprintln!("rc hold: waiting for a build slot, {} builds of the project are running", crate::hub::BUILD_SLOTS);
+            eprintln!(
+                "rc hold: waiting for a build slot, {} of the machine's {} are running",
+                crate::hub::builds_running(),
+                crate::hub::BUILD_SLOTS
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     };
@@ -3015,8 +3023,8 @@ pub enum PoolKind {
 /// once another project walks. A Fable project runs one card at a time, its own slot, in no
 /// pool: as many Fable projects as walk. The slots are the hub's locks, held by the run and
 /// released with it, dead or done. Six runs write code; what made six too heavy was six
-/// builds at once, which the project's two build slots ([`crate::hub::BUILD_SLOTS`]) now
-/// keep to two. The person's rule of 2026-11-12: "i want the 6x, just don't do stupid shit
+/// builds at once, which the machine's four shared build slots ([`crate::hub::BUILD_SLOTS`])
+/// now keep to four across every project. The person's rule of 2026-11-12: "i want the 6x, just don't do stupid shit
 /// like having them all building with gradle".
 pub struct Pool;
 

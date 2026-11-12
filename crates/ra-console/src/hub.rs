@@ -613,16 +613,47 @@ pub fn held_by(prefix: &str, count: usize, who: &str) -> usize {
 }
 
 /// The builds the machine runs at once, across every project's workers and checks: four
-/// builders beside the twelve writers. With a priority order set, the first project walking
-/// with work may use all four and a project below it the last two; without one, a project
-/// has two of its own and the two spare when it walks alone. The person's rules of
-/// 2026-11-12: "12 opus researchers, and 4 runners overall", "all 12 … and 4 builders [to]
-/// whichever project has priority first".
+/// builders beside the twelve writers, shared by every project. A project that wants a build
+/// and runs none goes before the projects that run one already, so each project asking has at
+/// least one. The person's rule of 2026-11-12: "the 4 are shared agent wide, with at least 1
+/// running per project if its requesting it (queue requested projects next always if they
+/// have a request and aren't in the pool already)".
 pub const BUILD_SLOTS: usize = 4;
 
-/// The build slots a project keeps for itself without a priority order, and the slots a
-/// project below the first in the order may use.
-pub const BUILD_SHARE: usize = 2;
+/// How long a project's wish for a build slot stands without being renewed: a waiter renews it
+/// on every try, so one that stopped waiting stops counting after this.
+const BUILD_WANT_FRESH: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The file that says a project waits for a build slot.
+fn build_want_path(project: &str) -> PathBuf {
+    locks_dir().join(format!("build-want-{}", project.to_ascii_lowercase()))
+}
+
+/// The projects waiting for a build slot right now: their wish renewed within
+/// [`BUILD_WANT_FRESH`].
+fn build_wanting() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(locks_dir()) else { return Vec::new() };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let project = name.strip_prefix("build-want-")?.to_owned();
+            let fresh = e.metadata().ok()?.modified().ok()?.elapsed().is_ok_and(|age| age < BUILD_WANT_FRESH);
+            fresh.then_some(project)
+        })
+        .collect()
+}
+
+/// The project a build slot's note names: `runelite #42` is runelite's.
+fn holder_project(who: &str) -> &str {
+    who.split(" #").next().unwrap_or(who).trim()
+}
+
+/// How many builds run on the machine right now, every project's.
+#[must_use]
+pub fn builds_running() -> usize {
+    build_slots().iter().flatten().count()
+}
 
 /// The project a directory works in: itself, or the project above a card's worktree
 /// (`<root>/var/worktrees/<id>`), whose build slots the worktree's builds take.
@@ -643,11 +674,10 @@ pub fn build_lock_name(slot: usize) -> String {
     format!("build-{slot}")
 }
 
-/// Takes one of the machine's [`BUILD_SLOTS`] once: `Ok(None)` while every slot the project
-/// may take is held. With a priority order, the first project walking may take any of the
-/// four and a project behind a walking one only the last [`BUILD_SHARE`]; without an order,
-/// a project takes its own two (the first two for the project first in the hub's open list,
-/// the last two for the next) and any of the four when it walks alone.
+/// Takes one of the machine's [`BUILD_SLOTS`] once: `Ok(None)` while the project may take none.
+/// Any free slot is any project's, except that a project already running a build leaves the
+/// free slots to the waiting projects that run none: those go next. A project that gets
+/// nothing leaves its wish for the others to see, renewed on each try.
 ///
 /// # Errors
 /// When a lock file cannot be made or opened.
@@ -664,23 +694,22 @@ pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
         Some(card) => format!("{project} #{card}"),
         None => project.clone(),
     };
-    let higher = crate::agent::higher_walking(&project_root);
-    let alone = crate::agent::other_walks(&project_root) == 0;
-    let slots: Vec<usize> = match rank_of(&project_root) {
-        _ if alone => (0..BUILD_SLOTS).collect(),
-        Some(_) if higher.is_empty() => (0..BUILD_SLOTS).collect(),
-        Some(_) => (BUILD_SLOTS - BUILD_SHARE..BUILD_SLOTS).collect(),
-        None => {
-            // no order: the first project of the hub's open list has the first two slots
-            let mine = recent().iter().position(|d| project_name(d).eq_ignore_ascii_case(&project)).unwrap_or(0);
-            if mine == 0 { (0..BUILD_SHARE).collect() } else { (BUILD_SLOTS - BUILD_SHARE..BUILD_SLOTS).collect() }
-        }
-    };
-    for slot in slots {
-        if let Some(guard) = try_guard_as(&build_lock_name(slot), &who)? {
-            return Ok(Some(guard));
+    let held: Vec<String> = build_slots().into_iter().flatten().map(|(w, _)| holder_project(&w).to_ascii_lowercase()).collect();
+    let free = BUILD_SLOTS.saturating_sub(held.len());
+    let me = project.to_ascii_lowercase();
+    let want = build_want_path(&project);
+    // a project that runs a build already leaves the free slots to the ones that run none
+    let first_in_line = build_wanting().into_iter().filter(|p| *p != me && !held.contains(p)).count();
+    if free > 0 && (!held.contains(&me) || free > first_in_line) {
+        for slot in 0..BUILD_SLOTS {
+            if let Some(guard) = try_guard_as(&build_lock_name(slot), &who)? {
+                let _ = std::fs::remove_file(&want);
+                return Ok(Some(guard));
+            }
         }
     }
+    let _ = std::fs::create_dir_all(locks_dir());
+    let _ = std::fs::write(&want, std::process::id().to_string());
     Ok(None)
 }
 

@@ -334,7 +334,7 @@ enum Command {
         /// The note, one line.
         text: Vec<String>,
     },
-    /// Runs a build command on one of the project's two build slots, waiting its turn while two other builds of the project run; the hook puts a worker's gradle and cargo commands under it.
+    /// Runs a build command on one of the machine's four build slots, shared by every project, waiting its turn while they are all taken; the hook puts a worker's gradle and cargo commands under it.
     Hold {
         /// The shell the command runs through: bash, sh or powershell; PowerShell on Windows and sh elsewhere when left out.
         #[arg(long)]
