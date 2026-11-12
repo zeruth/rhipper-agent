@@ -2443,6 +2443,18 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
                 );
             }
             lines.push(format!("merged {branch} into {}", git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()));
+            // a Rust tree is formatted as it lands, into the merge commit: a build on push
+            // that checks the format stays green without a worker ever running rustfmt
+            if root.join("Cargo.toml").is_file() {
+                let formatted = tokio::process::Command::new("cargo").args(["fmt", "--all"]).current_dir(&root).output().await;
+                if formatted.is_ok_and(|o| o.status.success())
+                    && git(&root, &["status", "--porcelain", "--untracked-files=no"]).await.is_ok_and(|s| !s.trim().is_empty())
+                {
+                    git(&root, &["add", "-u"]).await?;
+                    git(&root, &["commit", "-q", "--amend", "--no-edit"]).await?;
+                    lines.push("formatted the merged tree".to_owned());
+                }
+            }
             // the project's check on the merged tree: two cards right on their own are not
             // always right together (#176 and #181 compiled apart and not merged)
             let Checks { commands, timeout, .. } = checks_of(&root, &node);

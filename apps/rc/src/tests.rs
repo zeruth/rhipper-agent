@@ -182,6 +182,7 @@ fn a_status_card_line_carries_the_cost_and_the_tokens_a_turn_and_is_blank_before
             completion_tokens: 23_000,
             cached_tokens: 0,
             cost_usd: Some(0.4249),
+            estimated_usd: 0.0,
             turns: 10,
             read_in: 0,
         },
