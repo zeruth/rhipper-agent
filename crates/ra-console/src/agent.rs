@@ -2145,7 +2145,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
-                messages: harness_messages(&task, rerun.as_deref(), &project, &root, worker.debug),
+                messages: harness_messages(&task, node.acceptance.as_deref(), rerun.as_deref(), &project, &root, worker.debug),
                 temperature: Some(0.4),
                 max_tokens: Some(4096),
                 tools: Vec::new(),
@@ -2535,6 +2535,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 note.machine = machine;
             }
         }
+        // the acceptance the notes were written against, so a later change of it retires them
+        let print = crate::retro::acceptance_print(node.acceptance.as_deref());
+        for note in &mut notes {
+            note.against = Some(print.clone());
+        }
         if let Err(e) = crate::retro::record(&root, Some(id), &notes) {
             tracing::warn!("the look back of #{id} was not kept: {e:#}");
         }
@@ -2670,13 +2675,20 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
 /// as system messages, the task as the user turn. The machine notes name what tripped the last
 /// runs, so the worker does not find out the hard way again, and the warnings the last run of
 /// the card left, so a second attempt opens on the exact lines. On a rerun the `rerun` block
-/// stands in for the handoffs.
-fn harness_messages(task: &ra_context::TaskContext, rerun: Option<&str>, project: &str, root: &Path, debug: bool) -> Vec<Message> {
+/// stands in for the handoffs. `acceptance` is the card's, which the notes are judged against.
+fn harness_messages(
+    task: &ra_context::TaskContext,
+    acceptance: Option<&str>,
+    rerun: Option<&str>,
+    project: &str,
+    root: &Path,
+    debug: bool,
+) -> Vec<Message> {
     let mut messages = vec![Message::system(SYSTEM)];
     if !project.is_empty() {
         messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
     }
-    let notes = [machine_notes(root, project), warnings_note(task), digest_block(&crate::hub::digest_lines(root))]
+    let notes = [machine_notes(root, project, (task.id, acceptance)), warnings_note(task), digest_block(&crate::hub::digest_lines(root))]
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
@@ -2749,7 +2761,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
     let resume = resume_of(&node, unix_now());
     let messages = if harness {
-        harness_messages(&task, rerun.as_deref(), &project, &root, worker.debug)
+        harness_messages(&task, node.acceptance.as_deref(), rerun.as_deref(), &project, &root, worker.debug)
     } else {
         vec![Message::system(SYSTEM), Message::user(bare_context(&task, rerun.as_deref(), &project, worker.debug))]
     };
@@ -3332,14 +3344,15 @@ fn warnings_note(task: &ra_context::TaskContext) -> String {
 
 /// The machine notes of a run: what the gotchas say about the last hits in the journal, for the
 /// system prompt, so the worker does not find out the hard way again, less what `project`, the
-/// context the prompt already carries, or an earlier note says. Empty when nothing fired.
-fn machine_notes(workspace: &Path, project: &str) -> String {
+/// context the prompt already carries, or an earlier note says. Empty when nothing fired. `card`
+/// is the id and the acceptance of the card the run works, which a look-back is judged against.
+fn machine_notes(workspace: &Path, project: &str, card: (i64, Option<&str>)) -> String {
     let gotchas = match Catalogue::load(&workspace.join(GOTCHAS_FILE)) {
         Ok(catalogue) => catalogue.notes(&Journal::at(&workspace.join(GOTCHAS_LOG)).recent(RECENT_HITS)),
         Err(_) => String::new(),
     };
     // what the earlier runs said themselves, in debug mode, rides along
-    let retro = crate::retro::machine_lines(workspace);
+    let retro = crate::retro::machine_lines_for(workspace, Some(card));
     let notes = [gotchas, retro].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     ra_context::dedupe_notes(&notes, project)
 }

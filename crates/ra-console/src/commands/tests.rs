@@ -912,10 +912,18 @@ fn a_report_is_a_placeholder_when_it_names_no_file_and_says_nothing_beyond_the_c
     assert!(!crate::agent::is_empty_handoff("Nothing to change: the card is already implemented in the store."));
 }
 
+/// The package name of the probe in `dir`, one of its own: under a shared `CARGO_TARGET_DIR`, as
+/// a worker's harness sets it, two probes of one name build over each other and a failing one
+/// passes on the other's binary.
+fn probe_name(dir: &std::path::Path) -> String {
+    let own: String = dir.file_name().unwrap().to_string_lossy().chars().filter(char::is_ascii_alphanumeric).collect();
+    format!("probe{}", own.to_ascii_lowercase())
+}
+
 /// A one-crate Cargo project in `dir` whose single test passes or fails.
 fn cargo_project(dir: &std::path::Path, passing: bool) {
-    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n")
-        .unwrap();
+    let manifest = format!("[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n", probe_name(dir));
+    std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), format!("#[test]\nfn probe() {{ assert!({passing}, \"the probe broke\"); }}\n")).unwrap();
 }
@@ -1486,6 +1494,68 @@ async fn in_debug_mode_the_run_keeps_the_worker_s_look_back_for_the_next_one() {
     let (out, _) = run("/run 3", &store, &quiet).await.unwrap();
     assert!(!out.iter().any(|l| l.contains('↯')), "{out:?}");
     assert_eq!(crate::retro::recent(dir.path(), 10).len(), 2);
+}
+
+/// The system messages of a dry run of `id`, before the user turn.
+async fn dry_system(store: &Store, id: i64) -> String {
+    let (out, _) = run(&format!("/run {id} dry"), store, &Worker::new("claude-sonnet-5-5")).await.unwrap();
+    let end = out.iter().position(|l| l == "--- user ---").expect("the user turn follows the system messages");
+    out[..end].join("\n")
+}
+
+#[tokio::test]
+async fn a_look_back_naming_a_check_retires_once_the_config_or_the_card_changed_and_a_plain_one_rides_a_week() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let print = crate::retro::acceptance_print(None);
+    let (hour, week) = (now - 3600, now - crate::retro::RIDES_FOR - 60);
+    let log = format!(
+        "{hour}\t2\t0\t`cargo test --workspace` relinks rc.exe; run it with --exclude rc\t{print}\n\
+         {hour}\t2\t0\tthe card named no files; a files line would have saved the search\n\
+         {week}\t2\t0\tthe outline of agent.rs is long\n\
+         {hour}\t2\t0\tthe acceptance's `cargo test -p ra-tools` was typed by hand\t{print}\n"
+    );
+    std::fs::create_dir_all(dir.path().join("var")).unwrap();
+    std::fs::write(dir.path().join(crate::retro::RETRO_FILE), log).unwrap();
+    let system = dry_system(&store, 2).await;
+    assert!(system.contains("`cargo test --workspace` relinks") && system.contains("was typed by hand"), "{system}");
+    assert!(!system.contains("outline of agent.rs"), "a week-old note does not ride: {system}");
+    // the project's check is configured after the note was written: the note naming a command
+    // retires, the plain observation rides on
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\ncheck = \"cargo test -p ra-console\"\n").unwrap();
+    let system = dry_system(&store, 2).await;
+    assert!(!system.contains("cargo test --workspace") && !system.contains("was typed by hand"), "{system}");
+    assert!(system.contains("the card named no files"), "{system}");
+    // a note written after the config change, against the card's acceptance, retires once the
+    // acceptance changes
+    std::fs::remove_file(dir.path().join(crate::router::ROUTES_FILE)).unwrap();
+    let system = dry_system(&store, 2).await;
+    assert!(system.contains("was typed by hand"), "{system}");
+    run("/edit 2 acceptance `cargo test -p ra-console` passes", &store, &worker()).await.unwrap();
+    let system = dry_system(&store, 2).await;
+    assert!(!system.contains("was typed by hand") && system.contains("the card named no files"), "{system}");
+}
+
+#[test]
+fn rc_note_retire_drops_one_line_and_its_shared_copy_and_says_which() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path().join("hub").join("notes.log");
+    let notes = crate::retro::parse("## Faster next time\n- [machine] sed is refused\n- the card named no files\n");
+    crate::retro::record_with(dir.path(), &shared, Some(4), &notes).unwrap();
+    assert_eq!(std::fs::read_to_string(&shared).unwrap().lines().count(), 1);
+    let listed = crate::retro::numbered(dir.path(), 10);
+    assert_eq!(
+        listed.iter().map(|(line, n)| (*line, n.text.as_str())).collect::<Vec<_>>(),
+        [(2, "the card named no files"), (1, "sed is refused")]
+    );
+    assert_eq!(crate::retro::retire_with(dir.path(), &shared, 1).unwrap(), "[machine] sed is refused");
+    let left = crate::retro::recent(dir.path(), 10);
+    assert_eq!(left.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), ["the card named no files"]);
+    assert_eq!(std::fs::read_to_string(&shared).unwrap(), "");
+    let err = crate::retro::retire_with(dir.path(), &shared, 5).unwrap_err().to_string();
+    assert!(err.contains("no note on line 5"), "{err}");
 }
 
 #[tokio::test]
@@ -2080,7 +2150,8 @@ async fn linted_run(at: &str) -> (Vec<String>, ra_roadmap::model::Node, tempfile
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
     // the check, then the lines the change touched (the script's "ok" is no diff, so the new
     // file counts whole), then the lint of the crate of the change
-    assert_eq!(*seen.lock(), ["cargo test --workspace -q", "git diff -U0 HEAD -- src/extra.rs", "cargo clippy -p probe"]);
+    let lint = format!("cargo clippy -p {}", probe_name(dir.path()));
+    assert_eq!(*seen.lock(), ["cargo test --workspace -q", "git diff -U0 HEAD -- src/extra.rs", lint.as_str()]);
     (out, store.read(2).await.unwrap(), dir)
 }
 

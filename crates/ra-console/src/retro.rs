@@ -64,6 +64,9 @@ pub struct Note {
     /// rather than from a run.
     pub pair: bool,
     pub text: String,
+    /// The fingerprint of the acceptance of the card whose run wrote the note, as
+    /// [`acceptance_print`] has it: a note about a check the card has since changed retires.
+    pub against: Option<String>,
 }
 
 /// Keeps an observation of the person or a paired session, for the next runs to read with
@@ -77,7 +80,7 @@ pub fn record_pair(root: &Path, text: &str) -> anyhow::Result<()> {
         None => (false, text.trim()),
     };
     anyhow::ensure!(!text.is_empty(), "a note says something");
-    let note = Note { when: 0, node: None, machine, pair: true, text: text.chars().take(400).collect() };
+    let note = Note { when: 0, node: None, machine, pair: true, text: text.chars().take(400).collect(), against: None };
     crate::pair::event(root, &format!("note {}{}", if machine { "[machine] " } else { "" }, note.text));
     record(root, None, &[note])
 }
@@ -115,7 +118,7 @@ pub fn parse(report: &str) -> Vec<Note> {
             continue;
         }
         let text: String = text.chars().take(240).collect();
-        notes.push(Note { when: 0, node: None, machine, pair: false, text });
+        notes.push(Note { when: 0, node: None, machine, pair: false, text, against: None });
         if notes.len() == 3 {
             break;
         }
@@ -143,7 +146,11 @@ pub fn record_with(root: &Path, shared: &Path, node: Option<i64>, notes: &[Note]
     }
     let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let node = node.map_or(String::from("-"), |n| n.to_string());
-    append(&root.join(RETRO_FILE), notes.iter().map(|note| format!("{when}\t{node}\t{}\t{}", kind_of(note), clean(&note.text))))?;
+    let own = notes.iter().map(|note| {
+        let against = note.against.as_deref().map(|print| format!("\t{print}")).unwrap_or_default();
+        format!("{when}\t{node}\t{}\t{}{against}", kind_of(note), clean(&note.text))
+    });
+    append(&root.join(RETRO_FILE), own)?;
     let project = project_name(root);
     let general =
         notes.iter().filter(|note| note.machine).map(|note| format!("{when}\t{project}\t{}\t{}", kind_of(note), clean(&note.text)));
@@ -163,7 +170,7 @@ pub const SAVING: &str = "[saving]";
 /// When the file cannot be written.
 pub fn record_saving(root: &Path, node: i64, held: bool, why: &str) -> anyhow::Result<String> {
     let text = format!("{SAVING} #{node} {}: {why}", if held { "held" } else { "missed" });
-    record(root, Some(node), &[Note { when: 0, node: Some(node), machine: false, pair: false, text: text.clone() }])?;
+    record(root, Some(node), &[Note { when: 0, node: Some(node), machine: false, pair: false, text: text.clone(), against: None }])?;
     Ok(text)
 }
 
@@ -187,7 +194,7 @@ pub fn record_heavy(root: &Path, node: i64, per_turn: u64, biggest: Option<(&str
         None => "the tool results were the harness's, out of sight".to_owned(),
     };
     let text = format!("{HEAVY} #{node} {per_turn} tokens/turn over the ceiling of {TURN_CEILING}; {result}");
-    record(root, Some(node), &[Note { when: 0, node: Some(node), machine: false, pair: false, text: text.clone() }])?;
+    record(root, Some(node), &[Note { when: 0, node: Some(node), machine: false, pair: false, text: text.clone(), against: None }])?;
     Ok(text)
 }
 
@@ -229,7 +236,7 @@ pub async fn landed(root: &Path, card: &ra_roadmap::model::Node, ledger: &ra_usa
         if held { "held" } else { "missed" },
         own.totals.turns
     );
-    let note = Note { when: 0, node: Some(card.id), machine: held && across, pair: false, text: text.clone() };
+    let note = Note { when: 0, node: Some(card.id), machine: held && across, pair: false, text: text.clone(), against: None };
     match record(root, Some(card.id), &[note]) {
         Ok(()) => vec![text],
         Err(e) => {
@@ -326,6 +333,7 @@ fn parse_log(path: &Path) -> Vec<(usize, String, Note)> {
                 machine: matches!(kind, "1" | "3"),
                 pair: matches!(kind, "2" | "3"),
                 text: text.to_owned(),
+                against: cols.next().filter(|print| !print.is_empty()).map(str::to_owned),
             };
             Some((index + 1, second.to_owned(), note))
         })
@@ -379,14 +387,133 @@ fn tail<T>(mut all: Vec<T>) -> Vec<T> {
 /// it what the other projects on this machine learned about it; empty without any.
 #[must_use]
 pub fn machine_lines(root: &Path) -> String {
-    machine_lines_with(root, &shared_file())
+    machine_lines_against(root, &shared_file(), None)
+}
+
+/// `machine_lines` for a run of `card`, its id and its acceptance: a note its run wrote about a
+/// check the acceptance has since changed does not ride.
+#[must_use]
+pub fn machine_lines_for(root: &Path, card: Option<(i64, Option<&str>)>) -> String {
+    machine_lines_against(root, &shared_file(), card)
 }
 
 /// `machine_lines` with the shared store named, for the tests.
 #[must_use]
 pub fn machine_lines_with(root: &Path, shared: &Path) -> String {
+    machine_lines_against(root, shared, None)
+}
+
+/// How long a note rides: a lesson older than a week was about a machine or a project that has
+/// moved on since.
+pub const RIDES_FOR: u64 = 7 * 24 * 60 * 60;
+
+/// The fingerprint of a card's acceptance a run's notes carry, so a later run tells whether the
+/// checks they were written against still stand.
+#[must_use]
+pub fn acceptance_print(acceptance: Option<&str>) -> String {
+    let text = acceptance.unwrap_or("").replace("\r\n", "\n");
+    let hash = text.trim().bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    format!("{hash:016x}")
+}
+
+/// Whether a note names a command, a check or a config key: the kind of lesson a change of the
+/// project's `rhipper.toml` or of the card's acceptance makes stale (#9 spent a run on one about
+/// `cargo test --workspace` written before the project's check was configured).
+#[must_use]
+pub fn names_a_command(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    text.contains('`') || ["cargo ", "check", ".toml", " = ", " --"].iter().any(|word| lower.contains(word))
+}
+
+/// Whether a note written at `when` is past [`RIDES_FOR`] at `now`.
+fn stale(when: u64, now: u64) -> bool {
+    now.saturating_sub(when) > RIDES_FOR
+}
+
+/// Whether a line of the project's log still rides into a run: young enough, and, when it names
+/// a command, written after the last change of `rhipper.toml` (`config`, its mtime) and against
+/// the acceptance the card has now (`card`, its id and [`acceptance_print`]).
+fn rides(note: &Note, now: u64, config: Option<u64>, card: Option<(i64, &str)>) -> bool {
+    if stale(note.when, now) {
+        return false;
+    }
+    if !names_a_command(&note.text) {
+        return true;
+    }
+    let config_moved = config.is_some_and(|at| at > note.when);
+    let card_moved = card.is_some_and(|(id, print)| note.node == Some(id) && note.against.as_deref().is_some_and(|was| was != print));
+    !(config_moved || card_moved)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// When `path` was last written, in unix seconds; `None` without the file.
+fn modified(path: &Path) -> Option<u64> {
+    let at = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    at.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+/// The latest `limit` lines of the project's log with their line numbers, newest first: what
+/// `rc note --retire <n>` names.
+#[must_use]
+pub fn numbered(root: &Path, limit: usize) -> Vec<(usize, Note)> {
+    let mut lines: Vec<(usize, Note)> = parse_log(&root.join(RETRO_FILE)).into_iter().map(|(line, _, note)| (line, note)).collect();
+    lines.reverse();
+    lines.truncate(limit);
+    lines
+}
+
+/// Drops line `n` of the project's log by hand, and its copy in the shared store when it was a
+/// machine note; the line's text, its tag back on.
+///
+/// # Errors
+/// When the log has no such line or cannot be written.
+pub fn retire(root: &Path, n: usize) -> anyhow::Result<String> {
+    retire_with(root, &shared_file(), n)
+}
+
+/// `retire` with the shared store named, for the tests.
+///
+/// # Errors
+/// When the log has no such line or cannot be written.
+pub fn retire_with(root: &Path, shared: &Path, n: usize) -> anyhow::Result<String> {
+    let path = root.join(RETRO_FILE);
+    let Some((_, _, note)) = parse_log(&path).into_iter().find(|(line, _, _)| *line == n) else {
+        anyhow::bail!("{RETRO_FILE} has no note on line {n}");
+    };
+    drop_lines(&path, |index, _| index + 1 == n)?;
+    if note.machine {
+        let copy = format!("{}\t{}\t{}\t{}", note.when, project_name(root), kind_of(&note), note.text);
+        if let Err(e) = drop_lines(shared, |_, line| line == copy) {
+            tracing::warn!("the shared copy of the note was not retired: {e:#}");
+        }
+    }
+    Ok(tagged(&note))
+}
+
+/// Rewrites `path` without the lines `gone` picks, by their index from 0 and their text.
+fn drop_lines(path: &Path, gone: impl Fn(usize, &str) -> bool) -> anyhow::Result<()> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Ok(()) };
+    let kept: String = text.lines().enumerate().filter(|(index, line)| !gone(*index, line)).map(|(_, line)| format!("{line}\n")).collect();
+    std::fs::write(path, kept)?;
+    Ok(())
+}
+
+/// `machine_lines` with the shared store and the card named: every note that still [`rides`],
+/// and the other projects' that are not [`stale`].
+#[must_use]
+pub fn machine_lines_against(root: &Path, shared: &Path, card: Option<(i64, Option<&str>)>) -> String {
+    let now = unix_now();
+    let config = modified(&root.join(crate::router::ROUTES_FILE));
+    let print = card.map(|(id, acceptance)| (id, acceptance_print(acceptance)));
+    let card = print.as_ref().map(|(id, print)| (*id, print.as_str()));
+    let mut own: Vec<Note> =
+        parse_log(&root.join(RETRO_FILE)).into_iter().map(|(_, _, note)| note).filter(|note| rides(note, now, config, card)).collect();
+    own.reverse();
     let mut seen: Vec<String> = Vec::new();
-    for note in recent(root, SHOWN * 2) {
+    for note in own.into_iter().take(SHOWN * 2) {
         // the walk's verdicts on the plan's claims and on a run's weight are the planner's to
         // read, not a worker's
         if note.text.starts_with(SAVING) || note.text.starts_with(HEAVY) {
@@ -406,7 +533,14 @@ pub fn machine_lines_with(root: &Path, shared: &Path) -> String {
     }
     // a lesson this project already holds is not repeated from another's
     let mut elsewhere: Vec<String> = Vec::new();
-    for (project, note) in shared_recent(root, shared, SHOWN * 2) {
+    let this = project_name(root);
+    let mut theirs: Vec<(String, Note)> = parse_log(shared)
+        .into_iter()
+        .filter(|(_, project, note)| *project != this && !stale(note.when, now))
+        .map(|(_, project, note)| (project, note))
+        .collect();
+    theirs.reverse();
+    for (project, note) in theirs.into_iter().take(SHOWN * 2) {
         let known = seen.iter().any(|s| s.ends_with(&note.text));
         // a verdict another project shared is the planner's too
         if note.text.starts_with(SAVING) || elsewhere.len() == SHOWN || known || elsewhere.iter().any(|s| s.ends_with(&note.text)) {
