@@ -529,7 +529,7 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
             answer.usage.prompt_tokens,
             answer.usage.completion_tokens,
             answer.usage.cached_tokens,
-            cost_text(answer.usage.cost_usd)
+            cost_text(&answer.usage)
         ),
     ])
 }
@@ -894,12 +894,12 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
         lines.extend(review_after_run(store, id, worker).await);
     }
     match &outcome {
-        Ok((lines, cost, 0)) => {
-            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, cost_text(*cost));
+        Ok((lines, usage, 0)) => {
+            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, end_cost(usage));
             crate::pair::event(&root, &format!("end {}", lines.first().map_or("", String::as_str)));
         }
-        Ok((lines, cost, gotchas)) => {
-            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {} · {gotchas} gotchas", crate::logs::RUN_END, cost_text(*cost));
+        Ok((lines, usage, gotchas)) => {
+            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {} · {gotchas} gotchas", crate::logs::RUN_END, end_cost(usage));
             crate::pair::event(&root, &format!("end {} · {gotchas} gotcha(s)", lines.first().map_or("", String::as_str)));
         }
         Err(e) => {
@@ -1217,7 +1217,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
         short(&model),
         answer.usage.prompt_tokens,
         answer.usage.completion_tokens,
-        cost_text(answer.usage.cost_usd)
+        cost_text(&answer.usage)
     )];
     if let Verdict::NeedsRevision(points) = &verdict {
         lines.extend(points.iter().map(|point| format!("  - {point}")));
@@ -1341,7 +1341,7 @@ impl Plan {
             short(&self.model),
             self.usage.prompt_tokens,
             self.usage.completion_tokens,
-            cost_text(self.usage.cost_usd)
+            cost_text(&self.usage)
         )];
         lines.extend(self.outline.preview().into_iter().map(|line| format!("  {line}")));
         lines
@@ -3065,9 +3065,10 @@ fn project_kind(root: &Path) -> PoolKind {
     Pool::kind_of(model)
 }
 
-/// The work of [`run`], with the cost of the session and the count of the gotchas it hit beside
-/// the log lines.
-async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> anyhow::Result<(Vec<String>, Option<f64>, usize)> {
+/// The work of [`run`], with the usage of the session, its cost reported or computed, and the
+/// count of the gotchas it hit beside the log lines.
+#[allow(clippy::too_many_lines)]
+async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> anyhow::Result<(Vec<String>, Usage, usize)> {
     let id = node.id;
     let provider = worker.provider()?;
     store.set_state_by(id, TaskState::InProgress, Source::Run).await?;
@@ -3311,11 +3312,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             short(&worker.model),
             session.calls,
             tokens_line(&session),
-            cost_text(session.usage.cost_usd)
+            cost_text(&session.usage)
         )];
         lines.extend(fresh);
         lines.extend(noted);
-        return Ok((lines, session.usage.cost_usd, gotcha_hits.len()));
+        return Ok((lines, session.usage, gotcha_hits.len()));
     }
     // the local checks before the card counts as done: no model call, the acceptance names
     // them (else the project, else the workspace tests), and they run in order up to the first
@@ -3483,7 +3484,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             short(&worker.model),
             session.calls,
             tokens_line(&session),
-            cost_text(session.usage.cost_usd),
+            cost_text(&session.usage),
             if asked_twice { " · report asked twice" } else { "" }
         ),
         check_line,
@@ -3530,7 +3531,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         ids.dedup();
         lines.push(format!("  ⚠ {} gotcha(s): {} · rc gotchas lists them", gotcha_hits.len(), ids.join(", ")));
     }
-    Ok((lines, session.usage.cost_usd, gotcha_hits.len()))
+    Ok((lines, session.usage, gotcha_hits.len()))
 }
 
 /// What a run of a node has in hand before it calls the model: the workspace, the task context,
@@ -4701,6 +4702,8 @@ fn add_usage(sum: &mut Usage, one: &Usage) {
     sum.cached_tokens += one.cached_tokens;
     if let Some(cost) = one.cost_usd {
         sum.cost_usd = Some(sum.cost_usd.unwrap_or(0.0) + cost);
+        // a sum with an estimate in it is an estimate
+        sum.cost_computed |= one.cost_computed;
     }
 }
 
@@ -5412,8 +5415,24 @@ pub(crate) fn map_error(error: ProviderError) -> anyhow::Error {
     }
 }
 
-/// A cost for a log line: the dollars, or a word when the provider reported none.
-fn cost_text(cost: Option<f64>) -> String {
+/// A cost for a log line: the dollars the provider reported, the list price computed from the
+/// tokens marked as an estimate (`$4.12 est.`), or a word when there is neither.
+fn cost_text(usage: &Usage) -> String {
+    match usage.cost_usd {
+        Some(c) if usage.cost_computed => format!("${c:.2} est."),
+        cost => dollars(cost),
+    }
+}
+
+/// The cost of a run's end line with the cached share of its input beside it, `$4.12 est. ·
+/// 90% cached`: the share is what the cache rate priced, and what a fresh session gives up.
+fn end_cost(usage: &Usage) -> String {
+    let cached = usage.cached_tokens * 100 / usage.prompt_tokens.max(1);
+    format!("{} · {cached}% cached", cost_text(usage))
+}
+
+/// A bare cost for a log line: the dollars, or a word when there are none.
+fn dollars(cost: Option<f64>) -> String {
     cost.map_or_else(|| "cost unreported".to_owned(), |c| format!("${c:.4}"))
 }
 
