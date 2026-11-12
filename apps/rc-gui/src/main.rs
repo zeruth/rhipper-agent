@@ -364,6 +364,12 @@ struct App {
     title: String,
     /// Whether the dashboard is in front: every project at once, instead of the active tab.
     dashboard: bool,
+    /// What the dashboard's content ran past its window by, measured and kept: the shares of
+    /// the next frames are that much smaller, so the page fits without a scroll bar. It only
+    /// grows, so the layout never oscillates, and resets when the window is resized.
+    dash_slack: f32,
+    /// The window size the slack was measured for.
+    dash_slack_for: egui::Vec2,
     /// When the window started, for the dashboard's uptime.
     started: Instant,
     /// Whether the report is in front: the cards that landed across every project.
@@ -721,6 +727,8 @@ impl App {
             adding: None,
             title: String::new(),
             dashboard: false,
+            dash_slack: 0.0,
+            dash_slack_for: egui::Vec2::ZERO,
             started: Instant::now(),
             report: false,
             landed: Vec::new(),
@@ -1167,9 +1175,15 @@ impl App {
             // A project with nothing queued and nothing running keeps its natural height (as
             // it drew last frame) and the share goes to the projects with work: an idle
             // agent's card is a header and a finished run, not a third of the window
-            // the panel's bottom margin (8), the space under the last card (4) and a little
-            // slack: a share a few points over the window is a scroll bar for nothing
-            let left = ctx.content_rect().bottom() - ui.next_widget_position().y - 8.0 - 4.0 - 10.0;
+            // the panel's bottom margin (8), the space under the last card (4), and what the
+            // content ran past the window by on the frames before (measured below): a share
+            // a few points over the window is a scroll bar for nothing
+            let size = ctx.content_rect().size();
+            if self.dash_slack_for != size {
+                self.dash_slack = 0.0;
+                self.dash_slack_for = size;
+            }
+            let left = ctx.content_rect().bottom() - ui.next_widget_position().y - 8.0 - 4.0 - self.dash_slack;
             let small: Vec<bool> = self.tabs.iter().map(Workspace::dashboard_small).collect();
             // the idle projects are off the dashboard while one works, and cost it nothing
             let any_working = small.iter().any(|s| !*s);
@@ -1201,7 +1215,7 @@ impl App {
             // and a row flipped in or out about once a second
             let between = ui.spacing().item_spacing.y + 10.0;
             let pool = (left - kept - between * count).max(0.0);
-            egui::ScrollArea::vertical().id_salt("dashboard").auto_shrink([false, false]).show(ui, |ui| {
+            let scrolled = egui::ScrollArea::vertical().id_salt("dashboard").auto_shrink([false, false]).show(ui, |ui| {
                 // the page's width, handed down: a card holds itself to it, so nothing in it
                 // takes the room a scroll area's content would otherwise be allowed
                 ui.set_width(page);
@@ -1221,6 +1235,13 @@ impl App {
                     ui.add_space(10.0);
                 }
             });
+            // the content past the window, if any, comes off the next frame's shares; the
+            // slack only grows, so the shares settle in a frame and never swing back
+            let overflow = scrolled.content_size.y - scrolled.inner_rect.height();
+            if overflow > 0.5 && any_working {
+                self.dash_slack = (self.dash_slack + overflow.ceil()).min(300.0);
+                ctx.request_repaint();
+            }
         });
         if let Some(i) = open {
             self.active = i;
