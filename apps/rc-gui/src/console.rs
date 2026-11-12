@@ -178,7 +178,8 @@ fn clipped(ui: &mut Ui, raw: &str, limit: usize, font: &FontId, color: Color32) 
     // card past its column (two cards side by side halve it); truncated, it ends in an
     // ellipsis at the edge and the whole line is on hover
     let count = raw.chars().count();
-    let (shown, cut) = if count <= limit { (raw.to_owned(), false) } else { (format!("{}…", raw.chars().take(limit).collect::<String>()), true) };
+    let (shown, cut) =
+        if count <= limit { (raw.to_owned(), false) } else { (format!("{}…", raw.chars().take(limit).collect::<String>()), true) };
     let label = egui::Label::new(RichText::new(shown).font(font.clone()).color(color)).truncate();
     let response = ui.add(label);
     // the whole line on hover when it may not all be on the row
@@ -291,7 +292,11 @@ fn run_title(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, lane: Co
     // not wrap, and an uncut title pushed the card past its column (two cards side by side)
     let room = ((ui.available_width() - 260.0) / 6.5).max(16.0) as usize;
     let fit = |text: &str| -> (String, bool) {
-        if text.chars().count() <= room { (text.to_owned(), false) } else { (format!("{}…", text.chars().take(room.saturating_sub(1)).collect::<String>()), true) }
+        if text.chars().count() <= room {
+            (text.to_owned(), false)
+        } else {
+            (format!("{}…", text.chars().take(room.saturating_sub(1)).collect::<String>()), true)
+        }
     };
     let row = ui.horizontal(|ui| {
         ui.label(RichText::new(if folded { "▸" } else { "▾" }).color(theme::dim()).small());

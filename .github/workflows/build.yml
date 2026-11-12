@@ -1,0 +1,64 @@
+# The build on every push: the workspace builds and its tests pass on Windows, which is where
+# the agent runs. A later push to the same branch cancels a run still going on the older one,
+# so the queue never holds more than the newest state of a branch.
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: build and test (windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # the version is the tree's commit count: the whole history, not a shallow one
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-build
+
+      - name: format
+        run: cargo fmt --all -- --check
+
+      - name: build
+        run: cargo build --workspace --locked
+
+      - name: test
+        run: cargo test --workspace --locked -q
+
+      # the lint reports and does not fail the build: the pedantic set still names a few
+      # standing warnings the walk's own lint pass is working off
+      - name: clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: version
+        run: .\target\debug\rc.exe --version
+
+      - name: binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: rhipper-agent-debug-windows
+          path: |
+            target/debug/rc.exe
+            target/debug/rc-gui.exe
+          retention-days: 7
