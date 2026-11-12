@@ -280,7 +280,18 @@ fn a_build_runs_on_a_build_slot_and_a_held_one_is_left_alone() {
     }
     // the gradle wrapper under a bash-ish `&` too; a command already under `rc hold` stays
     assert!(only_held(&catalogue.command("& .\\gw.ps1 :core:test", quiet), "& .\\gw.ps1 :core:test"));
-    assert_eq!(catalogue.command("rc hold --shell bash -- cargo build -p rc", quiet), Verdict::Pass);
+    // a worker that typed `rc hold` itself is judged on the command inside: a build gets its
+    // slot as the hook would have put it there, anything else is told to run as written
+    let verdict = catalogue.command("rc hold --shell bash -- cargo check -p ra-console", quiet);
+    assert!(
+        matches!(&verdict, Verdict::Rewrite { command, .. } if command.starts_with("rc hold -- cargo check -p ra-console")),
+        "{verdict:?}"
+    );
+    assert!(
+        matches!(catalogue.command("rc hold -- cargo check -p ra-console", quiet), Verdict::Rewrite { ref command, .. } if command.starts_with("rc hold -- cargo check -p ra-console"))
+    );
+    assert!(matches!(catalogue.command("rc hold -- git status", quiet), Verdict::Deny { ref id, .. } if id == "self-held"));
+    assert!(matches!(catalogue.command("rc hold -- rm -rf src", quiet), Verdict::Deny { .. }));
     assert_eq!(insert_after("cargo build", 0, "rc hold --"), "rc hold -- cargo build");
 }
 

@@ -160,6 +160,18 @@ pub struct Conditions<'a> {
     pub allowed: bool,
 }
 
+/// The command inside an `rc hold [--shell <s>] -- <command>` a worker typed, when it is one.
+#[must_use]
+pub fn self_held(command: &str) -> Option<&str> {
+    let rest = command.trim_start().strip_prefix("rc hold")?;
+    let rest = rest.trim_start();
+    let rest = match rest.strip_prefix("--shell") {
+        Some(after) => after.trim_start().split_once(char::is_whitespace).map_or("", |(_, r)| r).trim_start(),
+        None => rest,
+    };
+    rest.strip_prefix("--").map(str::trim_start).filter(|inner| !inner.is_empty())
+}
+
 /// The gotcha that denies a shell outside the default allowlist; a project that allows the
 /// command sets [`Conditions::allowed`] and it stands aside.
 pub const ALLOWLIST_HINT: &str = "shell-outside-allowlist";
@@ -304,6 +316,26 @@ impl Catalogue {
     /// the rewrites before it compose, each on the command as the one before left it.
     #[must_use]
     pub fn command(&self, command: &str, conditions: Conditions) -> Verdict {
+        // a worker that typed `rc hold` itself (the slot messages name it) is judged on the
+        // command inside: `rc hold` runs whatever it is given, so it is no way past the
+        // allowlist. Heavy work the project allows gets its slot as it would have; anything
+        // else is told to run as written (#140's contract run and the agent's cargo tests were
+        // refused for typing it, 2026-11-12)
+        if let Some(inner) = self_held(command) {
+            return match self.command(inner, conditions) {
+                Verdict::Rewrite { id, command, reason } if command.trim_start().starts_with("rc hold") => {
+                    Verdict::Rewrite { id, command, reason }
+                }
+                Verdict::Deny { id, reason } => Verdict::Deny { id, reason },
+                _ => Verdict::Deny {
+                    id: String::from("self-held"),
+                    reason: format!(
+                        "`rc hold` is the hook's to add, not the worker's: run the command as written (`{}`); a build or other heavy work is put on a worker slot by itself",
+                        inner.trim()
+                    ),
+                },
+            };
+        }
         let mut current = command.to_owned();
         let mut rewritten: Option<(String, Vec<String>)> = None;
         for gotcha in self.entries.iter().filter(|g| g.place == Where::Command) {

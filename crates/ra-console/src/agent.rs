@@ -1913,6 +1913,48 @@ pub async fn run_next(store: &Store, worker: &Worker) -> anyhow::Result<Vec<Stri
     }
 }
 
+/// The cards a restart orphaned, back on the queue: every run in the activity log that started,
+/// never ended and whose process is gone ([`crate::pair::orphaned`]) has its card set from
+/// `in_progress` back to `defined` under [`Source::Run`], its session kept, so the next run
+/// resumes it as a rerun would; a card already past `in_progress` is left as it is. One feed
+/// line names them all, `re-queued 3 orphaned run(s): #179 #181 #184`, and is the line
+/// returned; none when no card went back. Before this the history showed the person
+/// resetting four or five cards by hand after each walk restart (2026-11-12).
+pub async fn requeue_orphans(store: &Store, root: &Path) -> Option<String> {
+    requeue_orphans_with(store, root, crate::hub::pid_alive).await
+}
+
+/// [`requeue_orphans`] with the liveness check given, for the tests.
+pub async fn requeue_orphans_with(store: &Store, root: &Path, alive: impl Fn(u32) -> bool) -> Option<String> {
+    let orphaned = crate::pair::orphaned(root, alive);
+    if orphaned.is_empty() {
+        return None;
+    }
+    let mut requeued = Vec::new();
+    let mut left = Vec::new();
+    for id in orphaned {
+        match store.read(id).await {
+            Ok(node) if node.state == TaskState::InProgress => match store.set_state_by(id, TaskState::Defined, Source::Run).await {
+                Ok(()) => requeued.push(format!("#{id}")),
+                Err(e) => left.push(format!("#{id} (not written: {e:#})")),
+            },
+            Ok(node) => left.push(format!("#{id} ({})", node.state)),
+            Err(_) => left.push(format!("#{id} (no such card)")),
+        }
+    }
+    // no line when nothing went back: `live_start` closes an open start on a `re-queued` line,
+    // and a window coming up beside a live run of another process must not read it idle
+    if requeued.is_empty() {
+        return None;
+    }
+    let mut text = format!("re-queued {} orphaned run(s): {}", requeued.len(), requeued.join(" "));
+    if !left.is_empty() {
+        let _ = write!(text, " · left as they are: {}", left.join(" "));
+    }
+    crate::pair::event(root, &text);
+    Some(text)
+}
+
 /// Runs the ready cards one after another, reading readiness again after each, until none is
 /// ready or a run fails. A card a run left needing revision is rerun by the walk on its session,
 /// after a failed check twice and after a rejection once ([`CHECK_RETRIES`], [`REVIEW_RETRIES`]);
@@ -1948,6 +1990,8 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     // the other projects see the walk from its start
     let root = workspace_of(store);
     write_digest(store, &root, Some(format!("walk · pid {} · started {}", std::process::id(), clock(unix_now()))), None, None).await;
+    // the cards a killed walk left in progress go back on the queue before this one reads it
+    lines.extend(requeue_orphans(store, &root).await);
     // the planned cards done a day ago are read back first: the day since them against the
     // day before, so the plan's claims are judged before the walk spends the next day
     lines.extend(crate::commands::plan::read_back(store, &root, worker).await);
@@ -2864,6 +2908,8 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
     };
     let mut lines = Vec::new();
+    // the cards a killed walk left in progress go back on the queue before this one reads it
+    lines.extend(requeue_orphans(store, &root).await);
     // the cards the reviewer accepted that a walk stopped before they landed: landed first, so
     // a restart never strands accepted work (runelite #21 and #35, 2026-11-12)
     for node in store.all().await? {

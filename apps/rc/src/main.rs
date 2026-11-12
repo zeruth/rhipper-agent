@@ -881,7 +881,9 @@ fn hook(event: &str) -> anyhow::Result<()> {
             let worker = ra_console::router::Router::load(&ra_console::hub::project_root_of(&cwd)).map(|r| r.worker).ok();
             // a command the project's `[worker] allow` names is the project's own: the shell
             // allowlist gotcha stands aside for it, the other gotchas do not
-            let own = worker.as_ref().is_some_and(|w| w.allows(command));
+            // a worker's own `rc hold -- <command>` is the command inside, as the catalogue judges it
+            let judged = ra_gotchas::self_held(command).unwrap_or(command);
+            let own = worker.as_ref().is_some_and(|w| w.allows(judged));
             // the full suite is the orchestrator's when it is the project's check: a worker's
             // own run of it goes to the crates the run has changed
             let suite_check = worker.as_ref().is_none_or(ra_console::router::WorkerConfig::checks_the_suite);

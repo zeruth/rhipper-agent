@@ -1404,6 +1404,71 @@ async fn run_all_stops_at_a_card_that_needs_revision_when_told_to() {
     assert_eq!(script.seen.lock().len(), 3);
 }
 
+/// Three cards in progress in a project whose activity log holds the starts given, none ended.
+async fn orphaned_project(dir: &std::path::Path, activity: &str) -> Store {
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    for title in ["A", "B", "C"] {
+        run(&format!("/add task {title} parent 1"), &store, &worker()).await.unwrap();
+    }
+    for id in 2..=4 {
+        store.set_state(id, ra_roadmap::model::TaskState::InProgress).await.unwrap();
+    }
+    std::fs::create_dir_all(dir.join("var")).unwrap();
+    std::fs::write(dir.join(crate::ui::ACTIVITY_FILE), activity).unwrap();
+    store
+}
+
+/// The feed lines beginning `re-queued`, without their stamps.
+fn requeued_lines(dir: &std::path::Path) -> Vec<String> {
+    crate::pair::recent(dir, 50).into_iter().filter(|l| l.starts_with("re-queued")).collect()
+}
+
+#[tokio::test]
+async fn a_restart_requeues_the_orphaned_cards_once() {
+    use crate::logs::RUN_START;
+    use ra_roadmap::model::TaskState;
+    let dir = tempfile::tempdir().unwrap();
+    // #2 was started by two killed walks in a row: it is listed once
+    let activity =
+        format!("{RUN_START}#2 A · m · pid 11\n{RUN_START}#3 B · m · pid 12\n{RUN_START}#2 A · m · pid 13\n{RUN_START}#4 C · m · pid 14\n");
+    let store = orphaned_project(dir.path(), &activity).await;
+    store.set_session(2, Some(("s-2", "claude-code")), 1).await.unwrap();
+    let line = crate::agent::requeue_orphans_with(&store, dir.path(), |_| false).await;
+    assert_eq!(line.as_deref(), Some("re-queued 3 orphaned run(s): #2 #3 #4"));
+    for id in 2..=4 {
+        assert_eq!(store.read(id).await.unwrap().state, TaskState::Defined, "#{id}");
+    }
+    // the session stays, so the next run resumes it; the history says the run gave it back
+    assert_eq!(store.read(2).await.unwrap().session.as_deref(), Some("s-2"));
+    assert_eq!(store.history(Some(2)).unwrap().last().unwrap().by, ra_roadmap::history::Source::Run);
+    // once: the next restart finds nothing and says nothing, and the feed shows no live run
+    assert_eq!(crate::agent::requeue_orphans_with(&store, dir.path(), |_| false).await, None);
+    assert_eq!(requeued_lines(dir.path()), ["re-queued 3 orphaned run(s): #2 #3 #4"]);
+    assert_eq!(crate::pair::live_start(dir.path()), None);
+}
+
+#[tokio::test]
+async fn an_orphan_that_ended_is_left_alone() {
+    use crate::logs::{RUN_END, RUN_START};
+    use ra_roadmap::model::TaskState;
+    let dir = tempfile::tempdir().unwrap();
+    // #2 ended, #3 is gone but its card moved on, #4 is still running: nothing goes back, so
+    // no `re-queued` line lands and #4's start stays open on the feed
+    let activity = format!("{RUN_START}#2 A · m · pid 11\n{RUN_END}✓ $0.01\n{RUN_START}#3 B · m · pid 12\n{RUN_START}#4 C · m · pid 14\n");
+    let store = orphaned_project(dir.path(), &activity).await;
+    store.set_state(3, TaskState::Review).await.unwrap();
+    crate::pair::event(dir.path(), "start #4 C · m · pid 14");
+    assert_eq!(crate::agent::requeue_orphans_with(&store, dir.path(), |pid| pid == 14).await, None);
+    assert_eq!(store.read(2).await.unwrap().state, TaskState::InProgress);
+    assert_eq!(store.read(3).await.unwrap().state, TaskState::Review);
+    assert_eq!(store.read(4).await.unwrap().state, TaskState::InProgress);
+    assert!(requeued_lines(dir.path()).is_empty());
+    assert_eq!(crate::pair::live_start(dir.path()), Some(("#4 C · m · pid 14".to_owned(), Some(14))));
+    // #3's orphan was closed in the activity log: the next restart does not see it again, and a
+    // card left alone is named only beside the ones that went back
+    assert_eq!(crate::pair::orphaned(dir.path(), |pid| pid == 14), Vec::<i64>::new());
+}
+
 #[tokio::test]
 async fn a_stopped_walk_ends_after_the_current_card_with_its_rerun_still_queued() {
     let dir = tempfile::tempdir().unwrap();
