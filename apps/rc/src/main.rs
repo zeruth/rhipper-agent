@@ -829,6 +829,20 @@ fn hook(event: &str) -> anyhow::Result<()> {
                 }
                 other => other,
             };
+            // a build, under `rc hold` by the rewrite or by the worker's own hand, is the
+            // session's to spend from a small budget: the code comes first, the check
+            // compiles after the report
+            let is_build = |text: &str| text.trim_start().starts_with("rc hold");
+            let built = match &verdict {
+                ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => is_build(rewritten),
+                ra_gotchas::Verdict::Pass => is_build(command),
+                ra_gotchas::Verdict::Deny { .. } => false,
+            };
+            let session = call.get("session_id").and_then(serde_json::Value::as_str).unwrap_or("-");
+            let verdict = match (built, ra_console::agent::build_allowance(&cwd, session)) {
+                (true, Err(reason)) => ra_gotchas::Verdict::Deny { id: String::from("build-budget"), reason },
+                _ => verdict,
+            };
             match verdict {
                 ra_gotchas::Verdict::Pass => None,
                 ra_gotchas::Verdict::Deny { reason, .. } => Some(serde_json::json!({

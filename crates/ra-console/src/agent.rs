@@ -1566,6 +1566,46 @@ async fn hold_build(root: &Path) -> Option<crate::hub::Guard> {
     }
 }
 
+/// The builds one session of a worker may run: the code comes first, and the project's check
+/// compiles after the report, so a build of the worker's own is for a compile it cannot read
+/// its way to. The person's rule of 2026-11-12: "they should be focusing on code first…
+/// report changes without wasting all the local resources building a bunch".
+pub const BUILDS_A_SESSION: u32 = 2;
+
+/// Whether a worker's session may run a build now, for the hook: `Ok` spends one of the
+/// session's [`BUILDS_A_SESSION`] and `Err` is the refusal's reason. A tree with nothing
+/// changed yet is refused outright (a build before the first edit measures nothing the card
+/// did not already say), and so is a session past its budget. The count lives in the tree's
+/// `var/builds/<session>`; a tree that cannot keep it allows the build.
+///
+/// # Errors
+/// The reason the build is refused, for the worker.
+pub fn build_allowance(tree: &Path, session: &str) -> Result<(), String> {
+    // the tree's `var/` is the orchestrator's, not the card's change
+    let changed = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude)var"])
+        .current_dir(tree)
+        .output()
+        .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    if matches!(changed, Ok(false)) {
+        return Err(String::from(
+            "nothing is changed yet: write the card's change first, then build once if a compile is in doubt; the project's check compiles after the report and a failure comes back as a rerun with its output",
+        ));
+    }
+    let dir = tree.join("var").join("builds");
+    let file = dir.join(session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>());
+    let spent: u32 = std::fs::read_to_string(&file).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
+    if spent >= BUILDS_A_SESSION {
+        return Err(format!(
+            "this session has built {spent} time(s), its budget: report the change as it stands and name what is unverified; the project's check compiles after the report, and a failure comes back as a rerun with its output"
+        ));
+    }
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(&file, (spent + 1).to_string());
+    }
+    Ok(())
+}
+
 /// Runs a build command in `dir` on one of its project's build slots, for `rc hold`: waits for
 /// a slot, says so once on stderr, then runs the command through `shell` (`bash`, `sh` or
 /// `powershell`) with the terminal's own streams, and answers with the command's exit code. The
