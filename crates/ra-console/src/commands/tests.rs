@@ -912,12 +912,24 @@ fn a_report_is_a_placeholder_when_it_names_no_file_and_says_nothing_beyond_the_c
     assert!(!crate::agent::is_empty_handoff("Nothing to change: the card is already implemented in the store."));
 }
 
-/// A one-crate Cargo project in `dir` whose single test passes or fails.
+/// A one-crate Cargo project in `dir` whose single test passes or fails. The package is named
+/// after the directory: the probes of the tests build in one inherited `CARGO_TARGET_DIR`, where
+/// cargo hashes a workspace's root package without its path, so two probes of one name share a
+/// test binary and a failing one ran a passing one's.
 fn cargo_project(dir: &std::path::Path, passing: bool) {
-    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n")
-        .unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n", probe_name(dir)),
+    )
+    .unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), format!("#[test]\nfn probe() {{ assert!({passing}, \"the probe broke\"); }}\n")).unwrap();
+}
+
+/// The package name of the probe in `dir`.
+fn probe_name(dir: &std::path::Path) -> String {
+    let unique: String = dir.file_name().unwrap_or_default().to_string_lossy().chars().filter(char::is_ascii_alphanumeric).collect();
+    format!("probe_{unique}")
 }
 
 #[test]
@@ -1376,13 +1388,76 @@ async fn run_all_in_a_tight_window_takes_the_smallest_ready_card_first_and_the_s
 async fn run_all_stops_at_a_card_that_needs_revision_when_told_to() {
     let dir = tempfile::tempdir().unwrap();
     let store = three_cards(dir.path(), false).await;
-    let script = Scripted::new(vec![says("did A", vec![]), says("did B", vec![])]);
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    // the check always fails: the walk reruns #2 twice by itself, and the third failure waits
+    let script = Scripted::new(vec![says("did A", vec![]), says("did A again", vec![]), says("did A once more", vec![])]);
+    let failing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((1, "the probe broke\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(failing);
     let out = crate::agent::run_all(&store, &runner, true).await.unwrap();
-    assert_eq!(out.last().unwrap(), "ran 1 card(s) · stopped: #2 needs revision");
+    assert_eq!(out.last().unwrap(), "ran 3 card(s) · stopped: #2 needs revision");
+    assert!(out.iter().any(|l| l.starts_with("rerun #2 A · its check failed 2 time(s)") && l.ends_with("(2 of 2)")), "{out:?}");
+    assert!(out.iter().any(|l| l.starts_with("waits #2 A · its check failed 3 time(s) · waits for the person")), "{out:?}");
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
     assert_eq!(store.read(3).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
-    assert_eq!(script.seen.lock().len(), 1);
+    assert_eq!(script.seen.lock().len(), 3);
+}
+
+#[tokio::test]
+async fn a_stopped_walk_ends_after_the_current_card_with_its_rerun_still_queued() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    crate::agent::stop_walk(dir.path());
+    let failing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((1, "the probe broke\n".to_owned())));
+    let provider = Scripted::new(vec![says("changed `src/lib.rs`", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(failing);
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    assert_eq!(out.last().unwrap(), "ran 1 card(s) · stopped after #2, as asked", "{out:?}");
+    assert_eq!(provider.seen.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn a_walk_reruns_a_failed_check_and_a_first_rejection_by_itself_and_leaves_the_second_to_the_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // the first check fails, every later one passes
+    let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = checks.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        if command.starts_with("cargo test") && counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Ok((1, "the probe broke\n".to_owned()));
+        }
+        Ok((0, "ok\n".to_owned()))
+    });
+    let provider = Scripted::new(vec![
+        says("changed `src/lib.rs`", vec![]),
+        says("changed `src/lib.rs` again", vec![]),
+        says("needs_revision\n- src/lib.rs: the probe is not covered", vec![]),
+        says("changed `src/lib.rs` to cover it", vec![]),
+        says("needs_revision\n- src/lib.rs: still not covered", vec![]),
+    ]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(script);
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    // three runs of the one card with no `rc set` between them, then nothing is ready
+    assert_eq!(out.last().unwrap(), "ran 3 card(s) · no card is ready", "{out:?}");
+    assert!(out.iter().any(|l| l.starts_with("rerun #2 Probe · its check failed 1 time(s)") && l.ends_with("(1 of 2)")), "{out:?}");
+    assert!(
+        out.iter().any(|l| l.starts_with("rerun #2 Probe · the reviewer sent it back 1 time(s)") && l.ends_with("(1 of 1)")),
+        "{out:?}"
+    );
+    let waits = "waits #2 Probe · the reviewer sent it back 2 time(s) · waits for the person: `rc set 2 defined` re-queues it";
+    assert!(out.iter().any(|l| l == waits), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+    // each rerun is a rerun: its prompt carries the last run's judgment
+    let seen = provider.seen.lock();
+    assert_eq!(seen.len(), 5);
+    for rerun in [&seen[1], &seen[3]] {
+        let prompt: String = rerun.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(prompt.contains("The last run of this card came back"), "{prompt}");
+    }
+    // the paired session reads that the card is the person's now
+    let pair = crate::pair::recent(dir.path(), 30);
+    assert!(pair.iter().any(|l| l == waits), "{pair:?}");
 }
 
 #[tokio::test]
@@ -2080,7 +2155,8 @@ async fn linted_run(at: &str) -> (Vec<String>, ra_roadmap::model::Node, tempfile
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
     // the check, then the lines the change touched (the script's "ok" is no diff, so the new
     // file counts whole), then the lint of the crate of the change
-    assert_eq!(*seen.lock(), ["cargo test --workspace -q", "git diff -U0 HEAD -- src/extra.rs", "cargo clippy -p probe"]);
+    let lint = format!("cargo clippy -p {}", probe_name(dir.path()));
+    assert_eq!(*seen.lock(), ["cargo test --workspace -q", "git diff -U0 HEAD -- src/extra.rs", lint.as_str()]);
     (out, store.read(2).await.unwrap(), dir)
 }
 
