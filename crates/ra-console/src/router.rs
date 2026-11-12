@@ -162,6 +162,11 @@ pub struct WorkerConfig {
     /// build nothing and edit nothing, so they cost the machine little; absent or zero, none.
     #[serde(default)]
     pub investigators: Option<u32>,
+    /// The builds one session of a worker may run itself; absent, two. Zero makes the
+    /// builds the orchestrator's alone: the workers write and report, and the project's check
+    /// compiles each report on one of the two build slots, so six workers never build at once.
+    #[serde(default)]
+    pub builds: Option<u32>,
 }
 
 impl WorkerConfig {
@@ -175,6 +180,12 @@ impl WorkerConfig {
     #[must_use]
     pub fn investigators(&self) -> usize {
         self.investigators.unwrap_or(0) as usize
+    }
+
+    /// The builds one session of a worker may run itself.
+    #[must_use]
+    pub fn builds(&self) -> u32 {
+        self.builds.unwrap_or(crate::agent::BUILDS_A_SESSION)
     }
 
     /// Whether a walk may borrow the pool's spare Opus slots past its own count.

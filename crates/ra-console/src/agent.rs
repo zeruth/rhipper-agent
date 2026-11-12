@@ -1584,6 +1584,13 @@ pub const BUILDS_A_SESSION: u32 = 2;
 /// # Errors
 /// The reason the build is refused, for the worker.
 pub fn build_allowance(tree: &Path, session: &str) -> Result<(), String> {
+    // the project's table, read above a worktree, which has no copy of it
+    let allowed = crate::router::Router::load(&crate::hub::project_root_of(tree)).map_or(BUILDS_A_SESSION, |r| r.worker.builds());
+    if allowed == 0 {
+        return Err(String::from(
+            "the builds are the orchestrator's in this project, not the workers': report the change as it stands, naming what you verified by reading; the project's check compiles it on a build slot after your report, and a failure comes back to this session with the compiler's output",
+        ));
+    }
     // the tree's `var/` is the orchestrator's, not the card's change
     let changed = std::process::Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude)var"])
@@ -1598,7 +1605,7 @@ pub fn build_allowance(tree: &Path, session: &str) -> Result<(), String> {
     let dir = tree.join("var").join("builds");
     let file = dir.join(session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>());
     let spent: u32 = std::fs::read_to_string(&file).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
-    if spent >= BUILDS_A_SESSION {
+    if spent >= allowed {
         return Err(format!(
             "this session has built {spent} time(s), its budget: report the change as it stands and name what is unverified; the project's check compiles after the report, and a failure comes back as a rerun with its output"
         ));
@@ -3161,6 +3168,11 @@ fn harness_messages(task: &ra_context::TaskContext, rerun: Option<&str>, project
     }
     if debug {
         messages.push(Message::system(crate::retro::PROMPT));
+    }
+    // a project whose builds are the orchestrator's alone says so up front, so the worker does
+    // not spend a turn finding the build refused
+    if crate::router::Router::load(root).is_ok_and(|r| r.worker.builds() == 0) {
+        messages.push(Message::system(NO_BUILDS));
     }
     // the investigator's brief, when one went ahead: where the code is and what to change,
     // so the builder writes rather than reads
@@ -4814,6 +4826,10 @@ fn first_line(text: &str) -> String {
 /// The system prompt of a worker session. A harness with tools implements in the workspace; a
 /// bare model answers with the plan and the changes.
 const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory and answer with a short report of what you changed, naming the file each change landed in in backticks, and what you verified. The code comes first and the report is the deliverable: the orchestrator compiles and checks your change after your report, on a build slot of its own, and a failure comes back to you with its output as a rerun of the same session. So do not build to explore, do not build before you have changed anything, and do not build at all when reading the code you changed and what it calls tells you it is right; build once, at the end, only when a compile is in doubt (a new API, a type you did not see defined, a generic bound), and never more than twice in a session. A change that is right by reading, reported without a build, is the normal case, not a shortcut; say in the report what you verified by reading and what the check will prove. Bash and PowerShell both run the build tools, the read-only git commands and the read-only listing commands; pipe a long output through tail. After your report the orchestrator lints the files you changed, and any warning comes back to you; do not hunt warnings yourself. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
+
+/// What a worker is told in a project whose `[worker] builds` is zero: the orchestrator builds,
+/// the worker writes.
+const NO_BUILDS: &str = "In this project you do not build: every gradle, cargo or other build command is refused, and six workers write at once while the orchestrator compiles on two build slots of its own. Research the code the card touches, write the change, read it against what it calls, and report it; the orchestrator's check compiles your report, and a compile failure comes back to this session with the compiler's output for you to fix the same way. Your report says what you verified by reading and what the check will prove.";
 
 /// The system prompt of a reassessment.
 const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done. When the objective and the acceptance already name only the remaining work and are checkable, you answer with the same text rather than rewording it.";

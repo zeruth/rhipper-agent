@@ -814,7 +814,8 @@ fn hook(event: &str) -> anyhow::Result<()> {
     let answer = match event {
         "pre" => {
             let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str).unwrap_or("");
-            let worker = ra_console::router::Router::load(&cwd).map(|r| r.worker).ok();
+            // the project's table, read above a worktree, which has no copy of it
+            let worker = ra_console::router::Router::load(&ra_console::hub::project_root_of(&cwd)).map(|r| r.worker).ok();
             // a command the project's `[worker] allow` names is the project's own: the shell
             // allowlist gotcha stands aside for it, the other gotchas do not
             let own = worker.as_ref().is_some_and(|w| w.allows(command));
