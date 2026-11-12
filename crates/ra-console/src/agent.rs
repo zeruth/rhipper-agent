@@ -1664,7 +1664,9 @@ pub async fn run_next(store: &Store, worker: &Worker) -> anyhow::Result<Vec<Stri
 }
 
 /// Runs the ready cards one after another, reading readiness again after each, until none is
-/// ready or a run fails; with `stop_on_revision` a card that needs revision stops the batch too.
+/// ready or a run fails. A card a run left needing revision is rerun by the walk on its session,
+/// after a failed check twice and after a rejection once ([`CHECK_RETRIES`], [`REVIEW_RETRIES`]);
+/// past that it waits for the person, and with `stop_on_revision` it stops the batch too.
 /// When none is ready and an active gambit says `plan-next`, the planner fills the next empty
 /// milestone first ([`crate::commands::run::plan_next`]) and the walk goes on with its cards.
 /// Each run is its own bubble and its own handoff, through [`run`]. A failed run ends the batch
@@ -1682,6 +1684,10 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     // whether the planner filled the roadmap since the last run: it plans once between runs,
     // so a plan that leaves no card ready ends the walk rather than plan the next milestone too
     let mut planned = false;
+    // the card the walk takes up again by itself, and per card the check failures and the
+    // rejections this walk has seen: a person re-queued those by hand before (#103, #47, #134)
+    let mut retry: Option<i64> = None;
+    let mut sent: std::collections::HashMap<i64, (usize, usize)> = std::collections::HashMap::new();
     // one walk per project: the lock is held for the whole of it
     let Some(_lock) = take_walk_lock(&workspace_of(store)) else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
@@ -1703,7 +1709,10 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         // the plan's room decides the pick before each card: a window that got tight during
         // the walk takes the small cards from here on
         let tight = plan_tight(&root);
-        let Some(id) = batch_ready(&roadmap.nodes, &roadmap.gambits, tight).map(|n| n.id) else {
+        // a rerun the walk queued goes first, while the card still waits on it: a person who
+        // took the card meanwhile has the say
+        let retried = retry.take().filter(|id| roadmap.nodes.iter().any(|n| n.id == *id && n.state == TaskState::NeedsRevision));
+        let Some(id) = retried.or_else(|| batch_ready(&roadmap.nodes, &roadmap.gambits, tight).map(|n| n.id)) else {
             // a `plan-next` gambit lets the planner fill the next empty milestone; its cards
             // are the next picks
             if !planned && crate::commands::run::plans_next(&roadmap.gambits) {
@@ -1745,7 +1754,7 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             Some(ledger) => ledger.last_id().await.ok(),
             None => None,
         };
-        match run_picked(store, id, worker, tight).await {
+        match run_picked(store, id, worker, tight && retried.is_none()).await {
             Ok(run_lines) => lines.extend(run_lines),
             Err(error) => {
                 done(&mut lines, format!("ran {ran} card(s) · stopped: the run of #{id} failed: {error:#}")).await;
@@ -1758,9 +1767,27 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         if let (Some(mark), Some(ledger), Ok(node)) = (mark, worker.ledger(), store.read(id).await) {
             lines.extend(crate::retro::landed(&root, &node, ledger, mark).await);
         }
-        if stop_on_revision && store.read(id).await?.state == TaskState::NeedsRevision {
-            done(&mut lines, format!("ran {ran} card(s) · stopped: #{id} needs revision")).await;
-            return Ok(lines);
+        let node = store.read(id).await?;
+        if node.state == TaskState::NeedsRevision {
+            // the first rejection and the first two check failures are rerun on the card's
+            // session, the verdict and the failing check as the prompt; past that it is the person's
+            let rejected = rejected_by_review(&root, id);
+            let (checks, rejections) = sent.entry(id).or_default();
+            let (count, allowed, why) = if rejected {
+                *rejections += 1;
+                (*rejections, REVIEW_RETRIES, format!("the reviewer sent it back {} time(s)", *rejections))
+            } else {
+                *checks += 1;
+                (*checks, CHECK_RETRIES, format!("its check failed {} time(s)", *checks))
+            };
+            let rerun = (count <= allowed).then_some((count, allowed));
+            lines.push(crate::pair::sent_back(&root, id, &node.title, &why, rerun));
+            if rerun.is_some() {
+                retry = Some(id);
+            } else if stop_on_revision {
+                done(&mut lines, format!("ran {ran} card(s) · stopped: #{id} needs revision")).await;
+                return Ok(lines);
+            }
         }
         // `stop` from the console or the window: the walk ends after the run it was in
         let stop = root.join(WALK_STOP);
@@ -1775,6 +1802,22 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
 /// How many runs in a row a walk gives one card before it stops: a card the project's turn cap
 /// ends this often is too large for the cap.
 const RESTARTS: usize = 5;
+
+/// How many times a walk reruns a card whose check (or lint) failed before it leaves the card
+/// to the person: the third failure waits.
+const CHECK_RETRIES: usize = 2;
+/// How many times a walk reruns a card the reviewer sent back: the second rejection waits.
+const REVIEW_RETRIES: usize = 1;
+
+/// Whether the reviewer sent card `id` back, read off the last handoff's verdict; a card that
+/// needs revision without one failed its check or its lint, which the reviewer never saw.
+fn rejected_by_review(root: &Path, id: i64) -> bool {
+    ra_context::TaskContext::open(root, id)
+        .handoffs
+        .last()
+        .and_then(|last| last.verdict.as_deref())
+        .is_some_and(|verdict| verdict.starts_with("needs revision"))
+}
 
 /// The file a `stop` leaves for a walk, which reads it between runs.
 const WALK_STOP: &str = "var/walk.stop";
@@ -4218,8 +4261,9 @@ fn capped_reading_in(task: &ra_context::TaskContext) -> bool {
 
 /// Whether a run of `node` is a rerun: the card came back from its check or its reviewer, or a
 /// fix pass is on it. A rerun resumes the card's session like any run and reads the verdict
-/// as its new prompt, not the handoffs. The walk takes only a ready card, so the person re-queues a card sent back with `rc set
-/// <id> defined`; that erases the state but not the reviewer's block at the head of the notes,
+/// as its new prompt, not the handoffs. The walk reruns a first rejection and the first two
+/// failed checks by itself; past that the person re-queues the card with `rc set <id> defined`,
+/// which erases the state but not the reviewer's block at the head of the notes,
 /// which stands until the next run writes its report: a card whose notes open with a
 /// `needs revision` review is a rerun whatever its state (rhipper-asm #47: the five points
 /// were in the notes and not in the prompt, and the worker spent its first turns finding them).
