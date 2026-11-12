@@ -2415,6 +2415,19 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
         }
     }
     let has_branch = git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).await.is_ok();
+    // the roadmap is the walk's, written in the project's tree with every state change and
+    // never committed there; a card branch that carries a copy of it (a catch-up merge brings
+    // one) cannot merge over those edits, and git refuses the whole landing (asm #139). The
+    // branch takes the project's committed roadmap back before the merge
+    if has_branch && path.join(".git").exists() {
+        let roadmap = crate::setup::ROADMAP_FILE;
+        let main = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_else(|_| String::from("HEAD"));
+        if git(&root, &["diff", "--quiet", &main, &branch, "--", roadmap]).await.is_err() {
+            git(&path, &["checkout", &main, "--", roadmap]).await?;
+            git(&path, &["commit", "-q", "-m", &format!("Leave the roadmap to the project before landing (#{id})"), "--", roadmap]).await?;
+            lines.push("the branch's copy of the roadmap gave way to the project's".to_owned());
+        }
+    }
     if !has_branch && !path.join(".git").exists() {
         // a run in the project's own tree: its work is in the tree, uncommitted; the files
         // its handoff names are committed by name, the other cards' dirty files left alone
