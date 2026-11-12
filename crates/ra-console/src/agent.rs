@@ -2546,6 +2546,10 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
     Ok(lines)
 }
 
+/// The runs in a row a parallel walk gives a card that each end sent back for revision before
+/// it parks the card until the next walk.
+const RERUNS_A_WALK: u32 = 3;
+
 /// A landing whose merge into the project's branch conflicted; the merge was aborted.
 #[derive(Debug)]
 pub struct LandConflict {
@@ -2823,6 +2827,9 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     let root_owned = root.clone();
     let mut flight: Vec<(i64, std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + '_>>, Seat)> = Vec::new();
     let mut stopped: Option<String> = None;
+    // the cards sent back in a row in this walk, and the ones parked past [`RERUNS_A_WALK`]
+    let mut reruns: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+    let mut parked: std::collections::HashSet<i64> = std::collections::HashSet::new();
     loop {
         // `stop` from the console or the window: nothing new starts, and the walk ends when
         // the runs it is in have ended
@@ -2843,7 +2850,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             let others = other_walks(&root);
             let ready: Vec<Node> = ready_cards(&roadmap.nodes, &roadmap.gambits, plan_tight(&root))
                 .into_iter()
-                .filter(|n| !in_flight.contains(&n.id))
+                .filter(|n| !in_flight.contains(&n.id) && !parked.contains(&n.id))
                 .cloned()
                 .collect();
             // the builders first, and a card with a brief before one without: the
@@ -2952,8 +2959,25 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // the checkpoint or the landing already happened inside the run's future
                 lines.extend(run_lines);
                 ran += 1;
-                if stop_on_revision && stopped.is_none() && store.read(id).await?.state == TaskState::NeedsRevision {
+                let sent_back = store.read(id).await?.state == TaskState::NeedsRevision;
+                if stop_on_revision && stopped.is_none() && sent_back {
                     stopped = Some(format!("stopped: #{id} needs revision"));
+                }
+                // a card sent back run after run is parked until the next walk: a rerun that
+                // ends in revision at once otherwise starts again at once, and asm ran #131 270
+                // times and #132 234 times in an afternoon, a turn each (2026-11-12)
+                if sent_back {
+                    let count = reruns.entry(id).or_insert(0);
+                    *count += 1;
+                    if *count >= RERUNS_A_WALK {
+                        parked.insert(id);
+                        let text = format!("#{id} parked: sent back {RERUNS_A_WALK} times in a row in this walk; it waits for the next walk or a person");
+                        tracing::warn!("{text}");
+                        crate::pair::event(&root, &text);
+                        lines.push(text);
+                    }
+                } else {
+                    reruns.remove(&id);
                 }
             }
             (Seat::Build(_), Err(error)) => {
