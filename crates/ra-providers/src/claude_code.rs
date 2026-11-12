@@ -29,6 +29,10 @@ pub const STREAM_FILE: &str = "var/runs/last.jsonl";
 /// it reads.
 const WORKER_TOOLS: &str = "Bash,PowerShell,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,WebSearch,NotebookEdit";
 
+/// The built-in tools of a read-only run, an investigator: it reads and searches the tree and
+/// the web, and has no shell to build with and no tool to edit with.
+pub const READER_TOOLS: &str = "Read,Glob,Grep,WebFetch,WebSearch";
+
 /// The settings a worker loads: the project's and the local ones, not the user's. The user's
 /// hooks are written for their interactive sessions (on this machine one denies Bash outright
 /// and another wraps every PowerShell command in a logging prelude no rule can read), and a
@@ -210,9 +214,9 @@ impl ClaudeCode {
         // subscription route runs on (card #11 found out)
         // stream-json: the events arrive as the harness works, so the console can show the work
         let mut args = ["-p", "--output-format", "stream-json", "--verbose"].map(str::to_owned).to_vec();
-        if request.workspace.is_none() {
-            // a chat completion leaves no session behind; a worker keeps its own, for the next
-            // run of the task to resume
+        if request.workspace.is_none() || request.read_only {
+            // a chat completion leaves no session behind, nor does a read-only run; a worker
+            // keeps its own, for the next run of the task to resume
             args.push("--no-session-persistence".to_owned());
         }
         // the card's effort when the request carries one, else the provider's
@@ -232,7 +236,15 @@ impl ClaudeCode {
                 None => args.extend(["--system-prompt".to_owned(), system]),
             }
         }
-        if request.workspace.is_some() {
+        if request.read_only && request.workspace.is_some() {
+            // an investigator: the reading tools alone, which ask no permission, inside the
+            // workspace; no shell, no edits, no session
+            args.push("--strict-mcp-config".to_owned());
+            if let Some(cap) = request.max_turns.or(self.max_turns) {
+                args.extend(["--max-turns".to_owned(), cap.to_string()]);
+            }
+            args.extend(["--tools".to_owned(), READER_TOOLS.to_owned(), "--setting-sources".to_owned(), WORKER_SETTING_SOURCES.to_owned()]);
+        } else if request.workspace.is_some() {
             // a worker: the file tools and the allowed shell commands, inside the workspace, and
             // no MCP servers: the project's .mcp.json would hand it the agent itself, holding
             // target/debug/rc.exe for the run and a `run` tool of its own

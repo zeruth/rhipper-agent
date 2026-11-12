@@ -17,7 +17,19 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
         max_turns: None,
         max_context: None,
         effort: None,
+        read_only: false,
     }
+}
+
+#[test]
+fn a_read_only_request_gets_the_reading_tools_alone_and_keeps_no_session() {
+    let mut request = request(Some(PathBuf::from(".")));
+    request.read_only = true;
+    let args = ClaudeCode::new().args(&request);
+    assert!(args.windows(2).any(|w| w == ["--tools", READER_TOOLS]), "{args:?}");
+    assert!(args.contains(&"--no-session-persistence".to_owned()), "{args:?}");
+    assert!(!args.contains(&"--allowedTools".to_owned()), "{args:?}");
+    assert!(!args.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]), "{args:?}");
 }
 
 #[test]
@@ -338,8 +350,10 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     assert!(gotchas_of_event(&catalogue, reading, quiet, &mut tools).is_empty());
     let quoted = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"notes: Not logged in · Please run /login"}]}}"#;
     assert!(gotchas_of_event(&catalogue, quoted, quiet, &mut tools).is_empty());
+    // a tailed, per-crate cargo test is right as written; it still builds, so it is put on a
+    // build slot, and that rewrite alone counts
     let fine = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap 2>&1 | tail -n 40"}}]}}"#;
-    assert!(gotchas_of_event(&catalogue, fine, quiet, &mut tools).is_empty());
+    assert_eq!(gotchas_of_event(&catalogue, fine, quiet, &mut tools).iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["build-slot"]);
     // a cargo test without a tail is rewritten, and the rewrite counts
     let untailed =
         r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap"}}]}}"#;
@@ -350,10 +364,12 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let suite = Conditions { suite_check: true, changed_crates: &changed, ..Conditions::default() };
     let whole = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -q 2>&1 | tail -n 80"}}]}}"#;
     let hits = gotchas_of_event(&catalogue, whole, suite, &mut tools);
+    // the first rewrite names the hit; the build slot composes on it unnamed
     assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["worker-full-suite"]);
     assert!(hits[0].message.contains("runs after the report"), "{}", hits[0].message);
-    assert!(gotchas_of_event(&catalogue, whole, Conditions { changed_crates: &changed, ..quiet }, &mut tools).is_empty());
-    assert!(gotchas_of_event(&catalogue, fine, suite, &mut tools).is_empty());
+    let ids = |hits: Vec<ra_gotchas::Hit>| hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+    assert_eq!(ids(gotchas_of_event(&catalogue, whole, Conditions { changed_crates: &changed, ..quiet }, &mut tools)), ["build-slot"]);
+    assert_eq!(ids(gotchas_of_event(&catalogue, fine, suite, &mut tools)), ["build-slot"]);
     // the reads of an event, relative to the workspace; a Bash call or a Grep is not one
     let root = Path::new(r"C:\work\repo");
     let two = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"C:\\work\\repo\\crates\\c.rs"}},{"type":"tool_use","name":"Grep","input":{"pattern":"fn"}},{"type":"tool_use","name":"Read","input":{"file_path":"D:\\elsewhere\\x.rs"}}]}}"#;

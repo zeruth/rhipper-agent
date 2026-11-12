@@ -516,6 +516,7 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
             max_turns: None,
             max_context: None,
             effort: None,
+            read_only: false,
         })
         .await
         .map_err(map_error)?;
@@ -1152,6 +1153,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
             max_turns: Some(1),
             max_context: None,
             effort: Some(Effort::default().to_string()),
+            read_only: false,
         })
         .await;
     let answer = match answer {
@@ -1390,6 +1392,7 @@ pub async fn plan(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Pla
             max_turns: Some(1),
             max_context: None,
             effort: Some(Effort::default().to_string()),
+            read_only: false,
         })
         .await
         .map_err(map_error)?;
@@ -2260,7 +2263,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     // saw one card going on a two-job project for the length of a long card). Every slot
     // is polled on this one task, so two runs never interleave a read-modify-write of the
     // roadmap, which a spawned task per run could not promise
-    let mut flight: Vec<(i64, std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + '_>>, PoolKind)> = Vec::new();
+    let mut flight: Vec<(i64, std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + '_>>, Seat)> = Vec::new();
     let mut stopped: Option<String> = None;
     loop {
         // `stop` from the console or the window: nothing new starts, and the walk ends when
@@ -2285,14 +2288,26 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 .filter(|n| !in_flight.contains(&n.id))
                 .cloned()
                 .collect();
-            for node in ready {
-                let kind = Pool::kind_of(&router.choose(&node, crate::router::IMPLEMENTER, &worker.model).model);
-                let held = flight.iter().filter(|(_, _, k)| *k == kind).count();
+            // the builders first, and a card with a brief before one without: the
+            // investigators run ahead down the queue, so a builder opens on a brief rather
+            // than on the bare card. A card an investigator is in waits for its brief unless
+            // no other card is ready for the builder
+            let (briefed, bare): (Vec<Node>, Vec<Node>) = ready.into_iter().partition(|n| brief_path(&root, n.id).exists());
+            let investigating: std::collections::HashSet<i64> =
+                flight.iter().filter(|(_, _, s)| *s == Seat::Investigate).map(|(id, _, _)| *id).collect();
+            let (waiting, bare): (Vec<Node>, Vec<Node>) = bare.into_iter().partition(|n| investigating.contains(&n.id));
+            let mut taken = std::collections::HashSet::new();
+            for node in briefed.iter().chain(&bare).chain(&waiting) {
+                let kind = Pool::kind_of(&router.choose(node, crate::router::IMPLEMENTER, &worker.model).model);
+                let held = flight.iter().filter(|(_, _, s)| *s == Seat::Build(kind)).count();
                 let Some(slot) = Pool::take(&root, kind, held, width, others, router.worker.borrow()) else {
                     starved = starved || held == 0;
                     continue;
                 };
                 let id = node.id;
+                // a builder on a card an investigator is still in: the brief, when it lands,
+                // is the next run's; the investigator goes on, its seat is its own
+                taken.insert(id);
                 let (path, branch) = worktree_add(&root, id).await?;
                 let runner = worker.clone().with_worktree(path, branch);
                 flight.push((
@@ -2301,8 +2316,22 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                         let _slot = slot;
                         run(store, id, &runner).await
                     }),
-                    kind,
+                    Seat::Build(kind),
                 ));
+            }
+            // the investigators: one a ready card without a brief, which no builder has, up to
+            // the project's count; they read the project's own tree and build nothing, so
+            // they sit in no pool
+            let seats = router.worker.investigators();
+            let mut reading = investigating.len();
+            for node in bare.iter().filter(|n| !taken.contains(&n.id)) {
+                if reading >= seats {
+                    break;
+                }
+                reading += 1;
+                let id = node.id;
+                let reader = worker.clone();
+                flight.push((id, Box::pin(async move { investigate(store, id, &reader).await }), Seat::Investigate));
             }
         }
         if flight.is_empty() {
@@ -2319,26 +2348,121 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
         let Ok((at, outcome)) = tokio::time::timeout(std::time::Duration::from_secs(30), poll_one(&mut flight)).await else {
             continue;
         };
-        let (id, _, _) = flight.remove(at);
-        match outcome {
-            Ok(run_lines) => {
+        let (id, _, seat) = flight.remove(at);
+        match (seat, outcome) {
+            // an investigator's end is a brief or a line in the log, never the walk's end
+            (Seat::Investigate, Ok(brief_lines)) => lines.extend(brief_lines),
+            (Seat::Investigate, Err(error)) => {
+                let text = format!("the investigation of #{id} failed: {error:#}");
+                tracing::warn!("{text}");
+                crate::pair::event(&root, &text);
+                lines.push(text);
+            }
+            (Seat::Build(_), Ok(run_lines)) => {
                 lines.extend(run_lines);
                 ran += 1;
                 if stop_on_revision && stopped.is_none() && store.read(id).await?.state == TaskState::NeedsRevision {
                     stopped = Some(format!("stopped: #{id} needs revision"));
                 }
             }
-            Err(error) => {
+            (Seat::Build(_), Err(error)) => {
                 stopped.get_or_insert(format!("stopped: the run of #{id} failed: {error:#}"));
             }
         }
     }
 }
 
+/// What a run in a walk's flight sits on: a builder's slot of the machine's pool, or an
+/// investigator's seat, which is the project's own and holds no build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seat {
+    Build(PoolKind),
+    Investigate,
+}
+
+/// Where a card's research brief lives, under the project's `var`.
+const BRIEFS_DIR: &str = "var/briefs";
+
+/// The most turns an investigator takes: reading, not building, forty turns cover a card.
+const INVESTIGATE_TURNS: u32 = 40;
+
+/// The path of a card's research brief.
+fn brief_path(root: &Path, id: i64) -> PathBuf {
+    root.join(BRIEFS_DIR).join(format!("{id}.md"))
+}
+
+/// A card's research brief, when an investigator left one.
+fn research_brief(root: &Path, id: i64) -> Option<String> {
+    std::fs::read_to_string(brief_path(root, id)).ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
+}
+
+/// What the investigator is told: read, do not build, and leave the builder a brief.
+const INVESTIGATE_INSTRUCTION: &str = "You are an investigator of a roadmap-driven orchestrator: you research one card so that a builder, who starts after you, can make its change with little reading and no exploratory builds. You have the reading and search tools and nothing else: you cannot edit, run a shell or build, and you do not try. Read the code the card touches and what it will call, and answer with a brief for the builder, in Markdown, under 150 lines, with these sections: `Where` (each file and the line region that matters, as `path:line`), `What exists` (what the current code does there, the types and helpers to reuse, the tests that cover it), `The change` (the exact edits, in order, each naming its file and the shape of the code; concrete enough to write from, short enough to read), `Leave alone` (what looks related but is not the card's), `Pitfalls` (what would break, what the acceptance checks, platform quirks you found), and `Verify` (the one check that proves the change, and whether a build is needed at all before reporting). Say what you verified by reading and what you could not; do not guess at code you did not open.";
+
+/// Investigates `id` for the walk: a read-only run of the project's implementer model in the
+/// project's own tree, which leaves the card's research brief in `var/briefs/<id>.md` for
+/// the builder to open on; the brief is not a handoff and the card keeps its state. The pair
+/// feed hears of the brief; the ledger books the usage under the investigator role.
+///
+/// # Errors
+/// When the card is not there, the route has no provider, or the model did not answer.
+pub async fn investigate(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
+    let node = store.read(id).await?;
+    anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; investigate a task");
+    let root = workspace_of(store);
+    let worker = worker.for_card(&root, &node)?;
+    let model = worker.model.clone();
+    let provider = worker.provider()?;
+    let brief = context_of(store, &node).await?;
+    let project = project_context(store);
+    let mut messages = vec![Message::system(INVESTIGATE_INSTRUCTION)];
+    if !project.is_empty() {
+        messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
+    }
+    messages.push(Message::user(brief.text));
+    tracing::info!(target: crate::trace::PROGRESS, "#{id} {} · investigated by {}", node.title, short(&model));
+    crate::pair::event(&root, &format!("investigate #{id} {} · {} · pid {}", node.title, short(&model), std::process::id()));
+    let answer = provider
+        .complete(CompletionRequest {
+            model: model.clone(),
+            messages,
+            temperature: Some(0.2),
+            max_tokens: Some(4096),
+            tools: Vec::new(),
+            workspace: Some(root.clone()),
+            budget_usd: None,
+            resume: None,
+            max_turns: Some(INVESTIGATE_TURNS),
+            max_context: None,
+            effort: Some(Effort::default().to_string()),
+            read_only: true,
+        })
+        .await
+        .map_err(map_error)?;
+    worker.record_as(&model, Some("investigator"), Some(id), &answer.usage, answer.turns).await;
+    let path = brief_path(&root, id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot make {}", dir.display()))?;
+    }
+    let text = format!("# Brief for #{id} {}\n\nBy {} on {}.\n\n{}\n", node.title, short(&model), clock(unix_now()), answer.text.trim());
+    std::fs::write(&path, &text).with_context(|| format!("cannot write {}", path.display()))?;
+    let line = format!(
+        "brief #{id} {} by {} · turns {} · in {} out {} · {}",
+        node.title,
+        short(&model),
+        answer.turns,
+        answer.usage.prompt_tokens,
+        answer.usage.completion_tokens,
+        cost_text(answer.usage.cost_usd)
+    );
+    crate::pair::event(&root, &line);
+    Ok(vec![line])
+}
+
 /// Drives the runs in flight together on the one task until one of them ends, and answers
 /// which and with what. The runs overlap in their waits, the model and the checks, not in
 /// their bookkeeping.
-async fn poll_one<T>(flight: &mut [(i64, std::pin::Pin<Box<dyn Future<Output = T> + '_>>, PoolKind)]) -> (usize, T) {
+async fn poll_one<T>(flight: &mut [(i64, std::pin::Pin<Box<dyn Future<Output = T> + '_>>, Seat)]) -> (usize, T) {
     std::future::poll_fn(|cx| {
         for (at, (_, future, _)) in flight.iter_mut().enumerate() {
             if let std::task::Poll::Ready(value) = future.as_mut().poll(cx) {
@@ -2502,6 +2626,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 max_turns: caps.limit(),
                 max_context: caps.context,
                 effort: Some(effort.to_string()),
+                read_only: false,
             })
             .await;
         match answer {
@@ -2536,6 +2661,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                             max_turns: Some(REPORT_TURNS),
                             max_context: None,
                             effort: Some(effort.to_string()),
+                            read_only: false,
                         })
                         .await;
                     match again {
@@ -3036,7 +3162,16 @@ fn harness_messages(task: &ra_context::TaskContext, rerun: Option<&str>, project
     if debug {
         messages.push(Message::system(crate::retro::PROMPT));
     }
-    messages.push(Message::user(task_text(task, rerun)));
+    // the investigator's brief, when one went ahead: where the code is and what to change,
+    // so the builder writes rather than reads
+    let mut text = task_text(task, rerun);
+    if let Some(brief) = research_brief(root, task.id) {
+        let _ = write!(
+            text,
+            "\n\nAn investigator read the tree for this card before you and left this brief; open on it, check what you rely on, and do not read the tree over again where it already says:\n\n{brief}"
+        );
+    }
+    messages.push(Message::user(text));
     messages
 }
 
@@ -3114,6 +3249,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
         max_turns: caps.limit(),
         max_context: caps.context,
         effort: Some(effort.to_string()),
+        read_only: false,
     };
     let mut lines = vec![
         format!(
@@ -3971,6 +4107,7 @@ async fn tool_loop(
                 max_turns: limit,
                 max_context: None,
                 effort: None,
+                read_only: false,
             })
             .await
             .map_err(map_error)?;
@@ -4195,6 +4332,7 @@ async fn reassess_one(
             max_turns: None,
             max_context: None,
             effort: None,
+            read_only: false,
         })
         .await
         .map_err(map_error)?;
@@ -4675,7 +4813,7 @@ fn first_line(text: &str) -> String {
 
 /// The system prompt of a worker session. A harness with tools implements in the workspace; a
 /// bare model answers with the plan and the changes.
-const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory, check it against the acceptance criteria, and answer with a short report of what you changed, naming the file each change landed in in backticks, and what you verified. Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through tail. After your report the orchestrator runs the check and lints the files you changed, and any warning comes back to you; do not hunt warnings yourself. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
+const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory and answer with a short report of what you changed, naming the file each change landed in in backticks, and what you verified. The code comes first and the report is the deliverable: the orchestrator compiles and checks your change after your report, on a build slot of its own, and a failure comes back to you with its output as a rerun of the same session. So do not build to explore, do not build before you have changed anything, and do not build at all when reading the code you changed and what it calls tells you it is right; build once, at the end, only when a compile is in doubt (a new API, a type you did not see defined, a generic bound), and never more than twice in a session. A change that is right by reading, reported without a build, is the normal case, not a shortcut; say in the report what you verified by reading and what the check will prove. Bash and PowerShell both run the build tools, the read-only git commands and the read-only listing commands; pipe a long output through tail. After your report the orchestrator lints the files you changed, and any warning comes back to you; do not hunt warnings yourself. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
 
 /// The system prompt of a reassessment.
 const ARCHITECT: &str = "You are the architect of a roadmap-driven orchestrator. You receive one roadmap node with its context. You keep the objective and the acceptance short, one topic per sentence, and you name the remaining work, not the work already done. When the objective and the acceptance already name only the remaining work and are checkable, you answer with the same text rather than rewording it.";

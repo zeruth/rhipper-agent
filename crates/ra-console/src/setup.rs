@@ -270,6 +270,7 @@ async fn outline_from_model(worker: &Worker, root: &Path, import: Option<&str>, 
             max_turns: None,
             max_context: None,
             effort: None,
+            read_only: false,
         })
         .await
         .map_err(agent::map_error)?;

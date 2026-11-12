@@ -156,6 +156,12 @@ pub struct WorkerConfig {
     /// `parallel`; absent, it may. `false` holds a project to its own count exactly.
     #[serde(default)]
     pub borrow: Option<bool>,
+    /// The investigators a walk runs beside its builders: read-only runs, one a ready card
+    /// ahead of the builders, each leaving a research brief (`var/briefs/<id>.md`) the
+    /// builder of the card opens on: where the code is, what to change, what to leave. They
+    /// build nothing and edit nothing, so they cost the machine little; absent or zero, none.
+    #[serde(default)]
+    pub investigators: Option<u32>,
 }
 
 impl WorkerConfig {
@@ -163,6 +169,12 @@ impl WorkerConfig {
     #[must_use]
     pub fn parallel(&self) -> Option<u32> {
         self.parallel.filter(|n| *n > 1)
+    }
+
+    /// The investigators a walk runs beside its builders.
+    #[must_use]
+    pub fn investigators(&self) -> usize {
+        self.investigators.unwrap_or(0) as usize
     }
 
     /// Whether a walk may borrow the pool's spare Opus slots past its own count.
