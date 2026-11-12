@@ -2102,7 +2102,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             for node in ready {
                 let kind = Pool::kind_of(&router.choose(&node, crate::router::IMPLEMENTER, &worker.model).model);
                 let held = flight.iter().filter(|(_, _, k)| *k == kind).count();
-                let Some(slot) = Pool::take(kind, held, width, others) else {
+                let Some(slot) = Pool::take(kind, held, width, others, router.worker.borrow()) else {
                     starved = starved || held == 0;
                     continue;
                 };
@@ -2194,21 +2194,23 @@ impl Pool {
 
     /// Takes a slot of `kind` for a walk that holds `held` of them, is owed `width` Opus
     /// slots as its own share, and shares the machine with `others` walking projects; `None`
-    /// when the share or the pool is out. A Fable walk takes one and only one.
+    /// when the share or the pool is out. A Fable walk takes one and only one. With `borrow`
+    /// off the walk holds to `width` exactly.
     #[must_use]
-    pub fn take(kind: PoolKind, held: usize, width: usize, others: usize) -> Option<crate::hub::Guard> {
+    pub fn take(kind: PoolKind, held: usize, width: usize, others: usize, borrow: bool) -> Option<crate::hub::Guard> {
         let (size, name) = match kind {
             PoolKind::Opus => (Self::OPUS, "opus"),
             PoolKind::Fable => (Self::FABLE, "fable"),
         };
         let allowed = match kind {
             PoolKind::Fable => 1,
+            PoolKind::Opus if !borrow => width.max(1).min(size),
             // the share, and an equal part of what the pool holds beyond every walking
             // project's share: one project alone has the six, two have three each, three have
             // two. First come first served let one take four and leave another its two
             PoolKind::Opus => {
                 let walking = others + 1;
-                width.max(1) + size.saturating_sub(Self::OPUS_SHARE * walking) / walking
+                (width.max(1) + size.saturating_sub(Self::OPUS_SHARE * walking) / walking).min(size)
             }
         };
         if held >= allowed {

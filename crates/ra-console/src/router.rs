@@ -106,6 +106,7 @@ impl fmt::Display for Rule {
 /// check_timeout = 1800                 # the seconds a check or the lint may run; 1200 without it
 /// parallel = 2                         # the cards a walk runs at once, in worktrees sharing one build; one without it
 /// carry = ["local.properties"]         # untracked files a new worktree gets a copy of
+/// borrow = false                       # no borrowing of the pool's spare Opus slots past `parallel`; true without it
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -151,6 +152,10 @@ pub struct WorkerConfig {
     /// Without it every worktree run of runelite failed its compile at once.
     #[serde(default)]
     pub carry: Vec<String>,
+    /// Whether a walk here may borrow the pool's Opus slots no other walk needs, past its
+    /// `parallel`; absent, it may. `false` holds a project to its own count exactly.
+    #[serde(default)]
+    pub borrow: Option<bool>,
 }
 
 impl WorkerConfig {
@@ -158,6 +163,12 @@ impl WorkerConfig {
     #[must_use]
     pub fn parallel(&self) -> Option<u32> {
         self.parallel.filter(|n| *n > 1)
+    }
+
+    /// Whether a walk may borrow the pool's spare Opus slots past its own count.
+    #[must_use]
+    pub fn borrow(&self) -> bool {
+        self.borrow.unwrap_or(true)
     }
 
     /// How long a check or the lint may run: the table's seconds, else the agent's default.

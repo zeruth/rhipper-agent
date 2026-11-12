@@ -6,8 +6,11 @@
 # the context it carries, so a run restarts fresh on a handoff once a turn passes this many
 # input tokens.
 context = 160000
-# Two cards at once, each in its own worktree, sharing the project's one build.
-parallel = 2
+# Four cards at once, each in its own worktree, sharing the project's one build, and no more:
+# the person's call of 2026-11-12 ("let agent rip 4x opus, pause runelite until agent is
+# green, then rip runelite 4x").
+parallel = 4
+borrow = false
 
 # The implementer of every card here is Opus; the reviewer and the cheap roles keep theirs.
 [[route]]
