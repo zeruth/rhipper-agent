@@ -879,19 +879,45 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     // the cheap roles of this run, resolved once: the local server is pinged here, not per role
     let roles = worker.roles(&root).await;
     let mut outcome = run_task(store, node, worker, &roles).await;
-    // a lint-only failure never reaches the reviewer, so its fix pass starts here: the warnings
-    // are the task, the pass lints again, and a clean one goes on to the reviewer
-    if let Ok((lines, _, _)) = &mut outcome
-        && store.read(id).await.is_ok_and(|n| n.state == TaskState::NeedsRevision)
-    {
-        lint_fix(store, id, worker, &roles, lines).await;
-    }
-    // the reviewer judges a run that passed its checks before the card is offered: implemented
-    // means review-ready, and a card is review-ready only with a verdict attached
-    if let Ok((lines, _, _)) = &mut outcome
-        && store.read(id).await.is_ok_and(|n| n.state == TaskState::Implemented)
-    {
-        lines.extend(review_after_run(store, id, worker).await);
+    // an absolute card is one run until it is done: a failed check or a rejection sends it
+    // straight back to work on its session, the verdict as the prompt, inside this run, not
+    // back to the walk's queue for a restart (the person: needs revision "passed around with
+    // an absolute card restarting, they shouldn't do that"). A pass that changed no file in
+    // three in a row is a card going round stuck; it ends the run and the walk blocks it
+    let mut idle = 0;
+    let mut passes = 0;
+    loop {
+        // a lint-only failure never reaches the reviewer, so its fix pass starts here: the
+        // warnings are the task, the pass lints again, and a clean one goes on to the reviewer
+        if let Ok((lines, _, _)) = &mut outcome
+            && store.read(id).await.is_ok_and(|n| n.state == TaskState::NeedsRevision)
+        {
+            lint_fix(store, id, worker, &roles, lines).await;
+        }
+        // the reviewer judges a run that passed its checks before the card is offered:
+        // implemented means review-ready, and a card is review-ready only with a verdict attached
+        if let Ok((lines, _, _)) = &mut outcome
+            && store.read(id).await.is_ok_and(|n| n.state == TaskState::Implemented)
+        {
+            lines.extend(review_after_run(store, id, worker).await);
+        }
+        let Ok(node) = store.read(id).await else { break };
+        if outcome.is_err() || !node.is_absolute() || node.state != TaskState::NeedsRevision {
+            break;
+        }
+        let moved = ra_context::TaskContext::open(&root, id).handoffs.last().is_some_and(|h| !h.changed.is_empty());
+        idle = if moved { 0 } else { idle + 1 };
+        if idle >= RERUNS_A_WALK {
+            break;
+        }
+        passes += 1;
+        tracing::info!(target: crate::trace::PROGRESS, "  absolute: pass {} goes on, the verdict as its prompt", passes + 1);
+        let previous = outcome.as_ref().map(|(lines, _, _)| lines.clone()).unwrap_or_default();
+        outcome = run_task(store, node, worker, &roles).await.map(|(lines, usage, gotchas)| {
+            let mut all = previous;
+            all.extend(lines);
+            (all, usage, gotchas)
+        });
     }
     match &outcome {
         Ok((lines, usage, 0)) => {

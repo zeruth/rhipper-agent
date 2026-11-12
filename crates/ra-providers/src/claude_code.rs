@@ -292,6 +292,12 @@ impl ClaudeCode {
         {
             command.env("CARGO_TARGET_DIR", target);
         }
+        // the worker's shell finds `rc` (its roadmap commands, `rc hold`) beside the binary that
+        // runs it: the PATH a walk inherits can predate the install directory's place on it, and
+        // every `rc show` of the agent's regeneration card was `command not found` (2026-11-12)
+        if let Some(path) = path_with_own_dir() {
+            command.env("PATH", path);
+        }
         let mut child = command.spawn().map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!("{} is not installed or not on the path", self.binary.display()))
@@ -908,6 +914,20 @@ fn write_system_prompt(workspace: &Path, text: &str) -> std::io::Result<PathBuf>
     // absolute: the harness runs in the workspace, and a relative path (a worktree's,
     // `var/worktrees/47`) read against it doubled into `var/worktrees/47/var/worktrees/47/…`
     std::path::absolute(&path).or(Ok(path))
+}
+
+/// The PATH this process has with the directory of its own binary first, the installed `rc`
+/// beside it; `None` when either cannot be read. A PATH that has the directory already is left
+/// as it is.
+fn path_with_own_dir() -> Option<std::ffi::OsString> {
+    let own = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    if dirs.iter().any(|d| d == &own) {
+        return Some(path);
+    }
+    dirs.insert(0, own);
+    std::env::join_paths(dirs).ok()
 }
 
 /// The target directory for a run in one of the project's worktrees

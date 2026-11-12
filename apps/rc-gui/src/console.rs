@@ -121,7 +121,11 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
             ui.spacing_mut().item_spacing.x = gap;
             for (index, id, title) in row {
                 let Some(run) = sink.run(*id) else { continue };
-                ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                // each card gets exactly its cell, clipped to it: a card whose text ran long grew
+                // past its half and pushed its neighbour (the person: "should never do that")
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
+                    ui.set_clip_rect(rect.expand(2.0).intersect(ui.clip_rect()));
                     ui.set_width(width);
                     ui.set_max_width(width);
                     run_card(ui, sink, *id, title, &run, *index, Some(height));
@@ -322,33 +326,41 @@ fn run_title(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, lane: Co
     } else {
         lane
     };
-    // the task's badge keeps to the row: the model's badge, the clock and the buttons take
-    // about 260 points at the right, and the rest is the title's at some 6.5 points a
-    // character; a title past that is cut with an ellipsis and whole on hover. A badge does
-    // not wrap, and an uncut title pushed the card past its column (two cards side by side)
-    let room = ((ui.available_width() - 260.0) / 6.5).max(16.0) as usize;
-    let fit = |text: &str| -> (String, bool) {
-        if text.chars().count() <= room {
-            (text.to_owned(), false)
-        } else {
-            (format!("{}…", text.chars().take(room.saturating_sub(1)).collect::<String>()), true)
+    // the row keeps to the card, measured, not guessed: the status (an outcome can be a whole
+    // sentence) is cut to a third of the row, the model's badge, the buttons and the badges'
+    // frames come off, and the task gets the rest, cut with an ellipsis and whole on hover. A
+    // badge does not wrap, and an uncut one pushed the card past its half of the grid
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let measure = |ui: &Ui, text: &str| ui.painter().layout_no_wrap(text.to_owned(), small.clone(), Color32::WHITE).size().x;
+    let cut_to = |ui: &Ui, text: &str, width: f32| -> (String, bool) {
+        if measure(ui, text) <= width {
+            return (text.to_owned(), false);
         }
+        let chars: Vec<char> = text.chars().collect();
+        let (mut lo, mut hi) = (0, chars.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            let candidate: String = chars[..mid].iter().collect::<String>() + "…";
+            if measure(ui, &candidate) <= width { lo = mid } else { hi = mid - 1 }
+        }
+        (chars[..lo].iter().collect::<String>() + "…", true)
     };
+    let total = ui.available_width();
+    let (status_shown, status_cut) = cut_to(ui, &status, (total / 3.0).max(60.0));
+    let model_width = title.rsplit_once(" · ").map_or(0.0, |(_, model)| measure(ui, model) + 34.0);
+    // the fold arrow, the two buttons, the badges' frames and marks, and the spacing between
+    let fixed = 14.0 + if folded { 0.0 } else { 52.0 } + 34.0 + 24.0;
+    let task_room = (total - measure(ui, &status_shown) - model_width - fixed).max(40.0);
+    let task = title.rsplit_once(" · ").map_or(title, |(task, _)| task);
+    let (shown_task, task_cut) = cut_to(ui, task, task_room);
     let row = ui.horizontal(|ui| {
         ui.label(RichText::new(if folded { "▸" } else { "▾" }).color(theme::dim()).small());
-        if let Some((task, model)) = title.rsplit_once(" · ") {
-            let (shown, cut) = fit(task);
-            let badge = crate::cards::badge_marked(ui, "◇", &shown, theme::trace());
-            if cut {
-                badge.on_hover_text(task);
-            }
+        let badge = crate::cards::badge_marked(ui, "◇", &shown_task, theme::trace());
+        if task_cut {
+            badge.on_hover_text(task);
+        }
+        if let Some((_, model)) = title.rsplit_once(" · ") {
             crate::cards::badge_marked(ui, "◉", model, theme::accent());
-        } else {
-            let (shown, cut) = fit(title);
-            let badge = crate::cards::badge_marked(ui, "◇", &shown, theme::trace());
-            if cut {
-                badge.on_hover_text(title);
-            }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             // the height of the card, two rows a notch, by the buttons or the wheel
@@ -360,7 +372,10 @@ fn run_title(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, lane: Co
                     sink.resize_run(id, 2);
                 }
             }
-            ui.label(RichText::new(status).color(status_color).small());
+            let shown = ui.label(RichText::new(&status_shown).color(status_color).small());
+            if status_cut {
+                shown.on_hover_text(&status);
+            }
         });
     });
     // the row is sensed after its buttons, so a click on one of them is theirs, not the fold's
