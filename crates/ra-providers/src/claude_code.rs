@@ -657,9 +657,13 @@ fn reads_of(line: &str, workspace: Option<&Path>) -> Vec<String> {
 
 /// A path inside the workspace relative to it, with forward slashes; another path as it came.
 fn relative(path: &str, workspace: Option<&Path>) -> String {
-    let shown = workspace
-        .and_then(|root| Path::new(path).strip_prefix(root).ok())
-        .map_or_else(|| path.to_owned(), |p| p.to_string_lossy().into_owned());
+    // the workspace as given and made absolute: a worktree's is relative (`var/worktrees/47`)
+    // while the tool's path is absolute, and the line showed the whole path
+    let roots = workspace.into_iter().flat_map(|root| [Some(root.to_path_buf()), std::path::absolute(root).ok()]).flatten();
+    let shown = roots
+        .filter_map(|root| Path::new(path).strip_prefix(&root).ok().map(|p| p.to_string_lossy().into_owned()))
+        .next()
+        .unwrap_or_else(|| path.to_owned());
     shown.replace('\\', "/")
 }
 
