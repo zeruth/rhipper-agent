@@ -1253,28 +1253,32 @@ async fn review_brief(project: &Path, root: &Path, node: &Node) -> String {
     // the list and the stat come before the diff: the reviewer of #159 looked for the change in
     // the one file it expected and judged the card unfinished for code that lived in another
     text.push_str(&crate::review::files_section(&node.files, &changed));
+    // the diff's base: HEAD in the project's own tree; in a card's worktree the merge base
+    // with the project's branch, so the checkpoints the walk commits on the card's branch
+    // after each run are in the reviewer's view and not behind it
+    let base = diff_base(project, root).await;
     if !files.is_empty() {
-        text.push_str(&crate::review::diff_stat_section(root, &files).await);
+        text.push_str(&crate::review::diff_stat_section(root, &base, &files).await);
     }
     // the notes hold the worker's report whole where the handoff holds its summary
     if let Some(notes) = node.notes.as_deref().filter(|notes| !notes.trim().is_empty()) {
         let notes: String = notes.chars().take(DIGEST_NOTES).collect();
         let _ = writeln!(text, "\n## Notes of the card\n{notes}");
     }
-    text.push_str("\n## git diff HEAD of the card's files\n");
+    let _ = writeln!(text, "\n## git diff {base} of the card's files");
     if files.is_empty() {
         text.push_str("the card names no files and no run changed any\n");
         return text;
     }
     let mut command = tokio::process::Command::new("git");
-    command.args(["diff", "HEAD", "--"]).args(&files).current_dir(root);
+    command.args(["diff", &base, "--"]).args(&files).current_dir(root);
     let diff = match command.output().await {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
         Ok(out) => format!("git diff failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
         Err(e) => format!("git diff did not run: {e}"),
     };
     if diff.trim().is_empty() {
-        let _ = writeln!(text, "no change against HEAD in {}", files.join(", "));
+        let _ = writeln!(text, "no change against {base} in {}", files.join(", "));
     } else if diff.chars().count() > REVIEW_DIFF {
         let cut: String = diff.chars().take(REVIEW_DIFF).collect();
         let _ = writeln!(text, "{cut}\n… clipped at {REVIEW_DIFF} characters");
@@ -2197,6 +2201,40 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
     Ok((path, branch))
 }
 
+/// The base a card's diff is read against: `HEAD` when the run acted in the project's own
+/// tree; in a worktree the merge base of the worktree's branch and the project's, so the
+/// checkpoints on the card's branch count as the card's change.
+async fn diff_base(project: &Path, root: &Path) -> String {
+    let same = match (std::fs::canonicalize(project), std::fs::canonicalize(root)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => project == root,
+    };
+    if same {
+        return String::from("HEAD");
+    }
+    let Ok(main) = git(project, &["rev-parse", "--abbrev-ref", "HEAD"]).await else { return String::from("HEAD") };
+    git(root, &["merge-base", "HEAD", &main]).await.unwrap_or_else(|_| String::from("HEAD"))
+}
+
+/// Commits what a run left in the card's worktree on the card's branch, as a checkpoint: the
+/// work is on the branch from its first run, not only in a working tree a crash or a removed
+/// worktree would lose, and `git log card/<id>` reads as the card's story. The reviewer reads
+/// the diff from the merge base ([`diff_base`]), so a checkpoint hides nothing from it. A
+/// line when something was committed; nothing when the tree was clean or git refused.
+async fn checkpoint_worktree(root: &Path, id: i64, title: &str) -> Option<String> {
+    let path = root.join(WORKTREES_DIR).join(id.to_string());
+    if !path.join(".git").exists() {
+        return None;
+    }
+    let dirty = git(&path, &["status", "--porcelain"]).await.ok()?;
+    if dirty.trim().is_empty() {
+        return None;
+    }
+    git(&path, &["add", "-A"]).await.ok()?;
+    git(&path, &["commit", "-q", "-m", &format!("wip: {title} (#{id})")]).await.ok()?;
+    Some(format!("  checkpoint: {} file(s) committed on {}", dirty.lines().count(), worktree_branch(id)))
+}
+
 /// How old an entry under the system temp directory is before a landing's sweep removes it:
 /// a test running now keeps its own.
 const TEMP_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -2646,7 +2684,12 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             (Seat::Build(_), Ok(run_lines)) => {
                 lines.extend(run_lines);
                 ran += 1;
-                let state = store.read(id).await?.state;
+                let node = store.read(id).await?;
+                let state = node.state;
+                // the run's work goes on the card's branch now, whatever the verdict
+                if state != TaskState::Implemented {
+                    lines.extend(checkpoint_worktree(&root, id, &node.title).await);
+                }
                 if stop_on_revision && stopped.is_none() && state == TaskState::NeedsRevision {
                     stopped = Some(format!("stopped: #{id} needs revision"));
                 }

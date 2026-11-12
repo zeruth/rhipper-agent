@@ -1256,24 +1256,24 @@ async fn run_parallel_runs_two_cards_at_once_in_two_worktrees_that_both_end_impl
     assert_eq!(ran.len(), 2, "{out:?}");
     assert_eq!(out.last().unwrap(), "ran 2 card(s) · no card is ready");
     for id in [2, 3] {
-        assert_eq!(store.read(id).await.unwrap().state, ra_roadmap::model::TaskState::Implemented, "{out:?}");
-        // the worktree is a git worktree on the card's branch, and the worker's file is in it
+        // each run worked in its worktree on its branch (the check line names it), and the
+        // walk landed each on the verdict: committed on the branch, merged, proved, accepted,
+        // the worktree and the branch cleared
+        assert_eq!(store.read(id).await.unwrap().state, ra_roadmap::model::TaskState::Accepted, "{out:?}");
+        assert!(out.iter().any(|l| l.contains(&format!("branch card/{id}"))), "{out:?}");
+        assert!(out.iter().any(|l| l == &format!("committed 1 file(s) on card/{id}")), "{out:?}");
+        assert!(out.iter().any(|l| l.starts_with(&format!("merged card/{id} into "))), "{out:?}");
         let worktree = dir.path().join("var").join("worktrees").join(id.to_string());
-        assert!(worktree.join(".git").is_file(), "{} is not a worktree", worktree.display());
-        assert_eq!(git_ok(&worktree, &["branch", "--show-current"]), format!("card/{id}"));
-        assert_eq!(std::fs::read_to_string(worktree.join("made.txt")).unwrap(), "by the worker\n");
-        // the handoff and the check line name the branch
-        let context = ra_context::TaskContext::open(dir.path(), id);
-        let handoff = context.handoffs.last().unwrap();
-        assert!(handoff.check.contains(&format!("branch card/{id}")), "{}", handoff.check);
-        assert_eq!(handoff.changed, vec!["made.txt".to_owned()], "{out:?}");
+        assert!(!worktree.join(".git").exists(), "{} was not cleared", worktree.display());
+        assert!(git_ok(dir.path(), &["branch", "--list", &format!("card/{id}")]).trim().is_empty(), "card/{id} was not removed");
     }
-    assert!(out.iter().any(|l| l.contains("branch card/2")), "{out:?}");
-    // the project itself was left alone
-    assert!(!dir.path().join("made.txt").exists());
+    // the worker's file reached the project through the merges, not through the project's tree
+    // (a checkout on Windows may end the line in CRLF)
+    assert_eq!(std::fs::read_to_string(dir.path().join("made.txt")).unwrap().trim_end(), "by the worker");
+    assert!(out.iter().any(|l| l == "check passed on the merged tree: cargo test --workspace -q"), "{out:?}");
     // the four completions went out as two runs of two turns, overlapping, then a verdict each
     assert_eq!(*script.seen.lock(), 6);
-    assert!(crate::agent::worktree_list(dir.path()).unwrap().iter().any(|l| l.starts_with("#2 · card/2")));
+    assert_eq!(crate::agent::worktree_list(dir.path()).unwrap(), ["no worktree"]);
 }
 
 /// A provider that answers by the turn of the request: a `write_file` of `made.txt` on the
