@@ -1518,9 +1518,8 @@ fn clock(when: u64) -> String {
 /// Takes the hub's lock on the cargo target of `root` for the check, waiting on a check of
 /// another project that builds in the same target; the wait is said once, on the progress
 /// channel and the paired feed. `None` when the lock cannot be opened: the check goes unguarded.
-async fn guard_target(root: &Path) -> Option<crate::hub::Guard> {
-    let target = crate::hub::cargo_target(root);
-    let name = crate::hub::target_lock_name(&target);
+async fn guard_target(root: &Path, target: &Path) -> Option<crate::hub::Guard> {
+    let name = crate::hub::target_lock_name(target);
     let mut said = false;
     loop {
         match crate::hub::try_guard(&name) {
@@ -3299,7 +3298,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // builds do, so six runs do not compile at once; a cargo check also takes the hub's lock
     // on a target another project may share, so two builds do not fight over the directory
     let _slot = if commands.is_empty() { None } else { hold_build(&root).await };
-    let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root).await } else { None };
+    // the lock is on the target the check builds in: a worktree's own under the project's,
+    // not the project's (six asm checks on one lock waited for each other for nothing)
+    let target = if workspace_dir.is_some() { root.join("target").join(format!("wt-{id}")) } else { crate::hub::cargo_target(&root) };
+    let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root, &target).await } else { None };
     let checks = run_checks(&toolbox, &commands).await;
     let status_after = git_status(&acting).await;
     let mut changed = run_changed(&acting, &dirty_before, &status_after, run_started);
