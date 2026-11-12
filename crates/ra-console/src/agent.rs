@@ -1515,6 +1515,29 @@ fn clock(when: u64) -> String {
     format!("{:02}:{:02}Z", day / 3600, day / 60 % 60)
 }
 
+/// Takes the hub's lock on landing in `root`'s checkout, waiting while another process lands
+/// there; the wait is said once. `None` when the lock cannot be opened: the landing goes
+/// unguarded, as before the lock.
+async fn guard_landing(root: &Path) -> Option<crate::hub::Guard> {
+    let name = format!("land-{}", crate::hub::project_name(&crate::hub::project_root_of(root)).to_ascii_lowercase());
+    let mut said = false;
+    loop {
+        match crate::hub::try_guard(&name) {
+            Ok(Some(guard)) => return Some(guard),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("the landing runs without its lock: {e:#}");
+                return None;
+            }
+        }
+        if !said {
+            said = true;
+            tracing::info!(target: crate::trace::PROGRESS, "  wait: another landing is merging into the project");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// Takes the hub's lock on the cargo target of `root` for the check, waiting on a check of
 /// another project that builds in the same target; the wait is said once, on the progress
 /// channel and the paired feed. `None` when the lock cannot be opened: the check goes unguarded.
@@ -2409,6 +2432,10 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
         node.state
     );
     let root = workspace_of(store);
+    // one landing at a time in the project's checkout across processes: `rc land` from a shell
+    // and a walk's own landings merge into the same tree, and the walk's lock is its own
+    // process's alone (a hand merge was clobbered by a walk's landing, asm, 2026-11-12)
+    let _landing = guard_landing(&root).await;
     let branch = worktree_branch(id);
     let path = root.join(WORKTREES_DIR).join(id.to_string());
     let mut lines = Vec::new();
