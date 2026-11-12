@@ -2084,7 +2084,14 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 let id = node.id;
                 let (path, branch) = worktree_add(&root, id).await?;
                 let runner = worker.clone().with_worktree(path, branch);
-                flight.push((id, Box::pin(async move { let _slot = slot; run(store, id, &runner).await }), kind));
+                flight.push((
+                    id,
+                    Box::pin(async move {
+                        let _slot = slot;
+                        run(store, id, &runner).await
+                    }),
+                    kind,
+                ));
             }
         }
         if flight.is_empty() {
