@@ -90,7 +90,7 @@ fn a_kill_by_pid_is_handed_to_the_person_and_a_process_listing_passes() {
 #[test]
 fn a_workspace_build_is_rewritten_only_while_a_console_runs() {
     let catalogue = Catalogue::seed();
-    let running = Conditions { console_running: true };
+    let running = Conditions { console_running: true, ..Conditions::default() };
     // the tail rewrite composes on the end of it; the first id names the verdict
     match catalogue.command("cargo test -q", running) {
         Verdict::Rewrite { id, command, reason } => {
@@ -115,6 +115,79 @@ fn a_workspace_build_is_rewritten_only_while_a_console_runs() {
         Verdict::Rewrite { command, .. } => assert_eq!(command, "cargo build --workspace --exclude rc --exclude rc-gui 2>&1 | tail -n 80"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_full_suite_runs_the_changed_crates_only_while_the_check_is_the_suite() {
+    let catalogue = Catalogue::seed();
+    let changed = ["ra-asm-emit".to_owned(), "ra-gotchas".to_owned()];
+    let suite = Conditions { suite_check: true, changed_crates: &changed, ..Conditions::default() };
+    for (command, expected) in [
+        ("cargo test -q 2>&1 | tail -n 80", "cargo test -p ra-asm-emit -p ra-gotchas -q 2>&1 | tail -n 80"),
+        ("cargo test --workspace -q", "cargo test -p ra-asm-emit -p ra-gotchas -q 2>&1 | tail -n 80"),
+        (
+            "cargo test --workspace --exclude rc --exclude=rc-gui -- --nocapture",
+            "cargo test -p ra-asm-emit -p ra-gotchas -- --nocapture 2>&1 | tail -n 80",
+        ),
+    ] {
+        match catalogue.command(command, suite) {
+            Verdict::Rewrite { id, command, reason } => {
+                assert_eq!(id, "worker-full-suite");
+                assert_eq!(command, expected);
+                assert!(reason.contains("runs after the report"), "{reason}");
+            }
+            other => panic!("{command}: {other:?}"),
+        }
+    }
+    // a console running brings no workspace flags back onto the narrowed command
+    let running = Conditions { console_running: true, ..suite };
+    assert!(
+        matches!(catalogue.command("cargo test -q", running), Verdict::Rewrite { command, .. } if command == "cargo test -p ra-asm-emit -p ra-gotchas -q 2>&1 | tail -n 80")
+    );
+    // a command that names its crate passes as it is
+    assert_eq!(catalogue.command("cargo test -p ra-asm-emit -q 2>&1 | tail -n 80", suite), Verdict::Pass);
+    // a project whose check is not the suite, or a run that changed no crate, keeps the command
+    for conditions in
+        [Conditions { changed_crates: &changed, ..Conditions::default() }, Conditions { suite_check: true, ..Conditions::default() }]
+    {
+        assert_eq!(catalogue.command("cargo test -q 2>&1 | tail -n 80", conditions), Verdict::Pass);
+    }
+    assert!(is_suite("cargo test -q") && is_suite("cargo test --workspace -q"));
+    assert!(!is_suite("cargo test -p ra-gotchas -q") && !is_suite(".\\gw.ps1 :core:test") && !is_suite("cargo build"));
+}
+
+#[test]
+fn a_changed_path_falls_in_the_package_of_its_nearest_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = [\"crates/a\"]\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("crates/a/src")).unwrap();
+    std::fs::write(dir.path().join("crates/a/Cargo.toml"), "[package]\nname = \"a-crate\"\n").unwrap();
+    assert_eq!(package_of(dir.path(), Path::new("crates/a/src/lib.rs")).as_deref(), Some("a-crate"));
+    // the workspace manifest is no package
+    assert_eq!(package_of(dir.path(), Path::new("rhipper.toml")), None);
+}
+
+#[test]
+fn the_hooks_full_suite_in_a_work_tree_runs_the_crate_its_changes_fall_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = std::process::Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status();
+    assert!(git.is_ok_and(|s| s.success()), "git init");
+    std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = [\"crates/a\"]\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("crates/a/src")).unwrap();
+    std::fs::write(dir.path().join("crates/a/Cargo.toml"), "[package]\nname = \"a-crate\"\n").unwrap();
+    std::fs::write(dir.path().join("crates/a/src/lib.rs"), "").unwrap();
+    assert_eq!(changed_crates(dir.path()), ["a-crate"]);
+    let catalogue = Catalogue::seed();
+    match catalogue.command_in(dir.path(), "cargo test -q 2>&1 | tail -n 80", false, true) {
+        Verdict::Rewrite { id, command, .. } => {
+            assert_eq!(id, "worker-full-suite");
+            assert_eq!(command, "cargo test -p a-crate -q 2>&1 | tail -n 80");
+        }
+        other => panic!("{other:?}"),
+    }
+    // a per-crate command, or a project whose check is not the suite, runs as written
+    assert_eq!(catalogue.command_in(dir.path(), "cargo test -p b -q 2>&1 | tail -n 80", false, true), Verdict::Pass);
+    assert_eq!(catalogue.command_in(dir.path(), "cargo test -q 2>&1 | tail -n 80", false, false), Verdict::Pass);
 }
 
 #[test]
@@ -313,8 +386,10 @@ fn a_refresh_brings_the_seeds_new_entries_and_keeps_the_files_own() {
     let seed = Catalogue::seed();
     let long_output = seed.get("long-output").unwrap();
     let (_, block) = seed_blocks().into_iter().find(|(id, _)| id == "long-output").unwrap();
-    assert!(SEED.contains(&block), "the seed's blocks are its own text");
-    let own = SEED.replacen(&format!("{block}\n"), "", 1).replace("a console or a window holds its binary", "the window holds rc.exe");
+    // a checkout may end the seed's lines in `\r\n`; the blocks end theirs in `\n`
+    let seed_text = SEED.replace("\r\n", "\n");
+    assert!(seed_text.contains(&block), "the seed's blocks are its own text");
+    let own = seed_text.replacen(&format!("{block}\n"), "", 1).replace("a console or a window holds its binary", "the window holds rc.exe");
     assert!(Catalogue::parse(&own).unwrap().get("long-output").is_none(), "{own}");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &own).unwrap();

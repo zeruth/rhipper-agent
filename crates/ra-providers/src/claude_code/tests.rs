@@ -344,6 +344,16 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
     let untailed =
         r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p ra-roadmap"}}]}}"#;
     assert_eq!(gotchas_of_event(&catalogue, untailed, quiet, &mut tools)[0].id, "long-output");
+    // the full suite, while the project's check is the suite, counts as the worker's own run
+    // narrowed to the changed crates; a project whose check is not the suite counts nothing
+    let changed = ["ra-gotchas".to_owned()];
+    let suite = Conditions { suite_check: true, changed_crates: &changed, ..Conditions::default() };
+    let whole = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -q 2>&1 | tail -n 80"}}]}}"#;
+    let hits = gotchas_of_event(&catalogue, whole, suite, &mut tools);
+    assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["worker-full-suite"]);
+    assert!(hits[0].message.contains("runs after the report"), "{}", hits[0].message);
+    assert!(gotchas_of_event(&catalogue, whole, Conditions { changed_crates: &changed, ..quiet }, &mut tools).is_empty());
+    assert!(gotchas_of_event(&catalogue, fine, suite, &mut tools).is_empty());
     // the reads of an event, relative to the workspace; a Bash call or a Grep is not one
     let root = Path::new(r"C:\work\repo");
     let two = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"C:\\work\\repo\\crates\\c.rs"}},{"type":"tool_use","name":"Grep","input":{"pattern":"fn"}},{"type":"tool_use","name":"Read","input":{"file_path":"D:\\elsewhere\\x.rs"}}]}}"#;
