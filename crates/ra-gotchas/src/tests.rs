@@ -7,10 +7,11 @@ fn held(command: &str) -> String {
     format!("rc hold -- {command}")
 }
 
-/// Whether a verdict is the build-slot rewrite alone of `command`: what a build command that
-/// no other gotcha touches comes to.
+/// Whether a verdict is the build-slot rewrite alone of `command`, by either slot entry: what a
+/// build command that no other gotcha touches comes to.
 fn only_held(verdict: &Verdict, command: &str) -> bool {
-    matches!(verdict, Verdict::Rewrite { id, command: rewritten, .. } if id == "build-slot" && *rewritten == held(command))
+    let slot = |id: &str| matches!(id, "build-slot" | "contract-runner-slot" | "heavy-work-slot");
+    matches!(verdict, Verdict::Rewrite { id, command: rewritten, .. } if slot(id.as_str()) && *rewritten == held(command))
 }
 
 #[test]
@@ -193,7 +194,7 @@ fn the_hooks_full_suite_in_a_work_tree_runs_the_crate_its_changes_fall_in() {
     std::fs::write(dir.path().join("crates/a/src/lib.rs"), "").unwrap();
     assert_eq!(changed_crates(dir.path()), ["a-crate"]);
     let catalogue = Catalogue::seed();
-    match catalogue.command_in(dir.path(), "cargo test -q 2>&1 | tail -n 80", false, true) {
+    match catalogue.command_in(dir.path(), "cargo test -q 2>&1 | tail -n 80", false, true, false) {
         Verdict::Rewrite { id, command, .. } => {
             assert_eq!(id, "worker-full-suite");
             assert_eq!(command, held("cargo test -p a-crate -q 2>&1 | tail -n 80"));
@@ -202,9 +203,9 @@ fn the_hooks_full_suite_in_a_work_tree_runs_the_crate_its_changes_fall_in() {
     }
     // a per-crate command, or a project whose check is not the suite, runs as written, on its slot
     let per_crate = "cargo test -p b -q 2>&1 | tail -n 80";
-    assert!(only_held(&catalogue.command_in(dir.path(), per_crate, false, true), per_crate));
+    assert!(only_held(&catalogue.command_in(dir.path(), per_crate, false, true, false), per_crate));
     let tailed = "cargo test -q 2>&1 | tail -n 80";
-    assert!(only_held(&catalogue.command_in(dir.path(), tailed, false, false), tailed));
+    assert!(only_held(&catalogue.command_in(dir.path(), tailed, false, false, false), tailed));
 }
 
 #[test]
@@ -250,8 +251,32 @@ fn a_build_runs_on_a_build_slot_and_a_held_one_is_left_alone() {
         "./gw.ps1 :core:test 2>&1 | tail -n 40",
         "./gradlew build",
         "gradlew.bat :app:assembleDebug",
+        // the AWT contract runner is a build too: a JVM per contract
+        "python -u tools-src/run-awt-contracts.py --java-home \"C:/Program Files/Java/jdk-21.0.10\" > build/awt140/out.txt 2>&1",
+        "python3 tools-src/run-awt-contracts.py",
     ] {
         assert!(only_held(&catalogue.command(command, quiet), command), "{command}");
+    }
+    // the other heavy work, in a project whose allowlist runs it: scripts, a JVM, recursive
+    // searches, the WSL toolchains; one the project does not allow stays denied
+    let allowed = Conditions { allowed: true, ..Conditions::default() };
+    assert!(matches!(catalogue.command("python tools-src/scan.py", quiet), Verdict::Deny { .. }));
+    for command in [
+        "python -u tools-src/hub-compat-scan.py --out build/report.json",
+        ".\\testdata\\build.ps1 -Name hello64",
+        "powershell -NoProfile -File tools/regen.ps1",
+        "node scripts/gen.mjs",
+        "java -cp build/classes Main",
+        "rg -n \"isValidateRoot\" android-awt",
+        "grep -rn \"class Foo\" src",
+        "Get-ChildItem -Recurse -Filter *.java | Select-String isValidateRoot",
+        "wsl -d Ubuntu-24.04 -- bash -lc \"make -C testdata/psx\"",
+    ] {
+        assert!(only_held(&catalogue.command(command, allowed), command), "{command}");
+    }
+    // light commands stay as they are: a one-line python, a plain listing, a grep of one file
+    for command in ["git status", "Get-ChildItem src", "Get-ChildItem -Recurse crates", "grep -n foo src/lib.rs"] {
+        assert!(!matches!(catalogue.command(command, quiet), Verdict::Rewrite { ref id, .. } if id.ends_with("-slot")), "{command}");
     }
     // the gradle wrapper under a bash-ish `&` too; a command already under `rc hold` stays
     assert!(only_held(&catalogue.command("& .\\gw.ps1 :core:test", quiet), "& .\\gw.ps1 :core:test"));

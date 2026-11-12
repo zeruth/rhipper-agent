@@ -249,10 +249,11 @@ pub(crate) const GAUGE_SPAN: usize = 120;
 /// under a line in `color`, the oldest end fading into the bubble's fill; a thin rule marks the
 /// top of the range.
 #[allow(clippy::cast_possible_truncation)]
-/// One build slot of the machine as a slim bubble `width` wide: `BUILDER n` and, while a build
-/// holds it, who (`runelite #42`) and for how long, lit in the lane of the slot; dim and `idle`
-/// when it is free.
-pub(crate) fn builder(ui: &mut Ui, index: usize, held: Option<(&str, u64)>, width: f32) {
+/// One of the machine's heavy-work slots as a slim bubble `width` wide: `WORKER n` and, while a
+/// build, a script or a search holds it, who (`runelite #42`), for how long and its share of the
+/// processor (`share` percent), lit in the lane of the slot; dim and `idle` when it is free. The
+/// person named them workers on 2026-11-12; in the code they are the build slots.
+pub(crate) fn builder(ui: &mut Ui, index: usize, held: Option<(&str, u64)>, share: u32, width: f32) {
     let color = if held.is_some() { theme::lane(7 + index % 3) } else { theme::dim() };
     bubble(ui, color, held.is_some(), |ui| {
         let inner = (width - 18.0).max(60.0);
@@ -260,10 +261,10 @@ pub(crate) fn builder(ui: &mut Ui, index: usize, held: Option<(&str, u64)>, widt
         ui.set_max_width(inner);
         ui.horizontal(|ui| {
             ui.set_width(inner);
-            ui.label(RichText::new(format!("BUILDER {}", index + 1)).small().strong().color(theme::dim()));
+            ui.label(RichText::new(format!("WORKER {}", index + 1)).small().strong().color(theme::dim()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| match held {
                 Some((who, secs)) => {
-                    badge(ui, &format!("{who} · {}:{:02}", secs / 60, secs % 60), color);
+                    badge(ui, &format!("{who} · {}:{:02} · {share}% cpu", secs / 60, secs % 60), color);
                 }
                 None => {
                     ui.label(RichText::new("idle").small().color(theme::dim()));
@@ -434,6 +435,10 @@ pub(crate) fn tooltip(ui: &mut Ui, node: &Node, lane: Color32, last: Option<&Cha
         priority(ui, node.complexity);
         if node.is_final() {
             badge(ui, "final", theme::warn());
+        }
+        // works until it is done: no cap, no rerun limit (marked, or complexity 5)
+        if node.is_absolute() {
+            badge(ui, "absolute", theme::lane(2));
         }
     });
     // a change recorded for another state than the card's came before a hand edit of the

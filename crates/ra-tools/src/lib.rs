@@ -17,6 +17,7 @@ use serde_json::json;
 use commands::clip;
 
 mod commands;
+pub mod cpu;
 
 /// The most matches a search reports.
 const MAX_HITS: usize = 200;

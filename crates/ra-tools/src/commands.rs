@@ -79,6 +79,10 @@ impl Toolbox {
                 command.env("CARGO_TARGET_DIR", target);
             }
             let mut child = command.spawn().with_context(|| format!("cannot start {program}"))?;
+            // the check is a build: it runs on its share of the builders' CPU, which follows
+            // the number of builds running until it ends
+            #[cfg(windows)]
+            let _share = child.raw_handle().and_then(crate::cpu::attach);
             // the output is read into buffers the run keeps when the limit ends it, so a check
             // that outlives its budget still leaves its last lines
             let stdout = drain(child.stdout.take());

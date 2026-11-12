@@ -21,11 +21,32 @@
 #          allow    — the command runs as it is; the hit is only counted
 
 [[gotcha]]
+# runelite's AWT contract runner compiles and runs a JVM per contract, two modes each: as heavy
+# as a build, and outside the slots it took the machine down (2026-11-12). Ahead of the allowlist
+# hint, which denies the python it starts with: held, the command starts with `rc`
+id = "contract-runner-slot"
+where = "command"
+pattern = '^\s*(python3?|py)(\.exe)?\s+(-\w+\s+)*\S*run-awt-contracts\.py\b'
+message = "the contract runner is a build: it takes one of the machine's four build slots, shared by every project, so the command runs under `rc hold --`, which waits its turn while they are all taken, then runs it as written"
+remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
+
+[[gotcha]]
 id = "shell-outside-allowlist"
 where = "command"
 pattern = '^\s*(cd|Set-Location|Start-Process|powershell(\.exe)?|pwsh|cmd(\.exe)?|sh|bash|python|pip|npm|node|sed|awk|perl)\b|^\s*git\s+-C\b'
 message = "the shells here run cargo, the read-only git commands and the read-only listing and reading commands, from the workspace directory; read files with Read, change them with Edit (never sed), search with Grep and Glob, start from the files on the card, and pipe a long output through tail"
 remedy = { kind = "hint" }
+
+[[gotcha]]
+# the other heavy work a worker starts, on the same slots as the builds (the person, 2026-11-12:
+# "catch more of the cpu time stuff in them like giant greps, script runs"): a script run (a .py,
+# a .ps1, a node script), a JVM, a recursive search, and the WSL toolchains. Held, it waits its
+# turn and runs on its share of the slots' CPU. After the allowlist hint: a project that does not allow the command is denied, one that does gets it held
+id = "heavy-work-slot"
+where = "command"
+pattern = '^\s*(python3?|py)(\.exe)?\s+(-[A-Za-z]+\s+)*[^-\s]\S*\.py\b|^\s*(powershell|pwsh)(\.exe)?\s.*-File\s|^\s*(&\s+)?\.?[\\/]?[\w.\\/-]+\.ps1\b|^\s*node(\.exe)?\s+\S+\.(m?js|cjs|ts)\b|^\s*java(\.exe)?\s|^\s*rg\s|^\s*grep\s+(-\w+\s+)*-\w*[rR]|^\s*(Get-ChildItem|gci|dir|ls)\b.*-Recurse.*\|\s*Select-String\b|^\s*wsl(\.exe)?\s'
+message = "heavy work (a script, a JVM, a recursive search, a WSL toolchain) takes one of the machine's four worker slots, shared by every project: the command runs under `rc hold --`, which waits its turn while they are all taken and runs it on its share of the slots' CPU"
+remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 
 [[gotcha]]
 id = "git-writes"

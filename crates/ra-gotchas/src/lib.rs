@@ -155,7 +155,14 @@ pub struct Conditions<'a> {
     pub suite_check: bool,
     /// The packages the run has changed so far, by name ([`changed_crates`]).
     pub changed_crates: &'a [String],
+    /// The project's own allowlist runs the command: the allowlist hint ([`ALLOWLIST_HINT`])
+    /// stands aside, and the rewrites after it (the heavy work's slot) still apply.
+    pub allowed: bool,
 }
+
+/// The gotcha that denies a shell outside the default allowlist; a project that allows the
+/// command sets [`Conditions::allowed`] and it stands aside.
+pub const ALLOWLIST_HINT: &str = "shell-outside-allowlist";
 
 /// Whether `command` is a full suite: a `cargo test` that names no package, nor a manifest.
 #[must_use]
@@ -288,9 +295,9 @@ impl Catalogue {
     /// the changed crates are read from the work tree only for a full suite while it is the
     /// project's check, as they cost a `git status`.
     #[must_use]
-    pub fn command_in(&self, workspace: &Path, command: &str, console_running: bool, suite_check: bool) -> Verdict {
+    pub fn command_in(&self, workspace: &Path, command: &str, console_running: bool, suite_check: bool, allowed: bool) -> Verdict {
         let changed = if suite_check && is_suite(command) { changed_crates(workspace) } else { Vec::new() };
-        self.command(command, Conditions { console_running, suite_check, changed_crates: &changed })
+        self.command(command, Conditions { console_running, suite_check, changed_crates: &changed, allowed })
     }
 
     /// What to do with a command about to run: the first hint or allow that matches decides;
@@ -304,6 +311,7 @@ impl Catalogue {
                 continue;
             }
             match &gotcha.remedy {
+                Remedy::Hint if conditions.allowed && gotcha.id == ALLOWLIST_HINT => continue,
                 Remedy::Hint => return Verdict::Deny { id: gotcha.id.clone(), reason: gotcha.message.clone() },
                 Remedy::Allow => break,
                 Remedy::Rewrite { insert, after, append, unless, when } => {

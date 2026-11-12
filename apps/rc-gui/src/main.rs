@@ -1183,10 +1183,14 @@ impl App {
             let slots = self.builders.len().max(1);
             #[allow(clippy::cast_precision_loss)]
             let builder_width = ((page - 10.0 * (slots as f32 - 1.0)) / slots as f32).floor();
+            // each held slot's share of the processor: the builds' budget split among them
+            let held = u32::try_from(self.builders.iter().flatten().count()).unwrap_or(1).max(1);
+            let share = ra_console::agent::BUILD_CPU / 100 / held;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 for (i, slot) in self.builders.iter().enumerate() {
-                    cards::builder(ui, i, slot.as_ref().map(|(who, since)| (who.as_str(), now.saturating_sub(*since))), builder_width);
+                    let holder = slot.as_ref().map(|(who, since)| (who.as_str(), now.saturating_sub(*since)));
+                    cards::builder(ui, i, holder, share, builder_width);
                 }
             });
             ui.add_space(4.0);
@@ -4540,6 +4544,9 @@ fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node]
                 }
                 if matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
                     cards::priority(ui, node.complexity);
+                    if node.is_absolute() {
+                        cards::badge(ui, "absolute", theme::lane(2)).on_hover_text("works until it is done: no cap, no rerun limit");
+                    }
                 } else {
                     // the progress of a bubble: the cards accepted of the cards under it
                     let cards_under: Vec<&Node> = tree::subtree(nodes, node.id)

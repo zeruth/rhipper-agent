@@ -112,6 +112,13 @@ enum Command {
         #[arg(long)]
         clear: bool,
     },
+    /// Marks a card absolute: it works until it is done, with no turn or context cap and no limit on the reruns a review sends it back for; only a full stop (the plan's limit, the provider gone, the person) ends its run. A card of complexity 5 is absolute already. `--clear` takes the mark off.
+    Absolute {
+        id: i64,
+        /// Takes the mark off.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Links a node to the nodes it waits for.
     Depend {
         /// The node that waits.
@@ -508,6 +515,21 @@ async fn run_main() -> anyhow::Result<()> {
             };
             console_line(&format!("/priority {id} {value}")).await
         }
+        Command::Absolute { id, clear } => {
+            plain_tracing()?;
+            let store = open_store().await?;
+            store.set_absolute(id, !clear).await?;
+            let node = store.read(id).await?;
+            println!(
+                "#{id} {}",
+                match (node.absolute, node.is_absolute()) {
+                    (true, _) => "is absolute: it works until it is done",
+                    (false, true) => "is not marked absolute, but runs as one: its complexity is 5",
+                    (false, false) => "is not absolute",
+                }
+            );
+            Ok(())
+        }
         Command::Depend { id, waits_for } => {
             plain_tracing()?;
             depend(id, &waits_for).await
@@ -863,7 +885,7 @@ fn hook(event: &str) -> anyhow::Result<()> {
             // the full suite is the orchestrator's when it is the project's check: a worker's
             // own run of it goes to the crates the run has changed
             let suite_check = worker.as_ref().is_none_or(ra_console::router::WorkerConfig::checks_the_suite);
-            let verdict = match catalogue.command_in(&cwd, command, console_running, suite_check) {
+            let verdict = match catalogue.command_in(&cwd, command, console_running, suite_check, own) {
                 ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. }
                     if own && id == "shell-outside-allowlist" =>
                 {
@@ -874,7 +896,21 @@ fn hook(event: &str) -> anyhow::Result<()> {
             // a build, under `rc hold` by the rewrite or by the worker's own hand, is the
             // session's to spend from a small budget: the code comes first, the check
             // compiles after the report
-            let is_build = |text: &str| text.trim_start().starts_with("rc hold");
+            // a build is gradle, cargo or the contract runner: the other heavy work the slots
+            // hold (a script, a search, a WSL toolchain) is the worker's to run, budget or not
+            let is_build = |text: &str| {
+                let inner = text.trim_start().strip_prefix("rc hold").map(|rest| {
+                    let rest = rest.trim_start();
+                    rest.split_once("-- ").map_or(rest, |(_, command)| command)
+                });
+                inner.is_some_and(|command| {
+                    let first = command.trim_start().trim_start_matches("& ").trim_start_matches(".\\").trim_start_matches("./");
+                    first.starts_with("gw.ps1")
+                        || first.starts_with("gradlew")
+                        || first.starts_with("cargo ")
+                        || command.contains("run-awt-contracts.py")
+                })
+            };
             let built = match &verdict {
                 ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => is_build(rewritten),
                 ra_gotchas::Verdict::Pass => is_build(command),

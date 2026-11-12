@@ -361,7 +361,7 @@ impl ClaudeCode {
                         Some(workspace) if self.suite_check && line.contains("cargo test") => ra_gotchas::changed_crates(workspace),
                         _ => Vec::new(),
                     };
-                    let conditions = Conditions { console_running, suite_check: self.suite_check, changed_crates: &changed };
+                    let conditions = Conditions { console_running, suite_check: self.suite_check, changed_crates: &changed, allowed: false };
                     for hit in gotchas_of_event(catalogue, &line, conditions, &mut tools) {
                         // the project's own commands are past the allowlist by design: the
                         // hook lets them run, and the count leaves them alone too

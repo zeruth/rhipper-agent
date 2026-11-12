@@ -100,6 +100,7 @@ impl Store {
                 notes: None,
                 assessed: None,
                 priority: None,
+                absolute: false,
                 evidence: None,
                 saving: None,
             };
@@ -221,6 +222,7 @@ impl Store {
             notes: None,
             assessed: None,
             priority: None,
+            absolute: false,
             evidence: card.evidence.map(str::to_owned),
             saving: card.saving.map(str::to_owned),
         };
@@ -574,6 +576,16 @@ impl Store {
         ensure_weight(priority, "priority")?;
         let mut roadmap = self.load().await?;
         node_mut(&mut roadmap.nodes, id)?.priority = priority;
+        self.write(roadmap).await
+    }
+
+    /// Marks a card absolute or not ([`crate::model::Node::absolute`]).
+    ///
+    /// # Errors
+    /// When the node is not there or the file cannot be written.
+    pub async fn set_absolute(&self, id: i64, absolute: bool) -> anyhow::Result<()> {
+        let mut roadmap = self.load().await?;
+        node_mut(&mut roadmap.nodes, id)?.absolute = absolute;
         self.write(roadmap).await
     }
 

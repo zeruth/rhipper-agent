@@ -1595,7 +1595,7 @@ async fn hold_build(root: &Path) -> Option<crate::hub::Guard> {
         if !said {
             said = true;
             let text = format!(
-                "wait: the check waits for a build slot, {} of the machine's {} are running",
+                "wait: the check waits for a worker slot, {} of the machine's {} are running",
                 crate::hub::builds_running(),
                 crate::hub::BUILD_SLOTS
             );
@@ -1668,18 +1668,18 @@ pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
             Ok(Some(guard)) => break Some(guard),
             Ok(None) => {}
             Err(e) => {
-                eprintln!("rc hold: the command runs without a build slot: {e:#}");
+                eprintln!("rc hold: the command runs without a worker slot: {e:#}");
                 break None;
             }
         }
         if started.elapsed() >= HOLD_WAIT {
-            eprintln!("rc hold: no build slot came free in {} minutes; the command runs without one", HOLD_WAIT.as_secs() / 60);
+            eprintln!("rc hold: no worker slot came free in {} minutes; the command runs without one", HOLD_WAIT.as_secs() / 60);
             break None;
         }
         if !said {
             said = true;
             eprintln!(
-                "rc hold: waiting for a build slot, {} of the machine's {} are running",
+                "rc hold: waiting for a worker slot, {} of the machine's {} are running",
                 crate::hub::builds_running(),
                 crate::hub::BUILD_SLOTS
             );
@@ -1702,13 +1702,35 @@ pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
             p
         }
     };
-    match process.current_dir(dir).status() {
-        Ok(status) => status.code().unwrap_or(1),
+    let mut child = match process.current_dir(dir).spawn() {
+        Ok(child) => child,
         Err(e) => {
             eprintln!("rc hold: cannot start {shell}: {e}");
-            127
+            return 127;
         }
-    }
+    };
+    // the build runs on its share of the builders' CPU, following the number of builds
+    share_cpu_among_builds();
+    #[cfg(windows)]
+    let _share = {
+        use std::os::windows::io::AsRawHandle;
+        ra_tools::cpu::attach(child.as_raw_handle())
+    };
+    child.wait().map_or(1, |status| status.code().unwrap_or(1))
+}
+
+/// The share of the processor every build on the machine runs at together: one build may use
+/// it all, `n` builds a `1/n` part each. The person's rule of 2026-11-12: "1 builder 90%, 3 at
+/// 30% each".
+pub const BUILD_CPU: u32 = 9000;
+
+/// Sets this process's builds to run on their share of [`BUILD_CPU`]: the whole budget split
+/// evenly among the builds holding a slot right now, read again as they come and go.
+pub fn share_cpu_among_builds() {
+    ra_tools::cpu::set_rate(Box::new(|| {
+        let running = u32::try_from(crate::hub::builds_running()).unwrap_or(1).max(1);
+        BUILD_CPU / running
+    }));
 }
 
 /// The share of the plan's five-hour window one run of a card is taken to use: the margin a run
@@ -1878,6 +1900,7 @@ pub async fn run_next(store: &Store, worker: &Worker) -> anyhow::Result<Vec<Stri
 /// # Errors
 /// When the roadmap cannot be read between runs.
 pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
+    share_cpu_among_builds();
     let mut lines = Vec::new();
     let mut ran = 0;
     // the card the last run continued and how many runs in a row it has had: a card the
@@ -1949,7 +1972,9 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             _ => 1,
         };
         again = Some((id, runs));
-        if runs > RESTARTS {
+        // an absolute card is continued as often as it takes: only a full stop ends it
+        let absolute = store.read(id).await.is_ok_and(|n| n.is_absolute());
+        if runs > RESTARTS && !absolute {
             done(
                 &mut lines,
                 format!("ran {ran} card(s) · stopped: #{id} continued {RESTARTS} times in a row; raise [worker] turns or split the card"),
@@ -1992,7 +2017,10 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
                 *checks += 1;
                 (*checks, CHECK_RETRIES, format!("its check failed {} time(s)", *checks))
             };
-            let rerun = (count <= allowed).then_some((count, allowed));
+            // an absolute card goes back to work however often it is sent back, while its runs
+            // change files: one that changed nothing is stuck, and the counts hold it again
+            let moved = ra_context::TaskContext::open(&root, id).handoffs.last().is_some_and(|h| !h.changed.is_empty());
+            let rerun = (count <= allowed || (node.is_absolute() && moved)).then_some((count, allowed.max(count)));
             lines.push(crate::pair::sent_back(&root, id, &node.title, &why, rerun));
             if rerun.is_some() {
                 retry = Some(id);
@@ -2804,6 +2832,7 @@ pub async fn run_in_worktree(store: &Store, id: i64, worker: &Worker) -> anyhow:
 /// When the roadmap cannot be read between waves, or a worktree cannot be made.
 pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
     anyhow::ensure!(width > 0, "the width of a parallel batch is at least one");
+    share_cpu_among_builds();
     let root = workspace_of(store);
     let Some(_lock) = take_walk_lock(&root) else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
@@ -2970,7 +2999,12 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // a card sent back run after run is parked until the next walk: a rerun that
                 // ends in revision at once otherwise starts again at once, and asm ran #131 270
                 // times and #132 234 times in an afternoon, a turn each (2026-11-12)
-                if sent_back {
+                // an absolute card is counted only on runs that changed nothing: work in
+                // progress is never cut, a card going round without touching a file is stuck
+                let task = ra_context::TaskContext::open(&root, id);
+                let idle = task.handoffs.last().is_none_or(|h| h.changed.is_empty());
+                let absolute = store.read(id).await.is_ok_and(|n| n.is_absolute());
+                if sent_back && (!absolute || idle) {
                     let count = reruns.entry(id).or_insert(0);
                     *count += 1;
                     if *count >= RERUNS_A_WALK {
@@ -3266,7 +3300,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // turn of every rerun (runelite #23 resumed at 132k tokens a turn, $7.39 for eleven turns;
     // #28 at 144k, $3.91 for four), where a fresh one cost a few tens of cents
     let resumed = match resume_of(&node, unix_now()) {
-        Ok(Some(_)) if rerun.is_some() && last_largest_turn(&task).is_some_and(|t| t > RERUN_RESUME_LIMIT) => Err(format!(
+        // an absolute card keeps its session whatever its weight: its work is one run
+        Ok(Some(_)) if rerun.is_some() && !node.is_absolute() && last_largest_turn(&task).is_some_and(|t| t > RERUN_RESUME_LIMIT) => Err(format!(
             "the last session ran to {}k tokens a turn, past the {}k a rerun resumes",
             last_largest_turn(&task).unwrap_or(0) / 1000,
             RERUN_RESUME_LIMIT / 1000
@@ -3813,13 +3848,16 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // cap only when one was asked for. No limit stands by default: the person asked for none
     let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
     let router = crate::router::Router::load(&root).ok();
+    // an absolute card works until it is done: no cap restarts it or ends it, the whole run in
+    // one session costing less than the restarts a cap would cut it into
+    let absolute = node.is_absolute();
     let caps = Caps {
-        hard: worker.turns,
-        restart: router.as_ref().and_then(|router| router.worker.turns()),
+        hard: worker.turns.filter(|_| !absolute),
+        restart: router.as_ref().and_then(|router| router.worker.turns()).filter(|_| !absolute),
         // no context cap on a run whose last session hit it while still reading in: the fresh
         // session reads the same files and hits it again, and the card never gets past them
         // (runelite #15: AffineTransform and Arc2D from the JDK, 161k at turn 7)
-        context: router.as_ref().and_then(|router| router.worker.context()).filter(|_| !capped_reading_in(&task)),
+        context: router.as_ref().and_then(|router| router.worker.context()).filter(|_| !capped_reading_in(&task) && !absolute),
     };
     let effort = worker.effort.unwrap_or(node.effort);
     Ok(Prepared { workspace, root, task, project, budget, caps, effort })
