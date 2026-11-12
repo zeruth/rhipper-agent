@@ -36,9 +36,11 @@ pub const SEED_MARK: &str = "# from the seed of ra-gotchas ";
 pub(crate) const ENTRY_HEAD: &str = "[[gotcha]]";
 
 /// The seed's entries as text, each with its id: the blocks [`Catalogue::refresh`] appends, so
-/// a project's file gains the entry as written, comments and quoting included.
+/// a project's file gains the entry as written, comments and quoting included. The lines end in
+/// `\n` whatever the checkout made of the seed's.
 fn seed_blocks() -> Vec<(String, String)> {
-    SEED.split(ENTRY_HEAD)
+    SEED.replace("\r\n", "\n")
+        .split(ENTRY_HEAD)
         .skip(1)
         .map(|rest| {
             let body = rest.trim();
@@ -93,6 +95,13 @@ pub enum Remedy {
     },
     /// The command runs as it is; the hit is only counted.
     Allow,
+    /// The command runs over the crates the run has changed: its workspace flags give way to a
+    /// `-p` for each, unless it matches `unless`; only while the project's check is the full
+    /// suite, which the orchestrator runs after the report, and the run has changed a crate.
+    Crates {
+        #[serde(default, with = "serde_regex_opt")]
+        unless: Option<Regex>,
+    },
 }
 
 /// One entry of the catalogue.
@@ -116,9 +125,51 @@ pub struct Catalogue {
 
 /// What the machine looks like right now, for the remedies that depend on it.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Conditions {
+pub struct Conditions<'a> {
     /// A console holds the binary.
     pub console_running: bool,
+    /// The project's check is the full suite ([`is_suite`]): the orchestrator runs it after the
+    /// report, so a worker that runs it too only waits.
+    pub suite_check: bool,
+    /// The packages the run has changed so far, by name ([`changed_crates`]).
+    pub changed_crates: &'a [String],
+}
+
+/// Whether `command` is a full suite: a `cargo test` that names no package, nor a manifest.
+#[must_use]
+pub fn is_suite(command: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words.starts_with(&["cargo", "test"])
+        && !words.iter().any(|w| w.starts_with("-p") || w.starts_with("--package") || w.starts_with("--manifest-path"))
+}
+
+/// The packages the uncommitted changes of `workspace` fall in: the nearest `Cargo.toml` with a
+/// `[package]` above each changed path, by its name, sorted. Empty outside a git work tree, and
+/// when git cannot run.
+#[must_use]
+pub fn changed_crates(workspace: &Path) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("git").args(["status", "--porcelain", "-uall"]).current_dir(workspace).output() else {
+        return Vec::new();
+    };
+    let mut crates: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.get(3..))
+        // a rename names the path it went to last
+        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"'))
+        .filter_map(|path| package_of(workspace, Path::new(path)))
+        .collect();
+    crates.sort();
+    crates.dedup();
+    crates
+}
+
+/// The name of the package whose manifest is nearest above `path`, within `workspace`.
+fn package_of(workspace: &Path, path: &Path) -> Option<String> {
+    path.ancestors().skip(1).find_map(|dir| {
+        let text = std::fs::read_to_string(workspace.join(dir).join("Cargo.toml")).ok()?;
+        let manifest: toml::Table = toml::from_str(&text).ok()?;
+        manifest.get("package")?.get("name")?.as_str().map(str::to_owned)
+    })
 }
 
 /// What the pre-tool hook does with a command.
@@ -211,6 +262,15 @@ impl Catalogue {
         self.entries.iter().find(|g| g.id == id)
     }
 
+    /// [`Catalogue::command`] for a worker's shell in `workspace`, as the pre-tool hook asks it:
+    /// the changed crates are read from the work tree only for a full suite while it is the
+    /// project's check, as they cost a `git status`.
+    #[must_use]
+    pub fn command_in(&self, workspace: &Path, command: &str, console_running: bool, suite_check: bool) -> Verdict {
+        let changed = if suite_check && is_suite(command) { changed_crates(workspace) } else { Vec::new() };
+        self.command(command, Conditions { console_running, suite_check, changed_crates: &changed })
+    }
+
     /// What to do with a command about to run: the first hint or allow that matches decides;
     /// the rewrites before it compose, each on the command as the one before left it.
     #[must_use]
@@ -234,11 +294,20 @@ impl Catalogue {
                         continue;
                     }
                     current = if *append { format!("{} {insert}", current.trim_end()) } else { insert_after(&current, *after, insert) };
-                    match &mut rewritten {
-                        None => rewritten = Some((gotcha.id.clone(), vec![gotcha.message.clone()])),
-                        Some((_, reasons)) => reasons.push(gotcha.message.clone()),
-                    }
                 }
+                Remedy::Crates { unless } => {
+                    if !conditions.suite_check
+                        || conditions.changed_crates.is_empty()
+                        || unless.as_ref().is_some_and(|u| u.is_match(&current))
+                    {
+                        continue;
+                    }
+                    current = over_crates(&current, conditions.changed_crates);
+                }
+            }
+            match &mut rewritten {
+                None => rewritten = Some((gotcha.id.clone(), vec![gotcha.message.clone()])),
+                Some((_, reasons)) => reasons.push(gotcha.message.clone()),
             }
         }
         match rewritten {
@@ -289,6 +358,32 @@ fn insert_after(command: &str, after: usize, insert: &str) -> String {
         out.push_str(&words[at..].join(" "));
     }
     out
+}
+
+/// The command with its first two words followed by a `-p` for each of `crates`, and its
+/// workspace flags (`--workspace`, `--all`, `--exclude x`) dropped up to the first pipe,
+/// redirect or `--`, past which the words belong to another program.
+fn over_crates(command: &str, crates: &[String]) -> String {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let mut out: Vec<String> = words.iter().take(2).map(|w| (*w).to_owned()).collect();
+    out.extend(crates.iter().map(|c| format!("-p {c}")));
+    let mut own = true;
+    let mut skip_next = false;
+    for word in words.iter().skip(2) {
+        own &= !(*word == "--" || word.starts_with('|') || word.contains('>') || word.starts_with('&') || word.starts_with(';'));
+        if own && std::mem::take(&mut skip_next) {
+            continue;
+        }
+        if own && (matches!(*word, "--workspace" | "--all") || word.starts_with("--exclude=")) {
+            continue;
+        }
+        if own && *word == "--exclude" {
+            skip_next = true;
+            continue;
+        }
+        out.push((*word).to_owned());
+    }
+    out.join(" ")
 }
 
 fn one() -> usize {

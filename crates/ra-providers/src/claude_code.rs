@@ -56,6 +56,9 @@ pub struct ClaudeCode {
     /// The programs of the project's own `[worker] allow` rules, which the allowlist gotcha
     /// does not count against a run.
     own_prefixes: Vec<String>,
+    /// The project's check is the full suite, so the count reads a worker's own run of it as
+    /// the hook narrows it: to the crates the run has changed.
+    suite_check: bool,
 }
 
 impl Default for ClaudeCode {
@@ -124,7 +127,15 @@ impl ClaudeCode {
             catalogue: None,
             env: Vec::new(),
             own_prefixes: Vec::new(),
+            suite_check: false,
         }
+    }
+
+    /// Whether the project's check is the full suite, the orchestrator's after the report.
+    #[must_use]
+    pub fn with_suite_check(mut self, suite: bool) -> Self {
+        self.suite_check = suite;
+        self
     }
 
     /// More permission rules for the worker, a project's own commands, on top of the defaults.
@@ -303,7 +314,7 @@ impl ClaudeCode {
         // which tool each call id belongs to, so only a shell's output is read for gotchas
         let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         // a console holds the binary while var/console.pid is in the workspace
-        let conditions = Conditions { console_running: request.workspace.as_deref().is_some_and(|w| w.join("var/console.pid").exists()) };
+        let console_running = request.workspace.as_deref().is_some_and(|w| w.join("var/console.pid").exists());
         let mut stream = Stream::open(request.workspace.as_deref());
         if let Some(pipe) = child.stdout.take() {
             let mut lines = tokio::io::BufReader::new(pipe).lines();
@@ -331,6 +342,12 @@ impl ClaudeCode {
                     } else {
                         Where::Answer
                     };
+                    // the changed crates cost a git status: asked only of an event that runs cargo test
+                    let changed = match &request.workspace {
+                        Some(workspace) if self.suite_check && line.contains("cargo test") => ra_gotchas::changed_crates(workspace),
+                        _ => Vec::new(),
+                    };
+                    let conditions = Conditions { console_running, suite_check: self.suite_check, changed_crates: &changed };
                     for hit in gotchas_of_event(catalogue, &line, conditions, &mut tools) {
                         // the project's own commands are past the allowlist by design: the
                         // hook lets them run, and the count leaves them alone too
@@ -865,7 +882,7 @@ fn rule_prefix(rule: &str) -> Option<String> {
 fn gotchas_of_event(
     catalogue: &Catalogue,
     line: &str,
-    conditions: Conditions,
+    conditions: Conditions<'_>,
     tools: &mut std::collections::HashMap<String, String>,
 ) -> Vec<Hit> {
     use serde_json::Value;

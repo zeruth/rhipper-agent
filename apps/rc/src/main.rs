@@ -788,14 +788,18 @@ fn hook(event: &str) -> anyhow::Result<()> {
         let path = cwd.join("target").join("debug").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         path.exists() && std::fs::OpenOptions::new().append(true).open(&path).is_err()
     };
-    let conditions = ra_gotchas::Conditions { console_running: locked("rc") || locked("rc-gui") };
+    let console_running = locked("rc") || locked("rc-gui");
     let answer = match event {
         "pre" => {
             let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str).unwrap_or("");
+            let worker = ra_console::router::Router::load(&cwd).map(|r| r.worker).ok();
             // a command the project's `[worker] allow` names is the project's own: the shell
             // allowlist gotcha stands aside for it, the other gotchas do not
-            let own = ra_console::router::Router::load(&cwd).is_ok_and(|r| r.worker.allows(command));
-            let verdict = match catalogue.command(command, conditions) {
+            let own = worker.as_ref().is_some_and(|w| w.allows(command));
+            // the full suite is the orchestrator's when it is the project's check: a worker's
+            // own run of it goes to the crates the run has changed
+            let suite_check = worker.as_ref().is_none_or(ra_console::router::WorkerConfig::checks_the_suite);
+            let verdict = match catalogue.command_in(&cwd, command, console_running, suite_check) {
                 ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. }
                     if own && id == "shell-outside-allowlist" =>
                 {

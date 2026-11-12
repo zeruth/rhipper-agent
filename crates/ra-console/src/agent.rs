@@ -460,6 +460,7 @@ fn connect(route: Route) -> anyhow::Result<Arc<dyn ModelProvider>> {
             match crate::router::Router::load(Path::new(".")) {
                 Ok(router) => {
                     let worker = router.worker;
+                    harness = harness.with_suite_check(worker.checks_the_suite());
                     if !worker.allow.is_empty() {
                         harness = harness.with_allowed(worker.rules());
                     }

@@ -13,6 +13,9 @@
 #                     unless said), or on the end with `append = true`, unless the command
 #                     already matches `unless`; `when = "console-running"` limits it to the time
 #                     a console holds the binary; the rewrites compose, in the order written
+#          crates   — the command runs over the crates the run has changed (`cargo test -p a
+#                     -p b`), its workspace flags dropped, unless it matches `unless`; only
+#                     while the project's check is the full suite and a crate has changed
 #          allow    — the command runs as it is; the hit is only counted
 
 [[gotcha]]
@@ -28,6 +31,14 @@ where = "command"
 pattern = '(^|&&|\|\||;)\s*git\s+(stash|checkout|switch|restore|reset|clean|add|commit|rebase|merge|push|pull|cherry-pick|revert|branch\s+-[dD])\b'
 message = "the git state is the person's: only the read-only git commands run here (status, diff, log, show); leave the working tree as you changed it and report, the person reviews and commits"
 remedy = { kind = "hint" }
+
+# before binary-locked and long-output: the `-p` it brings is what they stand aside for
+[[gotcha]]
+id = "worker-full-suite"
+where = "command"
+pattern = '^\s*cargo\s+test\b'
+message = "the full suite is the orchestrator's: it runs after the report, so a worker that runs it only waits; the command runs the tests of the crates the run has changed (`cargo test -p <crate>`), and the report goes in when they pass"
+remedy = { kind = "crates", unless = '(\s-p\s*\S|\s--package\b|\s--manifest-path\b)' }
 
 [[gotcha]]
 id = "binary-locked"

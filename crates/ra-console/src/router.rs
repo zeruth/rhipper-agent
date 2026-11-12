@@ -166,6 +166,14 @@ impl WorkerConfig {
         self.check.as_deref().map(str::trim).filter(|c| !c.is_empty())
     }
 
+    /// Whether the project's check is the full suite: none named, which is the workspace tests,
+    /// or a `cargo test` over no package. A worker's own run of it is then narrowed to the crates
+    /// it changed, as the orchestrator runs the suite after the report.
+    #[must_use]
+    pub fn checks_the_suite(&self) -> bool {
+        self.check().is_none_or(ra_gotchas::is_suite)
+    }
+
     /// The turns after which a run ends and the card continues fresh, when the table names a
     /// positive count.
     #[must_use]
