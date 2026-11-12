@@ -2216,22 +2216,96 @@ async fn diff_base(project: &Path, root: &Path) -> String {
     git(root, &["merge-base", "HEAD", &main]).await.unwrap_or_else(|_| String::from("HEAD"))
 }
 
+/// What a commit of a card's work is for: the landing of an accepted card, a checkpoint
+/// after a run, or the checkpoint before a catch-up merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitKind {
+    Landing,
+    Checkpoint,
+    BeforeCatchUp,
+}
+
+/// The message of a commit of card `node`'s work, written as a person would: the title as
+/// the subject, then what the card set out to do, what the last run reported it changed and
+/// verified, the reviewer's verdict and the check, and the card's number as a trailer. The
+/// person's rule of 2026-11-12: "the merges and all commits to be more professional /
+/// verbose, rather than cardx blah blah".
+fn card_commit_message(node: &Node, handoff: Option<&ra_context::Handoff>, kind: CommitKind, files: usize) -> String {
+    let subject = match kind {
+        CommitKind::Landing => node.title.clone(),
+        CommitKind::Checkpoint => format!("Checkpoint: {}", node.title),
+        CommitKind::BeforeCatchUp => format!("Checkpoint before catching up with the project: {}", node.title),
+    };
+    let mut body = Vec::new();
+    if let Some(objective) = node.objective.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+        body.push(format!("Objective: {objective}"));
+    }
+    if let Some(handoff) = handoff {
+        // the report's first paragraph: what the run changed and verified, in its own words
+        let report: String = handoff.report.trim().split("\n\n").next().unwrap_or_default().trim().to_owned();
+        if !report.is_empty() {
+            body.push(match kind {
+                CommitKind::Landing => format!("The implementing run reported:\n{report}"),
+                _ => format!("The last run reported:\n{report}"),
+            });
+        }
+        let mut proof = Vec::new();
+        if let Some(verdict) = handoff.verdict.as_deref() {
+            proof.push(format!("Review: {verdict}."));
+        }
+        if !handoff.check.trim().is_empty() {
+            proof.push(format!("Check: {}.", handoff.check.trim()));
+        }
+        if !proof.is_empty() {
+            body.push(proof.join(" "));
+        }
+    }
+    match kind {
+        CommitKind::Landing => body.push(format!("Landed by the walk on acceptance; {files} file(s) in this commit.")),
+        CommitKind::Checkpoint => body.push(format!(
+            "Work in progress, committed after a run so the branch carries it; {files} file(s). The card is not accepted yet."
+        )),
+        CommitKind::BeforeCatchUp => body.push(format!(
+            "Work in progress, committed before the project's branch is merged in; {files} file(s). The card is not accepted yet."
+        )),
+    }
+    body.push(format!("Card: #{}", node.id));
+    format!("{subject}\n\n{}", body.join("\n\n"))
+}
+
+/// The message of the merge commit that lands a card on the project's branch.
+fn merge_commit_message(node: &Node, main: &str, handoff: Option<&ra_context::Handoff>) -> String {
+    let mut body = vec![format!("Merges the branch card/{} into {} on the reviewer's acceptance.", node.id, main)];
+    if let Some(objective) = node.objective.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+        body.push(format!("Objective: {objective}"));
+    }
+    if let Some(verdict) = handoff.and_then(|h| h.verdict.as_deref()) {
+        body.push(format!("Review: {verdict}. The project's check ran on the merged tree before this commit."));
+    }
+    body.push(format!("Card: #{}", node.id));
+    format!("Land {} (#{})\n\n{}", node.title, node.id, body.join("\n\n"))
+}
+
 /// Merges the project's branch into the card's worktree before a run, when the project has
 /// moved on since the branch left it. A clean merge is a line; a conflicting one is left in
 /// the tree with its markers, for the worker to resolve first ([`conflicts_block`] puts the
 /// files at the head of the brief), and the checkpoint after the run completes the merge.
 /// Twenty-one runelite branches from one old base conflicted with main on 2026-11-12 and
 /// could not land; from here a branch is never more than one run behind.
-async fn catch_up_worktree(root: &Path, path: &Path, id: i64) -> Option<String> {
+async fn catch_up_worktree(root: &Path, path: &Path, node: &Node) -> Option<String> {
+    let id = node.id;
     let main = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.ok()?;
     let behind = git(path, &["rev-list", "--count", &format!("HEAD..{main}")]).await.ok()?;
     if behind.trim() == "0" {
         return None;
     }
     // a tree with changes a crash left uncommitted cannot take a merge: they go on the branch first
-    if git(path, &["status", "--porcelain"]).await.is_ok_and(|s| !s.trim().is_empty()) {
+    if let Ok(dirty) = git(path, &["status", "--porcelain"]).await
+        && !dirty.trim().is_empty()
+    {
+        let message = card_commit_message(node, None, CommitKind::BeforeCatchUp, dirty.lines().count());
         let _ = git(path, &["add", "-A"]).await;
-        let _ = git(path, &["commit", "-q", "-m", &format!("wip: before catching up with {main} (#{id})")]).await;
+        let _ = git(path, &["commit", "-q", "-m", &message]).await;
     }
     match git(path, &["merge", "--no-edit", &main]).await {
         Ok(_) => Some(format!("  #{id}: {main} merged into {}, {} commit(s) behind", worktree_branch(id), behind.trim())),
@@ -2269,7 +2343,8 @@ async fn conflicts_block(acting: &Path) -> Option<String> {
 /// worktree would lose, and `git log card/<id>` reads as the card's story. The reviewer reads
 /// the diff from the merge base ([`diff_base`]), so a checkpoint hides nothing from it. A
 /// line when something was committed; nothing when the tree was clean or git refused.
-async fn checkpoint_worktree(root: &Path, id: i64, title: &str) -> Option<String> {
+async fn checkpoint_worktree(root: &Path, node: &Node) -> Option<String> {
+    let id = node.id;
     let path = root.join(WORKTREES_DIR).join(id.to_string());
     if !path.join(".git").exists() {
         return None;
@@ -2278,8 +2353,10 @@ async fn checkpoint_worktree(root: &Path, id: i64, title: &str) -> Option<String
     if dirty.trim().is_empty() {
         return None;
     }
+    let task = ra_context::TaskContext::open(root, id);
+    let message = card_commit_message(node, task.handoffs.last(), CommitKind::Checkpoint, dirty.lines().count());
     git(&path, &["add", "-A"]).await.ok()?;
-    git(&path, &["commit", "-q", "-m", &format!("wip: {title} (#{id})")]).await.ok()?;
+    git(&path, &["commit", "-q", "-m", &message]).await.ok()?;
     Some(format!("  checkpoint: {} file(s) committed on {}", dirty.lines().count(), worktree_branch(id)))
 }
 
@@ -2315,12 +2392,14 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
     let branch = worktree_branch(id);
     let path = root.join(WORKTREES_DIR).join(id.to_string());
     let mut lines = Vec::new();
+    let task = ra_context::TaskContext::open(&root, id);
+    let handoff = task.handoffs.last();
     // the worktree's changes, committed on the card's branch
     if path.join(".git").exists() {
         let dirty = git(&path, &["status", "--porcelain"]).await?;
         if !dirty.trim().is_empty() {
             git(&path, &["add", "-A"]).await?;
-            git(&path, &["commit", "-q", "-m", &format!("{} (#{id})", node.title)]).await?;
+            git(&path, &["commit", "-q", "-m", &card_commit_message(&node, handoff, CommitKind::Landing, dirty.lines().count())]).await?;
             lines.push(format!("committed {} file(s) on {branch}", dirty.lines().count()));
         }
     }
@@ -2328,8 +2407,7 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
     if !has_branch && !path.join(".git").exists() {
         // a run in the project's own tree: its work is in the tree, uncommitted; the files
         // its handoff names are committed by name, the other cards' dirty files left alone
-        let task = ra_context::TaskContext::open(&root, id);
-        let files: Vec<String> = task.handoffs.last().map(|h| h.changed.clone()).unwrap_or_default();
+        let files: Vec<String> = handoff.map(|h| h.changed.clone()).unwrap_or_default();
         let dirty = git(&root, &["status", "--porcelain", "--", "."]).await.unwrap_or_default();
         let own: Vec<&str> = files
             .iter()
@@ -2340,7 +2418,7 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
             let mut args = vec!["add", "--"];
             args.extend(own.iter().copied());
             git(&root, &args).await?;
-            git(&root, &["commit", "-q", "-m", &format!("{} (#{id})", node.title)]).await?;
+            git(&root, &["commit", "-q", "-m", &card_commit_message(&node, handoff, CommitKind::Landing, own.len())]).await?;
             lines.push(format!(
                 "committed {} file(s) of the handoff on {}",
                 own.len(),
@@ -2353,7 +2431,11 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
         if merged {
             lines.push(format!("{branch} is in HEAD already"));
         } else {
-            if let Err(e) = git(&root, &["merge", "--no-edit", &branch]).await {
+            // a merge commit of its own, with the card's story, never a fast-forward: the
+            // project's history shows every landing as one
+            let main = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_else(|_| String::from("HEAD"));
+            let message = merge_commit_message(&node, &main, handoff);
+            if let Err(e) = git(&root, &["merge", "--no-ff", "-m", &message, &branch]).await {
                 let conflicts = git(&root, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
                 let _ = git(&root, &["merge", "--abort"]).await;
                 anyhow::bail!(
@@ -2674,7 +2756,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // the project's branch comes into the card's before the run: a card that
                 // started from an older main lands without a conflict later, and a conflict
                 // there is now is the worker's first job (the brief names the files)
-                lines.extend(catch_up_worktree(&root, &path, id).await);
+                lines.extend(catch_up_worktree(&root, &path, node).await);
                 let runner = worker.clone().with_worktree(path, branch);
                 // the card's span: every progress line of the run carries the card, so six
                 // runs' steps stay apart in the activity file and on the window's cards
@@ -2740,7 +2822,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 let state = node.state;
                 // the run's work goes on the card's branch now, whatever the verdict
                 if state != TaskState::Implemented {
-                    lines.extend(checkpoint_worktree(&root, id, &node.title).await);
+                    lines.extend(checkpoint_worktree(&root, &node).await);
                 }
                 if stop_on_revision && stopped.is_none() && state == TaskState::NeedsRevision {
                     stopped = Some(format!("stopped: #{id} needs revision"));
