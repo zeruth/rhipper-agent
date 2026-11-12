@@ -912,12 +912,19 @@ fn gotchas_of_event(
                 // what a shell said, and what an edit tool said; a file the worker read is not
                 // the machine talking
                 let tool = block.get("tool_use_id").and_then(Value::as_str).and_then(|id| tools.get(id)).map(String::as_str);
+                let content = text_of(block.get("content").unwrap_or(&Value::Null));
                 let place = match tool {
                     Some("Bash" | "PowerShell") => Where::Result,
                     Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit") => Where::Edit,
+                    // a Read the pre hook refused comes back an error with the reason; a file's
+                    // own text never does
+                    Some("Read") if block.get("is_error").and_then(Value::as_bool) == Some(true) => {
+                        hits.extend(catalogue.refused_read(&content));
+                        continue;
+                    }
                     _ => continue,
                 };
-                hits.extend(catalogue.scan(place, &text_of(block.get("content").unwrap_or(&Value::Null))));
+                hits.extend(catalogue.scan(place, &content));
             }
         }
         Some("result") => {
@@ -939,16 +946,41 @@ fn gotchas_of_event(
     hits
 }
 
+/// What the pre hook does with a Read `call` of the harness's hook input, in `root`: the
+/// catalogue's [`Catalogue::read`] on the file, its line count, whether the call names a range,
+/// and the items of the file when `context`, the card's context file, outlines it. A call that
+/// is no Read, or a file that cannot be read, passes.
+#[must_use]
+pub fn read_verdict(catalogue: &Catalogue, root: &Path, context: &str, call: &serde_json::Value) -> Verdict {
+    use serde_json::Value;
+    if call.get("tool_name").and_then(Value::as_str) != Some("Read") {
+        return Verdict::Pass;
+    }
+    let Some(input) = call.get("tool_input") else { return Verdict::Pass };
+    let Some(file) = input.get("file_path").and_then(Value::as_str) else { return Verdict::Pass };
+    let ranged = ["offset", "limit"].iter().any(|key| input.get(key).is_some_and(|v| !v.is_null()));
+    let path = if Path::new(file).is_absolute() { PathBuf::from(file) } else { root.join(file) };
+    let shown = relative(file, Some(root));
+    // the outline names a file as the card does, relative and with forward slashes
+    if ranged || !ra_context::outlined(context).contains(&shown) {
+        return Verdict::Pass;
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else { return Verdict::Pass };
+    let items = ra_context::item_ranges(Path::new(&shown), &text);
+    catalogue.read(ra_gotchas::ReadCall { file: &shown, ranged, lines: text.lines().count(), items: Some(&items) })
+}
+
 /// The `--settings` JSON that routes the harness's tool hooks to `rc hook pre` and `rc hook
-/// post`, so a command the catalogue knows is refused or rewritten before it runs, a result
-/// it knows gets its hint right after, and a whole-file Read is answered with the outline,
-/// with no model call.
+/// post`, so a command the catalogue knows is refused or rewritten before it runs, a whole-file
+/// Read of a long file the card outlines is refused with its items, a result it knows gets its
+/// hint right after, and any other whole-file Read is answered with the outline, with no model
+/// call.
 fn hook_settings(rc: &Path) -> String {
     // the JSON encoder escapes the backslashes of a Windows path itself
     let command = |event: &str| format!("\"{}\" hook {event}", rc.display());
     serde_json::json!({
         "hooks": {
-            "PreToolUse": [{"matcher": "Bash|PowerShell", "hooks": [{"type": "command", "command": command("pre"), "timeout": 10}]}],
+            "PreToolUse": [{"matcher": "Bash|PowerShell|Read", "hooks": [{"type": "command", "command": command("pre"), "timeout": 10}]}],
             "PostToolUse": [{"matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read", "hooks": [{"type": "command", "command": command("post"), "timeout": 10}]}]
         }
     })

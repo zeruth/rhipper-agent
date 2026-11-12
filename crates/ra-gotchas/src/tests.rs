@@ -45,6 +45,28 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
 }
 
 #[test]
+fn a_whole_read_of_a_long_outlined_file_is_denied_with_its_items_and_the_rest_pass() {
+    let catalogue = Catalogue::seed();
+    let items = ["parse 149-151".to_owned(), "command 217-248".to_owned()];
+    let bare = ReadCall { file: "crates/x/src/lib.rs", ranged: false, lines: 1200, items: Some(&items) };
+    match catalogue.read(bare) {
+        Verdict::Deny { id, reason } => {
+            assert_eq!(id, "whole-file-read");
+            assert!(reason.contains("crates/x/src/lib.rs is 1200 lines; its items: parse 149-151, command 217-248"), "{reason}");
+            // the harness hands the reason back as the Read's result, and the stream counts it
+            let hits = catalogue.refused_read(&reason);
+            assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["whole-file-read"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(catalogue.read(ReadCall { ranged: true, ..bare }), Verdict::Pass);
+    assert_eq!(catalogue.read(ReadCall { lines: 300, ..bare }), Verdict::Pass);
+    assert_eq!(catalogue.read(ReadCall { items: None, ..bare }), Verdict::Pass);
+    // a file's own text is no refusal
+    assert!(catalogue.refused_read("fn main() {}\n").is_empty());
+}
+
+#[test]
 fn a_kill_by_pid_is_handed_to_the_person_and_a_process_listing_passes() {
     let catalogue = Catalogue::seed();
     for command in [

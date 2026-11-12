@@ -4,7 +4,8 @@
 //! costs a model call.
 //!
 //! Three places use it. The pre-tool hook asks [`Catalogue::command`] what to do with a command
-//! before it runs. The post-tool hook and the provider's stream reader ask [`Catalogue::scan`]
+//! before it runs, and [`Catalogue::read`] what to do with a whole-file Read of a long file the
+//! card outlines. The post-tool hook and the provider's stream reader ask [`Catalogue::scan`]
 //! what a result or an answer shows. The [`Journal`] keeps every hit, so `rc gotchas` can say
 //! which ones keep coming back and the next run can read [`Catalogue::notes`] about them. The
 //! refused commands no gotcha names grow the catalogue through [`Catalogue::promote`].
@@ -68,6 +69,26 @@ pub enum Where {
     Text,
     /// The worker's final report.
     Answer,
+    /// A Read of a whole file, offset and limit both missing, of a file over [`LONG_FILE`]
+    /// lines the card's outline knows; the pattern is matched against the file's path.
+    Read,
+}
+
+/// A file of more lines than this is read by region once the card's outline knows it.
+pub const LONG_FILE: usize = 400;
+
+/// A Read about to run, as the pre-tool hook sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadCall<'a> {
+    /// The file, as the outline names it.
+    pub file: &'a str,
+    /// The Read names an offset or a limit.
+    pub ranged: bool,
+    /// The file's line count.
+    pub lines: usize,
+    /// The outline's items of the file with their lines, `name 120-159` each; `None` when the
+    /// card's outline does not know the file.
+    pub items: Option<&'a [String]>,
 }
 
 /// What to do about a gotcha.
@@ -247,7 +268,42 @@ impl Catalogue {
         }
     }
 
+    /// What to do with a Read about to run: a whole-file Read of a file over [`LONG_FILE`] lines
+    /// the card's outline knows is denied by the first hint whose pattern matches its path, the
+    /// outline's items in the reason, so the next Read takes a region; a ranged Read, a short
+    /// file and a file the outline does not know pass.
+    #[must_use]
+    pub fn read(&self, call: ReadCall<'_>) -> Verdict {
+        let Some(items) = call.items.filter(|_| !call.ranged && call.lines > LONG_FILE) else { return Verdict::Pass };
+        for gotcha in self.entries.iter().filter(|g| g.place == Where::Read && g.pattern.is_match(call.file)) {
+            match gotcha.remedy {
+                Remedy::Hint => {
+                    let mut reason = format!("{}: {} is {} lines", gotcha.message, call.file, call.lines);
+                    if !items.is_empty() {
+                        let _ = write!(reason, "; its items: {}", items.join(", "));
+                    }
+                    return Verdict::Deny { id: gotcha.id.clone(), reason };
+                }
+                Remedy::Allow => break,
+                Remedy::Rewrite { .. } => {}
+            }
+        }
+        Verdict::Pass
+    }
+
+    /// The Read gotchas a refused Read's result names, each once: the harness answers the call
+    /// with the hook's reason, which opens with the gotcha's message.
+    #[must_use]
+    pub fn refused_read(&self, result: &str) -> Vec<Hit> {
+        self.entries
+            .iter()
+            .filter(|g| g.place == Where::Read && result.contains(&g.message))
+            .map(|g| Hit { id: g.id.clone(), message: g.message.clone(), excerpt: clip(result.lines().next().unwrap_or("").trim(), 160) })
+            .collect()
+    }
+
     /// The gotchas a result or an answer shows, each once, with the first line that matched.
+    #[must_use]
     pub fn scan(&self, place: Where, text: &str) -> Vec<Hit> {
         self.entries
             .iter()

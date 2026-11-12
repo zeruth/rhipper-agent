@@ -770,8 +770,16 @@ fn hook(event: &str) -> anyhow::Result<()> {
     let cwd =
         call.get("cwd").and_then(serde_json::Value::as_str).map_or_else(|| std::env::current_dir().unwrap_or_default(), PathBuf::from);
     // a file the worker read is not the machine talking: no gotcha reads it, but a whole long
-    // file read at once gets the outline instead, catalogue or not
+    // file the card outlines is refused with its items, and any other gets the outline after
     if call.get("tool_name").and_then(serde_json::Value::as_str) == Some("Read") {
+        if event == "pre"
+            && let Some(reason) = ra_console::agent::read_refusal(&cwd, &call)
+        {
+            println!(
+                "{}",
+                serde_json::json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}})
+            );
+        }
         if event == "post"
             && let Some(hint) = ra_console::agent::read_hint(&cwd, &call)
         {
