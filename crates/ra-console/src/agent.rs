@@ -2320,7 +2320,9 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 let runner = worker.clone().with_worktree(path, branch);
                 // the card's span: every progress line of the run carries the card, so six
                 // runs' steps stay apart in the activity file and on the window's cards
-                let span = tracing::info_span!(crate::trace::CARD_SPAN, id);
+                // on the progress target: the filter lets that target through and no other,
+                // and a span the filter drops is no span at all
+                let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id);
                 flight.push((
                     id,
                     Box::pin(
@@ -2345,7 +2347,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 reading += 1;
                 let id = node.id;
                 let reader = worker.clone();
-                let span = tracing::info_span!(crate::trace::CARD_SPAN, id);
+                let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id);
                 flight.push((id, Box::pin(async move { investigate(store, id, &reader).await }.instrument(span)), Seat::Investigate));
             }
         }
