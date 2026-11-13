@@ -36,6 +36,55 @@ fn the_root_row_costs_what_the_ledger_totals() {
 }
 
 #[test]
+fn idle_lines_say_how_the_walk_stopped_what_is_yours_and_what_is_next() {
+    let mut nodes = roadmap();
+    nodes.iter_mut().find(|n| n.id == 5).expect("card 5").depends_on = vec![4];
+    let feed = vec![
+        "1000\tstart #4 Second".to_owned(),
+        "1100\twalk ran 1 card · stopped: #4 needs revision".to_owned(),
+        "1200\tnote unrelated".to_owned(),
+    ];
+    let end = walk_end_of(&feed);
+    assert_eq!(end, Some((Some(1100), Some("#4 needs revision".to_owned()))));
+    let waiting = vec![ra_console::hub::Waiting {
+        id: 4,
+        title: "Second".to_owned(),
+        state: TaskState::NeedsRevision,
+        reason: "the reviewer sent it back 5 times".to_owned(),
+    }];
+    let [walk, yours, next] = idle_lines(&nodes, &[5], &waiting, end.as_ref(), 1100 + 2 * 3600 + 300);
+    assert_eq!(walk, "walk stopped 2h 05m ago: #4 needs revision");
+    assert!(yours.starts_with("yours: #4 Second"), "{yours}");
+    assert!(yours.ends_with("rc set 4 defined"), "{yours}");
+    // the next card waits on the one sent back, and says which
+    assert_eq!(next, "next: #5 Loose · behind #4");
+    let [walk, yours, next] = idle_lines(&nodes, &[], &[], None, 0);
+    assert_eq!(walk, "no walk has run here");
+    assert_eq!(yours, "nothing waits on you");
+    assert_eq!(next, "next: no card is ready");
+}
+
+#[test]
+fn idle_lines_name_the_card_a_queue_row_is_behind() {
+    let mut nodes = roadmap();
+    nodes.iter_mut().find(|n| n.id == 5).expect("card 5").depends_on = vec![4];
+    let (short, why) = queue_reason(&nodes, 5, None, None);
+    assert_eq!(short, "behind #4");
+    assert!(why.contains("#4 Second"), "{why}");
+    let (short, why) = queue_reason(&nodes, 4, Some(3), Some(2));
+    assert_eq!(short, "after #2");
+    assert!(why.contains("#2"), "{why}");
+    assert_eq!(queue_reason(&nodes, 4, Some(4), None).0, "running");
+    let landing = ra_console::hub::Waiting {
+        id: 4,
+        title: "Second".to_owned(),
+        state: TaskState::Implemented,
+        reason: "not landed: main fails".to_owned(),
+    };
+    assert_eq!(landing_row(&landing, Some(0), 180), "#4 Second · landing 3m");
+}
+
+#[test]
 fn a_diff_splits_by_file_in_the_handoffs_order() {
     let output = "diff --git a/b.rs b/b.rs\nindex 1..2 100644\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-old\n+new\n\
                   diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -0,0 +1 @@\n+only\n";

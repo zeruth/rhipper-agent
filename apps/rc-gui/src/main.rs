@@ -1458,6 +1458,8 @@ struct Workspace {
     waiting: Vec<ra_console::hub::Waiting>,
     /// The cards landed today and their cost, read with the allocation.
     landed: (u32, Option<f64>),
+    /// How the walk last ended, read with the allocation while no run is live.
+    walk_end: Option<WalkEnd>,
     store: Store,
     worker: Worker,
     sink: Sink,
@@ -1678,6 +1680,7 @@ impl Workspace {
             since: since::Since::default(),
             waiting: Vec::new(),
             landed: (0, None),
+            walk_end: None,
             job_tx,
             job_done,
             ledger: Ledger::default(),
@@ -4092,11 +4095,16 @@ impl Workspace {
             self.landed = ra_console::allocation::landed(&self.root);
             self.lookback = (ra_console::lookback::landed_since(&self.root), ra_console::lookback::running(&self.root));
             self.since = since::of(&self.root, u32::try_from(self.waiting.len()).unwrap_or(u32::MAX));
+            // only an idle project says how its walk ended, and only it pays for the read
+            if live.is_none() {
+                self.walk_end = walk_end_of(&ra_console::pair::since(&self.root, 0));
+            }
             self.allocation_at = Some(Instant::now());
         }
         let waiting = self.waiting.clone();
         let since_band = self.since.clone();
         let landed = self.landed;
+        let walk_end = self.walk_end.clone();
         let (implementer, runners, place) = self.allocation.clone();
         let root = self.root.clone();
         let mut changed = false;
@@ -4129,6 +4137,12 @@ impl Workspace {
             dragging: None,
             shaking: None,
         };
+        // the landing queue: implemented cards not landed, each with how long it has waited
+        let landing: Vec<(String, String)> = waiting
+            .iter()
+            .filter(|w| w.state == TaskState::Implemented)
+            .map(|w| (landing_row(w, walk.last_changes.get(&w.id).map(|c| c.at), walk.now), w.reason.clone()))
+            .collect();
         let mut out = Walked::default();
         let mut open = false;
         let mut seen_pressed = false;
@@ -4223,9 +4237,14 @@ impl Workspace {
                 // run is live: an idle project's news is what the person comes back for
                 let waiting_lines: Vec<String> = waiting.iter().map(|w| w.line().trim_start().to_owned()).collect();
                 seen_pressed = crate::since::band(ui, &since_band, &waiting_lines);
-                // a project with nothing running is its header line: the queue and the run card
-                // wait for a run, and the room is the working projects'
+                // a project with nothing running is its header line and why it is idle: the
+                // queue and the run card wait for a run, and the room is the working projects'
                 if live.is_none() {
+                    ui.add_space(2.0);
+                    for line in idle_lines(&nodes, &order, &waiting, walk_end.as_ref(), walk.now) {
+                        // a long reason cuts to the card's width and reads whole on hover
+                        ui.add(egui::Label::new(RichText::new(line).small().color(theme::dim())).truncate());
+                    }
                     return;
                 }
                 ui.add_space(6.0);
@@ -4276,13 +4295,18 @@ impl Workspace {
                                     format!("{:>2}", rank + usize::from(running.is_none()))
                                 };
                                 ui.label(RichText::new(mark).monospace().color(theme::warn_text()).strong());
+                                // the row ends with why it is where it is: the card ahead of it is
+                                // the row above, or the running one for the first ready row
+                                let ahead = if rank == 0 { None } else { shown.get(rank - 1).copied().filter(|a| Some(*a) != running) };
+                                let (short, why) = queue_reason(&nodes, id, running, ahead);
                                 ui.vertical(|ui| {
-                                    // the row is held to the column, so a long title truncates
-                                    // instead of running under the badges
-                                    ui.set_max_width(ui.available_width());
+                                    // the row is held to the column less the reason, so a long
+                                    // title truncates instead of running under the badges
+                                    ui.set_max_width((ui.available_width() - QUEUE_REASON_WIDTH).max(80.0));
                                     let row_lane = theme::lane(walk.depths.get(&node.id).copied().unwrap_or(0));
                                     header_row(ui, &nodes, node, &[], row_lane, &walk, &mut out);
                                 });
+                                ui.add(egui::Label::new(RichText::new(short).small().color(theme::dim())).truncate()).on_hover_text(why);
                             });
                             waiting_subtree(ui, &nodes, &waiting, id, 1, &mut placed, &walk, &mut out);
                             rank += 1;
@@ -4300,6 +4324,13 @@ impl Workspace {
                                     shown.push(next);
                                 }
                             }
+                        }
+                        for (row, why) in &landing {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.label(RichText::new(" ⇣").monospace().color(theme::warn_text()).strong());
+                                ui.add(egui::Label::new(RichText::new(row).small().color(theme::dim())).truncate()).on_hover_text(why);
+                            });
                         }
                     });
                     // one run card is exactly as tall as the queue's rows: the rows grow into the
@@ -4350,6 +4381,73 @@ fn card_id_in(text: &str) -> Option<i64> {
     let at = text.find('#')?;
     let digits: String = text[at + 1..].chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
+}
+
+/// How a walk ended: when (a unix time, when the line was stamped), and why it stopped, `None`
+/// for a walk that ran out of ready cards.
+type WalkEnd = (Option<u64>, Option<String>);
+
+/// The latest walk end on a stamped feed (`time<TAB>text`, oldest first); none while no walk
+/// has ended.
+fn walk_end_of(stamped: &[String]) -> Option<WalkEnd> {
+    let split = |line: &String| line.split_once('\t').map_or((None, line.clone()), |(t, text)| (t.parse().ok(), text.to_owned()));
+    let (at, text) = stamped.iter().rev().map(split).find(|(_, text)| text.starts_with("walk ran "))?;
+    Some((at, ra_console::pair::stop_of(&[text])))
+}
+
+/// Why a queue row is where it is, in a word or two for the row's end and whole for its hover:
+/// the run on it, the card it waits on, the card the walk takes before it, or none ahead.
+fn queue_reason(nodes: &[Node], id: i64, running: Option<i64>, ahead: Option<i64>) -> (String, String) {
+    let title = |id: i64| nodes.iter().find(|n| n.id == id).map_or_else(String::new, |n| n.title.clone());
+    if Some(id) == running {
+        return ("running".to_owned(), "a run is on this card now".to_owned());
+    }
+    let open = nodes
+        .iter()
+        .find(|n| n.id == id)
+        .and_then(|node| node.depends_on.iter().copied().find(|d| !nodes.iter().any(|n| n.id == *d && n.state == TaskState::Accepted)));
+    if let Some(dep) = open {
+        return (format!("behind #{dep}"), format!("waits on #{dep} {}, which is not accepted yet", title(dep)));
+    }
+    match (ahead, running) {
+        (Some(prev), _) => (format!("after #{prev}"), format!("the walk takes #{prev} {} before it", title(prev))),
+        (None, Some(_)) => ("next".to_owned(), "the walk takes it when a runner frees".to_owned()),
+        (None, None) => ("next".to_owned(), "the next card a walk takes; no walk is running".to_owned()),
+    }
+}
+
+/// A card in the landing queue as its row reads: the card, and how long it has waited to land
+/// since its last state change.
+fn landing_row(waiting: &ra_console::hub::Waiting, changed_at: Option<u64>, now: u64) -> String {
+    let age = changed_at.map_or_else(String::new, |at| format!(" {}", ra_roadmap::history::age(now.saturating_sub(at))));
+    format!("#{} {} · landing{age}", waiting.id, waiting.title)
+}
+
+/// What an idle project says in place of its queue: how its walk last ended (or that none has
+/// run), what waits on the person with the command that puts it back, and what is next.
+fn idle_lines(nodes: &[Node], order: &[i64], waiting: &[ra_console::hub::Waiting], walk_end: Option<&WalkEnd>, now: u64) -> [String; 3] {
+    let ago = |at: &Option<u64>| at.map_or_else(String::new, |at| format!(" {} ago", ra_roadmap::history::age(now.saturating_sub(at))));
+    let walk = match walk_end {
+        None => "no walk has run here".to_owned(),
+        Some((at, Some(why))) => format!("walk stopped{}: {why}", ago(at)),
+        Some((at, None)) => format!("walk ended{}: no card was ready", ago(at)),
+    };
+    let yours = match waiting {
+        [] => "nothing waits on you".to_owned(),
+        [first, rest @ ..] => {
+            let more = if rest.is_empty() { String::new() } else { format!(" (+{} more)", rest.len()) };
+            format!("yours: #{} {} · {} · {}{more}", first.id, first.title, first.short(), first.requeue())
+        }
+    };
+    let next = order.first().map_or_else(
+        || "next: no card is ready".to_owned(),
+        |id| {
+            let title = nodes.iter().find(|n| n.id == *id).map_or("", |n| n.title.as_str());
+            let (short, _) = queue_reason(nodes, *id, None, None);
+            if short.starts_with("behind") { format!("next: #{id} {title} · {short}") } else { format!("next: #{id} {title}") }
+        },
+    );
+    [walk, yours, next]
 }
 
 impl Drop for Workspace {
@@ -4518,6 +4616,9 @@ fn waiting_on(nodes: &[Node]) -> HashMap<i64, Vec<i64>> {
     }
     map
 }
+
+/// The width a queue row keeps at its end for its reason (`after #123`).
+const QUEUE_REASON_WIDTH: f32 = 72.0;
 
 /// How many waiting cards a queue row shows under it before `+N more`, and how deep the tree goes.
 const WAITING_SHOWN: usize = 3;
