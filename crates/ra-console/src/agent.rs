@@ -3796,6 +3796,53 @@ pub async fn run_in_worktree(store: &Store, id: i64, worker: &Worker) -> anyhow:
     run(store, id, &worker.clone().with_worktree(path, branch)).await
 }
 
+/// The file two lists of paths share, a directory counting for the files under it.
+fn shared_file(a: &[String], b: &[String]) -> Option<String> {
+    let norm = |p: &str| p.trim().replace('\\', "/").trim_end_matches('/').to_owned();
+    let (a, b): (Vec<String>, Vec<String>) = (a.iter().map(|p| norm(p)).collect(), b.iter().map(|p| norm(p)).collect());
+    a.iter().filter(|x| !x.is_empty()).find_map(|x| {
+        b.iter()
+            .find(|y| !y.is_empty() && (x == *y || x.starts_with(&format!("{y}/")) || y.starts_with(&format!("{x}/"))))
+            .map(|y| if x.len() >= y.len() { x.clone() } else { y.clone() })
+    })
+}
+
+/// The ready cards in the order they should start, each with the running (or earlier-starting)
+/// card it shares a file with: those that share none first, in their order, then the held-back
+/// ones. Two cards on the same files land second with a conflict and rerun, so the dispatcher
+/// takes the next card that does not overlap while it has one.
+pub(crate) fn spread<'a>(ready: &'a [Node], nodes: &[Node], running: &[(i64, Vec<String>)]) -> Vec<(&'a Node, Option<(i64, String)>)> {
+    let mut claims = running.to_vec();
+    let mut left: Vec<&Node> = ready.iter().collect();
+    let mut order = Vec::new();
+    while !left.is_empty() {
+        let blocker = |n: &Node| {
+            let files = ra_roadmap::tree::files_of(nodes, n).0;
+            claims.iter().find_map(|(id, held)| shared_file(files, held).map(|f| (*id, f)))
+        };
+        let at = left.iter().position(|n| blocker(n).is_none()).unwrap_or(0);
+        let node = left.remove(at);
+        let held_back = blocker(node);
+        claims.push((node.id, ra_roadmap::tree::files_of(nodes, node).0.to_vec()));
+        order.push((node, held_back));
+    }
+    order
+}
+
+/// The files each card in `ids` names or has changed on its branch, as the dispatcher reads them.
+async fn claimed_files(root: &Path, nodes: &[Node], ids: &[i64]) -> Vec<(i64, Vec<String>)> {
+    let mut claims = Vec::new();
+    for &id in ids {
+        let mut files: Vec<String> =
+            nodes.iter().find(|n| n.id == id).map(|n| ra_roadmap::tree::files_of(nodes, n).0.to_vec()).unwrap_or_default();
+        if let Ok(changed) = git(root, &["diff", "--name-only", &format!("HEAD...card/{id}")]).await {
+            files.extend(changed.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned));
+        }
+        claims.push((id, files));
+    }
+    claims
+}
+
 /// The run of one card in a parallel walk, polled on the walk's own task.
 type InFlight<'a> = std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + 'a>>;
 
@@ -3842,6 +3889,8 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     // the cards parked past [`RERUNS_A_WALK`] or failed in this walk; the count of the rounds is
     // the card's context's, so a restarted window counts on
     let mut parked: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    // the held-back cards already said on the feed, so a wait is said once, not every tick
+    let mut said_waiting: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
     loop {
         // `stop` from the console or the window: nothing new starts, and the walk ends when
         // the runs it is in have ended
@@ -3877,7 +3926,24 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 flight.iter().filter(|(_, _, s)| *s == Seat::Investigate).map(|(id, _, _)| *id).collect();
             let (waiting, bare): (Vec<Node>, Vec<Node>) = bare.into_iter().partition(|n| investigating.contains(&n.id));
             let mut taken = std::collections::HashSet::new();
-            for node in briefed.iter().chain(&bare).chain(&waiting) {
+            // a card that shares a file with one running waits for a card that does not; when
+            // every ready card overlaps, the first runs anyway so no slot sits idle
+            let queue: Vec<Node> = briefed.iter().chain(&bare).chain(&waiting).cloned().collect();
+            let running: Vec<i64> = flight.iter().filter(|(_, _, s)| matches!(s, Seat::Build(_))).map(|(id, _, _)| *id).collect();
+            let claims = claimed_files(&root, &roadmap.nodes, &running).await;
+            let order = spread(&queue, &roadmap.nodes, &claims);
+            let free_ready = order.iter().any(|(_, held)| held.is_none());
+            let mut started_held = false;
+            for (node, held) in order {
+                if let Some((behind, file)) = held {
+                    if free_ready || started_held {
+                        if said_waiting.insert((node.id, behind)) {
+                            crate::pair::event(&root, &format!("#{} waits behind #{behind}: both name {file}", node.id));
+                        }
+                        continue;
+                    }
+                    started_held = true;
+                }
                 let kind =
                     Pool::kind_of(&router.route(node, crate::router::IMPLEMENTER, &worker.model, rejections(&root, node.id)).0.model);
                 let held = flight.iter().filter(|(_, _, s)| *s == Seat::Build(kind)).count();

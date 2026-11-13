@@ -1319,6 +1319,34 @@ async fn three_cards(dir: &std::path::Path, passing: bool) -> Store {
 }
 
 #[tokio::test]
+async fn a_card_overlapping_a_running_one_waits_for_one_that_does_not_and_runs_when_alone() {
+    use ra_roadmap::store::Card;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    let mut ids = Vec::new();
+    for (title, file) in [("Running", "src/a.rs"), ("Same", "src/a.rs"), ("Other", "src/b.rs")] {
+        let files = [file.to_owned()];
+        let card = Card { files: &files, ..Card::new() };
+        ids.push(store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, title, &card).await.unwrap());
+    }
+    let nodes = store.load().await.unwrap().nodes;
+    let by = |id: i64| nodes.iter().find(|n| n.id == id).unwrap().clone();
+    let running = vec![(ids[0], vec!["src/a.rs".to_owned()])];
+    // #3 overlaps the running #2: #4 goes first, and #3 is named as waiting behind it
+    let ready = [by(ids[1]), by(ids[2])];
+    let order = crate::agent::spread(&ready, &nodes, &running);
+    assert_eq!(order[0].0.id, ids[2]);
+    assert!(order[0].1.is_none());
+    assert_eq!(order[1].0.id, ids[1]);
+    assert_eq!(order[1].1.as_ref().map(|(id, _)| *id), Some(ids[0]));
+    // alone, it is still first in line to run
+    let alone = [by(ids[1])];
+    let order = crate::agent::spread(&alone, &nodes, &running);
+    assert_eq!(order.len(), 1);
+    assert_eq!(order[0].0.id, ids[1]);
+}
+
+#[tokio::test]
 async fn a_walk_judges_a_landed_cards_saving_on_the_ledger_before_and_after_its_run() {
     use ra_roadmap::store::Card;
     let dir = tempfile::tempdir().unwrap();
