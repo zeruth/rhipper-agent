@@ -117,6 +117,15 @@ pattern = '^\s*(&\s+)?(\.[\\/])?(gw\.ps1|gradlew(\.bat)?)\b|^\s*cargo\s+(build|t
 message = "a build takes one of the machine's build slots, shared by every project: the command runs under `rc hold --`, which waits its turn while they are all taken, then runs it as written"
 remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 
+# the last of the command hints: a pipeline or `;` chain the shape table allows stands aside, one
+# it refuses is named here instead of logging as unmatched
+[[gotcha]]
+id = "piped-or-chained"
+where = "command"
+pattern = '\|\s*(tail|head)\b|2>&1\s*\||;'
+message = "this pipeline or chain was refused: run each command alone, one per call, and read its output with Read or cut it with the command's own flags"
+remedy = { kind = "hint" }
+
 [[gotcha]]
 id = "binary-locked-result"
 where = "result"

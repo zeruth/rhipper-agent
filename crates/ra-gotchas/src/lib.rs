@@ -183,6 +183,16 @@ pub const ALLOWLIST_HINT: &str = "shell-outside-allowlist";
 /// The gotcha that denies a git command that writes the git state.
 const GIT_WRITES: &str = "git-writes";
 
+/// The gotcha that names the single-command form for a refused pipeline or `;` chain.
+const PIPED_OR_CHAINED: &str = "piped-or-chained";
+
+/// Whether the shape table allows every part of `command` in either shell.
+fn shaped_allowed(command: &str) -> bool {
+    [shape::Shell::Bash, shape::Shell::PowerShell]
+        .into_iter()
+        .any(|shell| matches!(shape::judge(command, shell, Path::new("."), &|_| false), shape::Shape::Allowed))
+}
+
 /// Whether `command` is a full suite: a `cargo test` that names no package, nor a manifest.
 #[must_use]
 pub fn is_suite(command: &str) -> bool {
@@ -501,6 +511,11 @@ impl Catalogue {
                             .find_iter(&current)
                             .all(|m| m.as_str().ends_with(|c: char| c.is_ascii_alphabetic()) && current[m.end()..].starts_with('-')) =>
                 {
+                    continue;
+                }
+                // a pipeline or chain the shape table allows runs; only a refused one is named. The
+                // command as written is judged, and a rewritten one is the rewrite's to answer
+                Remedy::Hint if gotcha.id == PIPED_OR_CHAINED && (conditions.allowed || rewritten.is_some() || shaped_allowed(command)) => {
                     continue;
                 }
                 Remedy::Hint => return Verdict::Deny { id: gotcha.id.clone(), reason: gotcha.message.clone() },

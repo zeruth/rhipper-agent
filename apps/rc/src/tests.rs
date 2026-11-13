@@ -272,6 +272,24 @@ fn gate_allows_listed_test_binary() {
 }
 
 #[test]
+fn gate_names_piped_or_chained() {
+    let catalogue = ra_gotchas::Catalogue::seed();
+    let conditions = ra_gotchas::Conditions { held_packages: &[], suite_check: false, changed_crates: &[], allowed: false };
+    for refused in ["curl http://x | tail -n 3", "curl http://x 2>&1 | head", "curl http://x; curl http://y"] {
+        match catalogue.command(refused, conditions) {
+            ra_gotchas::Verdict::Deny { id, reason } => {
+                assert_eq!(id, "piped-or-chained", "{refused}");
+                assert!(reason.contains("each command alone"), "{reason}");
+            }
+            other => panic!("{refused}: {other:?}"),
+        }
+    }
+    // a pipeline the shape table allows is no refusal
+    let allowed = catalogue.command("git status; git diff | tail -n 5", conditions);
+    assert!(!matches!(allowed, ra_gotchas::Verdict::Deny { .. }), "{allowed:?}");
+}
+
+#[test]
 fn rewrite_keeps_the_whole_tool_input_and_the_higher_timeout() {
     let call = serde_json::json!({"tool_input": {"command": "cargo build", "description": "build", "timeout": 300_000}});
     let input = rewritten_input(&call, "rc hold -- cargo build".to_string());
