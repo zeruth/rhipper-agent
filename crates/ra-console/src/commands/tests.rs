@@ -2828,7 +2828,9 @@ async fn review_kinds_a_work_point_beside_an_environment_one_sends_the_card_back
         "needs_revision\n- 1. [environment] tests/fixtures/upx.exe: the fixture needs UPX\n- 2. [work] src/load.rs: no test covers the empty fixture",
     )
     .await;
-    assert!(out[0].contains("needs revision (substantive) · 2 point(s)"), "{out:?}");
+    // the environment point leaves the card; the work point alone reruns it
+    assert!(out[0].contains("needs revision (substantive) · 1 point(s)"), "{out:?}");
+    assert!(out.contains(&"  person: 1. [environment] tests/fixtures/upx.exe: the fixture needs UPX".to_owned()), "{out:?}");
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
     let roadmap = store.load().await.unwrap();
     assert_eq!(crate::agent::walk_order(&roadmap.nodes, &roadmap.gambits, false), vec![2]);
@@ -2873,6 +2875,57 @@ async fn review_kinds_a_second_round_brief_holds_the_first_verdict_and_the_check
     assert!(second.contains("- 1. [work] hello.txt: the greeting lacks a newline"), "{second}");
     assert!(second.contains("## Check output\n") && second.contains("test result: ok. 7 passed"), "{second}");
     assert!(seen[5].messages[0].content.contains("N. [work|card|environment] file: what"), "{}", seen[5].messages[0].content);
+}
+
+#[tokio::test]
+async fn review_kinds_mixed_points_rerun_the_work_point_alone_and_the_rest_leave_the_card() {
+    let dir = tempfile::tempdir().unwrap();
+    git_ok(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join(".gitignore"), "var/\nrhipper.md\n").unwrap();
+    std::fs::write(dir.path().join("hello.txt"), "old\n").unwrap();
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "base"]);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let write = |content: &str| ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: format!(r#"{{"path":"hello.txt","content":"{content}"}}"#),
+    };
+    let environment = "1. [environment] tests/upx.exe: the fixture needs UPX";
+    let work = "2. [work] hello.txt: the greeting lacks a newline";
+    let card = "3. [card] rhipper.md: the acceptance asks for a CI run";
+    let script = Scripted::new(vec![
+        says("", vec![write("hello")]),
+        says("wrote `hello.txt`", vec![]),
+        says(&format!("needs_revision\n- {environment}\n- {work}\n- {card}"), vec![]),
+        says("", vec![write("hello\\n")]),
+        says("added the newline to `hello.txt`", vec![]),
+        says("accepted", vec![]),
+    ]);
+    let check: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "test result: ok. 7 passed\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(check);
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("needs revision (substantive) · 1 point(s)")), "{out:?}");
+    // the environment point is the person's, on the card's notes, past the block a rerun reads
+    let notes = store.read(2).await.unwrap().notes.unwrap();
+    assert!(notes.contains(&format!("- {work}\nperson: {environment}\nfollow-up #3: {card}")), "{notes}");
+    // the card point is a follow-up card under the same parent, waiting on this one
+    let follow = store.read(3).await.unwrap();
+    assert_eq!(follow.parent, Some(1));
+    assert_eq!(follow.depends_on, vec![2]);
+    assert_eq!(follow.objective.as_deref(), Some("rhipper.md: the acceptance asks for a CI run"));
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(out.iter().any(|l| l.starts_with("✓ #2 Probe accepted")), "{out:?}");
+    let seen = script.seen.lock();
+    assert_eq!(seen.len(), 6);
+    let rerun = &seen[3].messages.last().unwrap().content;
+    assert!(rerun.contains(work), "{rerun}");
+    assert!(!rerun.contains("[environment]") && !rerun.contains("[card]"), "{rerun}");
+    // the second review is told which points left the card
+    let second = &seen[5].messages.last().unwrap().content;
+    assert!(second.contains("## Points that left the card\n"), "{second}");
+    assert!(second.contains(&format!("person: {environment}\nfollow-up #3: {card}")), "{second}");
 }
 
 #[test]

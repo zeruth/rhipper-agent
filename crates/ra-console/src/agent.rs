@@ -12,7 +12,7 @@ use ra_providers::local::Role;
 use ra_providers::{CompletionRequest, Message, ModelProvider, ProviderError, TurnUsage, Usage};
 use ra_roadmap::history::Source;
 use ra_roadmap::model::{Effort, Estimate, Gambit, GambitState, Node, NodeKind, TaskState};
-use ra_roadmap::store::Store;
+use ra_roadmap::store::{Card, Store};
 use ra_roadmap::tree;
 use ra_usage::{Entry, Totals, UsageStore};
 use tracing::Instrument as _;
@@ -1234,7 +1234,84 @@ pub fn point_kind(point: &str) -> Option<PointKind> {
 /// fixtures another toolchain builds).
 #[must_use]
 pub fn for_the_person(points: &[String]) -> bool {
-    !points.is_empty() && points.iter().all(|point| matches!(point_kind(point), Some(PointKind::Card | PointKind::Environment)))
+    !points.is_empty() && points.iter().all(|point| leaves_the_card(point))
+}
+
+/// Whether a point is the card's or the environment's, which no rerun settles.
+fn leaves_the_card(point: &str) -> bool {
+    matches!(point_kind(point), Some(PointKind::Card | PointKind::Environment))
+}
+
+/// The prefix of a notes line that hands an environment point of a mixed rejection to the person.
+const PERSON_POINT: &str = "person: ";
+
+/// The prefix of a notes line that names the follow-up card a card point of a mixed rejection
+/// became: `follow-up #N: <point>`.
+const FOLLOW_UP_POINT: &str = "follow-up #";
+
+/// The characters of a card point a follow-up card takes for its title.
+const FOLLOW_UP_TITLE: usize = 80;
+
+/// A mixed rejection split at its source: the work points (and the untagged ones) stay the
+/// rerun's; each environment point goes on the notes as a `person:` line, and each card point
+/// becomes a follow-up card under the card's parent, waiting on this one, with the point as its
+/// objective. The verdict of the work points and the notes lines of the points that left; a
+/// list of one kind is left whole. Without the split the whole list rode every rerun, and the
+/// worker spent its turns on points only the person could settle (runelite passed 10 of 72).
+async fn split_points(store: &Store, node: &Node, verdict: Verdict) -> (Verdict, Vec<String>) {
+    let Verdict::NeedsRevision(points) = verdict else {
+        return (verdict, Vec::new());
+    };
+    if for_the_person(&points) || !points.iter().any(|point| leaves_the_card(point)) {
+        return (Verdict::NeedsRevision(points), Vec::new());
+    }
+    let (mut work, mut left) = (Vec::new(), Vec::new());
+    for point in points {
+        match tagged(&point) {
+            Some((_, PointKind::Environment, _)) => left.push(format!("{PERSON_POINT}{point}")),
+            Some((_, PointKind::Card, what)) => {
+                let title: String = what.chars().take(FOLLOW_UP_TITLE).collect();
+                let card = Card { objective: Some(what), waits_on: &[node.id], ..Card::new() };
+                match store.insert_card(node.parent, NodeKind::Task, title.trim(), &card).await {
+                    Ok(follow) => left.push(format!("{FOLLOW_UP_POINT}{follow}: {point}")),
+                    Err(e) => {
+                        // a point no card could take still leaves the rerun: the person reads it
+                        tracing::warn!("#{} could not add a follow-up card for {point}: {e:#}", node.id);
+                        left.push(format!("{PERSON_POINT}{point}"));
+                    }
+                }
+            }
+            _ => work.push(point),
+        }
+    }
+    (Verdict::NeedsRevision(work), left)
+}
+
+/// Whether a line of a card's notes is a point that left the card ([`split_points`]).
+fn is_left_point(line: &str) -> bool {
+    let point = line.strip_prefix(PERSON_POINT).or_else(|| {
+        let (number, point) = line.strip_prefix(FOLLOW_UP_POINT)?.split_once(": ")?;
+        number.parse::<i64>().is_ok().then_some(point)
+    });
+    point.is_some_and(leaves_the_card)
+}
+
+/// The points that left the card, each once, in the order of its notes.
+fn left_points(notes: &str) -> Vec<&str> {
+    let mut left: Vec<&str> = Vec::new();
+    for line in notes.lines().filter(|line| is_left_point(line)) {
+        if !left.contains(&line) {
+            left.push(line);
+        }
+    }
+    left
+}
+
+/// `report` with the points that left the card in `notes` ahead of it, so a rerun's notes keep
+/// them for the next reviewer, who is told not to raise them again.
+fn with_left_points(notes: Option<&str>, report: &str) -> String {
+    let left: Vec<&str> = left_points(notes.unwrap_or_default()).into_iter().filter(|line| !report.contains(line)).collect();
+    if left.is_empty() { report.to_owned() } else { format!("{}\n\n{report}", left.join("\n")) }
 }
 
 /// A point's number, kind and text after the tag: `3. [work] src/a.rs: x`, `3) [Work] …` and
@@ -1495,14 +1572,21 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
         }
     };
     worker.record_as(&model, Some("reviewer"), Some(id), &answer.usage, answer.turns).await;
-    let verdict = verdict_of(&answer.text);
+    let (verdict, left) = split_points(store, &node, verdict_of(&answer.text)).await;
     // the points' fingerprint rides the handoff's verdict, so a run that changed nothing and drew
     // the same points again is held on that round, not run a third time
     let print = match &verdict {
         Verdict::NeedsRevision(points) => format!("{}{}", ra_context::POINTS_MARK, points_fingerprint(points)),
         Verdict::Accepted => String::new(),
     };
-    let Judged { state, head, said, trivial } = judged(&verdict, id, &model, &root, accepted);
+    let Judged { state, mut head, said, trivial } = judged(&verdict, id, &model, &root, accepted);
+    // the points that left the card follow the rerun's, past the block the rerun reads
+    if !left.is_empty() {
+        head = format!("{head}\n{}", left.join("\n"));
+        for line in &left {
+            crate::pair::event(&root, &format!("#{id} {line}"));
+        }
+    }
     // the verdict rides the run's handoff: a card is offered for acceptance only with one
     // attached, and the weight of a rejection retags the outcome, a trivial one for a cheap
     // pass, a substantive one for the person. A card reviewed before any run has no handoff,
@@ -1543,6 +1627,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     if let Verdict::NeedsRevision(points) = &verdict {
         lines.extend(points.iter().map(|point| format!("  - {point}")));
     }
+    lines.extend(left.iter().map(|line| format!("  {line}")));
     Ok((lines, trivial))
 }
 
@@ -1596,6 +1681,14 @@ fn last_round(task: &ra_context::TaskContext, node: &Node) -> String {
     if let Some(verdict) = last_verdict {
         let _ =
             writeln!(text, "\n## Your last verdict on this card\nKeep the number of every point that still stands.\n{}", verdict.trim());
+    }
+    let left = left_points(node.notes.as_deref().unwrap_or_default());
+    if !left.is_empty() {
+        let _ = writeln!(
+            text,
+            "\n## Points that left the card\nThese went to the person or to a follow-up card; do not raise them again.\n{}",
+            left.join("\n")
+        );
     }
     text
 }
@@ -5060,14 +5153,16 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         if let Some(review) = carried_review(node.notes.as_deref()) {
             report = format!("{review}\n\n{report}");
         }
-        store.set_notes(id, &report).await?;
+        store.set_notes(id, &with_left_points(node.notes.as_deref(), &report)).await?;
         store.set_state_by(id, TaskState::Blocked, Source::Run).await?;
         check_line = format!("{check_line} · blocked: {reason}");
         let text = format!("#{id} blocked: {reason}; a person sets it defined again");
         tracing::warn!("{text}");
         crate::pair::event(&root, &text);
     } else if passed {
-        store.set_notes(id, &report).await?;
+        // the points that left the card stay on its notes, so its next reviewer does not raise
+        // them again
+        store.set_notes(id, &with_left_points(node.notes.as_deref(), &report)).await?;
         store.set_state_by(id, TaskState::Implemented, Source::Run).await?;
     } else {
         // a rerun that fails its check leaves no new verdict, so the reviewer's points stay at
@@ -5076,8 +5171,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         if let Some(review) = carried_review(node.notes.as_deref()) {
             report = format!("{review}\n\n{report}");
         }
-        if report != session.text {
-            store.set_notes(id, &report).await?;
+        let kept = with_left_points(node.notes.as_deref(), &report);
+        if kept != session.text {
+            store.set_notes(id, &kept).await?;
         }
         store.set_state_by(id, TaskState::NeedsRevision, Source::Run).await?;
     }
@@ -7695,7 +7791,8 @@ pub(crate) fn judgment_of(notes: &str) -> Vec<String> {
                 }
             }
             blocks.push(clip_middle(&block));
-        } else if !first.trim().is_empty() {
+        } else if !first.trim().is_empty() && !is_left_point(first) {
+            // the points that left the card are not the rerun's, and the judgment goes on past them
             break;
         }
     }
