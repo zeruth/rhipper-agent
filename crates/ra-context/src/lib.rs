@@ -812,7 +812,20 @@ pub struct TaskContext {
     /// The regions the last session read, as [`regions`] renders them, built afresh each run;
     /// the prompt opens with them. Not kept in the file: they are the files' current lines.
     pub regions: String,
+    /// The output of the last run's checks, clipped to its tail ([`TaskContext::set_check_output`]):
+    /// the reviewer reads it, so a point never asks for what the check already shows. Kept in
+    /// the file before the handoffs; empty until a run checked the card.
+    pub check_output: String,
 }
+
+/// The heading of the last run's check output in the file and the review brief.
+pub const CHECK_OUTPUT_HEADING: &str = "## Check output";
+
+/// How many characters of the check output are kept: the tail, where the summary is.
+const CHECK_OUTPUT_ROOM: usize = 4000;
+
+/// The indent of the check output's lines in the file, so no line of it reads as a heading.
+const CHECK_OUTPUT_INDENT: &str = "    ";
 
 /// The heading under which the last session's regions open the prompt.
 pub const REGIONS_HEADING: &str = "## Read by the last session";
@@ -966,12 +979,37 @@ impl TaskContext {
         workspace.join(CONTEXT_DIR).join(format!("{id}.md"))
     }
 
-    /// The context of task `id`: the handoffs of its file when there is one, nothing else yet;
-    /// the run sets the brief and the outlines.
+    /// The context of task `id`: the handoffs, the review and the check output of its file when
+    /// there is one; the run sets the brief and the outlines. A save after an open keeps the
+    /// review and the check output: the reviewer of the next round reads them.
     #[must_use]
     pub fn open(workspace: &Path, id: i64) -> Self {
-        let handoffs = std::fs::read_to_string(Self::path(workspace, id)).map(|text| parse_handoffs(&text)).unwrap_or_default();
-        Self { id, brief: String::new(), outlines: String::new(), handoffs, review: None, regions: String::new() }
+        let text = std::fs::read_to_string(Self::path(workspace, id)).unwrap_or_default();
+        let review = section_of(&text, REVIEW_HEADING).filter(|review| !review.is_empty());
+        let check_output = section_of(&text, CHECK_OUTPUT_HEADING)
+            .map(|output| output.lines().map(|line| line.strip_prefix(CHECK_OUTPUT_INDENT).unwrap_or(line)).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+        Self {
+            id,
+            brief: String::new(),
+            outlines: String::new(),
+            handoffs: parse_handoffs(&text),
+            review,
+            regions: String::new(),
+            check_output,
+        }
+    }
+
+    /// Keeps the output of a run's checks, clipped to its last [`CHECK_OUTPUT_ROOM`] characters.
+    pub fn set_check_output(&mut self, output: &str) {
+        let output = output.trim();
+        let count = output.chars().count();
+        self.check_output = if count <= CHECK_OUTPUT_ROOM {
+            output.to_owned()
+        } else {
+            let tail: String = output.chars().skip(count - CHECK_OUTPUT_ROOM).collect();
+            format!("… the head of the output is clipped\n{tail}")
+        };
     }
 
     /// The text a run sends the worker: the regions the last session read, when it left any,
@@ -1071,6 +1109,12 @@ impl TaskContext {
         // the review rides before the handoffs, where the reader of the handoffs skips it
         if let Some(review) = &self.review {
             let _ = write!(text, "\n{REVIEW_HEADING}\n\n{}\n", review.trim());
+        }
+        if !self.check_output.trim().is_empty() {
+            let _ = writeln!(text, "\n{CHECK_OUTPUT_HEADING}\n");
+            for line in self.check_output.trim().lines() {
+                let _ = writeln!(text, "{CHECK_OUTPUT_INDENT}{line}");
+            }
         }
         for handoff in &self.handoffs {
             text.push('\n');
@@ -1186,6 +1230,15 @@ fn parse_warnings(text: &str) -> Vec<String> {
         }
     }
     warnings
+}
+
+/// The text of the last `heading` section before the handoffs of a task's file, to the next
+/// heading, trimmed; `None` when the file has no such section.
+fn section_of(text: &str, heading: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().take_while(|line| !line.starts_with("## Handoff ")).collect();
+    let start = lines.iter().rposition(|line| line.trim_end() == heading)? + 1;
+    let body: Vec<&str> = lines[start..].iter().take_while(|line| !line.starts_with("## ")).copied().collect();
+    Some(body.join("\n").trim_matches('\n').trim_end().to_owned())
 }
 
 /// The handoffs of a task's file, oldest first; a file without any gives none.

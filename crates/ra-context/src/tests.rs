@@ -299,11 +299,41 @@ fn a_rerun_after_a_reject_quotes_the_review_block_and_a_fresh_card_has_none() {
     task.save(root).unwrap();
     let file = std::fs::read_to_string(TaskContext::path(root, 9)).unwrap();
     assert!(file.contains("\n## Review\n\nreview by z-ai/glm-5.3-flash: needs revision (substantive)\n- hello.txt"), "{file}");
-    // the section does not read back as a handoff, nor into one
+    // the section does not read back as a handoff, nor into one; it reads back as the review,
+    // which the reviewer of the next round reads as its last verdict
     let again = TaskContext::open(root, 9);
     assert_eq!(again.handoffs.len(), 1);
     assert_eq!(again.handoffs[0].report, "wrote hello.txt");
-    assert_eq!(again.review, None);
+    assert_eq!(again.review.as_deref(), task.review.as_deref());
+}
+
+#[test]
+fn the_check_output_is_kept_clipped_to_its_tail_and_reads_back_apart_from_the_handoffs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut task = TaskContext::open(root, 4);
+    task.brief = "Task #4\n".to_owned();
+    task.set_check_output("$ cargo test -q · exit code 0\n## not a heading\ntest result: ok. 3 passed");
+    task.record(Handoff {
+        when: 1,
+        model: "m".into(),
+        outcome: "implemented".into(),
+        check: "check passed: cargo test -q".into(),
+        verdict: None,
+        changed: vec![],
+        report: "done".into(),
+        warnings: vec![],
+        read: vec![],
+        failures: vec![],
+    });
+    task.save(root).unwrap();
+    let again = TaskContext::open(root, 4);
+    assert_eq!(again.check_output, task.check_output);
+    assert_eq!(again.handoffs.len(), 1);
+    assert_eq!(again.handoffs[0].report, "done");
+    let long = format!("{}the end", "x".repeat(CHECK_OUTPUT_ROOM * 2));
+    task.set_check_output(&long);
+    assert!(task.check_output.ends_with("the end") && task.check_output.chars().count() < CHECK_OUTPUT_ROOM + 50);
 }
 
 #[test]

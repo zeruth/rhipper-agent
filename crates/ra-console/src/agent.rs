@@ -1040,7 +1040,7 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
 }
 
 /// What the reviewer is told: the verdict on the first line, the points after it.
-const REVIEW_INSTRUCTION: &str = "You review one card of a roadmap after a worker implemented it. You get the card's objective and acceptance, the worker's handoff, the files the card names and the run changed with their diff stat, and the git diff of those files. A change may live in any file of that list, not only the one you expect; read the stat before judging something missing. Judge whether the diff meets the acceptance and whether the handoff tells the truth about it. Answer with one word on the first line: `accepted` or `needs_revision`. After `needs_revision`, list the points as `- ` lines, each naming the file and what is wrong or missing; after `accepted`, nothing or one line of why. No other text.";
+const REVIEW_INSTRUCTION: &str = "You review one card of a roadmap after a worker implemented it. You get the card's objective and acceptance, the worker's handoff, the files the card names and the run changed with their diff stat, and the git diff of those files, the output of the card's checks, which passed, and your own last verdict on the card when there was one. A change may live in any file of that list, not only the one you expect; read the stat before judging something missing, and the check output before asking for a run of it. Judge whether the diff meets the acceptance and whether the handoff tells the truth about it. Answer with one word on the first line: `accepted` or `needs_revision`. After `needs_revision`, list the points one per line as `N. [work|card|environment] file: what`: `work` is what the worker can change in the project's files; `card` is what only the card's own text or the person's decision settles (its acceptance, its files, a choice between designs); `environment` is what the machine lacks and the worker cannot make (another toolchain, a fixture another tool builds, a CI run, a service). Where your last verdict is given, a point of it that still stands keeps its number and its words, a point the change settled is dropped, and a new point takes the next number. After `accepted`, nothing or one line of why. No other text.";
 
 /// How much of the diff the reviewer reads: a card's files, not a reformat of the tree.
 const REVIEW_DIFF: usize = 60_000;
@@ -1067,7 +1067,14 @@ pub fn verdict_of(answer: &str) -> Verdict {
     if word.starts_with("accepted") {
         return Verdict::Accepted;
     }
-    let point = |line: &str| line.trim_start_matches(['-', '*', '•']).trim().to_owned();
+    let point = |line: &str| {
+        let bare = line.trim_start_matches(['-', '*', '•']).trim();
+        match tagged(bare) {
+            Some((Some(number), kind, what)) => format!("{number}. [{}] {what}", kind.name()),
+            Some((None, kind, what)) => format!("[{}] {what}", kind.name()),
+            None => bare.to_owned(),
+        }
+    };
     let rest: Vec<&str> = lines.collect();
     // A reviewer that opens with a sentence and closes with the word accepts.
     if rest.last().is_some_and(|last| word_of(last).starts_with("accepted")) {
@@ -1084,6 +1091,61 @@ pub fn verdict_of(answer: &str) -> Verdict {
         std::iter::once(first).chain(rest).map(point).collect()
     };
     Verdict::NeedsRevision(if points.is_empty() { vec!["the reviewer gave no points".to_owned()] } else { points })
+}
+
+/// Who can settle a point of the reviewer's: the tag it carries, `N. [kind] file: what`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointKind {
+    /// The worker can change it in the project's files: a rerun settles it.
+    Work,
+    /// Only the card's text or the person's decision settles it.
+    Card,
+    /// The machine lacks it (a toolchain, a fixture, a CI run): no rerun makes it.
+    Environment,
+}
+
+impl PointKind {
+    /// The tag of the kind, as the reviewer writes it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Card => "card",
+            Self::Environment => "environment",
+        }
+    }
+}
+
+/// The kind of a point as [`verdict_of`] leaves it; `None` for a point without a tag, which a
+/// rerun takes up as work.
+#[must_use]
+pub fn point_kind(point: &str) -> Option<PointKind> {
+    tagged(point).map(|(_, kind, _)| kind)
+}
+
+/// Whether a rejection's points are every one the card's or the environment's: no rerun can
+/// meet them, so the card waits for the person rather than the walk (asm #80 ran 109 rounds on
+/// fixtures another toolchain builds).
+#[must_use]
+pub fn for_the_person(points: &[String]) -> bool {
+    !points.is_empty() && points.iter().all(|point| matches!(point_kind(point), Some(PointKind::Card | PointKind::Environment)))
+}
+
+/// A point's number, kind and text after the tag: `3. [work] src/a.rs: x`, `3) [Work] …` and
+/// `[card] …` read; a point without a known tag is `None`.
+fn tagged(point: &str) -> Option<(Option<u32>, PointKind, &str)> {
+    let digits = point.find(|c: char| !c.is_ascii_digit()).unwrap_or(point.len());
+    let (head, tail) = point.split_at(digits);
+    let number = head.parse().ok();
+    let rest = if number.is_some() { tail.trim_start_matches(['.', ')', ':']).trim_start() } else { point };
+    let (tag, what) = rest.strip_prefix('[')?.split_once(']')?;
+    let kind = match tag.trim().to_ascii_lowercase().as_str() {
+        "work" => PointKind::Work,
+        "card" => PointKind::Card,
+        "environment" | "env" => PointKind::Environment,
+        _ => return None,
+    };
+    Some((number, kind, what.trim()))
 }
 
 /// A review point that passes: a check mark first, or `ok` / `passes` last.
@@ -1328,25 +1390,13 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     };
     worker.record_as(&model, Some("reviewer"), Some(id), &answer.usage, answer.turns).await;
     let verdict = verdict_of(&answer.text);
-    let mut trivial = None;
     // the points' fingerprint rides the handoff's verdict, so a run that changed nothing and drew
     // the same points again is held on that round, not run a third time
     let print = match &verdict {
         Verdict::NeedsRevision(points) => format!("{}{}", ra_context::POINTS_MARK, points_fingerprint(points)),
         Verdict::Accepted => String::new(),
     };
-    let (state, head, said) = match &verdict {
-        Verdict::Accepted => (accepted, format!("review by {model}: accepted"), "accepted".to_owned()),
-        Verdict::NeedsRevision(points) => {
-            let weight = crate::commands::review::classify(points);
-            let list: Vec<String> = points.iter().map(|point| format!("- {point}")).collect();
-            let head = format!("review by {model}: needs revision ({})\n{}", weight.name(), list.join("\n"));
-            if weight == crate::commands::review::Weight::Trivial {
-                trivial = Some(head.clone());
-            }
-            (TaskState::NeedsRevision, head, format!("needs revision ({}) · {} point(s)", weight.name(), points.len()))
-        }
-    };
+    let Judged { state, head, said, trivial } = judged(&verdict, id, &model, &root, accepted);
     // the verdict rides the run's handoff: a card is offered for acceptance only with one
     // attached, and the weight of a rejection retags the outcome, a trivial one for a cheap
     // pass, a substantive one for the person. A card reviewed before any run has no handoff,
@@ -1354,7 +1404,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     let mut task = ra_context::TaskContext::open(&root, id);
     if let Some(last) = task.handoffs.last_mut() {
         last.verdict = Some(format!("{said} by {model}{print}"));
-        if state == TaskState::NeedsRevision
+        if matches!(state, TaskState::NeedsRevision | TaskState::Blocked)
             && let Some((tag, _)) = said.split_once(" · ")
         {
             tag.clone_into(&mut last.outcome);
@@ -1390,6 +1440,60 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     Ok((lines, trivial))
 }
 
+/// Where a verdict leaves a card: its state, the head of its notes, the verdict's words for
+/// the handoff and the end line, and the head again when the rejection was trivial.
+struct Judged {
+    state: TaskState,
+    head: String,
+    said: String,
+    trivial: Option<String>,
+}
+
+/// The [`Judged`] of `verdict` by `model`; `accepted` is where an acceptance leaves the card.
+/// A rejection whose points only the person can settle goes on the feed as well.
+fn judged(verdict: &Verdict, id: i64, model: &str, root: &Path, accepted: TaskState) -> Judged {
+    let Verdict::NeedsRevision(points) = verdict else {
+        return Judged { state: accepted, head: format!("review by {model}: accepted"), said: "accepted".to_owned(), trivial: None };
+    };
+    let list: Vec<String> = points.iter().map(|point| format!("- {point}")).collect();
+    // points only the person can settle block the card: the reason leads the notes, which the
+    // person's list reads, and the walk does not take a blocked card up again
+    if for_the_person(points) {
+        let reason = format!("blocked by the reviewer: {} point(s) for the person, the card's or the environment's", points.len());
+        let head = format!("{reason}\nreview by {model}: needs revision (person)\n{}", list.join("\n"));
+        let text = format!("#{id} {reason}: {}; a person sets it defined again", points.join("; "));
+        tracing::warn!("{text}");
+        crate::pair::event(root, &text);
+        return Judged {
+            state: TaskState::Blocked,
+            head,
+            said: format!("blocked · {} point(s) for the person", points.len()),
+            trivial: None,
+        };
+    }
+    let weight = crate::commands::review::classify(points);
+    let head = format!("review by {model}: needs revision ({})\n{}", weight.name(), list.join("\n"));
+    let trivial = (weight == crate::commands::review::Weight::Trivial).then(|| head.clone());
+    let said = format!("needs revision ({}) · {} point(s)", weight.name(), points.len());
+    Judged { state: TaskState::NeedsRevision, head, said, trivial }
+}
+
+/// The reviewer's view of the last round: the output of the card's checks and its own last
+/// verdict, whose points it keeps by number. Without them a reviewer asked for a run the check
+/// had made, and its points rotated round after round (asm #53: 5, 5, 6, 4).
+fn last_round(task: &ra_context::TaskContext, node: &Node) -> String {
+    let mut text = String::new();
+    if !task.check_output.trim().is_empty() {
+        let _ = writeln!(text, "\n{}\n{}", ra_context::CHECK_OUTPUT_HEADING, task.check_output.trim_end());
+    }
+    let last_verdict = node.notes.as_deref().and_then(ra_context::review_of).or_else(|| task.review.clone());
+    if let Some(verdict) = last_verdict {
+        let _ =
+            writeln!(text, "\n## Your last verdict on this card\nKeep the number of every point that still stands.\n{}", verdict.trim());
+    }
+    text
+}
+
 /// What the reviewer reads: the card, the last handoff when there is one, and the diff of the
 /// card's own change ([`card_changed`]) and its files, clipped: in a worktree the branch from
 /// its merge base, every run of the card; in the project's tree the handoff's set against
@@ -1411,6 +1515,7 @@ pub(crate) async fn review_brief(project: &Path, root: &Path, node: &Node) -> St
         }
         None => text.push_str("\n## Handoff of the last run\nnone: no run of this card left one\n"),
     }
+    text.push_str(&last_round(&task, node));
     // the card's change is the branch's in a worktree, whatever the last run alone touched: the
     // reviewer judges the card, not its last session (#182, #183); in a shared tree the dirty
     // files no handoff of the card names are someone else's
@@ -3691,6 +3796,9 @@ pub async fn run_in_worktree(store: &Store, id: i64, worker: &Worker) -> anyhow:
     run(store, id, &worker.clone().with_worktree(path, branch)).await
 }
 
+/// The run of one card in a parallel walk, polled on the walk's own task.
+type InFlight<'a> = std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + 'a>>;
+
 /// Runs the ready cards `width` at a time, each in its own worktree, in waves: the ready cards
 /// are read, up to `width` of them run together, and readiness is read again once the wave
 /// ends, until no card is ready, a run fails, or with `stop_on_revision` a card needs revision.
@@ -3729,7 +3837,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     // the project's root, which the runs' futures borrow
     let git_lock_owned = tokio::sync::Mutex::new(());
     let root_owned = root.clone();
-    let mut flight: Vec<(i64, std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + '_>>, Seat)> = Vec::new();
+    let mut flight: Vec<(i64, InFlight<'_>, Seat)> = Vec::new();
     let mut stopped: Option<String> = None;
     // the cards parked past [`RERUNS_A_WALK`] or failed in this walk; the count of the rounds is
     // the card's context's, so a restarted window counts on
@@ -4685,6 +4793,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     } else {
         "needs revision"
     };
+    // the checks' output, for the reviewer: it reads what the check showed, not only its line
+    let output: Vec<String> = checks.iter().map(|run| format!("$ {} · {}\n{}", run.command, run.exit, run.text.trim_end())).collect();
+    task.set_check_output(&output.join("\n\n"));
     let mut last = handoff(outcome, check_line.trim(), &handed, changed);
     last.warnings = lint_warnings;
     // a run sent back by its check hands on what it read, as a capped one does, and every

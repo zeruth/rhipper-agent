@@ -2704,6 +2704,137 @@ async fn a_reviewer_that_accepts_moves_the_card_to_accepted_and_the_verdict_lead
     );
 }
 
+/// Reviews an implemented card with one handoff whose reviewer answers `answer`: the lines,
+/// the store and the project directory.
+async fn reviewed_with_kinds(answer: &str) -> (Vec<String>, Store, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    store.set_notes(2, "wrote the fixture loader").await.unwrap();
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    task.record(ra_context::Handoff {
+        when: 7,
+        model: "z-ai/glm-5.3-flash".to_owned(),
+        outcome: "implemented".to_owned(),
+        check: "cargo test -q: passed".to_owned(),
+        verdict: None,
+        changed: vec!["src/load.rs".to_owned()],
+        report: "wrote the fixture loader".to_owned(),
+        warnings: Vec::new(),
+        read: Vec::new(),
+        failures: Vec::new(),
+    });
+    task.save(dir.path()).unwrap();
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(answer, vec![])]));
+    let (out, _) = run("/review 2", &store, &runner).await.unwrap();
+    (out, store, dir)
+}
+
+#[tokio::test]
+async fn review_kinds_a_verdict_of_only_card_and_environment_points_blocks_the_card_without_a_rerun() {
+    let (out, store, dir) = reviewed_with_kinds(
+        "needs_revision\n- 1. [environment] tests/fixtures/upx.exe: the fixture needs UPX, which the machine lacks\n- 2. [card] rhipper.md: the acceptance asks for a CI run",
+    )
+    .await;
+    assert!(out[0].starts_with("✗ #2 Probe blocked · 2 point(s) for the person"), "{out:?}");
+    assert_eq!(out[1], "  - 1. [environment] tests/fixtures/upx.exe: the fixture needs UPX, which the machine lacks");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Blocked);
+    let notes = node.notes.unwrap();
+    assert!(notes.starts_with("blocked by the reviewer: 2 point(s) for the person"), "{notes}");
+    assert!(notes.contains("\n- 2. [card] rhipper.md: the acceptance asks for a CI run\n"), "{notes}");
+    assert_eq!(ra_context::TaskContext::open(dir.path(), 2).handoffs.pop().unwrap().outcome, "blocked");
+    // the person's list names it with the reason, and the walk does not take it up again
+    let status = crate::hub::status_with(dir.path(), |_| true, &[], "2026-11-12");
+    let waiting = status.waiting.iter().find(|w| w.id == 2).expect("the blocked card waits for the person");
+    assert!(waiting.reason.starts_with("blocked by the reviewer"), "{waiting:?}");
+    let feed = std::fs::read_to_string(dir.path().join(crate::pair::PAIR_FILE)).unwrap_or_default();
+    assert!(feed.contains("the fixture needs UPX"), "{feed}");
+    let roadmap = store.load().await.unwrap();
+    assert!(!crate::agent::walk_order(&roadmap.nodes, &roadmap.gambits, false).contains(&2));
+}
+
+#[tokio::test]
+async fn review_kinds_a_work_point_beside_an_environment_one_sends_the_card_back_to_the_walk() {
+    let (out, store, _dir) = reviewed_with_kinds(
+        "needs_revision\n- 1. [environment] tests/fixtures/upx.exe: the fixture needs UPX\n- 2. [work] src/load.rs: no test covers the empty fixture",
+    )
+    .await;
+    assert!(out[0].contains("needs revision (substantive) · 2 point(s)"), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+    let roadmap = store.load().await.unwrap();
+    assert_eq!(crate::agent::walk_order(&roadmap.nodes, &roadmap.gambits, false), vec![2]);
+}
+
+#[tokio::test]
+async fn review_kinds_a_second_round_brief_holds_the_first_verdict_and_the_check_output() {
+    let dir = tempfile::tempdir().unwrap();
+    git_ok(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join(".gitignore"), "var/\nrhipper.md\n").unwrap();
+    std::fs::write(dir.path().join("hello.txt"), "old\n").unwrap();
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "base"]);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let write = |content: &str| ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: format!(r#"{{"path":"hello.txt","content":"{content}"}}"#),
+    };
+    let script = Scripted::new(vec![
+        says("", vec![write("hello")]),
+        says("wrote `hello.txt`", vec![]),
+        says("needs_revision\n- 1. [work] hello.txt: the greeting lacks a newline", vec![]),
+        says("", vec![write("hello\\n")]),
+        says("added the newline to `hello.txt`", vec![]),
+        says("accepted", vec![]),
+    ]);
+    let check: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "test result: ok. 7 passed\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(check);
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("needs revision (substantive) · 1 point(s)")), "{out:?}");
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(out.iter().any(|l| l.starts_with("✓ #2 Probe accepted")), "{out:?}");
+    let seen = script.seen.lock();
+    assert_eq!(seen.len(), 6);
+    let first = &seen[2].messages.last().unwrap().content;
+    assert!(first.contains("## Check output\n") && first.contains("test result: ok. 7 passed"), "{first}");
+    assert!(!first.contains("## Your last verdict"), "{first}");
+    let second = &seen[5].messages.last().unwrap().content;
+    assert!(second.contains("## Your last verdict on this card\n"), "{second}");
+    assert!(second.contains("- 1. [work] hello.txt: the greeting lacks a newline"), "{second}");
+    assert!(second.contains("## Check output\n") && second.contains("test result: ok. 7 passed"), "{second}");
+    assert!(seen[5].messages[0].content.contains("N. [work|card|environment] file: what"), "{}", seen[5].messages[0].content);
+}
+
+#[test]
+fn review_kinds_verdict_of_parses_the_tags() {
+    use crate::agent::{PointKind, Verdict, for_the_person, point_kind, verdict_of};
+    let Verdict::NeedsRevision(points) = verdict_of(
+        "needs_revision\n- 1. [Environment] tests/a.asm: needs nasm\n* 2) [CARD] rhipper.md: name the fixture\n- 3. [work] src/a.rs: no test\n- untagged point",
+    ) else {
+        panic!("a revision");
+    };
+    assert_eq!(
+        points,
+        [
+            "1. [environment] tests/a.asm: needs nasm",
+            "2. [card] rhipper.md: name the fixture",
+            "3. [work] src/a.rs: no test",
+            "untagged point"
+        ]
+    );
+    let kinds: Vec<Option<PointKind>> = points.iter().map(String::as_str).map(point_kind).collect();
+    assert_eq!(kinds, [Some(PointKind::Environment), Some(PointKind::Card), Some(PointKind::Work), None]);
+    assert!(for_the_person(&points[..2]));
+    assert!(!for_the_person(&points[..3]), "a work point reruns the card");
+    assert!(!for_the_person(&points[1..2].iter().cloned().chain(["untagged point".to_owned()]).collect::<Vec<_>>()));
+    assert!(!for_the_person(&[]));
+    assert_eq!(point_kind("[env] the CI run"), Some(PointKind::Environment));
+    assert_eq!(point_kind("[later] something"), None);
+}
+
 /// Reviews a fresh card run on `implementer` in a project whose `rhipper.toml` is `routes`:
 /// the verdict line, the model the reviewer was asked on, and the ledger's reviewer rows.
 async fn reviewed_on(implementer: &str, routes: &str) -> (String, String, Vec<(String, Option<String>)>) {
@@ -3779,11 +3910,15 @@ async fn a_worktree_check_builds_in_the_worktrees_target() {
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(std::sync::Arc::new(ByTurn { seen: parking_lot::Mutex::new(0) }));
     let out = crate::agent::run_parallel(&store, &runner, 1, false).await.unwrap();
     assert!(out.iter().any(|l| l.contains("branch card/2")), "{out:?}");
-    let targets = std::fs::read_to_string(outside.path().join("seen.txt")).unwrap();
-    let first = targets.split(';').next().unwrap().replace('\\', "/");
+    // the run's lines ride every panic: a check that never ran leaves no file to read
+    let targets =
+        std::fs::read_to_string(outside.path().join("seen.txt")).unwrap_or_else(|e| panic!("the check left no seen.txt ({e}): {out:?}"));
+    let first = targets.split(';').next().unwrap_or_default().replace('\\', "/");
     // the worktree's own directory under the project's target, wherever the target lives: the
     // project's tree, or a scratch root's target/<project> when the machine has one (`rc scratch`)
-    assert!(first.ends_with("/wt-2") && first.contains("/target/"), "the worktree's check built in {first}: {out:?}");
+    let worktree = dir.path().join("var").join("worktrees").join("2");
+    let expected = ra_providers::claude_code::shared_target(&worktree).unwrap().display().to_string().replace('\\', "/");
+    assert!(first.ends_with(expected.trim_start_matches("//?/")), "the worktree's check built in {first}, not {expected}: {out:?}");
 }
 
 #[tokio::test]
