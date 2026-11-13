@@ -95,6 +95,21 @@ fn roadmap() -> Vec<ra_roadmap::model::Node> {
     .expect("a roadmap")
 }
 
+#[test]
+fn card_check_flags_unknown_rc_flag() {
+    let card = |objective: &str, acceptance: &str| {
+        let text = format!(
+            "- 1 ‹project› P {{c3}} [defined]\n    - 2 ‹task› T {{c2}} [defined]\n        objective: {objective}\n        acceptance: {acceptance}\n"
+        );
+        markdown::parse(&text).expect("a roadmap")
+    };
+    let faults = unknown_rc_faults(&card("plain", "`rc check --dry-run` passes"));
+    assert!(faults.iter().any(|f| f.contains("unknown: rc check --dry-run (say \"new\" on the card)")), "{faults:?}");
+    assert!(unknown_rc_faults(&card("adds a new --dry-run flag", "`rc check --dry-run` passes")).is_empty());
+    assert!(unknown_rc_faults(&card("plain", "`rc show 3` and `rc check`")).is_empty());
+    assert_eq!(unknown_rc_faults(&card("plain", "`rc frobnicate`")).len(), 1);
+}
+
 /// A context file for `id` whose last run carries `verdict`.
 fn judged(root: &Path, id: i64, verdict: &str) {
     let mut context = TaskContext::open(root, id);

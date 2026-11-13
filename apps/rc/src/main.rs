@@ -1532,6 +1532,61 @@ async fn route(id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The first subcommand or flag of an `rc …` command line that `rc` does not have, if any, as the
+/// command reads up to it.
+fn unknown_rc_part(line: &str) -> Option<String> {
+    use clap::CommandFactory;
+    let mut tokens = line.split_whitespace();
+    if tokens.next() != Some("rc") {
+        return None;
+    }
+    let mut command = Options::command();
+    let mut seen = vec!["rc"];
+    let mut positional = false;
+    for token in tokens {
+        seen.push(token);
+        if let Some(long) = token.strip_prefix("--") {
+            let long = long.split('=').next().unwrap_or_default();
+            let known =
+                long.is_empty() || matches!(long, "help" | "version") || command.get_arguments().any(|a| a.get_long() == Some(long));
+            if !known {
+                return Some(seen.join(" "));
+            }
+        } else if let Some(short) = token.strip_prefix('-').and_then(|rest| rest.chars().next()).filter(|c| c.is_alphabetic()) {
+            let known = matches!(short, 'h' | 'V') || command.get_arguments().any(|a| a.get_short() == Some(short));
+            if !known {
+                return Some(seen.join(" "));
+            }
+        } else if !positional && command.has_subcommands() {
+            let Some(sub) = command.find_subcommand(token).cloned() else {
+                return Some(seen.join(" "));
+            };
+            command = sub;
+        } else {
+            positional = true;
+        }
+    }
+    None
+}
+
+/// A fault for each `rc` command a card's acceptance names that `rc` does not have, unless the
+/// objective says the command or flag is new.
+fn unknown_rc_faults(nodes: &[ra_roadmap::model::Node]) -> Vec<String> {
+    let mut faults = Vec::new();
+    for node in nodes {
+        let Some(acceptance) = node.acceptance.as_deref() else { continue };
+        let objective = node.objective.as_deref().unwrap_or_default();
+        for span in acceptance.split('`').skip(1).step_by(2).map(str::trim) {
+            let Some(part) = unknown_rc_part(span) else { continue };
+            let last = part.rsplit(' ').next().unwrap_or_default();
+            if !(objective.contains(last) && objective.to_lowercase().contains("new")) {
+                faults.push(format!("#{} unknown: {part} (say \"new\" on the card)", node.id));
+            }
+        }
+    }
+    faults
+}
+
 /// Prints every fault the lint finds, and every named path missing from the project's tree,
 /// and exits 1 when there is one, so a script or a hook can gate on a clean roadmap.
 async fn check() -> anyhow::Result<()> {
@@ -1541,6 +1596,7 @@ async fn check() -> anyhow::Result<()> {
     let root = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut faults = tree::lint(&nodes);
     faults.extend(tree::missing_files(&nodes, |file| root.join(file).exists()));
+    faults.extend(unknown_rc_faults(&nodes));
     // a check that cannot run fails every run of its card for a reason no worker can fix
     faults.extend(ra_console::agent::unrunnable_checks(&ra_console::agent::workspace_of(&store), &nodes).await);
     // a command the tool rejects is a fault of the card's text, found before a walk holds it
