@@ -4646,7 +4646,7 @@ async fn clean_after(root: &Path, id: i64, has_branch: bool) -> Vec<String> {
 #[must_use]
 pub fn sweep_temp(names: &[String], age: std::time::Duration) -> (usize, u64) {
     let temp = std::env::temp_dir();
-    let cutoff = std::time::SystemTime::now().checked_sub(age);
+    let cutoff = crate::clock::now().checked_sub(age);
     let (mut count, mut bytes) = (0usize, 0u64);
     for name in names {
         let dir = temp.join(name);
@@ -4721,7 +4721,7 @@ fn temp_check(root: &Path) -> Result<String, String> {
         return Ok("no `[worker] temp` names; nothing is swept".to_owned());
     }
     let temp = std::env::temp_dir();
-    let cutoff = std::time::SystemTime::now().checked_sub(TEMP_SWEEP_AGE);
+    let cutoff = crate::clock::now().checked_sub(TEMP_SWEEP_AGE);
     let (mut total, mut old) = (0u64, 0u64);
     for name in &names {
         let dir = temp.join(name);
@@ -5413,7 +5413,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let dirty_before = git_status(&acting).await;
     // set back by [`MTIME_SLACK`]: a file's time comes off a coarser clock than `now`, and a
     // write in the run's first tick read as older than the run
-    let run_started = std::time::SystemTime::now() - MTIME_SLACK;
+    let run_started = crate::clock::now() - MTIME_SLACK;
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
     // a run of a card resumes the session of the last one (the person: be generous with
@@ -6669,7 +6669,7 @@ async fn git_status(root: &Path) -> String {
 }
 
 pub(crate) fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    crate::clock::unix_now()
 }
 
 /// The check of a node when its acceptance names none and its files name no crate.

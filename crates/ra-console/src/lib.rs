@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod allocation;
+pub mod clock;
 pub mod commands;
 pub mod hub;
 pub mod install;

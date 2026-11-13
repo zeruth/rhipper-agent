@@ -16,7 +16,7 @@ pub const PAIR_FILE: &str = "var/pair.log";
 pub fn event(root: &Path, text: &str) {
     let path = root.join(PAIR_FILE);
     let _ = std::fs::create_dir_all(root.join("var"));
-    let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let when = crate::clock::unix_now();
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(file, "{when}\t{}", text.replace(['\t', '\n'], " "));
     }
@@ -204,7 +204,7 @@ pub async fn window_up_with(
     tabs: usize,
     alive: impl Fn(u32) -> bool,
 ) -> Vec<(i64, u32)> {
-    let now = crate::hub::unix_now();
+    let now = crate::clock::unix_now();
     let restarts = since(root, now.saturating_sub(RESTART_SPAN))
         .iter()
         .filter(|line| line.split_once('\t').is_some_and(|(_, text)| text.starts_with("window up ")))
