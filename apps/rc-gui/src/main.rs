@@ -373,6 +373,9 @@ struct App {
     /// The machine's build slots as last read, and when: who holds each and since when.
     builders: Vec<Option<(String, u64)>>,
     builders_at: Option<std::time::Instant>,
+    /// Where the dashboard's Blood Moon scroll bar was dragged to, for the scroll area of the
+    /// next frame.
+    dash_scroll_to: Option<f32>,
     /// When the window started, for the dashboard's uptime.
     started: Instant,
     /// Whether the report is in front: the cards that landed across every project.
@@ -734,6 +737,7 @@ impl App {
             dash_slack_for: egui::Vec2::ZERO,
             builders: Vec::new(),
             builders_at: None,
+            dash_scroll_to: None,
             started: Instant::now(),
             report: false,
             landed: Vec::new(),
@@ -1252,7 +1256,15 @@ impl App {
             // and a row flipped in or out about once a second
             let between = ui.spacing().item_spacing.y + 10.0;
             let pool = (left - kept - between * count).max(0.0);
-            let scrolled = egui::ScrollArea::vertical().id_salt("dashboard").auto_shrink([false, false]).show(ui, |ui| {
+            let mut area = egui::ScrollArea::vertical()
+                .id_salt("dashboard")
+                .auto_shrink([false, false])
+                // the page draws its own bar, the Blood Moon one, always shown while it scrolls
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+            if let Some(offset) = self.dash_scroll_to.take() {
+                area = area.vertical_scroll_offset(offset);
+            }
+            let scrolled = area.show(ui, |ui| {
                 // the page's width, handed down: a card holds itself to it, so nothing in it
                 // takes the room a scroll area's content would otherwise be allowed
                 ui.set_width(page);
@@ -1272,6 +1284,8 @@ impl App {
                     ui.add_space(10.0);
                 }
             });
+            // the bar sits in the strip the page leaves at the right for it
+            self.dash_scroll_to = cards::blood_scroll_bar(ui, &scrolled, scrolled.inner_rect.left() + page + 3.0, 9.0);
             // the content past the window, if any, comes off the next frame's shares; the
             // slack only grows, so the shares settle in a frame and never swing back
             let overflow = scrolled.content_size.y - scrolled.inner_rect.height();

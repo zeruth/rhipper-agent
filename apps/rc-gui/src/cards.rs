@@ -285,7 +285,7 @@ pub(crate) fn builders(ui: &mut Ui, count: usize, width: f32) -> i32 {
         ui.set_max_width(inner);
         ui.horizontal(|ui| {
             ui.set_width(inner);
-            ui.label(RichText::new("BUILDERS").small().strong().color(theme::dim()));
+            ui.label(RichText::new("WORKERS").small().strong().color(theme::dim()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let end = |ui: &mut Ui, text: &str| {
@@ -382,6 +382,50 @@ pub(crate) fn chip(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
         .response
         .interact(egui::Sense::click());
     response.on_hover_text(if on { "shown · click to hide" } else { "hidden · click to show" }).clicked()
+}
+
+/// The Blood Moon scroll bar at the right of a scroll area's view: shown for as long as the
+/// content overflows, never fading; a red thumb on a dark track, dragged to scroll and clicked on
+/// the track to jump there. The area's own bar is hidden. The person's ask of 2026-11-12: "a
+/// permanent visible, blood moon themed slider on the far right when the content is
+/// scrollable". `x` is the bar's left edge, `width` its width.
+pub(crate) fn blood_scroll_bar<R>(ui: &mut Ui, output: &egui::scroll_area::ScrollAreaOutput<R>, x: f32, width: f32) -> Option<f32> {
+    let view = output.inner_rect;
+    let content = output.content_size.y;
+    let room = content - view.height();
+    if room <= 0.5 {
+        return None;
+    }
+    let track = egui::Rect::from_min_max(egui::pos2(x, view.top()), egui::pos2(x + width, view.bottom()));
+    let thumb_height = (view.height() / content * track.height()).clamp(28.0, track.height());
+    let travel = (track.height() - thumb_height).max(1.0);
+    let current = output.state.clamped_offset().y;
+    let mut offset = current.clamp(0.0, room);
+    let response = ui.interact(track, output.id.with("blood-bar"), egui::Sense::click_and_drag());
+    if response.dragged() {
+        offset = (offset + response.drag_delta().y * room / travel).clamp(0.0, room);
+    } else if response.clicked()
+        && let Some(at) = response.interact_pointer_pos()
+    {
+        // the thumb's middle goes where the track was clicked
+        offset = (((at.y - track.top() - thumb_height / 2.0) / travel) * room).clamp(0.0, room);
+    }
+    // the caller hands the new offset to the area on the next frame: egui's state has no setter
+    let moved = ((offset - current).abs() > 0.1).then(|| {
+        ui.ctx().request_repaint();
+        offset
+    });
+    let thumb_top = track.top() + offset / room * travel;
+    let thumb = egui::Rect::from_min_size(egui::pos2(track.left(), thumb_top), egui::vec2(width, thumb_height));
+    let lit = response.hovered() || response.dragged();
+    let painter = ui.painter();
+    let radius = CornerRadius::same(u8::try_from((width / 2.0).round() as i32).unwrap_or(4));
+    painter.rect_filled(track, radius, theme::mix(theme::bg(), theme::deep(), 0.7));
+    painter.rect_stroke(track, radius, Stroke::new(1.0, alpha(theme::accent(), 50)), egui::StrokeKind::Inside);
+    // a soft glow under the thumb, then the thumb itself, brighter while held or hovered
+    painter.rect_filled(thumb.expand(2.0), radius, alpha(theme::accent(), if lit { 70 } else { 35 }));
+    painter.rect_filled(thumb, radius, if lit { theme::accent() } else { theme::mix(theme::deep(), theme::accent(), 0.75) });
+    moved
 }
 
 /// A `−` `name value` `+` stepper in one slim pill: answers -1 or +1 on a click of its ends,

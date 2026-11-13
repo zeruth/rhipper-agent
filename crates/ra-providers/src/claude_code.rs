@@ -7,6 +7,7 @@
 //! request are not forwarded: the harness owns its tool set, and the answer carries no tool
 //! calls. `temperature` and `max_tokens` have no flag on the command line and are not sent.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -80,56 +81,9 @@ impl ClaudeCode {
             binary: PathBuf::from("claude"),
             max_turns: None,
             // the build, the read-only git commands, and the read-only shell in both shells: a
-            // denied `ls` costs a turn and teaches nothing. A pipe is judged by its parts, so
-            // `cargo test 2>&1 | tail -20` passes and keeps the output short
-            allowed_shell: [
-                "Bash(cargo *)",
-                "Bash(rustfmt *)",
-                "Bash(git status*)",
-                "Bash(git diff*)",
-                "Bash(git log*)",
-                "Bash(git show*)",
-                "Bash(ls*)",
-                "Bash(cat *)",
-                "Bash(head *)",
-                "Bash(tail *)",
-                "Bash(wc *)",
-                "Bash(grep *)",
-                "Bash(rg *)",
-                "Bash(find *)",
-                "Bash(pwd*)",
-                "Bash(tree*)",
-                "Bash(mkdir *)",
-                // a word to the log, and the one more git question that only reads
-                "Bash(echo *)",
-                "Bash(git check-ignore*)",
-                // the text filters a pipe ends in, so a long output can be narrowed
-                "Bash(sort*)",
-                "Bash(uniq*)",
-                "Bash(cut *)",
-                "Bash(paste *)",
-                "Bash(tr *)",
-                // the one sanctioned wait on a long job of the worker's own
-                "Bash(rc wait *)",
-                "PowerShell(cargo *)",
-                "PowerShell(rustfmt *)",
-                "PowerShell(git status*)",
-                "PowerShell(git diff*)",
-                "PowerShell(git log*)",
-                "PowerShell(git show*)",
-                "PowerShell(Get-ChildItem*)",
-                "PowerShell(Get-Content *)",
-                "PowerShell(Select-String *)",
-                "PowerShell(Select-Object *)",
-                "PowerShell(Test-Path *)",
-                "PowerShell(Get-Location*)",
-                "PowerShell(New-Item *)",
-                "PowerShell(Write-Output *)",
-                "PowerShell(git check-ignore*)",
-                "PowerShell(rc wait *)",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
+            // denied `ls` costs a turn and teaches nothing. The table is the hook's too, which
+            // judges a chain or a pipe by its parts and answers for the shapes this list cannot
+            allowed_shell: ra_gotchas::shape::rules(),
             effort: "medium".to_owned(),
             hooks: None,
             catalogue: None,
@@ -211,6 +165,22 @@ impl ClaudeCode {
         &self.allowed_shell
     }
 
+    /// The system prompt of one request: the request's own, and for a worker with a shell the
+    /// allowed shapes block, so the rules are read before a refusal has to teach them.
+    fn system_of(&self, request: &CompletionRequest) -> String {
+        let mut system = system_prompt(&request.messages);
+        if request.workspace.is_some() && !request.read_only {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&ra_gotchas::shape::block());
+            if !self.own_prefixes.is_empty() {
+                let _ = writeln!(system, "\n- the project's own commands run too: {}", self.own_prefixes.join(", "));
+            }
+        }
+        system
+    }
+
     /// The command-line arguments of one request. The prompt goes on stdin, so its length is no
     /// concern of the argument list.
     fn args(&self, request: &CompletionRequest) -> Vec<String> {
@@ -230,7 +200,7 @@ impl ClaudeCode {
             // the harness picks up where the last run of the task left off, its context intact
             args.extend(["--resume".to_owned(), session.trim().to_owned()]);
         }
-        let system = system_prompt(&request.messages);
+        let system = self.system_of(request);
         if !system.is_empty() {
             // a worker's system prompt goes by file: on the command line it ran past Windows'
             // limit (os error 206) once the project context, the other projects' digests and

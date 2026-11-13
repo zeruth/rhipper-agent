@@ -918,7 +918,20 @@ impl TaskContext {
     }
 }
 
+/// The mark of a failed check's fingerprint on a handoff's check line: ` · fingerprint <hex>`.
+/// The line is kept in the file, so the next run of the card tells the same failure again.
+pub const FINGERPRINT_MARK: &str = " · fingerprint ";
+
 impl Handoff {
+    /// The fingerprint of the failed check the run ended on, as its check line carries it;
+    /// `None` for a run whose check passed or that predates the fingerprints.
+    #[must_use]
+    pub fn fingerprint(&self) -> Option<&str> {
+        let (_, rest) = self.check.split_once(FINGERPRINT_MARK)?;
+        let print = rest.split(" · ").next().unwrap_or_default().trim();
+        (!print.is_empty()).then_some(print)
+    }
+
     /// The handoff as a block of the file and of the prompt.
     fn render(&self) -> String {
         let mut text = format!("## Handoff {} · {} · {}\n", self.when, self.model, self.outcome);

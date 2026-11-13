@@ -289,7 +289,9 @@ fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: us
             }
         })
         .response;
-    if !run.folded() {
+    // the wheel sizes a card in a project's console; on the dashboard (a bounded card, sized by
+    // its grid) the wheel scrolls the page, as anywhere else on it
+    if !run.folded() && room.is_none() {
         wheel(ui, sink, id, response.rect);
     }
     // a finished card that has not folded yet is waiting on the clock, not on a push
