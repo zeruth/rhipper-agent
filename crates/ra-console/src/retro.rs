@@ -198,15 +198,15 @@ pub const MEDIAN_OF: u32 = 20;
 /// tokens a turn and cost from the ledger against the median tokens a turn of the last
 /// [`MEDIAN_OF`] cards the ledger wrote up to `mark` (the newest row before the run), the card
 /// itself left out; held when the card's are fewer. One `[saving]` line under the card in
-/// `var/retro.log`, the card's own claim quoted beside the figures, returned too; nothing when
-/// the card did not land, claims no saving, was judged already, or the ledger has no rows on
-/// one side (the day-later reading of `plan::read_back` takes that claim). A claim that holds
+/// `var/retro.log`, the card's claim quoted beside the figures, returned too: its `saving:`
+/// field, else the `[saving]`/`Saving:` sentence of its objective, else `claimed by estimate`
+/// with the complexity's tokens a turn, so every landed card is judged; nothing when the card
+/// did not land, was judged already, or the ledger has no rows on one side. A claim that holds
 /// across projects, its evidence cited from another project's `notes.log`, is a `[machine]`
 /// note too: it reaches the hub, and every project's planner reads it through [`evidence`] as
 /// a lesson that paid off twice; a worker's prompt ([`machine_lines`]) leaves every verdict out.
 pub async fn landed(root: &Path, card: &ra_roadmap::model::Node, ledger: &ra_usage::UsageStore, mark: i64) -> Vec<String> {
     use ra_roadmap::model::TaskState;
-    let Some(saving) = card.saving.as_deref() else { return Vec::new() };
     if !matches!(card.state, TaskState::Implemented | TaskState::Accepted) || saving_read(root, card.id) {
         return Vec::new();
     }
@@ -223,8 +223,12 @@ pub async fn landed(root: &Path, card: &ra_roadmap::model::Node, ledger: &ra_usa
     let held = per_turn < median;
     let across = card.evidence.as_deref().is_some_and(|e| e.contains("notes.log"));
     let cost = own.totals.cost_usd.map(|c| format!(", ${c:.2}")).unwrap_or_default();
+    let claimed = match card.saving.clone().or_else(|| card.objective.as_deref().and_then(claim_in)) {
+        Some(saving) => format!("claimed \"{saving}\""),
+        None => format!("claimed by estimate of {} tokens/turn", crate::agent::estimate_of(card).a_turn()),
+    };
     let text = format!(
-        "{SAVING} #{} {}: {} turns, {per_turn} tokens/turn{cost} vs median {median}; claimed \"{saving}\"",
+        "{SAVING} #{} {}: {} turns, {per_turn} tokens/turn{cost} vs median {median}; {claimed}",
         card.id,
         if held { "held" } else { "missed" },
         own.totals.turns
@@ -237,6 +241,16 @@ pub async fn landed(root: &Path, card: &ra_roadmap::model::Node, ledger: &ra_usa
             Vec::new()
         }
     }
+}
+
+/// The saving an objective claims in its own text, as the Phase P/Q cards wrote it: the sentence
+/// after `[saving]` or `Saving:`, to its full stop or line end; `None` when it claims none.
+fn claim_in(objective: &str) -> Option<String> {
+    let (at, tag) = [SAVING, "Saving:"].iter().filter_map(|tag| objective.find(tag).map(|at| (at, tag.len()))).min()?;
+    let rest = objective[at + tag..].trim_start_matches([':', ' ']);
+    let end = [rest.find(". "), rest.find('\n')].into_iter().flatten().min().unwrap_or(rest.len());
+    let claim = rest[..end].trim().trim_end_matches('.').trim();
+    (!claim.is_empty()).then(|| claim.to_owned())
 }
 
 /// The median tokens a turn over `cards`, the lower middle of an even count; `None` when there
