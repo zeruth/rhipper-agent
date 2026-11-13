@@ -560,12 +560,12 @@ async fn a_run_whose_mean_turn_passes_the_ceiling_is_noted_heavy_with_its_bigges
     let big = ra_providers::ToolCall { id: "call_1".into(), name: "read_file".into(), arguments: r#"{"path":"big.txt"}"#.into() };
     let small = ra_providers::ToolCall { id: "call_2".into(), name: "list_dir".into(), arguments: r#"{"path":"."}"#.into() };
     let ceiling = crate::retro::TURN_CEILING;
-    // two turns at 60,000 tokens and one at 10: the mean passes the ceiling
-    let provider = Scripted::new(vec![says_at(60_000, "", vec![big, small]), says_at(60_000, "", vec![]), says("accepted", vec![])]);
+    // two turns at 100,000 tokens and one at 10: the mean passes the ceiling
+    let provider = Scripted::new(vec![says_at(100_000, "", vec![big, small]), says_at(100_000, "", vec![]), says("accepted", vec![])]);
     let heavy = Worker::new("z-ai/glm-5.3-flash").with_provider(provider);
     let (out, _) = run("/run 2", &store, &heavy).await.unwrap();
     let heavy = out.iter().find(|l| l.contains("[heavy]")).unwrap_or_else(|| panic!("{out:?}"));
-    let expected = format!("[heavy] #2 60000 tokens/turn over the ceiling of {ceiling}; biggest tool result: read_file big.txt (");
+    let expected = format!("[heavy] #2 100000 tokens/turn over the ceiling of {ceiling}; biggest tool result: read_file big.txt (");
     assert!(heavy.starts_with(&format!("  ⚠ {expected}")), "{heavy}");
     // the line is kept under the card for the next walk, and left out of the next worker's prompt
     let notes = crate::retro::recent(dir.path(), 5);
@@ -1459,8 +1459,8 @@ async fn a_landed_card_without_a_saving_field_is_judged_by_its_objective() {
 async fn a_landed_card_without_any_claim_is_judged_by_its_estimate() {
     let card = ra_roadmap::store::Card { objective: Some("Make the walk judge every card."), ..ra_roadmap::store::Card::new() };
     let (id, lines, logged) = saving_of(&card).await;
-    // a c3 card: 120k tokens over 15 turns
-    let held = format!("[saving] #{id} held: 3 turns, 110 tokens/turn vs median 1000; claimed by estimate of 8000 tokens/turn");
+    // a c3 card: 675k tokens over 15 turns
+    let held = format!("[saving] #{id} held: 3 turns, 110 tokens/turn vs median 1000; claimed by estimate of 45000 tokens/turn");
     assert_eq!((lines, logged), (vec![held.clone()], vec![held]));
 }
 
@@ -4197,7 +4197,7 @@ fn the_complexity_sets_the_budget() {
 fn the_complexity_sets_the_estimate_unless_the_card_names_one() {
     use crate::agent::{estimate_for, estimate_of};
     use ra_roadmap::model::Estimate;
-    assert_eq!([1, 2, 3, 4, 5].map(|c| estimate_for(c).tokens), [20_000, 50_000, 120_000, 250_000, 500_000]);
+    assert_eq!([1, 2, 3, 4, 5].map(|c| estimate_for(c).tokens), [120_000, 320_000, 675_000, 1_250_000, 2_200_000]);
     assert_eq!([1, 2, 3, 4, 5].map(|c| estimate_for(c).turns), [4, 8, 15, 25, 40]);
     assert_eq!(estimate_for(0), estimate_for(1));
     assert_eq!(estimate_for(9), estimate_for(5));
@@ -4229,9 +4229,9 @@ async fn sized_run(tokens: u64, turns: u64, estimate: Option<ra_roadmap::model::
 
 #[tokio::test]
 async fn a_run_whose_turns_carried_more_than_the_estimates_is_over() {
-    // a c3 card is 120k tokens over 15 turns, 8k a turn: one turn of 400k is over the measure
+    // a c3 card is 675k tokens over 15 turns, 45k a turn: one turn of 400k is over the measure
     let (out, handoff) = sized_run(400_000, 1, None).await;
-    assert!(out[0].contains("over the estimate of 8k a turn at 400k a turn"), "{out:?}");
+    assert!(out[0].contains("over the estimate of 45k a turn at 400k a turn"), "{out:?}");
     assert!(handoff.contains("over the estimate"), "{handoff}");
     // the context a turn carried, on the run line and in the handoff
     assert!(out[0].contains("avg 400k tokens a turn, largest 400k"), "{out:?}");
@@ -4240,9 +4240,9 @@ async fn a_run_whose_turns_carried_more_than_the_estimates_is_over() {
 
 #[tokio::test]
 async fn a_run_of_many_lean_turns_is_under_whatever_its_total_and_the_card_can_size_itself() {
-    // 100k in all, more turns than the estimate, but 5k a turn against its 8k
+    // 100k in all, more turns than the estimate, but 5k a turn against its 45k
     let (out, handoff) = sized_run(100_000, 20, None).await;
-    assert!(out[0].contains("under the estimate of 8k a turn at 5k a turn"), "{out:?}");
+    assert!(out[0].contains("under the estimate of 45k a turn at 5k a turn"), "{out:?}");
     assert!(handoff.contains("under the estimate"), "{handoff}");
     // the card's own line is the measure: 110 tokens a turn against 50 is over
     let estimate = ra_roadmap::model::Estimate { tokens: 50, turns: 1 };

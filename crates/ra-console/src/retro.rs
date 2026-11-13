@@ -178,8 +178,9 @@ pub fn record_saving(root: &Path, node: i64, held: bool, why: &str) -> anyhow::R
 pub const HEAVY: &str = "[heavy]";
 
 /// The ledger's ceiling on the tokens a turn: a run whose mean turn passes it carried more
-/// context than the work needed (#119 ran at 70,606 a turn, #114 at 48,703), and is noted.
-pub const TURN_CEILING: u64 = 40_000;
+/// context than the work needed, and is noted. About the 90th percentile of the Claude Code runs
+/// of 2026-11-12 (83k a turn): at 40k, under their median of 55k, nearly every run was noted.
+pub const TURN_CEILING: u64 = 90_000;
 
 /// Keeps `[heavy] #id N tokens/turn over the ceiling of C; biggest tool result: … (M chars)`
 /// under the card when a run's mean turn passes [`TURN_CEILING`], naming the tool call whose

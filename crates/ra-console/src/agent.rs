@@ -6126,8 +6126,10 @@ fn warnings_note(task: &ra_context::TaskContext) -> String {
 /// context the prompt already carries, or an earlier note says. Empty when nothing fired. `card`
 /// is the id and the acceptance of the card the run works, which a look-back is judged against.
 fn machine_notes(workspace: &Path, project: &str, card: (i64, Option<&str>)) -> String {
-    let gotchas = match Catalogue::load(&workspace.join(GOTCHAS_FILE)) {
-        Ok(catalogue) => catalogue.notes(&Journal::at(&workspace.join(GOTCHAS_LOG)).recent(RECENT_HITS)),
+    // the journal is the project's, which every worktree's runs write to
+    let (home, _) = ra_providers::claude_code::project_of(workspace);
+    let gotchas = match Catalogue::load(&home.join(GOTCHAS_FILE)) {
+        Ok(catalogue) => catalogue.notes(&Journal::at(&home.join(GOTCHAS_LOG)).recent(RECENT_HITS)),
         Err(_) => String::new(),
     };
     // what the earlier runs said themselves, in debug mode, rides along
@@ -6271,17 +6273,20 @@ pub fn budget_for(complexity: u8) -> f64 {
     }
 }
 
-/// The estimate of a run on a node of `complexity`, when the card names none: what a lean run
-/// reads and writes over its turns. c1 20k tokens in 4 turns, c2 50k in 8, c3 120k in 15, c4
-/// 250k in 25, c5 500k in 40. An out-of-range complexity takes the nearest end.
+/// The estimate of a run on a node of `complexity`, when the card names none: what a run
+/// reads and writes over its turns, about the median of the 898 Claude Code runs of 2026-11-12
+/// (every turn reads the harness's own prompt and the session so far again, so c2 to c4 all ran
+/// near 54k a turn; the old 5k to 12k a turn put every run over). c1 120k tokens in 4 turns (30k
+/// a turn), c2 320k in 8 (40k), c3 675k in 15 (45k), c4 1.25M in 25 (50k), c5 2.2M in 40 (55k).
+/// An out-of-range complexity takes the nearest end.
 #[must_use]
 pub fn estimate_for(complexity: u8) -> Estimate {
     let (tokens, turns) = match complexity {
-        0 | 1 => (20_000, 4),
-        2 => (50_000, 8),
-        3 => (120_000, 15),
-        4 => (250_000, 25),
-        _ => (500_000, 40),
+        0 | 1 => (120_000, 4),
+        2 => (320_000, 8),
+        3 => (675_000, 15),
+        4 => (1_250_000, 25),
+        _ => (2_200_000, 40),
     };
     Estimate { tokens, turns }
 }

@@ -22,6 +22,14 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
 }
 
 #[test]
+fn a_worktree_belongs_to_its_project_and_names_its_card() {
+    let (root, card) = project_of(Path::new("C:/code/agent/var/worktrees/47"));
+    assert_eq!((root, card), (PathBuf::from("C:/code/agent"), Some(47)));
+    assert_eq!(project_of(Path::new("var/worktrees/9")), (PathBuf::from("."), Some(9)));
+    assert_eq!(project_of(Path::new("C:/code/agent")), (PathBuf::from("C:/code/agent"), None));
+}
+
+#[test]
 fn a_read_only_request_gets_the_reading_tools_alone_and_keeps_no_session() {
     let mut request = request(Some(PathBuf::from(".")));
     request.read_only = true;

@@ -355,8 +355,11 @@ impl ClaudeCode {
                         tracing::info!(target: "ra::progress", "⚠ {}: {}", hit.id, hit.excerpt);
                         // the journal is written here, as the hits come, so a run that ends badly
                         // still counts them
+                        // a worktree's hits go to its project's journal, named by the card: the
+                        // worktree's own went with it when the card landed, and no look-back saw them
                         if let Some(workspace) = &request.workspace {
-                            if let Err(e) = Journal::at(&workspace.join("var/gotchas.log")).record(None, place, &hit) {
+                            let (root, card) = project_of(workspace);
+                            if let Err(e) = Journal::at(&root.join("var/gotchas.log")).record(card, place, &hit) {
                                 tracing::warn!("cannot write the gotchas journal: {e:#}");
                             }
                         }
@@ -967,17 +970,27 @@ pub fn project_target(root: &Path) -> PathBuf {
     }
 }
 
+/// The project a workspace belongs to and the card whose worktree it is: a worktree's project is
+/// three levels up (`<root>/var/worktrees/<id>`), any other workspace is its own with no card.
+#[must_use]
+pub fn project_of(workspace: &Path) -> (PathBuf, Option<i64>) {
+    if workspace.parent().and_then(Path::file_name).is_some_and(|n| n == "worktrees")
+        && let Some(root) = workspace.ancestors().nth(3)
+    {
+        let card = workspace.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok());
+        // a relative worktree (`var/worktrees/47`) has an empty root: the current directory
+        let root = if root.as_os_str().is_empty() { Path::new(".") } else { root };
+        return (root.to_path_buf(), card);
+    }
+    (workspace.to_path_buf(), None)
+}
+
 /// The environment a run or a check gets from the scratch root: its temp directory (the tests'
 /// leftovers land there, not on the system drive) and the Gradle cache. Empty without one.
 #[must_use]
 pub fn scratch_env(workspace: &Path) -> Vec<(String, PathBuf)> {
     let Some(scratch) = scratch() else { return Vec::new() };
-    // the project of a worktree is three levels up (`<root>/var/worktrees/<id>`)
-    let root = workspace
-        .ancestors()
-        .nth(3)
-        .filter(|_| workspace.parent().and_then(Path::file_name).is_some_and(|n| n == "worktrees"))
-        .unwrap_or(workspace);
+    let (root, _) = project_of(workspace);
     let name = root.file_name().map_or_else(|| "project".into(), |n| n.to_string_lossy().into_owned());
     let temp = scratch.join("tmp").join(name);
     let _ = std::fs::create_dir_all(&temp);
