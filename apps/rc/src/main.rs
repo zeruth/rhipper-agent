@@ -1601,6 +1601,35 @@ fn unknown_rc_faults(nodes: &[ra_roadmap::model::Node]) -> Vec<String> {
     faults
 }
 
+/// A fault for each directory a card not yet done names (in its text or its `files:`) that is not
+/// in the tree while a workspace member of the same last segment is elsewhere: `crates/rc/` for
+/// `apps/rc/`. The worker would otherwise look for the path and find nothing.
+fn wrong_crate_paths(nodes: &[ra_roadmap::model::Node], root: &Path) -> Vec<String> {
+    let mut faults = Vec::new();
+    for node in nodes.iter().filter(|n| !matches!(n.state, TaskState::Accepted | TaskState::Cancelled)) {
+        let texts = [Some(node.title.as_str()), node.objective.as_deref(), node.acceptance.as_deref()];
+        let mut seen: Vec<String> = Vec::new();
+        for text in texts.into_iter().flatten().chain(node.files.iter().map(String::as_str)) {
+            for token in text.split(|c: char| !(c.is_alphanumeric() || "/._-+".contains(c))) {
+                let mut segments = token.trim_start_matches(ra_roadmap::tree::NEW_MARK).split('/');
+                let (Some(parent @ ("crates" | "apps")), Some(member)) = (segments.next(), segments.next()) else { continue };
+                if member.is_empty() || root.join(parent).join(member).exists() {
+                    continue;
+                }
+                let Some(real) = ["crates", "apps"].into_iter().find(|p| root.join(p).join(member).join("Cargo.toml").exists()) else {
+                    continue;
+                };
+                let named = format!("{parent}/{member}/");
+                if !seen.contains(&named) {
+                    faults.push(format!("#{}: {named} is not in the tree; the crate is {real}/{member}/", node.id));
+                    seen.push(named);
+                }
+            }
+        }
+    }
+    faults
+}
+
 /// Prints every fault the lint finds, and every named path missing from the project's tree,
 /// and exits 1 when there is one, so a script or a hook can gate on a clean roadmap.
 async fn check() -> anyhow::Result<()> {
@@ -1610,6 +1639,7 @@ async fn check() -> anyhow::Result<()> {
     let root = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut faults = tree::lint(&nodes);
     faults.extend(tree::missing_files(&nodes, |file| root.join(file).exists()));
+    faults.extend(wrong_crate_paths(&nodes, root));
     faults.extend(unknown_rc_faults(&nodes));
     // a check that cannot run fails every run of its card for a reason no worker can fix
     faults.extend(ra_console::agent::unrunnable_checks(&ra_console::agent::workspace_of(&store), &nodes).await);
