@@ -69,6 +69,47 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
 }
 
 #[test]
+fn a_cargo_test_piped_through_tail_is_allowed_on_its_build_slot() {
+    let catalogue = Catalogue::seed();
+    let workspace = tempfile::tempdir().unwrap();
+    let gate = |command: &str| {
+        let shape = shape::judge(command, shape::Shell::Bash, workspace.path(), &|_| false);
+        Answer::of(catalogue.command(command, Conditions::default()), shape)
+    };
+    // every part is the table's: the hook allows it, held on a build slot as written
+    let piped = "cargo test -p ra-console -q 2>&1 | tail -n 60";
+    let answer = gate(piped);
+    assert!(answer.allows(), "{answer:?}");
+    assert!(matches!(&answer, Answer::Rewrite { command, .. } if *command == held(piped)), "{answer:?}");
+    // a read-only pipe of a read-only command is allowed as written
+    assert_eq!(gate("git log --oneline 2>&1 | tail -n 20"), Answer::Allow);
+    // a refused part denies the whole, the rewrite's allow included
+    assert!(matches!(gate("cargo test -p ra-console 2>&1 | tee var/out.txt"), Answer::Deny { id, .. } if id == "shell-shape"));
+}
+
+#[test]
+fn a_file_written_through_dotnet_names_the_edit_tool_whatever_shell_runs_it() {
+    let catalogue = Catalogue::seed();
+    for command in [
+        "[System.IO.File]::WriteAllLines(...)",
+        "[IO.File]::WriteAllText('x.rs', $text)",
+        "powershell -NoProfile -Command \"[System.IO.File]::WriteAllLines('x.rs', $lines)\"",
+    ] {
+        let gotcha = catalogue.matching(command).map(|g| g.id.as_str());
+        assert_eq!(gotcha, Some("file-write-via-shell"), "{command}");
+        match catalogue.command(command, Conditions::default()) {
+            Verdict::Deny { id, reason } => {
+                assert_eq!(id, "file-write-via-shell", "{command}");
+                assert!(reason.contains("Edit"), "{reason}");
+            }
+            other => panic!("{command}: {other:?}"),
+        }
+    }
+    // a read through the same API is no write
+    assert!(catalogue.matching("[System.IO.File]::ReadAllText('x.rs')").is_none());
+}
+
+#[test]
 fn a_whole_read_of_a_long_outlined_file_is_denied_with_its_items_and_the_rest_pass() {
     let catalogue = Catalogue::seed();
     let items = ["parse 149-151".to_owned(), "command 217-248".to_owned()];

@@ -334,6 +334,11 @@ enum Command {
     },
     /// The gotchas that fired, by id, and the refused commands no gotcha names yet.
     Gotchas,
+    /// The id of the first command gotcha a command line matches, or `none`.
+    GotchaMatch {
+        /// The command line to match.
+        command: String,
+    },
     /// The link to a paired session: the latest events of var/pair.log (a run's start and end, a walk's end, a note), which a pairing session watches.
     Pair {
         /// Prints the events after this unix time instead of the last twenty, stamped, so a watch that expired catches up.
@@ -776,6 +781,7 @@ async fn run_main() -> anyhow::Result<()> {
         Command::Hook { event } => hook(&event),
         Command::Gate { command, shell } => gate(&command, &shell),
         Command::Gotchas => gotchas(),
+        Command::GotchaMatch { command } => gotcha_match(&command),
         Command::Open { dir } => {
             let dir = dir.unwrap_or_else(|| PathBuf::from("."));
             println!("{}", ra_console::hub::open(&dir)?);
@@ -978,22 +984,15 @@ fn hook_pre(
             ra_gotchas::shape::judge(judged, shell, cwd, &own_part)
         },
     );
-    let final_verdict = match (verdict, shape) {
-        (ra_gotchas::Verdict::Deny { id, reason }, _) => ra_gotchas::Verdict::Deny { id, reason },
-        (_, ra_gotchas::shape::Shape::Denied(reason)) => ra_gotchas::Verdict::Deny { id: String::from("shell-shape"), reason },
-        (ra_gotchas::Verdict::Pass, ra_gotchas::shape::Shape::Allowed) => {
-            return Some(serde_json::json!({
-                "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "every part of the command is allowed"}
-            }));
-        }
-        (verdict, _) => verdict,
-    };
-    match final_verdict {
-        ra_gotchas::Verdict::Pass => None,
-        ra_gotchas::Verdict::Deny { reason, .. } => Some(serde_json::json!({
+    match ra_gotchas::Answer::of(verdict, shape) {
+        ra_gotchas::Answer::Pass => None,
+        ra_gotchas::Answer::Allow => Some(serde_json::json!({
+            "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "every part of the command is allowed"}
+        })),
+        ra_gotchas::Answer::Deny { reason, .. } => Some(serde_json::json!({
             "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
         })),
-        ra_gotchas::Verdict::Rewrite { command, reason, .. } => {
+        ra_gotchas::Answer::Rewrite { command, reason } => {
             // a command put under `rc hold` runs through the shell of the tool that called it:
             // the Bash tool's bash, the PowerShell tool's powershell
             let shell = match call.get("tool_name").and_then(serde_json::Value::as_str) {
@@ -1086,7 +1085,8 @@ fn hook(event: &str) -> anyhow::Result<()> {
 }
 
 /// Prints the verdict of the pre hook on `command` without running it: `allow`, `deny: <reason>`,
-/// or `ask` for a command neither the hook nor the shape table allows.
+/// or `ask` for a command neither the hook nor the shape table allows. A rewrite is the hook's
+/// allow too, of the command as rewritten, which a second line names.
 fn gate(command: &str, shell: &str) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let tool = if shell.eq_ignore_ascii_case("powershell") { "PowerShell" } else { "Bash" };
@@ -1101,7 +1101,14 @@ fn gate(command: &str, shell: &str) -> anyhow::Result<()> {
                 answer.as_ref().and_then(|a| a.pointer("/hookSpecificOutput/permissionDecisionReason")).and_then(serde_json::Value::as_str);
             println!("deny: {}", reason.unwrap_or_default());
         }
-        Some(other) => println!("{other}"),
+        Some(other) => {
+            println!("{other}");
+            let rewritten =
+                answer.as_ref().and_then(|a| a.pointer("/hookSpecificOutput/updatedInput/command")).and_then(serde_json::Value::as_str);
+            if let Some(rewritten) = rewritten {
+                println!("as: {rewritten}");
+            }
+        }
         // the shape table is the allowlist the harness is given: a command it allows runs
         // without a prompt whether or not the hook spoke
         None => {
@@ -1115,6 +1122,13 @@ fn gate(command: &str, shell: &str) -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Prints the id of the first command gotcha `command` matches.
+fn gotcha_match(command: &str) -> anyhow::Result<()> {
+    let (catalogue, _) = ra_gotchas::Catalogue::refresh(Path::new("var/gotchas.toml"))?;
+    println!("{}", catalogue.matching(command).map_or("none", |g| g.id.as_str()));
     Ok(())
 }
 

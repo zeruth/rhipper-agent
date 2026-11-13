@@ -31,6 +31,16 @@ message = "the contract runner is a build: it takes one of the machine's build s
 remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 
 [[gotcha]]
+# a file written through .NET from a PowerShell one-liner is a shell writer like Set-Content,
+# which the shells refuse; anywhere in the line, and ahead of the allowlist hint, so a
+# `powershell -Command "[IO.File]::…"` is named for what it does, not for its first word
+id = "file-write-via-shell"
+where = "command"
+pattern = '\[(System\.)?IO\.File\]::(Write|Append|Create|Copy|Move|Delete)'
+message = "a file is not written from the shell, whatever the API: create it with Write and change it with Edit, not [System.IO.File]::WriteAllLines or another shell writer"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 # the first word of a command; the parts after a pipe or a `;`, `&&` or `||` are judged by the
 # hook's shape table (`ra_gotchas::shape`), which names the form to use instead of each refusal
 id = "shell-outside-allowlist"

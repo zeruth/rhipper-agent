@@ -321,6 +321,42 @@ pub enum Verdict {
     Rewrite { id: String, command: String, reason: String },
 }
 
+/// What the pre-tool hook answers a shell command, the catalogue's verdict and the command's
+/// shape weighed together: a refused part denies the whole, a rewrite's allow included; a
+/// command every part of which is allowed is allowed outright, which the static allowlist,
+/// unable to parse a pipe or a chain, would have refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// Allowed as written.
+    Allow,
+    /// Allowed as `command`, the catalogue's rewrite of it.
+    Rewrite { command: String, reason: String },
+    /// Refused; `id` names the gotcha, or `shell-shape` for a refused part.
+    Deny { id: String, reason: String },
+    /// No answer: the static allowlist decides.
+    Pass,
+}
+
+impl Answer {
+    /// The answer to a command the catalogue gave `verdict` and the shape table `shape`.
+    #[must_use]
+    pub fn of(verdict: Verdict, shape: shape::Shape) -> Self {
+        match (verdict, shape) {
+            (Verdict::Deny { id, reason }, _) => Self::Deny { id, reason },
+            (_, shape::Shape::Denied(reason)) => Self::Deny { id: String::from("shell-shape"), reason },
+            (Verdict::Pass, shape::Shape::Allowed) => Self::Allow,
+            (Verdict::Rewrite { command, reason, .. }, _) => Self::Rewrite { command, reason },
+            (Verdict::Pass, shape::Shape::Unknown) => Self::Pass,
+        }
+    }
+
+    /// Whether the command runs, as written or rewritten, without the static allowlist's say.
+    #[must_use]
+    pub fn allows(&self) -> bool {
+        matches!(self, Self::Allow | Self::Rewrite { .. })
+    }
+}
+
 /// One hit: the gotcha and what it matched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
@@ -406,6 +442,12 @@ impl Catalogue {
     #[must_use]
     pub fn is_routine(&self, id: &str) -> bool {
         self.get(id).is_some_and(|g| matches!(&g.remedy, Remedy::Rewrite { insert, .. } if insert.trim_start().starts_with("rc hold")))
+    }
+
+    /// The first command gotcha whose pattern matches `command`, as `rc gotcha-match` names it.
+    #[must_use]
+    pub fn matching(&self, command: &str) -> Option<&Gotcha> {
+        self.entries.iter().find(|g| g.place == Where::Command && g.pattern.is_match(command))
     }
 
     /// [`Catalogue::command`] for a worker's shell in `workspace`, as the pre-tool hook asks it:
