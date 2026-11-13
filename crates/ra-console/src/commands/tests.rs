@@ -2372,6 +2372,46 @@ async fn a_report_that_says_its_check_is_running_is_overwritten_by_the_agents_ow
     assert_eq!(store.read(2).await.unwrap().notes.as_deref(), Some(ran));
 }
 
+#[tokio::test]
+async fn acceptance_check_runs_a_forbidden_long_command_for_the_worker_and_hands_its_output_to_the_review() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    std::fs::write(dir.path().join("rhipper.toml"), "[worker]\ncheck_timeout = 1800\n").unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Contract parent 1", &store, &worker()).await.unwrap();
+    // runelite's shape: the contract runner a worker may not run and that outlives its turn,
+    // then a build the worker may run itself
+    let acceptance = r"`.\gw.ps1 :contract` (long) passes; `cargo test -p probe -q` passes";
+    store.set_details(2, None, Some(acceptance)).await.unwrap();
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        log.lock().push(command.to_owned());
+        let output = if command.contains("gw.ps1") { "contract: 412 of 412 passed\n" } else { "test result: ok\n" };
+        Ok((0, output.to_owned()))
+    });
+    let provider = Scripted::new(vec![says("changed `src/lib.rs` so the contract holds", vec![])]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(script);
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    // every command of the acceptance ran, in order, the script path with its backslash whole
+    let ran: Vec<String> = seen.lock().iter().take(2).cloned().collect();
+    assert_eq!(ran, [r".\gw.ps1 :contract", "cargo test -p probe -q"], "{out:?}");
+    assert!(out.iter().any(|l| l.contains(r"check passed: .\gw.ps1 :contract · cargo test -p probe -q")), "{out:?}");
+    // the worker was told which command is the orchestrator's, under the project's limit
+    let prompt = provider.seen.lock()[0].messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
+    assert!(prompt.contains(r"The orchestrator runs `.\gw.ps1 :contract` for you"), "{prompt}");
+    assert!(prompt.contains("under the project's 1800 s limit"), "{prompt}");
+    assert!(!prompt.contains("runs `cargo test -p probe -q`"), "{prompt}");
+    // the contract runner's output, which the worker never saw, rides the handoff and the review
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    let report = &task.handoffs.last().unwrap().report;
+    assert!(report.starts_with("check passed: .\\gw.ps1 :contract · exit code 0\ncontract: 412 of 412 passed"), "{report}");
+    assert!(!report.contains("check passed: cargo test"), "{report}");
+    let node = store.read(2).await.unwrap();
+    let brief = crate::agent::review_brief(dir.path(), dir.path(), &node).await;
+    assert!(brief.contains("contract: 412 of 412 passed"), "{brief}");
+}
+
 /// A run over a git-tracked cargo project whose worker writes `src/extra.rs`; the check and the
 /// lint come from a script, with clippy warning at `at`. The node after the run, and the lines.
 async fn linted_run(at: &str) -> (Vec<String>, ra_roadmap::model::Node, tempfile::TempDir) {

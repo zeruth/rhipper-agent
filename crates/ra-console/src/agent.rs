@@ -1794,6 +1794,60 @@ pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
     child.wait().map_or(1, |status| status.code().unwrap_or(1))
 }
 
+/// How long `rc wait` waits unless told otherwise: under a worker's 600-second turn, so the
+/// turn ends with an answer rather than a kill.
+pub const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_mins(9);
+
+/// How long a file `rc wait` watches must hold still before its job counts as done.
+const WAIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The lines of the file `rc wait` prints once it settles.
+const WAIT_TAIL_LINES: usize = 40;
+
+/// Waits on a long job of the worker's own, for `rc wait`: a pid until the process is gone, a
+/// file until it exists and has not changed for [`WAIT_SETTLE`], whose last lines it then
+/// prints. The one sanctioned wait: a `sleep` loop is refused, and a background shell the
+/// session outlives is no result (#159). Answers 0 when the job ended within `limit`, 124 when
+/// the limit ran out first, as `timeout` does.
+#[must_use]
+pub fn wait(dir: &Path, target: &str, limit: std::time::Duration) -> i32 {
+    let started = std::time::Instant::now();
+    let poll = std::time::Duration::from_millis(500);
+    if let Ok(pid) = target.trim().parse::<u32>() {
+        while crate::hub::pid_alive(pid) {
+            if started.elapsed() >= limit {
+                eprintln!("rc wait: pid {pid} still runs after {} s", limit.as_secs());
+                return 124;
+            }
+            std::thread::sleep(poll);
+        }
+        println!("rc wait: pid {pid} has ended");
+        return 0;
+    }
+    let path = dir.join(target);
+    let seen = |path: &Path| std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()));
+    let mut last = seen(&path);
+    let mut still = std::time::Instant::now();
+    let code = loop {
+        if started.elapsed() >= limit {
+            eprintln!("rc wait: {target} still changes after {} s", limit.as_secs());
+            break 124;
+        }
+        std::thread::sleep(poll);
+        let now = seen(&path);
+        if now != last {
+            last = now;
+            still = std::time::Instant::now();
+        } else if last.is_some() && still.elapsed() >= WAIT_SETTLE {
+            break 0;
+        }
+    };
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        println!("{}", last_lines(&text, WAIT_TAIL_LINES));
+    }
+    code
+}
+
 /// The share of the processor every build on the machine runs at together: one build may use
 /// it all, `n` builds a `1/n` part each. The person's rule of 2026-11-12: "1 builder 90%, 3 at
 /// 30% each".
@@ -2766,7 +2820,7 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
             if !commands.is_empty() {
                 let toolbox = worker.toolbox(&root).map(|t| t.with_timeout(timeout));
                 let _slot = hold_build(&root).await;
-                let runs = run_checks(&toolbox, &commands).await;
+                let runs = run_checks(&toolbox, &commands, &[]).await;
                 if let Some(failed) = runs.iter().find(|r| !r.passed) {
                     let _ = git(&root, &["reset", "--merge", "ORIG_HEAD"]).await;
                     anyhow::bail!(
@@ -3773,7 +3827,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the local checks before the card counts as done: no model call, the acceptance names
     // them (else the project, else the workspace tests), and they run in order up to the first
     // failure
-    let Checks { commands, lint: project_lint, timeout } = checks_of(&root, &node);
+    let Checks { commands, lint: project_lint, timeout, orchestrated } = checks_of(&root, &node);
     let command = commands.join(" · ");
     let toolbox = worker.toolbox(workspace_dir.as_deref().unwrap_or(Path::new("."))).map(|toolbox| toolbox.with_timeout(timeout));
     // a check is a build: it takes one of the project's build slots, as the workers' own
@@ -3784,7 +3838,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // not the project's (six asm checks on one lock waited for each other for nothing)
     let target = if workspace_dir.is_some() { root.join("target").join(format!("wt-{id}")) } else { crate::hub::cargo_target(&root) };
     let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root, &target).await } else { None };
-    let checks = run_checks(&toolbox, &commands).await;
+    let checks = run_checks(&toolbox, &commands, &orchestrated).await;
     let status_after = git_status(&acting).await;
     // the card's own set: on a tree other hands share, a dirty file joins it only when the run
     // wrote to it and the report or an earlier handoff names it (#157 lost a named file, #185
@@ -3814,13 +3868,17 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     }
     let mut report = session.text.clone();
     // what leads the answer in the notes and the handoff alike: the failed check, when one did,
-    // else the agent's run of the checks when the worker's report claimed its own was running
+    // else the agent's run of the checks when the worker's report claimed its own was running,
+    // else the runs of the commands only the orchestrator ran, which the worker never saw
     let mut lead = String::new();
     let (mut passed, mut check_line) = match checks.iter().find(|run| !run.passed) {
         None => {
-            if placeholder {
-                let ran: Vec<String> =
-                    checks.iter().map(|run| format!("check passed: {} · {}\n{}", run.command, run.exit, run.text)).collect();
+            let ran: Vec<String> = checks
+                .iter()
+                .filter(|run| placeholder || orchestrated.contains(&run.command))
+                .map(|run| format!("check passed: {} · {}\n{}", run.command, run.exit, run.text))
+                .collect();
+            if !ran.is_empty() {
                 lead = format!("{}\n\n", ran.join("\n\n"));
                 report = format!("{lead}{}", session.text);
             }
@@ -4110,7 +4168,9 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     let workspace = worker.workspace.clone().or(project);
     let mut task = ra_context::TaskContext::open(&root, node.id);
     let brief = context_of(store, node).await?;
-    task.brief = brief.text;
+    // the commands of the acceptance the worker may not run, or that outlive its turn, are
+    // named under the card, so the session spends no turn on a refusal or a wait
+    task.brief = format!("{}{}", brief.text, orchestrated_line(&checks_of(&root, node)));
     task.outlines = ra_context::outline_files(&root, &brief.files, &last_change(&root, node, &task).await);
     // a card sent back by its reviewer carries the verdict's points in its context: the notes
     // that hold them are in the roadmap, which the worker does not read
@@ -4620,6 +4680,9 @@ struct Checks {
     lint: Option<String>,
     /// How long each check, and the lint, may run: the project's `check_timeout`.
     timeout: std::time::Duration,
+    /// The commands among them that are the orchestrator's alone ([`orchestrated_checks`]):
+    /// their output rides the handoff, and the worker's prompt names them.
+    orchestrated: Vec<String>,
 }
 
 impl Checks {
@@ -4650,7 +4713,53 @@ fn checks_of(root: &Path, node: &Node) -> Checks {
     } else {
         ra_roadmap::check::commands(&node.files)
     };
-    Checks { commands, lint: worker.lint().map(str::to_owned), timeout: worker.check_timeout() }
+    let orchestrated = orchestrated_checks(node.acceptance.as_deref(), &worker);
+    Checks { commands, lint: worker.lint().map(str::to_owned), timeout: worker.check_timeout(), orchestrated }
+}
+
+/// The programs a worker's shell runs a check through by itself; any other is the
+/// orchestrator's unless the project's `[worker] allow` names it.
+const WORKER_CHECKS: [&str; 2] = ["cargo", "rustfmt"];
+
+/// What marks a backticked command as long, right after its closing backtick: it outlives a
+/// worker's turn, so the orchestrator runs it whatever the worker may run.
+pub const LONG_MARK: &str = "(long)";
+
+/// The acceptance commands the orchestrator runs for the worker: the ones the worker may not
+/// run (runelite's contract runner), and the ones marked [`LONG_MARK`]. The worker is told not to
+/// run them, and their output, not only their exit, reaches the review and the handoff: the
+/// reviews of runelite #31, #51, #73 and #152 each asked again for the contract runner's result.
+fn orchestrated_checks(acceptance: Option<&str>, worker: &crate::router::WorkerConfig) -> Vec<String> {
+    let Some(text) = acceptance else { return Vec::new() };
+    let pieces: Vec<&str> = text.split('`').collect();
+    let mut found = Vec::new();
+    for at in (1..pieces.len()).step_by(2) {
+        let span = pieces[at].trim();
+        if !is_command(span) {
+            continue;
+        }
+        let long = pieces.get(at + 1).is_some_and(|after| after.trim_start().starts_with(LONG_MARK));
+        let program = span.split_whitespace().next().unwrap_or_default();
+        let may_run = WORKER_CHECKS.contains(&program) || worker.allows(span);
+        if (long || !may_run) && !found.iter().any(|c| c == span) {
+            found.push(span.to_owned());
+        }
+    }
+    found
+}
+
+/// The line of a worker's prompt that names the commands the orchestrator runs for it, under
+/// the project's time limit; empty when there are none.
+fn orchestrated_line(checks: &Checks) -> String {
+    if checks.orchestrated.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> = checks.orchestrated.iter().map(|c| format!("`{c}`")).collect();
+    format!(
+        "The orchestrator runs {} for you after your report, on a worker slot under the project's {} s limit, and attaches the output to the review and the handoff: do not run them yourself. To wait on a long job of your own, use `rc wait <file|pid>`.\n",
+        named.join(", "),
+        checks.timeout.as_secs()
+    )
 }
 
 /// The programs an acceptance runs a check through. `git` is not one: a backticked `git log`
@@ -4793,20 +4902,25 @@ fn held_reason(report: &str, changed: &[String], failed: Option<&CheckRun>, prin
 const PASSED_TAIL_LINES: usize = 5;
 
 /// Runs the checks of a card in the project directory, in the order written, and stops at the
-/// first failure; each command's verdict goes to the activity log as it comes.
-async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[String]) -> Vec<CheckRun> {
+/// first failure; each command's verdict goes to the activity log as it comes. Each command is
+/// split into its words once, here, and they reach the program as its arguments. A passed
+/// command among `orchestrated` keeps the tail a failed one would: the worker never saw its
+/// output, and the reviewer judges by it.
+async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[String], orchestrated: &[String]) -> Vec<CheckRun> {
     let mut runs = Vec::new();
     for command in commands {
-        let outcome = match toolbox {
-            Ok(toolbox) => toolbox.check_acceptance(command).await,
-            Err(e) => Err(anyhow::anyhow!("{e:#}")),
+        let outcome = match (toolbox, ra_tools::words(command)) {
+            (Ok(toolbox), Ok(words)) => toolbox.check_args(&words).await,
+            (Err(e), _) => Err(anyhow::anyhow!("{e:#}")),
+            (_, Err(e)) => Err(e),
         };
+        let kept = if orchestrated.contains(command) { TAIL_LINES } else { PASSED_TAIL_LINES };
         let run = match outcome {
             Ok((true, output)) => CheckRun {
                 command: command.clone(),
                 passed: true,
                 exit: output.lines().last().unwrap_or_default().to_owned(),
-                text: last_lines(&output, PASSED_TAIL_LINES),
+                text: last_lines(&output, kept),
                 failed_tests: 0,
                 first_error: String::new(),
                 setup: false,

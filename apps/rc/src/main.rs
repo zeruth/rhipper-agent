@@ -355,6 +355,14 @@ enum Command {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// Waits on a long job of the worker's own: a pid until it ends, a file until it holds still for ten seconds, then prints its last lines; the one sanctioned way for a worker to wait.
+    Wait {
+        /// The pid of the job, or the file its output goes to.
+        target: String,
+        /// The most seconds to wait; 540 when left out, under a worker's turn.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
     /// Makes this directory a project: drafts rhipper.md with a strong model from what the directory shows, imports a roadmap-shaped file, or starts empty.
     Init {
         /// A roadmap-shaped file (ROADMAP.md, TODO.md, a plan) the model converts, keeping every item.
@@ -780,6 +788,11 @@ async fn run_main() -> anyhow::Result<()> {
             let shell = shell.unwrap_or_else(|| String::from(if cfg!(windows) { "powershell" } else { "sh" }));
             let dir = std::env::current_dir()?;
             std::process::exit(ra_console::agent::hold(&dir, &shell, &command.join(" ")));
+        }
+        Command::Wait { target, timeout } => {
+            let limit = timeout.filter(|s| *s > 0).map_or(ra_console::agent::WAIT_LIMIT, std::time::Duration::from_secs);
+            let dir = std::env::current_dir()?;
+            std::process::exit(ra_console::agent::wait(&dir, &target, limit));
         }
         Command::Init { import, empty, model } => {
             plain_tracing()?;

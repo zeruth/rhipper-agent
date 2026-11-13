@@ -111,6 +111,23 @@ fn a_backslash_before_a_path_character_is_the_separator() {
     assert!(err.contains("ends in a backslash"), "{err}");
 }
 
+#[tokio::test]
+async fn a_check_passed_as_words_keeps_its_backslash() {
+    let (_dir, tools) = workspace().await;
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let log = seen.clone();
+    let tools = tools.with_script(Arc::new(move |line: &str| {
+        line.clone_into(&mut log.lock().unwrap());
+        Ok((0, "ok\n".to_owned()))
+    }));
+    let words = words(r".\gw.ps1 :contract").unwrap();
+    assert_eq!(words, [r".\gw.ps1", ":contract"]);
+    let (passed, out) = tools.check_args(&words).await.unwrap();
+    assert!(passed, "{out}");
+    assert_eq!(*seen.lock().unwrap(), r".\gw.ps1 :contract");
+    assert!(tools.check_args(&[]).await.unwrap_err().to_string().contains("empty"));
+}
+
 #[test]
 fn clip_keeps_the_head_and_the_tail() {
     let long = "a".repeat(MAX_OUTPUT + 100);
