@@ -271,8 +271,8 @@ fn judge_part(part: &Part, shell: Shell, workspace: &Path, own: &dyn Fn(&str) ->
 /// path stays inside the workspace; a path outside it is refused.
 fn judge_move(args: &[&str], shell: Shell, workspace: &Path, assigned: &[String]) -> Shape {
     let paths: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
-    if args.iter().any(|w| outside(w, workspace)) {
-        return Shape::Denied(GIT_FORM.to_owned());
+    if let Some(path) = args.iter().find(|w| outside(w, workspace)) {
+        return Shape::Denied(format!("`git mv` runs inside the workspace only, and `{path}` leaves it: {GIT_FORM}"));
     }
     if paths.len() < 2 || args.iter().any(|w| !known(w, shell, assigned)) {
         return Shape::Unknown;
