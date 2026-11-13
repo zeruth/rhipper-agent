@@ -31,8 +31,8 @@ struct Options {
 enum Command {
     /// Shows the roadmap, or one node with its subtree.
     Show {
-        /// The id of the node; the whole roadmap when left out.
-        id: Option<i64>,
+        /// The ids of the nodes, one block each in the order given; the whole roadmap when left out.
+        ids: Vec<i64>,
         /// Prints a plain Markdown checklist instead, for a README or an issue.
         #[arg(long)]
         markdown: bool,
@@ -498,9 +498,9 @@ fn main() -> anyhow::Result<()> {
 async fn run_main() -> anyhow::Result<()> {
     let options = Options::parse();
     match options.command {
-        Command::Show { id, markdown } => {
+        Command::Show { ids, markdown } => {
             plain_tracing()?;
-            if markdown { show_markdown(id).await } else { show(id).await }
+            if markdown { show_markdown(ids.first().copied()).await } else { show(&ids).await }
         }
         Command::Add { kind, title, parent, objective, acceptance, complexity, files, waits_on, model } => {
             plain_tracing()?;
@@ -1395,12 +1395,27 @@ fn ensure_roadmap(roadmap: &Path) -> anyhow::Result<()> {
     anyhow::bail!("{}", ra_console::setup::hint(root).join("\n"))
 }
 
-async fn show(id: Option<i64>) -> anyhow::Result<()> {
+/// Prints the roadmap when `ids` is empty, else one block per id in order; an id with no node
+/// prints `no such node` and the rest still print.
+async fn show(ids: &[i64]) -> anyhow::Result<()> {
     let store = open_store().await?;
     let roadmap = store.load().await?;
     let nodes = roadmap.nodes;
+    let root = store_path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    if !ids.is_empty() {
+        for &id in ids {
+            if nodes.iter().any(|n| n.id == id) {
+                for line in show_lines(&nodes, Some(id), &root)? {
+                    println!("{line}");
+                }
+            } else {
+                println!("no such node {id}");
+            }
+        }
+        return Ok(());
+    }
     // the gambits come first, as in the file: the direction before the work
-    if id.is_none() && !roadmap.gambits.is_empty() {
+    if !roadmap.gambits.is_empty() {
         for gambit in &roadmap.gambits {
             for line in ra_console::commands::gambit_lines(std::slice::from_ref(gambit)) {
                 println!("{line}");
@@ -1408,8 +1423,7 @@ async fn show(id: Option<i64>) -> anyhow::Result<()> {
         }
         println!();
     }
-    let root = store_path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    for line in show_lines(&nodes, id, &root)? {
+    for line in show_lines(&nodes, None, &root)? {
         println!("{line}");
     }
     Ok(())
