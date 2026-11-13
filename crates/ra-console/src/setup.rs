@@ -238,7 +238,62 @@ pub async fn init(root: &Path, worker: &Worker, mode: Mode) -> anyhow::Result<Ve
     {
         lines.push(format!("{} drafted from the directory; edit it by hand, every run reads it", ra_context::PROJECT_FILE));
     }
+    if ensure_line_endings(root).with_context(|| format!("cannot write {GITATTRIBUTES_FILE}"))? {
+        lines.push(format!("{GITATTRIBUTES_FILE} fixes the line endings of the sources and fixtures to LF; commit it"));
+    }
     Ok(lines)
+}
+
+/// The file that fixes the line endings of a project's sources.
+pub const GITATTRIBUTES_FILE: &str = ".gitattributes";
+
+/// The attributes every project gets: a CRLF checkout makes an edit miss its old text and
+/// breaks an `include_str!` fixture, so text is LF in the tree and in the checkout; the
+/// Windows scripts that need CRLF keep it.
+const LINE_ENDINGS: &str = "# one line ending for the sources and the fixtures on every OS, so an edit finds its text\n# and a fixture reads the same bytes (rhipper)\n* text=auto eol=lf\n*.bat text eol=crlf\n*.cmd text eol=crlf\n";
+
+/// Whether the attributes of `text` settle the line ending of every file: a `*` line that
+/// names `text` or `eol`.
+fn settles_line_endings(text: &str) -> bool {
+    text.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next() == Some("*") && words.any(|w| w.starts_with("text") || w.starts_with("eol="))
+    })
+}
+
+/// Gives `root` the line-ending attributes when its `.gitattributes` does not settle them,
+/// keeping what the file already says; true when the file was written.
+///
+/// # Errors
+/// When the file cannot be read or written.
+pub fn ensure_line_endings(root: &Path) -> std::io::Result<bool> {
+    let path = root.join(GITATTRIBUTES_FILE);
+    let current = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    if settles_line_endings(&current) {
+        return Ok(false);
+    }
+    let separator = if current.is_empty() || current.ends_with('\n') { "" } else { "\n" };
+    std::fs::write(&path, format!("{current}{separator}{LINE_ENDINGS}"))?;
+    Ok(true)
+}
+
+/// The line-endings check of `rc doctor`: a project whose attributes do not settle the line
+/// ending fails it once, and gets them, so the person commits the file.
+///
+/// # Errors
+/// When the project had no such attributes, or they could not be written.
+pub fn line_endings_check(root: &Path) -> Result<String, String> {
+    match ensure_line_endings(root) {
+        Ok(false) => Ok(format!("{GITATTRIBUTES_FILE} fixes the line endings")),
+        Ok(true) => {
+            Err(format!("no line-ending attributes: CRLF files miss edits and break fixtures; {GITATTRIBUTES_FILE} written now, commit it"))
+        }
+        Err(e) => Err(format!("no line-ending attributes, and {GITATTRIBUTES_FILE} cannot be written: {e}")),
+    }
 }
 
 /// The line that parts the outline from the project context in the model's answer.

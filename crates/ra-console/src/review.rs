@@ -7,20 +7,30 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+/// The heading of the dirty files of a shared tree that are not the card's change.
+pub const NOT_THE_CARDS: &str = "not this card’s (dirty before the run)";
+
 /// The `## Files of the card` section of the reviewer's brief: the card's `files:` first, the
-/// ones the run's handoff added after them, one per line.
+/// ones the run's handoff added after them, one per line; then, under [`NOT_THE_CARDS`], the
+/// files `stray` names: dirty in a shared tree but not this card's, which the reviewer is told
+/// not to judge (#185 was sent back three times for the person's own uncommitted edits).
 #[must_use]
-pub fn files_section(card: &[String], changed: &[String]) -> String {
+pub fn files_section(card: &[String], changed: &[String], stray: &[String]) -> String {
     let mut text = String::from("\n## Files of the card\n");
     if card.is_empty() && changed.is_empty() {
         text.push_str("the card names no files and no run changed any\n");
-        return text;
     }
-    for file in card {
+    for file in card.iter().filter(|f| !stray.contains(f)) {
         let _ = writeln!(text, "- {file}");
     }
     for file in changed.iter().filter(|f| !card.contains(f)) {
         let _ = writeln!(text, "- {file} (changed by the run, not on the card)");
+    }
+    if !stray.is_empty() {
+        let _ = writeln!(text, "\n## {NOT_THE_CARDS}\nother edits in the shared tree; they are not in the diff below, do not judge them");
+        for file in stray {
+            let _ = writeln!(text, "- {file}");
+        }
     }
     text
 }

@@ -75,6 +75,8 @@ const BASH: &[&str] = &[
     "cut *",
     "paste *",
     "tr *",
+    // the one sanctioned wait on a long job of the worker's own
+    "rc wait *",
 ];
 
 /// The commands a worker's PowerShell runs, as [`BASH`] for its cmdlets.
@@ -94,6 +96,7 @@ const POWERSHELL: &[&str] = &[
     "New-Item *",
     "Write-Output *",
     "git check-ignore*",
+    "rc wait *",
 ];
 
 /// The programs refused in either shell, each group with the form to use instead.
