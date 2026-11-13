@@ -176,7 +176,7 @@ pub(crate) fn metrics(sessions: &[Session]) -> Vec<Metric> {
 }
 
 /// The number right after the first `marker` in `text` (`in 78259`, `$0.3336`, `read-in 92k`).
-fn number_after(text: &str, marker: &str) -> Option<f64> {
+pub(crate) fn number_after(text: &str, marker: &str) -> Option<f64> {
     let at = text.find(marker)? + marker.len();
     let digits: String = text[at..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
     digits.trim_end_matches('.').parse().ok()

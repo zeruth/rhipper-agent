@@ -63,33 +63,6 @@ fn a_ring_keeps_the_last_two_minutes_newest_last() {
     assert_eq!(*samples.last().unwrap(), (cards::GAUGE_SPAN + 9) as f32);
 }
 
-fn landed(tab: usize, id: i64, at: Option<u64>) -> Landed {
-    Landed {
-        tab,
-        project: format!("p{tab}"),
-        id,
-        title: format!("card {id}"),
-        state: TaskState::Accepted,
-        model: String::new(),
-        cost: None,
-        tokens_per_turn: 0,
-        at,
-        seq: usize::try_from(id).unwrap(),
-    }
-}
-
-#[test]
-fn the_report_reads_newest_first_and_groups_by_project_when_asked() {
-    // three projects: two with a history, one without, whose cards keep their store's order
-    let mut items = vec![landed(0, 1, Some(100)), landed(0, 2, Some(300)), landed(1, 3, Some(200)), landed(2, 4, None), landed(2, 5, None)];
-    order_landed(&mut items, false);
-    assert_eq!(items.iter().map(|l| l.id).collect::<Vec<_>>(), vec![2, 3, 1, 4, 5]);
-    order_landed(&mut items, true);
-    assert_eq!(items.iter().map(|l| l.id).collect::<Vec<_>>(), vec![2, 1, 3, 4, 5]);
-    let groups: Vec<usize> = items.chunk_by(|a, b| a.tab == b.tab).map(<[Landed]>::len).collect();
-    assert_eq!(groups, vec![2, 1, 2]);
-}
-
 fn spend(at: &str, tokens: u64, cost: Option<f64>) -> ra_usage::Spend {
     ra_usage::Spend { at: at.to_owned(), tokens, cost_usd: cost }
 }

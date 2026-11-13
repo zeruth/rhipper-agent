@@ -13,6 +13,7 @@ mod fonts;
 mod input;
 mod markdown;
 mod metrics;
+mod report;
 #[cfg(test)]
 mod tests;
 mod theme;
@@ -383,13 +384,15 @@ struct App {
     report_metrics_at: Option<Instant>,
     /// When the window started, for the dashboard's uptime.
     started: Instant,
-    /// Whether the report is in front: the cards that landed across every project.
+    /// Whether the report is in front: the cards runs ended on across every project.
     report: bool,
-    /// The report's bubbles in the order they draw, rebuilt when a roadmap or a ledger moves.
-    landed: Vec<Landed>,
-    /// What the report was built from: each tab's roadmap and ledger stamps, so a frame rebuilds
-    /// it only when one of them moved.
-    landed_from: Vec<(Option<SystemTime>, Option<Instant>)>,
+    /// How far back the report reaches.
+    report_span: report::Span,
+    /// The report's rows in the order they draw, rebuilt when a roadmap or a ledger moves.
+    report_rows: Vec<report::Row>,
+    /// What the report was built from: each tab's roadmap and ledger stamps and the span, so a
+    /// frame rebuilds it only when one of them moved; `None` before the first build.
+    report_from: Option<(Vec<(Option<SystemTime>, Option<Instant>)>, report::Span)>,
     /// Why the window goes when it does, for the projects' pair feeds: `close` unless
     /// `rc restart` asked.
     down: &'static str,
@@ -747,8 +750,9 @@ impl App {
             report_metrics_at: None,
             started: Instant::now(),
             report: false,
-            landed: Vec::new(),
-            landed_from: Vec::new(),
+            report_span: report::Span::default(),
+            report_rows: Vec::new(),
+            report_from: None,
             down: "close",
             gauges: Gauges::start(&projects[0]),
             tokens: TokenGauges::default(),
@@ -1364,204 +1368,6 @@ impl App {
         let live = self.tabs.iter().any(|t| t.sink.live_run().is_some() || t.job.is_some());
         ctx.request_repaint_after(Duration::from_millis(if live { 40 } else { 250 }));
     }
-
-    /// The report: the cards that landed in every open project, as bubbles in two columns,
-    /// newest first; grouped under a divider per project when the toggle says so. A click on
-    /// a bubble opens the project's tab with the card selected.
-    fn report_view(&mut self, root: &mut egui::Ui) {
-        let ctx = root.ctx().clone();
-        self.rebuild_landed();
-        let mut by_project = self.tabs.first().is_some_and(|t| t.report_by_project);
-        let mut open: Option<(usize, i64)> = None;
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        egui::CentralPanel::default().frame(Frame::new().fill(theme::bg()).inner_margin(Margin::symmetric(18, 12))).show(root, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("REPORT").small().strong().color(theme::dim()));
-                let text = format!("{} landed across {} open", self.landed.len(), self.tabs.len());
-                ui.label(RichText::new(text).small().color(theme::dim()));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    if cards::tab(ui, "by time", theme::accent(), !by_project) {
-                        by_project = false;
-                    }
-                    if cards::tab(ui, "by project", theme::accent(), by_project) {
-                        by_project = true;
-                    }
-                });
-            });
-            ui.add_space(6.0);
-            egui::ScrollArea::vertical().id_salt("report").auto_shrink([false, false]).show(ui, |ui| {
-                // the page's width, handed down: the columns are sized from it, so no bubble
-                // takes the room a scroll area's content would otherwise be allowed
-                let page = ui.available_width();
-                ui.set_width(page);
-                let column = ((page - 10.0) / 2.0).max(200.0);
-                if self.landed.is_empty() {
-                    ui.label(RichText::new("nothing has landed yet: a card implemented or accepted shows here").color(theme::dim()));
-                }
-                let mut rows: Vec<&[Landed]> = Vec::new();
-                if by_project {
-                    for group in self.landed.chunk_by(|a, b| a.tab == b.tab) {
-                        rows.push(group);
-                    }
-                } else {
-                    rows.push(&self.landed);
-                }
-                for (g, group) in rows.into_iter().enumerate() {
-                    if by_project {
-                        let lane = theme::lane(1 + group[0].tab % 9);
-                        if g > 0 {
-                            ui.add_space(4.0);
-                        }
-                        ui.horizontal(|ui| {
-                            cards::badge(ui, &group[0].project, lane);
-                            ui.label(RichText::new(format!("{} landed", group.len())).small().color(theme::dim()));
-                        });
-                        cards::divider(ui, lane);
-                    }
-                    for pair in group.chunks(2) {
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = 10.0;
-                            for item in pair {
-                                ui.allocate_ui_with_layout(egui::vec2(column, 0.0), Layout::top_down(Align::Min), |ui| {
-                                    ui.set_width(column);
-                                    if landed_bubble(ui, item, now) {
-                                        open = Some((item.tab, item.id));
-                                    }
-                                });
-                            }
-                        });
-                    }
-                }
-            });
-        });
-        if self.tabs.first().is_some_and(|t| t.report_by_project != by_project) {
-            // every project's layout keeps the choice, so whichever opens first reads it back
-            for tab in &mut self.tabs {
-                tab.report_by_project = by_project;
-                tab.save_layout();
-            }
-            self.landed_from.clear();
-        }
-        if let Some((tab, id)) = open
-            && tab < self.tabs.len()
-        {
-            self.active = tab;
-            self.report = false;
-            self.tabs[tab].select(Some(id));
-        }
-        ctx.request_repaint_after(Duration::from_millis(250));
-    }
-
-    /// Rebuilds the report's list when a tab's roadmap or ledger moved since the last build,
-    /// or a tab came or went; a frame that finds them where they were draws the list it has.
-    fn rebuild_landed(&mut self) {
-        let from: Vec<_> = self.tabs.iter().map(|t| (t.roadmap_seen, t.ledger.read_at)).collect();
-        if from == self.landed_from {
-            return;
-        }
-        self.landed_from = from;
-        let mut landed = Vec::new();
-        for (tab, workspace) in self.tabs.iter().enumerate() {
-            let project = workspace
-                .project_title
-                .clone()
-                .unwrap_or_else(|| workspace.root.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
-            let cards = workspace
-                .roadmap
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| n.kind == NodeKind::Task && matches!(n.state, TaskState::Implemented | TaskState::Accepted));
-            for (seq, node) in cards {
-                landed.push(Landed {
-                    tab,
-                    project: project.clone(),
-                    id: node.id,
-                    title: node.title.clone(),
-                    state: node.state,
-                    model: node.assignee.as_ref().map(|a| short(&a.model).to_owned()).unwrap_or_default(),
-                    cost: workspace.costs.get(&node.id).filter(|t| t.calls > 0).and_then(|t| t.cost_usd),
-                    tokens_per_turn: workspace.costs.get(&node.id).map_or(0, |t| t.tokens().checked_div(t.turns).unwrap_or(0)),
-                    at: workspace.last_changes.get(&node.id).map(|c| c.at),
-                    seq,
-                });
-            }
-        }
-        let by_project = self.tabs.first().is_some_and(|t| t.report_by_project);
-        order_landed(&mut landed, by_project);
-        self.landed = landed;
-    }
-}
-
-/// One bubble of the report: a card that landed, with what the bubble shows of it.
-#[derive(Clone, Debug, PartialEq)]
-struct Landed {
-    /// The index of the project's tab.
-    tab: usize,
-    project: String,
-    id: i64,
-    title: String,
-    state: TaskState,
-    /// The model's short name; empty when the card names none.
-    model: String,
-    /// The card's cost from the ledger, when it had a call.
-    cost: Option<f64>,
-    /// The tokens one turn took on average over the card's runs; 0 before the first turn.
-    tokens_per_turn: u64,
-    /// When its state last changed, from the history; `None` when the project has none.
-    at: Option<u64>,
-    /// The card's place in the store, the order a project without history falls back to.
-    seq: usize,
-}
-
-/// Orders the report's bubbles: newest first by the time of the last state change, the cards
-/// without one after them in their store's order; `by_project` keeps that order within each
-/// project and lays the projects out in the tabs' order.
-fn order_landed(landed: &mut [Landed], by_project: bool) {
-    landed.sort_by_key(|l| (l.at.is_none(), std::cmp::Reverse(l.at), l.tab, l.seq));
-    if by_project {
-        landed.sort_by_key(|l| l.tab);
-    }
-}
-
-/// The bubble of one landed card: the project as a small badge, the id and the title, the
-/// state, the model, the cost, the tokens a turn and how long ago it landed. Returns true when
-/// clicked.
-fn landed_bubble(ui: &mut egui::Ui, item: &Landed, now: u64) -> bool {
-    let lane = theme::lane(1 + item.tab % 9);
-    let shown = cards::bubble(ui, lane, false, |ui| {
-        let inner = ui.available_width();
-        ui.set_width(inner);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            cards::badge(ui, &item.project, lane);
-            ui.label(RichText::new(format!("#{}", item.id)).small().strong().color(cards::alpha(theme::text(), 180)));
-            let title = egui::Label::new(RichText::new(&item.title).color(theme::text())).truncate();
-            ui.add(title).on_hover_text(format!("#{} {}", item.id, item.title));
-        });
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            cards::badge(ui, &item.state.to_string(), theme::state_color(item.state));
-            if !item.model.is_empty() {
-                cards::badge(ui, &item.model, theme::accent());
-            }
-            if let Some(cost) = item.cost {
-                ui.label(RichText::new(dollars(Some(cost))).small().color(theme::dim()));
-            }
-            if item.tokens_per_turn > 0 {
-                let text = format!("{} tok/turn", compact(item.tokens_per_turn));
-                ui.label(RichText::new(text).small().color(theme::dim()))
-                    .on_hover_text("the tokens a turn read and wrote, on average over the card's runs");
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let when = item.at.map_or_else(|| "—".to_owned(), |at| format!("{} ago", ra_roadmap::history::age(now.saturating_sub(at))));
-                ui.label(RichText::new(when).small().color(theme::dim()));
-            });
-        });
-    });
-    ui.interact(shown.response.rect, ui.make_persistent_id(("landed", item.tab, item.id)), egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
 }
 
 /// What one of the window's own tabs in the strip answered: whether it was clicked, and its
