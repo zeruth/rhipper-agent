@@ -1447,7 +1447,12 @@ async fn run_parallel_runs_two_cards_at_once_in_two_worktrees_that_both_end_impl
         // the worktree and the branch cleared
         assert_eq!(store.read(id).await.unwrap().state, ra_roadmap::model::TaskState::Accepted, "{out:?}");
         assert!(out.iter().any(|l| l.contains(&format!("branch card/{id}"))), "{out:?}");
-        assert!(out.iter().any(|l| l == &format!("committed 1 file(s) on card/{id}")), "{out:?}");
+        // the work is committed by the landing, or by the catch-up before the review when the
+        // other card landed first
+        assert!(
+            out.iter().any(|l| l == &format!("committed 1 file(s) on card/{id}") || l.starts_with(&format!("  #{id}: caught up: "))),
+            "{out:?}"
+        );
         assert!(out.iter().any(|l| l.starts_with(&format!("merged card/{id} into "))), "{out:?}");
         let worktree = dir.path().join("var").join("worktrees").join(id.to_string());
         assert!(!worktree.join(".git").exists(), "{} was not cleared", worktree.display());
@@ -1548,6 +1553,95 @@ async fn a_third_failed_landing_check_waits_for_the_person() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 6, "{out:?}");
     let sent = crate::pair::recent(dir.path(), 100).iter().filter(|l| l.ends_with("sent back to its worker")).count();
     assert_eq!(sent, 3);
+}
+
+/// A committed probe project with card #2 `Probe` and its worktree, and a worker in the worktree
+/// on `answers` whose check commits `file` with `content` on the project's branch the first time
+/// it runs: the project moves on while the card's run goes.
+async fn a_run_the_project_moves_under(
+    dir: &std::path::Path,
+    file: &'static str,
+    content: &'static str,
+    answers: Vec<ra_providers::Completion>,
+) -> (Store, Worker, std::sync::Arc<Scripted>) {
+    cargo_project(dir, true);
+    git_ok(dir, &["init", "-q"]);
+    git_ok(dir, &["add", "-A"]);
+    git_ok(dir, &["commit", "-q", "-m", "probe"]);
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let (path, branch) = crate::agent::worktree_add(dir, 2).await.unwrap();
+    let project = dir.to_path_buf();
+    let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let check: ra_tools::Script = std::sync::Arc::new(move |_: &str| {
+        if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            std::fs::write(project.join(file), content).unwrap();
+            git_ok(&project, &["add", file]);
+            git_ok(&project, &["commit", "-q", "-m", "the project moves on"]);
+        }
+        Ok((0, "ok\n".to_owned()))
+    });
+    let script = Scripted::new(answers);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(check).with_worktree(path, branch);
+    (store, runner, script)
+}
+
+/// The worker's turn that writes `made.txt` in its tree.
+fn writes_made() -> ra_providers::Completion {
+    let write = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"made.txt","content":"by the worker\n"}"#.into(),
+    };
+    says("", vec![write])
+}
+
+#[tokio::test]
+async fn a_conflicting_catch_up_skips_the_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let answers = vec![writes_made(), says("wrote made.txt", vec![]), says("wrote made.txt again", vec![])];
+    let (store, runner, script) = a_run_the_project_moves_under(dir.path(), "made.txt", "by the project\n", answers).await;
+    let out = crate::agent::run(&store, 2, &runner).await.unwrap();
+    assert!(
+        out.iter().any(|l| l.contains("#2 not reviewed: ") && l.contains("with conflicts in 1 file(s); sent back to its worker")),
+        "{out:?}"
+    );
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+    // the markers stay in the tree for the worker, and no reviewer read a tree that cannot land
+    let made = std::fs::read_to_string(dir.path().join("var").join("worktrees").join("2").join("made.txt")).unwrap();
+    assert!(made.contains("<<<<<<<"), "{made}");
+    assert_eq!(script.seen.lock().len(), 2);
+    // the next run opens on the conflicts; unresolved, they send it back again, still unreviewed
+    let out = crate::agent::run(&store, 2, &runner).await.unwrap();
+    let seen = script.seen.lock();
+    assert_eq!(seen.len(), 3, "{out:?}");
+    assert!(seen.iter().all(|request| !request.tools.is_empty()), "a reviewer was asked");
+    let prompt = &seen[2].messages.last().unwrap().content;
+    assert!(prompt.contains("FIRST: the project's branch was merged into this card's branch") && prompt.contains("- made.txt"), "{prompt}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+}
+
+#[tokio::test]
+async fn the_review_reads_the_merged_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let answers = vec![writes_made(), says("wrote made.txt", vec![]), says("accepted", vec![])];
+    let (store, runner, script) = a_run_the_project_moves_under(dir.path(), "other.txt", "by the project\n", answers).await;
+    let out = crate::agent::run(&store, 2, &runner).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Implemented, "{out:?}");
+    // the catch-up and the merged tree's check come before the verdict
+    let caught = out.iter().position(|l| l.contains("caught up: 1 commit(s) merged")).unwrap_or_else(|| panic!("{out:?}"));
+    let verdict = out.iter().position(|l| l.contains("accepted by")).unwrap_or_else(|| panic!("{out:?}"));
+    assert!(caught < verdict, "{out:?}");
+    assert!(out[caught].contains("check passed on the merged tree: cargo test --workspace -q"), "{out:?}");
+    // the stat's base is the project's HEAD, which the merge made the merge base: the commit
+    // made after the run started is behind it, and the stat is the card's own file
+    let head = git_ok(dir.path(), &["rev-parse", "HEAD"]);
+    let seen = script.seen.lock();
+    let brief = &seen[2].messages.last().unwrap().content;
+    assert!(seen[2].tools.is_empty());
+    let stat = brief.split(&format!("## git diff --stat {head} of the card's files\n")).nth(1).unwrap_or_else(|| panic!("{brief}"));
+    let stat = stat.split("\n## ").next().unwrap_or_default();
+    assert!(stat.contains("made.txt") && !stat.contains("other.txt"), "{stat}");
 }
 
 /// Leaves the plan's five-hour window at `utilization` in the project's `var/limits.json`, seen

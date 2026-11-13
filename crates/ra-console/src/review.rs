@@ -38,7 +38,9 @@ pub fn files_section(card: &[String], changed: &[String], stray: &[String]) -> S
 /// The `git diff --stat <base>` of `files` in `root`, as a section of the brief; the line that
 /// says so when the stat is empty or git has nothing to say. `base` is `HEAD` in a project's
 /// own tree and the merge base with the project's branch in a card's worktree, so the
-/// checkpoints the walk commits on the card's branch stay in the reviewer's view.
+/// checkpoints the walk commits on the card's branch stay in the reviewer's view; the catch-up
+/// before the review moves that base to the project's HEAD, so the stat is the card's change
+/// on the tree that lands, not what the project's branch brought in.
 pub async fn diff_stat_section(root: &Path, base: &str, files: &[String]) -> String {
     let mut text = format!("\n## git diff --stat {base} of the card's files\n");
     let mut command = tokio::process::Command::new("git");

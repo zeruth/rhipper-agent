@@ -170,6 +170,56 @@ pub(crate) fn badge_marked(ui: &mut Ui, mark: &str, text: &str, color: Color32) 
         .response
 }
 
+/// A badge whose text runs in a marquee when it is wider than `width`: the text scrolls left
+/// through the badge and comes round again, so a long task name reads whole in its own room
+/// instead of an ellipsis (the person: "the long task name marquee instead of going on
+/// forever"). A text that fits sits still.
+pub(crate) fn marquee_badge(ui: &mut Ui, mark: &str, text: &str, width: f32, color: Color32) -> egui::Response {
+    Frame::new()
+        .fill(alpha(color, 28))
+        .stroke(Stroke::new(1.0, alpha(color, 160)))
+        .corner_radius(CornerRadius::same(9))
+        .inner_margin(Margin::symmetric(7, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(RichText::new(mark).color(color).small());
+                let font = egui::TextStyle::Small.resolve(ui.style());
+                let galley = ui.painter().layout_no_wrap(text.to_owned(), font, theme::text());
+                let room = width.max(20.0).min(galley.size().x);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(room, galley.size().y), egui::Sense::hover());
+                let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                if galley.size().x <= room + 0.5 {
+                    painter.galley(rect.min, galley, theme::text());
+                } else {
+                    // thirty points a second, a gap of forty between the end and the start again
+                    let lap = galley.size().x + 40.0;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let shift = (ui.input(|i| i.time) as f32 * 30.0) % lap;
+                    painter.galley(rect.min - egui::vec2(shift, 0.0), galley.clone(), theme::text());
+                    painter.galley(rect.min + egui::vec2(lap - shift, 0.0), galley, theme::text());
+                    ui.ctx().request_repaint();
+                }
+            });
+        })
+        .response
+}
+
+/// The colour a model wears: Fable red, Opus orange, Haiku yellow, Sonnet and the rest the
+/// accent (the person's colours, 2026-11-12).
+pub(crate) fn model_color(model: &str) -> Color32 {
+    let model = model.to_ascii_lowercase();
+    if model.contains("fable") {
+        Color32::from_rgb(0xE5, 0x3E, 0x3E)
+    } else if model.contains("opus") {
+        Color32::from_rgb(0xF0, 0x8A, 0x2E)
+    } else if model.contains("haiku") {
+        Color32::from_rgb(0xF2, 0xD0, 0x3C)
+    } else {
+        theme::accent()
+    }
+}
+
 /// A toast: a card the width of a note, the run's name in `color` over its outcome, that
 /// answers a click on its whole face. A failed run's is lit and its outcome reads as an error;
 /// an outcome that counts gotchas reads as a warning.
@@ -255,23 +305,36 @@ pub(crate) const GAUGE_SPAN: usize = 120;
 /// person named them workers on 2026-11-12; in the code they are the build slots.
 pub(crate) fn builder(ui: &mut Ui, index: usize, held: Option<(&str, u64)>, share: u32, width: f32) {
     let color = if held.is_some() { theme::lane(7 + index % 3) } else { theme::dim() };
-    bubble(ui, color, held.is_some(), |ui| {
+    let drawn = bubble(ui, color, held.is_some(), |ui| {
         let inner = (width - 18.0).max(60.0);
         ui.set_width(inner);
         ui.set_max_width(inner);
         ui.horizontal(|ui| {
             ui.set_width(inner);
-            ui.label(RichText::new(format!("WORKER {}", index + 1)).small().strong().color(theme::dim()));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| match held {
+            match held {
+                // a busy slot is its holder: who, how long and the share, on a light glow that
+                // fills the slot, with no label and no badge in it (the person, 2026-11-12)
                 Some((who, secs)) => {
-                    badge(ui, &format!("{who} · {}:{:02} · {share}% cpu", secs / 60, secs % 60), color);
+                    ui.label(RichText::new(who).small().strong().color(theme::text()));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{share}% cpu")).small().strong().color(color));
+                        ui.label(RichText::new(format!("{}:{:02}", secs / 60, secs % 60)).small().color(theme::text()));
+                    });
                 }
                 None => {
-                    ui.label(RichText::new("idle").small().color(theme::dim()));
+                    ui.label(RichText::new(format!("WORKER {}", index + 1)).small().strong().color(theme::dim()));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new("idle").small().color(theme::dim()));
+                    });
                 }
-            });
+            }
         });
     });
+    if held.is_some() {
+        // the glow over the whole slot, under the text's own contrast
+        let rect = drawn.response.rect.shrink(1.5);
+        ui.painter().rect_filled(rect, CornerRadius::same(9), alpha(color, 26));
+    }
 }
 
 /// The machine's worker-slot count as a bubble of the worker row, the same height as a slot:
