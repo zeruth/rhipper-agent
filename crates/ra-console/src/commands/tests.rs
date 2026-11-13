@@ -2696,6 +2696,12 @@ async fn a_reviewer_that_accepts_moves_the_card_to_accepted_and_the_verdict_lead
     use crate::agent::{Verdict, verdict_of};
     assert_eq!(verdict_of("needs revision\n* a\n* b"), Verdict::NeedsRevision(vec!["a".into(), "b".into()]));
     assert_eq!(verdict_of("the diff misses the test"), Verdict::NeedsRevision(vec!["the diff misses the test".into()]));
+    assert_eq!(verdict_of("I read the diff.\nIt is fine.\naccepted"), Verdict::Accepted);
+    assert_eq!(verdict_of("needs_revision\n- ✓ tests pass\n- lint ok\n- docs passes"), Verdict::Accepted);
+    assert_eq!(
+        verdict_of("needs_revision\n- ✓ tests pass\n- the doc comment is missing\n- lint ok"),
+        Verdict::NeedsRevision(vec!["the doc comment is missing".into()])
+    );
 }
 
 /// Reviews a fresh card run on `implementer` in a project whose `rhipper.toml` is `routes`:

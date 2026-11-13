@@ -1062,17 +1062,39 @@ pub fn verdict_of(answer: &str) -> Verdict {
     let Some(first) = lines.next() else {
         return Verdict::NeedsRevision(vec!["the reviewer answered nothing".to_owned()]);
     };
-    let word = first.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase().replace(' ', "_");
+    let word_of = |line: &str| line.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase().replace(' ', "_");
+    let word = word_of(first);
     if word.starts_with("accepted") {
         return Verdict::Accepted;
     }
     let point = |line: &str| line.trim_start_matches(['-', '*', '•']).trim().to_owned();
+    let rest: Vec<&str> = lines.collect();
+    // A reviewer that opens with a sentence and closes with the word accepts.
+    if rest.last().is_some_and(|last| word_of(last).starts_with("accepted")) {
+        return Verdict::Accepted;
+    }
     let points: Vec<String> = if word.starts_with("needs_revision") {
-        lines.map(point).collect()
+        // Every point a tick is an acceptance; a mixed list keeps only the failing ones.
+        let failing: Vec<String> = rest.iter().filter(|line| !is_tick(line)).map(|line| point(line)).collect();
+        if failing.is_empty() && !rest.is_empty() {
+            return Verdict::Accepted;
+        }
+        failing
     } else {
-        std::iter::once(first).chain(lines).map(point).collect()
+        std::iter::once(first).chain(rest).map(point).collect()
     };
     Verdict::NeedsRevision(if points.is_empty() { vec!["the reviewer gave no points".to_owned()] } else { points })
+}
+
+/// A review point that passes: a check mark first, or `ok` / `passes` last.
+fn is_tick(line: &str) -> bool {
+    let line = point_text(line);
+    let end = line.trim_end_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+    line.starts_with(['✓', '✔', '☑', '✅']) || end.ends_with(" ok") || end.ends_with("passes") || end == "ok"
+}
+
+fn point_text(line: &str) -> &str {
+    line.trim_start_matches(['-', '*', '•', ' '])
 }
 
 /// What a fix pass is told, ahead of the verdict and the card.
