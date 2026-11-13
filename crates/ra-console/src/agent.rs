@@ -2151,6 +2151,28 @@ pub async fn requeue_orphans_with(store: &Store, root: &Path, alive: impl Fn(u32
     Some(text)
 }
 
+/// A run of an earlier window the window adopted ([`crate::pair::window_up`]): waits, asking
+/// `alive` every `poll`, while process `pid` of card `id` lives, then takes its end as the
+/// run's own. A run that wrote its end is closed already and nothing more is written; one that
+/// died without it is an orphan, and its end and re-queue are written once, through
+/// [`requeue_orphans`], whose line is returned.
+pub async fn adopt(
+    store: &Store,
+    root: &Path,
+    id: i64,
+    pid: u32,
+    alive: impl Fn(u32) -> bool,
+    poll: std::time::Duration,
+) -> Option<String> {
+    while alive(pid) {
+        tokio::time::sleep(poll).await;
+    }
+    tracing::debug!("adopted run #{id} of process {pid} ended");
+    // only its own run is the adoption's to close: another adopted run may still go, and the
+    // runs no window adopted were judged when the window came up
+    requeue_orphans_with(store, root, |other| other != pid).await
+}
+
 /// Runs the ready cards one after another, reading readiness again after each, until none is
 /// ready or a run fails. A card a run left needing revision is rerun by the walk on its session,
 /// after a failed check twice and after a rejection once ([`CHECK_RETRIES`], [`REVIEW_RETRIES`]);

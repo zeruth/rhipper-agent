@@ -70,10 +70,13 @@ fn a_follower_catches_up_then_sees_new_lines_and_survives_a_rotation() {
 async fn the_window_says_when_it_comes_up_and_goes_down() {
     let dir = tempfile::tempdir().unwrap();
     let store = ra_roadmap::store::Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
-    window_up_with(&store, dir.path(), "0.9.1+abc", 3, |_| true).await;
+    assert!(window_up_with(&store, dir.path(), "0.9.1+abc", 3, |_| true).await.is_empty());
     window_down(dir.path(), "restart");
     let pid = std::process::id();
-    assert_eq!(recent(dir.path(), 10), [format!("window up 0.9.1+abc pid {pid} tabs 3"), "window down restart".to_owned()]);
+    assert_eq!(
+        recent(dir.path(), 10),
+        [format!("window up 0.9.1+abc pid {pid} tabs 3 · restarts in 24 h: 0"), "window down restart".to_owned()]
+    );
 }
 
 #[test]

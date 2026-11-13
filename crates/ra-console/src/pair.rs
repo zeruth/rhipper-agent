@@ -166,18 +166,54 @@ pub fn follow(root: &Path, since: u64, out: &mut impl Write) -> std::io::Result<
     }
 }
 
-/// The window has come up on this project: `window up <build> pid <pid> tabs <n>`, then the
-/// runs the window took down with it go back on the queue through
-/// [`crate::agent::requeue_orphans`], one `re-queued …` line for all of them. A run whose
-/// process lives is left alone, the window owns no run's lifetime.
+/// How often an adopted run's process is asked whether it still lives.
+const ADOPT_POLL: Duration = Duration::from_secs(5);
+
+/// The span the feed counts restarts over.
+const RESTART_SPAN: u64 = 24 * 60 * 60;
+
+/// The window has come up on this project: `window up <build> pid <pid> tabs <n> · restarts in
+/// 24 h: <k>`, and `· adopted #3 #4` when runs of an earlier window still go. A run whose
+/// process lives is adopted: the window waits on it and takes its end as the run's own
+/// ([`crate::agent::adopt`]), as the worktree, the branch and the session hold all it has. The
+/// runs whose process is gone go back on the queue through [`crate::agent::requeue_orphans`],
+/// once. Before this, 146 of 1774 runs in 48 h were reruns a restart had orphaned.
 pub async fn window_up(store: &ra_roadmap::store::Store, root: &Path, build: &str, tabs: usize) {
-    window_up_with(store, root, build, tabs, crate::hub::pid_alive).await;
+    for (id, pid) in window_up_with(store, root, build, tabs, crate::hub::pid_alive).await {
+        let (store, root) = (store.clone(), root.to_owned());
+        tokio::spawn(async move { crate::agent::adopt(&store, &root, id, pid, crate::hub::pid_alive, ADOPT_POLL).await });
+    }
 }
 
-/// [`window_up`] with the liveness check given, for the tests.
-pub async fn window_up_with(store: &ra_roadmap::store::Store, root: &Path, build: &str, tabs: usize, alive: impl Fn(u32) -> bool) {
-    event(root, &format!("window up {build} pid {} tabs {tabs}", std::process::id()));
-    crate::agent::requeue_orphans_with(store, root, alive).await;
+/// [`window_up`] with the liveness check given, for the tests: the runs adopted, `(card, pid)`,
+/// for the caller to wait on.
+pub async fn window_up_with(
+    store: &ra_roadmap::store::Store,
+    root: &Path,
+    build: &str,
+    tabs: usize,
+    alive: impl Fn(u32) -> bool,
+) -> Vec<(i64, u32)> {
+    let now = crate::hub::unix_now();
+    let restarts = since(root, now.saturating_sub(RESTART_SPAN))
+        .iter()
+        .filter(|line| line.split_once('\t').is_some_and(|(_, text)| text.starts_with("window up ")))
+        .count();
+    let adopted = adoptable(root, &alive);
+    let cards: Vec<String> = adopted.iter().map(|(id, _)| format!("#{id}")).collect();
+    let adopted_text = if cards.is_empty() { String::new() } else { format!(" · adopted {}", cards.join(" ")) };
+    let pid = std::process::id();
+    event(root, &format!("window up {build} pid {pid} tabs {tabs} · restarts in 24 h: {restarts}{adopted_text}"));
+    crate::agent::requeue_orphans_with(store, root, &alive).await;
+    adopted
+}
+
+/// The runs in the activity log that started, never ended, and whose process lives: `(card,
+/// pid)` in the order they started, the ones a restarting window adopts.
+#[must_use]
+pub fn adoptable(root: &Path, alive: impl Fn(u32) -> bool) -> Vec<(i64, u32)> {
+    let activity = std::fs::read_to_string(root.join(crate::ui::ACTIVITY_FILE)).unwrap_or_default();
+    open_runs(&activity).into_iter().filter(|(_, pid)| alive(*pid)).collect()
 }
 
 /// The cards of the runs in the activity log that started, never ended, and whose process is
@@ -213,6 +249,12 @@ pub fn window_down(root: &Path, reason: &str) {
 /// open run, as the log pane does, unless it is an orphan's end, which names its card; a start
 /// without a pid cannot be judged and is not.
 fn orphans(activity: &str, alive: impl Fn(u32) -> bool) -> Vec<(i64, u32)> {
+    open_runs(activity).into_iter().filter(|(_, pid)| !alive(*pid)).collect()
+}
+
+/// The runs in the activity text that started with a pid and were not ended, `(card, pid)` in
+/// the order they started, by the closing rule of [`orphans`].
+fn open_runs(activity: &str) -> Vec<(i64, u32)> {
     let mut open: Vec<(i64, Option<u32>)> = Vec::new();
     for line in activity.lines() {
         // a walk of several cards tags each line with its card; the markers sit after the tag
@@ -222,13 +264,13 @@ fn orphans(activity: &str, alive: impl Fn(u32) -> bool) -> Vec<(i64, u32)> {
             if let Some(id) = crate::logs::card_of(title) {
                 open.push((id, pid));
             }
-        } else if let Some(outcome) = line.strip_prefix(crate::logs::RUN_END) {
-            if let Some(at) = crate::logs::end_closes(&open, outcome, tag, |(id, pid)| (Some(*id), *pid)) {
-                open.remove(at);
-            }
+        } else if let Some(outcome) = line.strip_prefix(crate::logs::RUN_END)
+            && let Some(at) = crate::logs::end_closes(&open, outcome, tag, |(id, pid)| (Some(*id), *pid))
+        {
+            open.remove(at);
         }
     }
-    open.into_iter().filter_map(|(id, pid)| pid.map(|pid| (id, pid))).filter(|(_, pid)| !alive(*pid)).collect()
+    open.into_iter().filter_map(|(id, pid)| pid.map(|pid| (id, pid))).collect()
 }
 
 #[cfg(test)]

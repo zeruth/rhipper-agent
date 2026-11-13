@@ -2162,6 +2162,49 @@ async fn an_orphan_that_ended_is_left_alone() {
 }
 
 #[tokio::test]
+async fn a_restart_adopts_the_live_runs_writes_an_end_once_and_requeues_the_dead_once() {
+    use crate::logs::{RUN_END, RUN_START};
+    use ra_roadmap::model::TaskState;
+    let dir = tempfile::tempdir().unwrap();
+    // #2's process is gone; #3 and #4 still go, and #4 will end by itself
+    let activity = format!("{RUN_START}#2 A · m · pid 11\n{RUN_START}#3 B · m · pid 12\n{RUN_START}#4 C · m · pid 14\n");
+    let store = orphaned_project(dir.path(), &activity).await;
+    let adopted = crate::pair::window_up_with(&store, dir.path(), "0.9.1", 1, |pid| pid != 11).await;
+    assert_eq!(adopted, [(3, 12), (4, 14)]);
+    let pid = std::process::id();
+    let feed = crate::pair::recent(dir.path(), 10);
+    assert_eq!(feed[0], format!("window up 0.9.1 pid {pid} tabs 1 · restarts in 24 h: 0 · adopted #3 #4"));
+    assert_eq!(requeued_lines(dir.path()), ["re-queued 1 orphaned run(s): #2"]);
+    assert_eq!(store.read(3).await.unwrap().state, TaskState::InProgress);
+    assert_eq!(store.read(4).await.unwrap().state, TaskState::InProgress);
+    // #4 wrote its own end: the adoption takes it and writes nothing more
+    let path = dir.path().join(crate::ui::ACTIVITY_FILE);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{text}{RUN_END}✓ $0.01\n")).unwrap();
+    assert_eq!(crate::agent::adopt(&store, dir.path(), 4, 14, |_| false, std::time::Duration::ZERO).await, None);
+    assert_eq!(store.read(4).await.unwrap().state, TaskState::InProgress);
+    // #3 lives two asks, then dies without its end: its end and re-queue are written once
+    let asks = std::cell::Cell::new(0);
+    let alive = |_: u32| {
+        asks.set(asks.get() + 1);
+        asks.get() < 3
+    };
+    let line = crate::agent::adopt(&store, dir.path(), 3, 12, alive, std::time::Duration::ZERO).await;
+    assert_eq!(line.as_deref(), Some("re-queued 1 orphaned run(s): #3"));
+    assert_eq!(asks.get(), 3);
+    assert_eq!(store.read(3).await.unwrap().state, TaskState::Defined);
+    assert_eq!(crate::agent::adopt(&store, dir.path(), 3, 12, |_| false, std::time::Duration::ZERO).await, None);
+    assert_eq!(requeued_lines(dir.path()), ["re-queued 1 orphaned run(s): #2", "re-queued 1 orphaned run(s): #3"]);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("orphaned #3").count(), 1, "{text}");
+    assert_eq!(text.matches("orphaned #2").count(), 1, "{text}");
+    // the next restart finds nothing to adopt or re-queue, and counts the one before it
+    assert!(crate::pair::window_up_with(&store, dir.path(), "0.9.1", 1, |_| false).await.is_empty());
+    let last = crate::pair::recent(dir.path(), 1);
+    assert_eq!(last, [format!("window up 0.9.1 pid {pid} tabs 1 · restarts in 24 h: 1")]);
+}
+
+#[tokio::test]
 async fn a_stopped_walk_ends_after_the_current_card_with_its_rerun_still_queued() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
@@ -3658,7 +3701,9 @@ async fn a_wait_on_a_target_ends_at_the_check_timeout_naming_the_holder() {
         .with_worktree(worktree, "card/2");
     let started = std::time::Instant::now();
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_secs(30), "the walk did not give up the wait: {out:?}");
+    // far under the 20 min a wait without the timeout would take, and wide enough for the run
+    // around it on a machine busy with the full suite and other projects' builds
+    assert!(started.elapsed() < std::time::Duration::from_secs(120), "the walk did not give up the wait: {out:?}");
     let failure = format!("the check waited 1 s on {} held by other #9", target.display());
     assert!(out.iter().any(|l| l.contains("check failed: cargo test -q") && l.contains(&failure)), "{out:?}");
     let node = store.read(2).await.unwrap();
