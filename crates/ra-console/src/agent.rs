@@ -625,6 +625,7 @@ pub async fn doctor(root: &Path) -> Vec<Check> {
         Check::new("ledger", true, ledger_check(root).await),
         Check::new("landing", false, landing_check(root).await),
         Check::new("temp", false, temp_check(root)),
+        Check::new("line endings", false, crate::setup::line_endings_check(root)),
     ]
 }
 
@@ -3427,7 +3428,10 @@ impl Pool {
                             crate::hub::held_by("pool-opus", size, &name) + ready
                         })
                         .sum();
-                    size.saturating_sub(demand)
+                    // never past the project's own runners: the order decides who is served
+                    // first, the runners how many it runs (the agent at four runners took nine
+                    // slots the order left it, 2026-11-12)
+                    size.saturating_sub(demand).min(width.max(1))
                 } else if borrow {
                     // the share, and an equal part of what the pool holds beyond every walking
                     // project's share: one project alone has the four, two have two each
@@ -3855,6 +3859,29 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             (false, format!("  check failed: {}{count}{after}{where_}", failed.command))
         }
     };
+    // the failure's fingerprint rides on the check line, which the handoff keeps: the next run
+    // of the card tells a failure that repeats on the same tree (asm #131 and #132 ran 23 times
+    // on a check cargo rejected on its own arguments)
+    let failed = checks.iter().find(|run| !run.passed);
+    let print = match failed {
+        Some(failed) => {
+            let diff = git_text(&acting, &["diff", "HEAD"]).await;
+            let base = git_text(&acting, &["rev-parse", "HEAD"]).await;
+            Some(check_fingerprint(&failed.command, &failed.first_error, &diff, &base))
+        }
+        None => None,
+    };
+    if let Some(print) = &print {
+        check_line = format!("{check_line}{}{print}", ra_context::FINGERPRINT_MARK);
+    }
+    let last_print = task
+        .handoffs
+        .iter()
+        .rev()
+        .find(|h| !h.outcome.starts_with("note from"))
+        .and_then(ra_context::Handoff::fingerprint)
+        .map(str::to_owned);
+    let held = held_reason(&session.text, &changed, failed, print.as_deref(), last_print.as_deref());
     // the lint of what the run changed, once the check passed: the orchestrator finds the
     // warnings so the worker spends no turns on them. A lint that cannot run is a line, not a
     // verdict; a warning in a changed file is.
@@ -3880,7 +3907,20 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             lint_warnings = lint.warnings;
         }
     }
-    if passed {
+    // a card no rerun can move is held for a person on the first sight, with the line that
+    // says why on its check line, the feed and the run's lines; the walk does not send it again
+    if let Some(reason) = &held {
+        passed = false;
+        if let Some(review) = carried_review(node.notes.as_deref()) {
+            report = format!("{review}\n\n{report}");
+        }
+        store.set_notes(id, &report).await?;
+        store.set_state_by(id, TaskState::Blocked, Source::Run).await?;
+        check_line = format!("{check_line} · blocked: {reason}");
+        let text = format!("#{id} blocked: {reason}; a person sets it defined again");
+        tracing::warn!("{text}");
+        crate::pair::event(&root, &text);
+    } else if passed {
         store.set_notes(id, &report).await?;
         store.set_state_by(id, TaskState::Implemented, Source::Run).await?;
     } else {
@@ -3916,7 +3956,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let summary = worker.ask_role(roles, Role::Summary, Some(id), SUMMARY_INSTRUCTION, &session.text).await;
     let answer = summary.as_deref().unwrap_or(&session.text);
     let handed = if lint_warnings.is_empty() { format!("{lead}{answer}") } else { answer.to_owned() };
-    let mut last = handoff(if passed { "implemented" } else { "needs revision" }, check_line.trim(), &handed, changed);
+    let outcome = if held.is_some() {
+        "blocked"
+    } else if passed {
+        "implemented"
+    } else {
+        "needs revision"
+    };
+    let mut last = handoff(outcome, check_line.trim(), &handed, changed);
     last.warnings = lint_warnings;
     // a run sent back by its check hands on what it read, as a capped one does
     if !passed {
@@ -3934,7 +3981,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             if passed { "✓" } else { "✗" },
             id,
             node.title,
-            if passed { "implemented" } else { "needs revision" },
+            outcome,
             short(&worker.model),
             session.calls,
             tokens_line(&session),
@@ -3943,6 +3990,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         ),
         check_line,
     ];
+    if let Some(reason) = &held {
+        lines.push(format!("  #{id} blocked: {reason}; a person sets it defined again"));
+    }
     lines.extend(fresh);
     lines.extend(noted);
     lines.extend(lint_lines);
@@ -4606,6 +4656,104 @@ struct CheckRun {
     /// short tail of a passed one.
     text: String,
     failed_tests: usize,
+    /// The first line of a failed command's output that reads as its error, else its first
+    /// line; empty for a passed one. The fingerprint and the reason of a block name it.
+    first_error: String,
+    /// Whether the command failed before any compile or test output: an argument the tool
+    /// rejects, a program not found, an SDK location missing. A rerun cannot move such a card.
+    setup: bool,
+}
+
+/// What a failed command's output says when it never reached a build or a test: the tool
+/// rejected its arguments, the program or the SDK is not there.
+const SETUP_FAILURES: [&str; 16] = [
+    "unexpected argument",
+    "unrecognized option",
+    "unrecognized argument",
+    "unknown option",
+    "invalid value",
+    "no such command",
+    "no such subcommand",
+    "did not match any packages",
+    "command not found",
+    "is not recognized as",
+    "no such file or directory",
+    "cannot find the path",
+    "sdk location not found",
+    "could not find `cargo.toml`",
+    "no targets specified",
+    "not installed",
+];
+
+/// The lines of an output that show a build or a test ran: past them a failure is the code's.
+const BUILD_OUTPUT: [&str; 10] =
+    ["compiling ", "checking ", "running ", "test ", "test result:", "finished ", "> task", "build ", "error[e", "warning:"];
+
+/// The line a failed command's output leads with as its error: the first that names an error,
+/// a failed test or a panic, else the first that is not blank.
+fn first_error(output: &str) -> String {
+    let lines = || output.lines().map(str::trim).filter(|line| !line.is_empty());
+    let is_error = |line: &&str| {
+        let lower = line.to_lowercase();
+        lower.starts_with("error") || lower.contains("error:") || line.ends_with(" FAILED") || lower.contains("panicked")
+    };
+    lines().find(is_error).or_else(|| lines().next()).unwrap_or_default().chars().take(200).collect()
+}
+
+/// Whether a failed command's output is a setup failure: it says so, and no line of it shows
+/// a build or a test running.
+fn is_setup_failure(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    let built = lower.lines().map(str::trim_start).any(|line| BUILD_OUTPUT.iter().any(|mark| line.starts_with(mark)));
+    !built && SETUP_FAILURES.iter().any(|mark| lower.contains(mark))
+}
+
+/// The fingerprint of a failed check: the command, its first error line, the hash of the
+/// tree's diff and the commit it is on. A run that ends on the fingerprint its last run ended
+/// on failed the same way on the same tree, and a third run would too. FNV-1a, so a fingerprint
+/// kept in a context file reads the same to the next build of the agent.
+fn check_fingerprint(command: &str, first_error: &str, diff: &str, base: &str) -> String {
+    let hash = |text: &str| {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3))
+    };
+    let diff = format!("{:016x}", hash(diff));
+    format!("{:016x}", hash(&format!("{command}\n{first_error}\n{diff}\n{}", base.trim())))
+}
+
+/// The output of a read-only git command in `root`, or nothing where git has nothing to say.
+async fn git_text(root: &Path, args: &[&str]) -> String {
+    match tokio::process::Command::new("git").args(args).current_dir(root).output().await {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => String::new(),
+    }
+}
+
+/// The reason a worker's report gives under its `## Blocked` heading: the rest of the heading's
+/// line, else the first line under it. `None` when the report has no such heading.
+fn blocked_reason(report: &str) -> Option<String> {
+    let mut lines = report.lines().map(str::trim);
+    let heading = lines
+        .find(|line| line.strip_prefix("## Blocked").is_some_and(|rest| rest.is_empty() || !rest.starts_with(char::is_alphanumeric)))?;
+    let own = heading.trim_start_matches("## Blocked").trim_start_matches([':', ' ', '-', '—', '·']).trim();
+    let reason = if own.is_empty() { lines.find(|line| !line.is_empty()).unwrap_or("the worker reported the card blocked") } else { own };
+    Some(reason.chars().take(200).collect())
+}
+
+/// Why a run holds its card for a person at once instead of sending it back: a report under
+/// `## Blocked` from a run that changed nothing, a check that failed before any build, or one
+/// that failed as the last run's did. `None` leaves the verdict to the check.
+fn held_reason(report: &str, changed: &[String], failed: Option<&CheckRun>, print: Option<&str>, last: Option<&str>) -> Option<String> {
+    if changed.is_empty()
+        && let Some(reason) = blocked_reason(report)
+    {
+        return Some(format!("the worker reported it blocked: {reason}"));
+    }
+    let failed = failed?;
+    if failed.setup {
+        return Some(format!("the check failed before any build: {}: {}", failed.command, failed.first_error));
+    }
+    (print.is_some() && print == last)
+        .then(|| format!("the check failed as the last run's did: {}: {}", failed.command, failed.first_error))
 }
 
 /// How many lines of a passed command's output the notes keep.
@@ -4627,6 +4775,8 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                 exit: output.lines().last().unwrap_or_default().to_owned(),
                 text: last_lines(&output, PASSED_TAIL_LINES),
                 failed_tests: 0,
+                first_error: String::new(),
+                setup: false,
             },
             Ok((false, output)) => {
                 let failure = check_failure(&output);
@@ -4636,9 +4786,22 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                     exit: output.lines().last().unwrap_or_default().to_owned(),
                     text: failure.text,
                     failed_tests: failure.failed,
+                    first_error: first_error(&output),
+                    setup: is_setup_failure(&output),
                 }
             }
-            Err(e) => CheckRun { command: command.clone(), passed: false, exit: format!("{e:#}"), text: format!("{e:#}"), failed_tests: 0 },
+            Err(e) => {
+                let text = format!("{e:#}");
+                CheckRun {
+                    command: command.clone(),
+                    passed: false,
+                    exit: text.clone(),
+                    first_error: first_error(&text),
+                    setup: is_setup_failure(&text),
+                    text,
+                    failed_tests: 0,
+                }
+            }
         };
         tracing::info!(
             target: crate::trace::PROGRESS,

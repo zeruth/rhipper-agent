@@ -31,6 +31,8 @@ message = "the contract runner is a build: it takes one of the machine's four bu
 remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 
 [[gotcha]]
+# the first word of a command; the parts after a pipe or a `;`, `&&` or `||` are judged by the
+# hook's shape table (`ra_gotchas::shape`), which names the form to use instead of each refusal
 id = "shell-outside-allowlist"
 where = "command"
 pattern = '^\s*(cd|Set-Location|Start-Process|powershell(\.exe)?|pwsh|cmd(\.exe)?|sh|bash|python|pip|npm|node|sed|awk|perl)\b|^\s*git\s+-C\b'
@@ -136,7 +138,7 @@ remedy = { kind = "hint" }
 id = "edit-missed"
 where = "edit"
 pattern = '(?i)string to replace not found|old_string .*not found|not found in (the )?file|has not been read yet|has been modified since|found \d+ matches of the string|must be unique|no changes to make|is identical to'
-message = "an edit missed: its old text was not current or not unique, and the turn went on nothing; Read the lines first, quote them exactly, whitespace included, and make each edit at one place"
+message = "an edit missed: its old text was not current or not unique, and the turn went on nothing; Read the lines first, quote them exactly, whitespace included, and make each edit at one place. When the text was quoted right and still missed, the cause is the line ending: the file is CRLF and Read shows no CR, so a multi-line old text never matches; edit one line at a time, and `rc doctor` gives the project the .gitattributes that keeps its files LF"
 remedy = { kind = "hint" }
 
 [[gotcha]]
