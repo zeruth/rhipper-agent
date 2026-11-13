@@ -1128,15 +1128,22 @@ pub async fn review(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<V
 /// [`review`] with an accepting verdict leaving the card implemented, the verdict on its
 /// handoff, so acceptance is the person's glance at it; a rejection sets needs revision as
 /// ever. A reviewer that does not answer leaves the card in review, without a verdict and so
-/// not offered: `review <id>` judges it once the reviewer answers. The lines of the verdict.
+/// not offered: `review <id>` judges it once the reviewer answers. A run in a card's worktree
+/// takes the project's branch in first and passes its checks on the merged tree
+/// ([`catch_up_for_review`]); a conflict or a failure there sends the card back unreviewed. The
+/// lines of the catch-up and the verdict.
 async fn review_after_run(store: &Store, id: i64, worker: &Worker) -> Vec<String> {
     let root = workspace_of(store);
+    let caught = match catch_up_for_review(store, id, worker).await {
+        Ok(caught) => caught,
+        Err(lines) => return lines,
+    };
     match review_to(store, id, worker, TaskState::Implemented).await {
         Ok(lines) => {
             if let Some(first) = lines.first() {
                 crate::pair::event(&root, &format!("review {first}"));
             }
-            lines
+            caught.into_iter().chain(lines).collect()
         }
         Err(error) => {
             let why = first_line(&format!("{error:#}"));
@@ -1144,7 +1151,10 @@ async fn review_after_run(store: &Store, id: i64, worker: &Worker) -> Vec<String
                 tracing::warn!("#{id} could not be held in review: {e:#}");
             }
             crate::pair::event(&root, &format!("review #{id} no verdict: {why}"));
-            vec![format!("  no verdict on #{id}: {why} · the card waits in review; `review {id}` judges it")]
+            caught
+                .into_iter()
+                .chain([format!("  no verdict on #{id}: {why} · the card waits in review; `review {id}` judges it")])
+                .collect()
         }
     }
 }
@@ -2682,12 +2692,42 @@ fn merge_commit_message(node: &Node, main: &str, handoff: Option<&ra_context::Ha
 /// could not land; from here a branch is never more than one run behind.
 async fn catch_up_worktree(root: &Path, path: &Path, node: &Node) -> Option<String> {
     let id = node.id;
+    let (main, outcome) = catch_up(root, path, node).await?;
+    Some(match outcome {
+        CatchUp::Merged(behind) => format!("  #{id}: {main} merged into {}, {behind} commit(s) behind", worktree_branch(id)),
+        CatchUp::Conflicts(files) => {
+            format!("  #{id}: {main} merged into {} with conflicts in {files}; the worker resolves them first", worktree_branch(id))
+        }
+        CatchUp::Refused => format!("  #{id}: {main} could not be merged into {}; the run goes on without it", worktree_branch(id)),
+    })
+}
+
+/// What merging the project's branch into a card's worktree came to.
+enum CatchUp {
+    /// A clean merge of this many commits of the project's branch.
+    Merged(String),
+    /// Conflicts left in this many files, in the tree with their markers.
+    Conflicts(usize),
+    /// A merge git refused without naming a conflict; it was aborted.
+    Refused,
+}
+
+/// Merges the project's branch into the card's worktree at `path`: the branch's name and what
+/// the merge came to, `None` when the card's branch has every commit of it already or git
+/// cannot say. A tree whose conflicts are still unresolved takes no second merge: committing it
+/// would put the markers on the branch.
+async fn catch_up(root: &Path, path: &Path, node: &Node) -> Option<(String, CatchUp)> {
     let main = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.ok()?;
+    let open = unresolved(path).await;
+    if !open.is_empty() {
+        return Some((main, CatchUp::Conflicts(open.len())));
+    }
     let behind = git(path, &["rev-list", "--count", &format!("HEAD..{main}")]).await.ok()?;
     if behind.trim() == "0" {
         return None;
     }
-    // a tree with changes a crash left uncommitted cannot take a merge: they go on the branch first
+    // a tree with changes cannot take a merge: a crash's leftovers, or the run's own work when
+    // the catch-up comes before the review, go on the branch first
     if let Ok(dirty) = git(path, &["status", "--porcelain"]).await
         && !dirty.trim().is_empty()
     {
@@ -2695,21 +2735,112 @@ async fn catch_up_worktree(root: &Path, path: &Path, node: &Node) -> Option<Stri
         let _ = git(path, &["add", "-A"]).await;
         let _ = git(path, &["commit", "-q", "-m", &message]).await;
     }
-    match git(path, &["merge", "--no-edit", &main]).await {
-        Ok(_) => Some(format!("  #{id}: {main} merged into {}, {} commit(s) behind", worktree_branch(id), behind.trim())),
+    let outcome = match git(path, &["merge", "--no-edit", &main]).await {
+        Ok(_) => CatchUp::Merged(behind.trim().to_owned()),
         Err(_) => {
             let conflicts = git(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
             if conflicts.trim().is_empty() {
                 let _ = git(path, &["merge", "--abort"]).await;
-                return Some(format!("  #{id}: {main} could not be merged into {}; the run goes on without it", worktree_branch(id)));
+                CatchUp::Refused
+            } else {
+                CatchUp::Conflicts(conflicts.lines().count())
             }
-            Some(format!(
-                "  #{id}: {main} merged into {} with conflicts in {}; the worker resolves them first",
-                worktree_branch(id),
-                conflicts.lines().count()
-            ))
         }
+    };
+    Some((main, outcome))
+}
+
+/// The unmerged files of a tree that still hold a conflict marker: a merge the worker has not
+/// resolved yet. A file the worker resolved and left unstaged is not among them.
+async fn unresolved(path: &Path) -> Vec<String> {
+    let conflicts = git(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
+    conflicts
+        .lines()
+        .map(str::trim)
+        .filter(|file| !file.is_empty())
+        .filter(|file| std::fs::read_to_string(path.join(file)).is_ok_and(|text| text.lines().any(|l| l.starts_with("<<<<<<< "))))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The project's branch brought into the card's worktree after a run and before the reviewer
+/// reads it, so what is reviewed is what lands (#182 passed review and failed the merged tree;
+/// asm #73 and #78 passed review and conflicted at landing). `Ok` with the line of the catch-up
+/// when the tree is the project's already, merged clean and passing the card's checks, or git
+/// refused the merge; `Err` with the lines of why the card went back to its worker unreviewed: a
+/// conflict, which the next run's brief opens on ([`conflicts_block`]), or a failed check on
+/// the merged tree, at the head of the notes as a check failure of the card. A run in the
+/// project's own tree has nothing to catch up.
+async fn catch_up_for_review(store: &Store, id: i64, worker: &Worker) -> Result<Option<String>, Vec<String>> {
+    let root = workspace_of(store);
+    let Some(path) = worker.workspace.clone().filter(|p| p.join(".git").exists() && !same_tree(&root, p)) else {
+        return Ok(None);
+    };
+    let Ok(node) = store.read(id).await else { return Ok(None) };
+    let branch = worktree_branch(id);
+    let Some((main, outcome)) = catch_up(&root, &path, &node).await else { return Ok(None) };
+    let behind = match outcome {
+        CatchUp::Merged(behind) => behind,
+        CatchUp::Refused => {
+            return Ok(Some(format!("  #{id}: {main} could not be merged into {branch}; the review reads the branch as it stands")));
+        }
+        CatchUp::Conflicts(files) => {
+            let text = match store.set_state_by(id, TaskState::NeedsRevision, Source::Run).await {
+                Ok(()) => format!(
+                    "#{id} not reviewed: {main} merged into {branch} with conflicts in {files} file(s); sent back to its worker to resolve them"
+                ),
+                Err(e) => format!(
+                    "#{id} not reviewed: {main} merged into {branch} with conflicts in {files} file(s); it could not be sent back ({e:#})"
+                ),
+            };
+            crate::pair::event(&root, &text);
+            return Err(vec![format!("  {text}")]);
+        }
+    };
+    let caught = format!("  #{id}: caught up: {behind} commit(s) merged from {main} into {branch}");
+    tracing::info!(target: crate::trace::PROGRESS, "{}", caught.trim_start());
+    let Checks { commands, timeout, .. } = checks_of(&root, &node);
+    if commands.is_empty() {
+        return Ok(Some(caught));
     }
+    // the merged tree's check is a build like the run's: a slot, the worktree's own target and
+    // the lock on it, a wait that runs out failing the check
+    let own_target = ra_providers::claude_code::shared_target(&path);
+    let toolbox = worker.toolbox(&path).map(|toolbox| {
+        toolbox.with_timeout(timeout).with_env(own_target.iter().map(|t| ("CARGO_TARGET_DIR".to_owned(), t.display().to_string())))
+    });
+    let failed = {
+        let _slot = hold_build(&root, &path).await;
+        let target = own_target.unwrap_or_else(|| crate::hub::cargo_target(&root));
+        let cargo = commands.iter().find(|c| c.trim_start().starts_with("cargo")).cloned();
+        let waited = match &cargo {
+            Some(_) => guard_target(&root, &path, &target, timeout).await,
+            None => Ok(None),
+        };
+        match waited {
+            Ok(_target) => {
+                run_checks(&toolbox, &commands, &[]).await.into_iter().find(|run| !run.passed).map(|run| (run.command, run.text))
+            }
+            Err(text) => Some((cargo.unwrap_or_default(), text)),
+        }
+    };
+    let Some((command, output)) = failed else {
+        return Ok(Some(format!("{caught} · check passed on the merged tree: {}", commands.join(" · "))));
+    };
+    // a failure on the merged tree is the card's check failure: its output leads the notes,
+    // where the rerun reads it, and the walk counts it against the check's retries
+    let notes = node.notes.unwrap_or_default();
+    let lead = format!("check failed: {command}\n{output}\n\n{notes}");
+    let sent = match store.set_notes(id, lead.trim_end()).await {
+        Ok(()) => store.set_state_by(id, TaskState::NeedsRevision, Source::Run).await,
+        Err(e) => Err(e),
+    };
+    let text = match sent {
+        Ok(()) => format!("#{id} not reviewed: the merged tree fails {command}; sent back to its worker"),
+        Err(e) => format!("#{id} not reviewed: the merged tree fails {command}; it could not be sent back ({e:#})"),
+    };
+    crate::pair::event(&root, &text);
+    Err(vec![caught, format!("  {text}")])
 }
 
 /// The block at the head of a worker's brief when its tree has unmerged files: the merge of
@@ -2721,7 +2852,7 @@ async fn conflicts_block(acting: &Path) -> Option<String> {
         return None;
     }
     Some(format!(
-        "FIRST: the project's branch was merged into this card's branch before this run and left merge conflicts (the `<<<<<<<`, `=======`, `>>>>>>>` markers) in these files:\n{}\nResolve every one before anything else, keeping both the project's change and this card's; then go on with the card. Do not commit: the orchestrator commits the resolution after your report.\n",
+        "FIRST: the project's branch was merged into this card's branch and left merge conflicts (the `<<<<<<<`, `=======`, `>>>>>>>` markers) in these files:\n{}\nResolve every one before anything else, keeping both the project's change and this card's; then go on with the card. Do not commit: the orchestrator commits the resolution after your report.\n",
         files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
     ))
 }
@@ -2734,7 +2865,9 @@ async fn conflicts_block(acting: &Path) -> Option<String> {
 async fn checkpoint_worktree(root: &Path, node: &Node) -> Option<String> {
     let id = node.id;
     let path = root.join(WORKTREES_DIR).join(id.to_string());
-    if !path.join(".git").exists() {
+    // a merge the worker has not resolved stays open: committed, its markers would be the
+    // branch's and the next run's brief would not name them
+    if !path.join(".git").exists() || !unresolved(&path).await.is_empty() {
         return None;
     }
     let dirty = git(&path, &["status", "--porcelain"]).await.ok()?;
@@ -2863,7 +2996,9 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
                 }
             }
             // the project's check on the merged tree: two cards right on their own are not
-            // always right together (#176 and #181 compiled apart and not merged)
+            // always right together (#176 and #181 compiled apart and not merged). A reviewed
+            // card ran it on the caught-up tree already; this is the last guard, for a project
+            // that moved on since the review
             let Checks { commands, timeout, .. } = checks_of(&root, &node);
             if !commands.is_empty() {
                 let toolbox = worker.toolbox(&root).map(|t| t.with_timeout(timeout));
