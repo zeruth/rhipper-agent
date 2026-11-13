@@ -35,6 +35,16 @@ pub fn sent_back(root: &Path, id: i64, title: &str, why: &str, rerun: Option<(us
     text
 }
 
+/// What a run did with card `id` whose last two runs changed nothing: it is blocked with
+/// `reason`, the first run's refusal or the verdict it drew twice. The event goes on the feed, so
+/// the paired session knows the card waits on it; the line is the run's.
+#[must_use]
+pub fn parked(root: &Path, id: i64, reason: &str) -> String {
+    let text = format!("parked #{id}: two runs changed nothing: {reason}");
+    event(root, &text);
+    text
+}
+
 /// The latest `limit` events, oldest first; none without a feed.
 #[must_use]
 pub fn recent(root: &Path, limit: usize) -> Vec<String> {
