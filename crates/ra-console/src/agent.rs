@@ -1224,11 +1224,9 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; review a task");
     let root = workspace_of(store);
-    // the reviewer is a role of its own: the card's assignee is its implementer, not its judge
-    let model = match crate::router::Router::load(&root)?.pick(&node, crate::router::REVIEWER, rejections(&root, id)) {
-        Some((_, rule)) => resolve(&rule.model),
-        None => worker.model.clone(),
-    };
+    // the reviewer is a role of its own: the card's assignee is its implementer, not its judge,
+    // and a model judging its own work sent #185 back seven times on the same points
+    let (model, by) = crate::router::Router::load(&root)?.reviewer(&node, &worker.model, rejections(&root, id));
     let provider = worker.provider_for(&model)?;
     // the diff is read where the run acted: a card run in its worktree left nothing in the
     // project's tree, and the reviewer judged an empty diff (#173, the first parallel walk)
@@ -1239,7 +1237,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     let brief = review_brief(&root, &acting, &node).await;
     let before = node.state;
     store.set_state_by(id, TaskState::Review, Source::Run).await?;
-    tracing::info!(target: crate::trace::PROGRESS, "#{id} {} · review by {}", node.title, short(&model));
+    tracing::info!(target: crate::trace::PROGRESS, "#{id} {} · review by {} ({by})", node.title, short(&model));
     let answer = provider
         .complete(CompletionRequest {
             model: model.clone(),
@@ -1307,7 +1305,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     }
     store.set_state_by(id, state, Source::Run).await?;
     let mut lines = vec![format!(
-        "{} #{} {} {said} by {} · in {} out {} · {}",
+        "{} #{} {} {said} by {} ({by}) · in {} out {} · {}",
         if verdict == Verdict::Accepted { "✓" } else { "✗" },
         id,
         node.title,

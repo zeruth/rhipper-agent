@@ -77,3 +77,9 @@ up_after = 1
 # summary = "local/qwen3-8b"     # the worker's report condensed for the handoff of the card
 # digest = "local/qwen3-8b"      # the run's one-line digest for the other projects on the machine
 # classify = "local/qwen3-8b"    # whether a look-back bullet without its tag is [machine]
+# The reviewer is its own role, never the implementer judging itself: `reviewer` names its
+# model, read before any `[[route]]` rule with `role = "reviewer"`. Left out, the reviewer is one
+# rung below the card's implementer on the `[ladder]` (a rung above at the bottom), and never
+# below the ladder's sonnet for a c4–5 card; the review line says `review by <model> (role)`,
+# `(rule N)` or `(default, one rung down)`.
+# reviewer = "sonnet"
