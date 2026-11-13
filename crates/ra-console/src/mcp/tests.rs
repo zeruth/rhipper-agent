@@ -179,6 +179,7 @@ async fn the_handoffs_tool_lists_the_runs_of_a_card() {
         report: "Decoded the byte.\nThe test is missing.".into(),
         warnings: vec!["warning: unused variable `x`".into()],
         read: vec![],
+        failures: vec![],
     });
     task.save(dir.path()).unwrap();
     let reply = send(&store, &mut worker, call(4, "handoffs", json!({"id": 2}))).await.unwrap();

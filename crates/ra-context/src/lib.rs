@@ -173,6 +173,7 @@ pub struct Project;
 
 impl Project {
     /// The project context, when the file exists and says something.
+    #[must_use]
     pub fn load(workspace: &Path) -> Option<String> {
         std::fs::read_to_string(workspace.join(PROJECT_FILE)).ok().filter(|t| !t.trim().is_empty())
     }
@@ -193,6 +194,7 @@ impl Project {
     /// A draft of the project context from the workspace itself: the name, the first paragraph
     /// of the README, the crates of a Cargo workspace with their descriptions, the checks and
     /// the conventions the manifest shows. Short on purpose: it rides on every run.
+    #[must_use]
     pub fn draft(workspace: &Path) -> String {
         let manifest = read_toml(&workspace.join("Cargo.toml"));
         let (title, lead) = readme_lead(workspace).unwrap_or_default();
@@ -212,7 +214,7 @@ impl Project {
         if !members.is_empty() {
             text.push_str("## Layout\n\n");
             for (path, description) in &members {
-                text.push_str(&format!("- `{path}` — {description}\n"));
+                let _ = writeln!(text, "- `{path}` — {description}");
             }
             text.push('\n');
         }
@@ -227,7 +229,7 @@ impl Project {
             if let Some(edition) = manifest.as_ref().and_then(|m| {
                 m.get("workspace").and_then(|w| w.get("package")).or_else(|| m.get("package"))?.get("edition")?.as_str().map(str::to_owned)
             }) {
-                text.push_str(&format!("- Rust edition {edition}.\n"));
+                let _ = writeln!(text, "- Rust edition {edition}.");
             }
             text.push('\n');
         }
@@ -235,7 +237,7 @@ impl Project {
         text.push_str("- Match the surrounding code: its comment density, naming and idiom. Doc comments say what and why, not how.\n");
         text.push_str("- Read the files the card names first, by the regions the outline points at; search before exploring.\n");
         text.push_str("- Run the check the card names before reporting, and report what changed and what was verified, briefly.\n\n");
-        text.push_str(&format!("_Drafted by `rc context --init` from the workspace. Edit it by hand: every run reads {PROJECT_FILE}._\n"));
+        let _ = writeln!(text, "_Drafted by `rc context --init` from the workspace. Edit it by hand: every run reads {PROJECT_FILE}._");
         text
     }
 }
@@ -341,7 +343,7 @@ pub fn outline_marked(path: &Path, text: &str, changed: &[(usize, usize)]) -> St
     if extension == "rs"
         && let Some(doc) = lines.iter().find_map(|l| l.strip_prefix("//!").map(str::trim)).filter(|d| !d.is_empty())
     {
-        out.push_str(&format!(" — {}", clip(doc, 140)));
+        let _ = write!(out, " — {}", clip(doc, 140));
     }
     out.push('\n');
     for (start, end, item) in items.iter().take(OUTLINE_ROOM) {
@@ -349,7 +351,7 @@ pub fn outline_marked(path: &Path, text: &str, changed: &[(usize, usize)]) -> St
         let _ = writeln!(out, "{mark} {start:>5}  {}", clip(item, 110));
     }
     if hidden > 0 {
-        out.push_str(&format!("         … and {hidden} more\n"));
+        let _ = writeln!(out, "         … and {hidden} more");
     }
     out
 }
@@ -626,10 +628,172 @@ pub struct Handoff {
     /// it: `path` for a file read whole, `path:<from>-<to>` for a region. The next session opens
     /// on those regions instead of reading them in again; empty for any other run.
     pub read: Vec<String>,
+    /// The failures of the run's failed check as [`failures_of`] reads them from the whole
+    /// output, each its name line and its error lines; empty when the check passed. Kept apart
+    /// from the report so the clip of the output never eats a failure.
+    pub failures: Vec<String>,
 }
 
 /// The heading of a handoff's warnings in the file.
 const WARNINGS_HEADING: &str = "### Warnings";
+
+/// The heading of a handoff's failures in the file.
+const FAILURES_HEADING: &str = "### Failures";
+
+/// The mark on a failure's name line when the same failure comes out of the base the card's
+/// branch started from: the card did not break it.
+pub const ON_BASE: &str = " · also fails on the base";
+
+/// How many failures one check keeps; past them a line counts the rest.
+const FAILURES_KEPT: usize = 40;
+
+/// How many error lines one failure keeps under its name.
+const FAILURE_LINES: usize = 12;
+
+/// The failures of a failed check's output, read by their structure rather than by where they
+/// fall in it: every failing test of a cargo or a gradle run, each with the lines after its
+/// `panicked at` or under its gradle name, then every compiler `error`, each with the lines up
+/// to its blank line. When none of those is there, gradle's `What went wrong` block. Each
+/// failure is its name line and its error lines, without blank lines; an output that names
+/// nothing gives none.
+#[must_use]
+pub fn failures_of(output: &str) -> Vec<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut failures: Vec<(String, Vec<String>)> = Vec::new();
+    // a test named twice, by its FAILED line and by its own output, is one failure with the
+    // lines of the second
+    let add = |failures: &mut Vec<(String, Vec<String>)>, name: String, detail: Vec<String>| match failures
+        .iter_mut()
+        .find(|(known, _)| *known == name)
+    {
+        Some((_, known)) if known.is_empty() => *known = detail,
+        Some(_) => {}
+        None => failures.push((name, detail)),
+    };
+    let mut at = 0;
+    while at < lines.len() {
+        let line = lines[at].trim_end();
+        let bare = line.trim();
+        if let Some(name) = cargo_failed(bare) {
+            add(&mut failures, name.to_owned(), Vec::new());
+        } else if let Some(name) = bare.strip_prefix("---- ").and_then(|rest| rest.strip_suffix(" stdout ----")) {
+            // the test's own output: what it printed from its panic on
+            let mut detail = Vec::new();
+            let mut panicked = false;
+            let mut next = at + 1;
+            while next < lines.len() && !is_cargo_section_end(lines[next]) {
+                let text = lines[next].trim_end();
+                panicked |= text.contains("panicked at") || text.trim_start().starts_with("error");
+                // the panic's message ends at its first blank line; what follows is not its
+                let ended = panicked && text.trim().is_empty() && !detail.is_empty();
+                if ended {
+                    panicked = false;
+                } else if panicked && !text.starts_with("note: run with") && detail.len() < FAILURE_LINES {
+                    detail.push(text.to_owned());
+                }
+                next += 1;
+            }
+            add(&mut failures, name.trim().to_owned(), detail);
+            at = next;
+            continue;
+        } else if let Some(name) = gradle_failed(line) {
+            let mut detail = Vec::new();
+            let mut next = at + 1;
+            while next < lines.len() && lines[next].starts_with(char::is_whitespace) && !lines[next].trim().is_empty() {
+                if detail.len() < FAILURE_LINES {
+                    detail.push(lines[next].trim_end().to_owned());
+                }
+                next += 1;
+            }
+            add(&mut failures, name.to_owned(), detail);
+            at = next;
+            continue;
+        } else if is_compiler_error(bare) {
+            let mut detail = Vec::new();
+            let mut next = at + 1;
+            while next < lines.len() && !lines[next].trim().is_empty() && !is_compiler_error(lines[next].trim()) {
+                if detail.len() < FAILURE_LINES {
+                    detail.push(lines[next].trim_end().to_owned());
+                }
+                next += 1;
+            }
+            add(&mut failures, bare.to_owned(), detail);
+            at = next;
+            continue;
+        }
+        at += 1;
+    }
+    if failures.is_empty()
+        && let Some(start) = lines.iter().position(|l| l.trim() == "* What went wrong:")
+    {
+        let detail: Vec<String> =
+            lines[start + 1..].iter().take_while(|l| !l.trim().is_empty()).take(FAILURE_LINES).map(|l| l.trim_end().to_owned()).collect();
+        if !detail.is_empty() {
+            failures.push(("What went wrong:".to_owned(), detail));
+        }
+    }
+    let total = failures.len();
+    let mut kept: Vec<String> = failures
+        .into_iter()
+        .take(FAILURES_KEPT)
+        .map(|(name, detail)| if detail.is_empty() { name } else { format!("{name}\n{}", detail.join("\n")) })
+        .collect();
+    if total > FAILURES_KEPT {
+        kept.push(format!("… {} more failure(s) in the output", total - FAILURES_KEPT));
+    }
+    kept
+}
+
+/// The name of a cargo test `line` marks failed: `test name ... FAILED`, or `name --- FAILED`.
+fn cargo_failed(line: &str) -> Option<&str> {
+    let rest = line.strip_suffix(" FAILED")?;
+    if let Some(name) = rest.strip_prefix("test ") {
+        return Some(name.strip_suffix(" ...").unwrap_or(name).trim());
+    }
+    rest.strip_suffix(" ---").map(str::trim).filter(|name| !name.is_empty() && !name.contains(' '))
+}
+
+/// The name of a gradle test `line` marks failed: `Class > method FAILED`, at the line's start.
+fn gradle_failed(line: &str) -> Option<&str> {
+    let name = line.strip_suffix(" FAILED")?;
+    (!line.starts_with(char::is_whitespace) && name.contains(" > ")).then_some(name.trim())
+}
+
+/// Whether a line of a test's own output ends it: the next test's, or cargo's list after them.
+fn is_cargo_section_end(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("---- ") || line == "failures:" || line.starts_with("test result:")
+}
+
+/// Whether `line` opens a compiler error: rustc's `error[E…]:` or `error:`, javac's `file:12:
+/// error:`, kotlinc's `e: `; not cargo's summaries of them (`could not compile`, `test failed`).
+fn is_compiler_error(line: &str) -> bool {
+    const SUMMARIES: [&str; 4] = ["error: could not compile", "error: test failed", "error: aborting", "error: build failed"];
+    if SUMMARIES.iter().any(|summary| line.starts_with(summary)) {
+        return false;
+    }
+    line.starts_with("error[") || line.starts_with("error: ") || line.contains(": error: ") || line.starts_with("e: ")
+}
+
+/// `failures` with [`ON_BASE`] on the name line of each the base's own check also gave.
+#[must_use]
+pub fn marked_on_base(failures: &[String], base: &[String]) -> Vec<String> {
+    let name = |failure: &str| failure.lines().next().unwrap_or_default().trim_end_matches(ON_BASE).to_owned();
+    let on_base: Vec<String> = base.iter().map(|failure| name(failure)).collect();
+    failures
+        .iter()
+        .map(|failure| {
+            let (head, rest) = failure.split_once('\n').map_or((failure.as_str(), None), |(head, rest)| (head, Some(rest)));
+            if head.ends_with(ON_BASE) || !on_base.contains(&name(failure)) {
+                return failure.clone();
+            }
+            match rest {
+                Some(rest) => format!("{head}{ON_BASE}\n{rest}"),
+                None => format!("{head}{ON_BASE}"),
+            }
+        })
+        .collect()
+}
 
 /// A task's context: the brief, the outlines and the handoffs, in `var/context/<id>.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,6 +961,7 @@ pub fn review_of(notes: &str) -> Option<String> {
 
 impl TaskContext {
     /// The file of task `id` under `workspace`.
+    #[must_use]
     pub fn path(workspace: &Path, id: i64) -> PathBuf {
         workspace.join(CONTEXT_DIR).join(format!("{id}.md"))
     }
@@ -827,8 +992,11 @@ impl TaskContext {
             text.push_str(&self.outlines);
         }
         if let Some(review) = &self.review {
-            let _ =
-                write!(text, "\n{REVIEW_HEADING}\nThe reviewer sent the last run back on these points; answer each:\n{}\n", review.trim());
+            let _ = write!(
+                text,
+                "\n{REVIEW_HEADING}\nThe reviewer sent the last run back on these points; answer each:\n{}\n",
+                review.trim_matches(['\n', '\r'])
+            );
         }
         let shown = &self.handoffs[self.handoffs.len().saturating_sub(HANDOFFS_SHOWN)..];
         if !shown.is_empty() {
@@ -872,6 +1040,7 @@ impl TaskContext {
             report: text.to_owned(),
             warnings: Vec::new(),
             read: Vec::new(),
+            failures: Vec::new(),
         });
         task.save(workspace)
     }
@@ -901,6 +1070,7 @@ impl TaskContext {
     }
 
     /// Removes the files of every task not in `keep`: the done cards. Returns how many went.
+    #[must_use]
     pub fn prune(workspace: &Path, keep: &[i64]) -> usize {
         let Ok(entries) = std::fs::read_dir(workspace.join(CONTEXT_DIR)) else { return 0 };
         let mut removed = 0;
@@ -945,7 +1115,11 @@ impl Handoff {
         if !self.read.is_empty() {
             let _ = writeln!(text, "read: {}", self.read.join(" "));
         }
-        let report: Vec<&str> = self.report.lines().filter(|l| !l.starts_with("## Handoff ") && l.trim_end() != WARNINGS_HEADING).collect();
+        let report: Vec<&str> = self
+            .report
+            .lines()
+            .filter(|l| !l.starts_with("## Handoff ") && l.trim_end() != WARNINGS_HEADING && l.trim_end() != FAILURES_HEADING)
+            .collect();
         let shown = &report[..report.len().min(REPORT_LINES)];
         if !shown.is_empty() {
             text.push_str(&shown.join("\n"));
@@ -954,7 +1128,11 @@ impl Handoff {
         if report.len() > shown.len() {
             let _ = writeln!(text, "… {} more lines in the notes of the card", report.len() - shown.len());
         }
-        // the warnings close the block, whole and after the clip, each a paragraph
+        // the failures and the warnings close the block, whole and after the clip, each a
+        // paragraph
+        if !self.failures.is_empty() {
+            let _ = writeln!(text, "{FAILURES_HEADING}\n{}", self.failures.join("\n\n"));
+        }
         if !self.warnings.is_empty() {
             let _ = writeln!(text, "{WARNINGS_HEADING}\n{}", self.warnings.join("\n\n"));
         }
@@ -984,18 +1162,24 @@ fn parse_warnings(text: &str) -> Vec<String> {
 /// The handoffs of a task's file, oldest first; a file without any gives none.
 fn parse_handoffs(text: &str) -> Vec<Handoff> {
     let mut handoffs: Vec<Handoff> = Vec::new();
-    // the warnings section of the current handoff, gathered to its end
+    // the warnings or the failures section of the current handoff, gathered to its end; the
+    // flag says which
     let mut warnings: Option<String> = None;
-    let close = |handoffs: &mut Vec<Handoff>, warnings: &mut Option<String>| {
+    let mut in_failures = false;
+    let close = |handoffs: &mut Vec<Handoff>, warnings: &mut Option<String>, in_failures: bool| {
         if let Some(text) = warnings.take()
             && let Some(current) = handoffs.last_mut()
         {
-            current.warnings = parse_warnings(&text);
+            if in_failures {
+                current.failures = text.split("\n\n").map(str::trim).filter(|f| !f.is_empty()).map(str::to_owned).collect();
+            } else {
+                current.warnings = parse_warnings(&text);
+            }
         }
     };
     for line in text.lines() {
         if let Some(header) = line.strip_prefix("## Handoff ") {
-            close(&mut handoffs, &mut warnings);
+            close(&mut handoffs, &mut warnings, in_failures);
             let mut parts = header.split(" · ");
             let when = parts.next().and_then(|w| w.trim().parse().ok()).unwrap_or(0);
             let model = parts.next().unwrap_or("").trim().to_owned();
@@ -1010,20 +1194,26 @@ fn parse_handoffs(text: &str) -> Vec<Handoff> {
                 report: String::new(),
                 warnings: Vec::new(),
                 read: Vec::new(),
+                failures: Vec::new(),
             });
             continue;
         }
-        let Some(current) = handoffs.last_mut() else { continue };
+        if handoffs.is_empty() {
+            continue;
+        }
         if line.starts_with("## ") {
             // another section after the handoffs; nothing of the format writes one, but a hand
             // edit may
-            close(&mut handoffs, &mut warnings);
+            close(&mut handoffs, &mut warnings, in_failures);
             continue;
         }
-        if line.trim_end() == WARNINGS_HEADING {
+        if line.trim_end() == WARNINGS_HEADING || line.trim_end() == FAILURES_HEADING {
+            close(&mut handoffs, &mut warnings, in_failures);
+            in_failures = line.trim_end() == FAILURES_HEADING;
             warnings = Some(String::new());
             continue;
         }
+        let Some(current) = handoffs.last_mut() else { continue };
         if let Some(section) = &mut warnings {
             section.push_str(line);
             section.push('\n');
@@ -1058,7 +1248,7 @@ fn parse_handoffs(text: &str) -> Vec<Handoff> {
             current.report.push_str(line);
         }
     }
-    close(&mut handoffs, &mut warnings);
+    close(&mut handoffs, &mut warnings, in_failures);
     for handoff in &mut handoffs {
         handoff.report = handoff.report.trim().to_owned();
     }
@@ -1067,6 +1257,7 @@ fn parse_handoffs(text: &str) -> Vec<Handoff> {
 
 /// The paths whose line of `git status --porcelain` differs between `before` and `after`: what
 /// a run changed, whatever was already dirty.
+#[must_use]
 pub fn changed_between(before: &str, after: &str) -> Vec<String> {
     let before: std::collections::HashSet<&str> = before.lines().collect();
     let mut changed: Vec<String> = after

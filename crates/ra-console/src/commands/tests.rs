@@ -1738,6 +1738,7 @@ async fn land_reason_an_accepted_card_is_never_counted_toward_the_park() {
         report: "done".into(),
         warnings: vec![],
         read: vec![],
+        failures: vec![],
     };
     task.record(handoff("accepted by m"));
     task.save(dir.path()).unwrap();
@@ -2227,6 +2228,7 @@ async fn laddered_card(dir: &std::path::Path, complexity: u8, rejections: u64) -
             report: "wrote hello.txt".to_owned(),
             warnings: Vec::new(),
             read: Vec::new(),
+            failures: Vec::new(),
         });
     }
     task.save(dir).unwrap();
@@ -2560,6 +2562,7 @@ async fn reviewed_after_a_run(answer: &str) -> (Vec<String>, String, String) {
         report: "wrote hello.txt".to_owned(),
         warnings: Vec::new(),
         read: Vec::new(),
+        failures: Vec::new(),
     });
     task.save(dir.path()).unwrap();
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(answer, vec![])]));
@@ -2693,6 +2696,7 @@ async fn a_worktree_review_diffs_the_branch_from_its_merge_base() {
         report: "wrote `second.txt`".to_owned(),
         warnings: Vec::new(),
         read: Vec::new(),
+        failures: Vec::new(),
     });
     task.save(dir.path()).unwrap();
     let node = store.read(2).await.unwrap();
@@ -2729,6 +2733,7 @@ async fn reviewed_with_a_fix_role(answers: Vec<&str>) -> (Vec<String>, Store, st
         report: "wrote hello.txt".to_owned(),
         warnings: Vec::new(),
         read: Vec::new(),
+        failures: Vec::new(),
     });
     task.save(dir.path()).unwrap();
     let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
@@ -3906,7 +3911,9 @@ async fn a_rerun_of_a_card_sent_back_starts_fresh_on_the_verdict_without_the_tra
         prompt.contains("\nreview by z-ai/glm-5.3-flash: needs revision (") && prompt.contains(")\n- rename greet to salute\n"),
         "{prompt}"
     );
-    assert!(!prompt.contains("wrote the greeting into hello.rs"), "the transcript of the first run went along:\n{prompt}");
+    // the last report rides once, in the rerun block; the handoffs do not
+    assert_eq!(prompt.matches("wrote the greeting into hello.rs").count(), 1, "{prompt}");
+    assert!(prompt.contains("The last run's report:\nwrote the greeting into hello.rs and read it back"), "{prompt}");
     assert!(!prompt.contains("Earlier runs of this task"), "{prompt}");
     assert_eq!(seen[2].resume, None);
     // the file keeps both runs for the person; the rerun did not pay for them
@@ -3915,13 +3922,41 @@ async fn a_rerun_of_a_card_sent_back_starts_fresh_on_the_verdict_without_the_tra
 }
 
 #[tokio::test]
-async fn a_rerun_resumes_the_session_it_came_back_from() {
-    // the person: be generous with --resume unless the topic changes. A worker sent back by the
-    // reviewer answers the points on the session it read the code in, cache and all; the
-    // verdict is its new prompt, the handoffs are not re-sent
+async fn a_rerun_of_a_card_not_absolute_starts_fresh_though_it_has_a_session() {
+    // #210: resumed reruns paid the whole transcript every turn of a one-line answer; the
+    // rerun block carries the report, the points and the failures instead
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Greet parent 1", &store, &worker()).await.unwrap();
+    let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\nexit code 0\n".to_owned())));
+    let mut first = says("wrote the greeting into hello.rs", vec![]);
+    first.session_id = Some("sess-1".into());
+    let provider = Scripted::new(vec![
+        first,
+        says("needs revision\n- rename greet to salute", vec![]),
+        says("renamed it", vec![]),
+        says("accepted", vec![]),
+    ]);
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(provider.clone()))).with_script(script);
+    run("/run 2", &store, &runner).await.unwrap();
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("fresh start: a rerun starts a fresh session; the rerun carries")), "{}", out.join("\n"));
+    let seen = provider.seen.lock();
+    assert_eq!(seen[2].resume, None);
+    let prompt = &seen[2].messages.last().unwrap().content;
+    assert!(prompt.contains("## Review\n") && prompt.contains(")\n- rename greet to salute\n"), "{prompt}");
+    assert!(prompt.contains("The last run's report:\nwrote the greeting into hello.rs"), "{prompt}");
+}
+
+#[tokio::test]
+async fn a_rerun_of_an_absolute_card_resumes_the_session_it_came_back_from() {
+    // the person: be generous with --resume unless the topic changes. An absolute card's work
+    // is one run: sent back by the reviewer, it answers the points on the session it read the
+    // code in, cache and all; the verdict is its new prompt, the handoffs are not re-sent
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Greet parent 1", &store, &worker()).await.unwrap();
+    run("/edit 2 complexity 5", &store, &worker()).await.unwrap();
     let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\nexit code 0\n".to_owned())));
     let mut first = says("wrote the greeting into hello.rs", vec![]);
     first.session_id = Some("sess-1".into());
@@ -3964,7 +3999,7 @@ async fn a_card_sent_back_and_requeued_as_defined_is_still_a_rerun() {
     let seen = provider.seen.lock();
     let prompt = &seen[2].messages.last().unwrap().content;
     assert!(prompt.contains("## Review\n") && prompt.contains(")\n- rename greet to salute\n"), "{prompt}");
-    assert!(!prompt.contains("wrote the greeting into hello.rs"), "{prompt}");
+    assert_eq!(prompt.matches("wrote the greeting into hello.rs").count(), 1, "{prompt}");
     assert_eq!(seen[2].resume, None);
 }
 

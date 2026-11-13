@@ -195,6 +195,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
             report: format!("report {i}\nsecond line\n## Handoff 9 · fake · header in a report"),
             warnings: vec![],
             read: vec![],
+            failures: vec![],
         });
     }
     task.save(root).unwrap();
@@ -227,6 +228,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
             report: "r".into(),
             warnings: vec![],
             read: vec![],
+            failures: vec![],
         });
     }
     assert_eq!(task.handoffs.len(), 10);
@@ -243,6 +245,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
         report: (0..50).map(|i| format!("line {i}\n")).collect(),
         warnings: vec![],
         read: vec![],
+        failures: vec![],
     });
     long.save(root).unwrap();
     let back = TaskContext::open(root, 8);
@@ -291,6 +294,7 @@ fn a_rerun_after_a_reject_quotes_the_review_block_and_a_fresh_card_has_none() {
         report: "wrote hello.txt".into(),
         warnings: vec![],
         read: vec![],
+        failures: vec![],
     });
     task.save(root).unwrap();
     let file = std::fs::read_to_string(TaskContext::path(root, 9)).unwrap();
@@ -322,6 +326,7 @@ fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_ca
         report: (0..50).map(|i| format!("line {i}\n")).collect::<String>() + "### Warnings\nnot a section",
         warnings: vec![unused.to_owned(), docs.to_owned()],
         read: vec![],
+        failures: vec![],
     });
     task.save(root).unwrap();
     let text = std::fs::read_to_string(TaskContext::path(root, 9)).unwrap();
@@ -346,6 +351,7 @@ fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_ca
         report: "r".into(),
         warnings: vec![],
         read: vec![],
+        failures: vec![],
     });
     assert!(task.last_warnings().is_empty());
     task.save(root).unwrap();
@@ -353,6 +359,55 @@ fn a_handoff_with_warnings_keeps_them_under_their_heading_and_the_next_prompt_ca
     assert_eq!(again.handoffs[0].warnings.len(), 2);
     assert!(again.handoffs[1].warnings.is_empty());
     assert_eq!(again.handoffs[1].report, "r");
+}
+
+#[test]
+fn the_failures_of_a_check_are_every_failing_test_and_error_with_its_lines_and_read_back_from_the_file() {
+    let cargo = "running 3 tests\ntest a::one ... ok\ntest a::two ... FAILED\ntest a::three ... FAILED\n\nfailures:\n\n---- a::two stdout ----\nsome print\n\nthread 'a::two' panicked at src/a.rs:4:5:\nassertion `left == right` failed\n  left: 1\n right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n---- a::three stdout ----\nthread 'a::three' panicked at src/a.rs:9:5:\nno greeting\n\nfailures:\n    a::two\n    a::three\n\ntest result: FAILED. 1 passed; 2 failed\nerror: test failed, to rerun pass `-p a --lib`\nexit code 101";
+    let failures = failures_of(cargo);
+    assert_eq!(
+        failures,
+        [
+            "a::two\nthread 'a::two' panicked at src/a.rs:4:5:\nassertion `left == right` failed\n  left: 1\n right: 2",
+            "a::three\nthread 'a::three' panicked at src/a.rs:9:5:\nno greeting"
+        ]
+    );
+    let compile = "   Compiling a v0.1.0\nerror[E0308]: mismatched types\n --> src/a.rs:3:5\n  |\n3 |     1\n  |     ^ expected `String`\n\nerror: could not compile `a` (lib) due to 1 previous error\nexit code 101";
+    assert_eq!(failures_of(compile), ["error[E0308]: mismatched types\n --> src/a.rs:3:5\n  |\n3 |     1\n  |     ^ expected `String`"]);
+    let gradle = "> Task :app:test\n\nGreeterTest > greetsByName() FAILED\n    org.opentest4j.AssertionFailedError: expected: <hi> but was: <ho>\n        at app//GreeterTest.greetsByName(GreeterTest.java:12)\n\nGreeterTest > greetsNobody() FAILED\n    java.lang.NullPointerException\n\n3 tests completed, 2 failed\n\n> Task :app:test FAILED\n\nFAILURE: Build failed with an exception.\n\n* What went wrong:\nExecution failed for task ':app:test'.\n\nexit code 1";
+    let failures = failures_of(gradle);
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    assert!(failures[0].starts_with("GreeterTest > greetsByName()\n    org.opentest4j.AssertionFailedError"), "{failures:?}");
+    assert_eq!(failures[1], "GreeterTest > greetsNobody()\n    java.lang.NullPointerException");
+    // a build that names no test still says what went wrong; an output that names nothing gives none
+    assert_eq!(
+        failures_of("FAILURE: x\n\n* What went wrong:\nCould not resolve all files.\n\nexit code 1"),
+        ["What went wrong:\nCould not resolve all files."]
+    );
+    assert!(failures_of("ok\nexit code 1").is_empty());
+    // the base's own failures mark theirs
+    let marked = marked_on_base(&failures, &[failures[1].clone()]);
+    assert_eq!(marked[0], failures[0]);
+    assert_eq!(marked[1], format!("GreeterTest > greetsNobody(){ON_BASE}\n    java.lang.NullPointerException"));
+    // the handoff keeps them whole, apart from the report, and reads them back
+    let dir = tempfile::tempdir().unwrap();
+    let mut task = TaskContext::open(dir.path(), 3);
+    task.record(Handoff {
+        when: 1,
+        model: "m".into(),
+        outcome: "needs revision".into(),
+        check: "check failed: gradle test".into(),
+        verdict: None,
+        changed: vec![],
+        report: "did it".into(),
+        warnings: vec![],
+        read: vec![],
+        failures: marked.clone(),
+    });
+    task.save(dir.path()).unwrap();
+    let again = TaskContext::open(dir.path(), 3);
+    assert_eq!(again.handoffs[0].failures, marked);
+    assert_eq!(again.handoffs[0].report, "did it");
 }
 
 #[test]
@@ -386,6 +441,7 @@ fn the_handoff_names_the_read_set_and_the_next_prompt_opens_with_its_regions_cli
         report: "half way".into(),
         warnings: vec![],
         read: read_set(&["src/big.rs:1-300".to_owned(), "src/small.rs".to_owned(), "src/gone.rs:1-9".to_owned()]),
+        failures: vec![],
     });
     task.save(root).unwrap();
     let text = std::fs::read_to_string(TaskContext::path(root, 11)).unwrap();
@@ -476,6 +532,7 @@ fn the_leftovers_are_the_files_of_a_rejected_card_still_dirty_and_a_clean_tree_h
         report: "did it".to_owned(),
         warnings: vec![],
         read: vec![],
+        failures: vec![],
     });
     task.save(root).unwrap();
     // a clean tree names nothing, whatever the card changed

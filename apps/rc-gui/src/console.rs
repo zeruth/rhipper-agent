@@ -232,6 +232,7 @@ fn clipped(ui: &mut Ui, raw: &str, limit: usize, font: &FontId, color: Color32) 
 /// inside at the run's height, a soft light flowing along the border while it is live. The
 /// wheel over the card sizes the card, not the log; a click on the header folds the card to
 /// that one line, and a finished card folds itself after a minute.
+#[allow(clippy::too_many_arguments)]
 fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: usize, room: Option<f32>, project_model: Option<&str>) {
     let lane = theme::lane(1 + index % 9);
     // the animation runs on the window's clock, not the run's: every live card on the
@@ -318,6 +319,7 @@ fn clock(d: Duration) -> String {
 /// them; the clock and the step count while the run is live, the outcome and how long it took
 /// when it ends; and the two buttons that size the card, which a folded card does without.
 /// The row answers a click, which folds or unfolds the card.
+#[allow(clippy::too_many_arguments)]
 fn run_title(
     ui: &mut Ui,
     sink: &Sink,

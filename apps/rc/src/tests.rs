@@ -108,6 +108,7 @@ fn judged(root: &Path, id: i64, verdict: &str) {
         report: "done".to_owned(),
         warnings: Vec::new(),
         read: Vec::new(),
+        failures: Vec::new(),
     });
     context.save(root).expect("the context saves");
 }

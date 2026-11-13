@@ -218,6 +218,102 @@ fn a_session_within_the_day_is_resumed_and_an_older_one_is_not() {
 }
 
 #[test]
+fn a_rerun_of_a_card_not_absolute_drops_its_session_and_an_absolute_one_keeps_it() {
+    let now = 1_800_000_000;
+    let node = with_session(60, now);
+    assert_eq!(rerun_resume(&node, true, now), Err("a rerun starts a fresh session".to_owned()));
+    assert_eq!(rerun_resume(&node, false, now), Ok(Some("sess-1".to_owned())));
+    let mut absolute = node;
+    absolute.absolute = true;
+    assert_eq!(rerun_resume(&absolute, true, now), Ok(Some("sess-1".to_owned())));
+}
+
+/// A card sent back with `notes` and the last run's `report` and `failures`, and its prompt
+/// on a rerun as the run builds it.
+fn rerun_prompt_of(notes: &str, report: &str, failures: Vec<String>, since: &[String]) -> String {
+    let mut node = ra_roadmap::markdown::parse("- 2 ‹task› T\n    objective: a goal\n").unwrap().remove(0);
+    node.notes = Some(notes.to_owned());
+    node.state = TaskState::NeedsRevision;
+    let dir = tempfile::tempdir().unwrap();
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    task.brief = "Task #2: T\n".to_owned();
+    task.review = ra_context::review_of(notes);
+    task.record(ra_context::Handoff {
+        when: 1,
+        model: "m".into(),
+        outcome: "needs revision".into(),
+        check: "check failed: cargo test -q · 2 test(s) failed".into(),
+        verdict: Some("needs revision (substantive) · 9 point(s) by r".into()),
+        changed: vec!["src/a.rs".into()],
+        report: report.to_owned(),
+        warnings: vec![],
+        read: vec![],
+        failures,
+    });
+    let block = rerun_text(&task, &node, since).expect("a run is behind the card");
+    task_text(&task, Some(&block))
+}
+
+#[test]
+fn a_rerun_prompt_holds_every_review_point_verbatim_and_the_last_report() {
+    let points: Vec<String> = (1..=9).map(|i| format!("- point {i}: `src/a.rs` line {i} {}", "is wrong; ".repeat(i))).collect();
+    let notes = format!("review by r: needs revision (substantive)\n{}\n\nwrote src/a.rs and the test", points.join("\n"));
+    let report = "check failed: cargo test -q\ntest a ... FAILED\nexit code 101\n\nwrote src/a.rs and the test\nverified by reading";
+    let prompt = rerun_prompt_of(&notes, report, Vec::new(), &[]);
+    for point in &points {
+        assert!(prompt.contains(&format!("{point}\n")), "{point} is not in:\n{prompt}");
+    }
+    assert!(prompt.contains("The last run's report:\nwrote src/a.rs and the test\nverified by reading\n"), "{prompt}");
+    assert!(!prompt.contains("Earlier runs of this task"), "{prompt}");
+}
+
+#[test]
+fn a_rerun_prompt_holds_every_failing_cargo_test_with_its_error_lines() {
+    let mut output = String::from("running 40 tests\n");
+    for i in 0..40 {
+        output.push_str(&format!("test t{i} ... {}\n", if i % 10 == 3 { "FAILED" } else { "ok" }));
+    }
+    output.push_str("\nfailures:\n\n");
+    for i in [3, 13, 23, 33] {
+        output.push_str(&format!("---- t{i} stdout ----\nthread 't{i}' panicked at src/a.rs:{i}:5:\nthe value {i} is off\n\n"));
+    }
+    output.push_str(&"padding\n".repeat(80));
+    output.push_str("test result: FAILED. 36 passed; 4 failed\nexit code 101\n");
+    let failures = ra_context::failures_of(&output);
+    let notes = "check failed: cargo test -q\ntest t3 ... FAILED\n\npadding\nexit code 101\n\nwrote it";
+    let prompt = rerun_prompt_of(notes, "wrote it", failures, &["merge main: Fast-forward".to_owned()]);
+    for i in [3, 13, 23, 33] {
+        assert!(prompt.contains(&format!("t{i}\nthread 't{i}' panicked at src/a.rs:{i}:5:\nthe value {i} is off")), "t{i}:\n{prompt}");
+    }
+    assert!(prompt.contains("What changed since the last run:\n- merge main: Fast-forward\n"), "{prompt}");
+}
+
+#[test]
+fn a_rerun_prompt_holds_every_failing_gradle_test_and_marks_those_failing_on_the_base() {
+    let output = "> Task :app:test\n\nGreeterTest > greetsByName() FAILED\n    org.opentest4j.AssertionFailedError: expected: <hi> but was: <ho>\n        at app//GreeterTest.greetsByName(GreeterTest.java:12)\n\nClockTest > ticks() FAILED\n    java.lang.IllegalStateException: no clock\n\n2 tests completed, 2 failed\n\n> Task :app:test FAILED\nexit code 1";
+    let base = "ClockTest > ticks() FAILED\n    java.lang.IllegalStateException: no clock\nexit code 1";
+    let failures = ra_context::marked_on_base(&ra_context::failures_of(output), &ra_context::failures_of(base));
+    let prompt = rerun_prompt_of("check failed: gradle test\nexit code 1\n\ndid it", "did it", failures, &[]);
+    assert!(
+        prompt.contains("GreeterTest > greetsByName()\n    org.opentest4j.AssertionFailedError: expected: <hi> but was: <ho>\n"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("greetsByName() · also fails on the base"), "{prompt}");
+    assert!(prompt.contains("ClockTest > ticks() · also fails on the base\n    java.lang.IllegalStateException: no clock"), "{prompt}");
+}
+
+#[test]
+fn what_changed_since_the_last_run_is_the_moves_of_the_tree_and_of_the_environment() {
+    let reflog = "HEAD@{300} reset: moving to HEAD~1\nHEAD@{200} commit: a change\nHEAD@{150} merge main: Merge made by the 'ort' strategy.\nHEAD@{50} merge old: Fast-forward";
+    assert_eq!(reflog_since(reflog, 100), ["merge main: Merge made by the 'ort' strategy.", "reset: moving to HEAD~1"]);
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let before = format!("PATH=/a{sep}/b\nallow=rhtest\n");
+    let now = format!("PATH=/a{sep}/c\nallow=rhtest\u{1f}ninja\n");
+    assert_eq!(environment_moved(&before, &now), ["the PATH gained /c", "the PATH lost /b", "the allowlist gained ninja"]);
+    assert!(environment_moved(&now, &now).is_empty());
+}
+
+#[test]
 fn an_output_without_failed_tests_is_its_tail_alone() {
     let failure = check_failure("error[E0425]: cannot find value `x`\n --> src/lib.rs:1:1\nerror: could not compile");
     assert_eq!(failure.failed, 0);
@@ -350,6 +446,7 @@ fn a_fingerprint_changes_with_the_command_the_error_the_diff_and_the_base() {
         report: String::new(),
         warnings: vec![],
         read: vec![],
+        failures: vec![],
     };
     assert_eq!(handoff.fingerprint(), Some(print.as_str()));
     handoff.check = "check passed: cargo test -q".to_owned();

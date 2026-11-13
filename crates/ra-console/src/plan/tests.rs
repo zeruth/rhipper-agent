@@ -202,6 +202,7 @@ async fn a_walk_after_a_cheaper_day_records_that_the_saving_held_once() {
         report: "done".to_owned(),
         warnings: vec![],
         read: vec![],
+        failures: vec![],
     });
     task.save(dir.path()).unwrap();
     // the day before carried 1000 tokens a turn, the last day 200
@@ -250,6 +251,7 @@ fn capped_runs(root: &std::path::Path, id: i64, n: usize) {
             report: "the context cap of 160k tokens ended the run after 30 turn(s)\nthe store is done; the walk is left".to_owned(),
             warnings: vec![],
             read: vec![],
+            failures: vec![],
         });
     }
     task.save(root).unwrap();

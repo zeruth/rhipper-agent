@@ -2806,16 +2806,15 @@ async fn catch_up(root: &Path, path: &Path, node: &Node) -> Option<(String, Catc
         let _ = git(path, &["add", "-A"]).await;
         let _ = git(path, &["commit", "-q", "-m", &message]).await;
     }
-    let outcome = match git(path, &["merge", "--no-edit", &main]).await {
-        Ok(_) => CatchUp::Merged(behind.trim().to_owned()),
-        Err(_) => {
-            let conflicts = git(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
-            if conflicts.trim().is_empty() {
-                let _ = git(path, &["merge", "--abort"]).await;
-                CatchUp::Refused
-            } else {
-                CatchUp::Conflicts(conflicts.lines().count())
-            }
+    let outcome = if git(path, &["merge", "--no-edit", &main]).await.is_ok() {
+        CatchUp::Merged(behind.trim().to_owned())
+    } else {
+        let conflicts = git(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
+        if conflicts.trim().is_empty() {
+            let _ = git(path, &["merge", "--abort"]).await;
+            CatchUp::Refused
+        } else {
+            CatchUp::Conflicts(conflicts.lines().count())
         }
     };
     Some((main, outcome))
@@ -3170,8 +3169,11 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
                     let _slot = hold_build(&root, &root).await;
                     let formatted = tokio::process::Command::new("cargo").args(["fmt", "--all"]).current_dir(&root).output().await;
                     if formatted.is_ok_and(|o| o.status.success()) {
-                        let rust: Vec<&str> =
-                            staged.iter().map(String::as_str).filter(|f| f.ends_with(".rs") && root.join(f).is_file()).collect();
+                        let rust: Vec<&str> = staged
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|f| Path::new(f).extension().is_some_and(|e| e.eq_ignore_ascii_case("rs")) && root.join(f).is_file())
+                            .collect();
                         if !rust.is_empty() {
                             let mut args = vec!["add", "--"];
                             args.extend(rust.iter().copied());
@@ -4024,12 +4026,13 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let run_started = std::time::SystemTime::now();
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
-    // every run of a card resumes the session of the last one, a rerun included: the harness
-    // holds the transcript and the cache holds its context, and a worker that just read the
-    // code answers the verdict from what it knows (the person: be generous with --resume unless
-    // the topic changes). The session is dropped only when it is stale: then the brief and the
-    // handoffs carry it, and the run says so first
-    let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
+    // a run of a card resumes the session of the last one (the person: be generous with
+    // --resume unless the topic changes), but a rerun of a card that is not absolute starts
+    // fresh on the rerun block ([`rerun_resume`]); a stale session is dropped too, and the run
+    // says so first
+    let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node, &acting, &root) } else { None };
+    // the environment this run has, read against by the next one's rerun block
+    save_stamp(&root, id);
     // a run after an idle one starts fresh, as `--clear-session` would: the session that changed
     // nothing is only resumed to change nothing again at a heavier turn. Its prompt is the last
     // report and the review, not the transcript
@@ -4041,20 +4044,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     if idle.is_some() && node.session.is_some() {
         store.set_session(id, None, unix_now()).await?;
     }
-    // a rerun after a rejection or a failed check resumes only a lean session: the verdict and
-    // the handoff carry what it needs, and a session already heavy paid its whole weight every
-    // turn of every rerun (runelite #23 resumed at 132k tokens a turn, $7.39 for eleven turns;
-    // #28 at 144k, $3.91 for four), where a fresh one cost a few tens of cents
-    let resumed = match resume_of(&node, unix_now()) {
+    let resumed = match rerun_resume(&node, rerun.is_some(), unix_now()) {
         Ok(Some(_)) if idle.is_some() => Err(format!("the last run changed nothing ({})", idle.as_deref().unwrap_or_default())),
-        // an absolute card keeps its session whatever its weight: its work is one run
-        Ok(Some(_)) if rerun.is_some() && !node.is_absolute() && last_largest_turn(&task).is_some_and(|t| t > RERUN_RESUME_LIMIT) => {
-            Err(format!(
-                "the last session ran to {}k tokens a turn, past the {}k a rerun resumes",
-                last_largest_turn(&task).unwrap_or(0) / 1000,
-                RERUN_RESUME_LIMIT / 1000
-            ))
-        }
         other => other,
     };
     let (resume, fresh) = match resumed {
@@ -4067,6 +4058,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             None,
             rerun.as_ref().map(|_| "  fresh start: no session to resume; a rerun carries the verdict and the failing check".to_owned()),
         ),
+        Err(reason) if rerun.is_some() => {
+            (None, Some(format!("  fresh start: {reason}; the rerun carries the last report, the review points and the failures")))
+        }
         Err(reason) => (None, Some(format!("  fresh start: {reason}; the brief and the handoffs go instead"))),
     };
     if let Some(fresh) = &fresh {
@@ -4218,6 +4212,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         report: worker.step.as_ref().map_or_else(|| report.to_owned(), |step| format!("Route: {step}.\n{report}")),
         warnings: Vec::new(),
         read: Vec::new(),
+        failures: Vec::new(),
     };
     let mut session = match session {
         Ok(session) => session,
@@ -4254,7 +4249,12 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         store.set_session(id, None, unix_now()).await?;
         let changed = card_changed(&root, &acting, &dirty_before, &git_status(&acting).await, run_started, &session.text, &task).await;
         let report = capped_report(cap, &session, &changed, &node);
-        store.set_notes(id, &report).await?;
+        // the reviewer's points stand over a capped run as over a failed check: the next
+        // session answers them still
+        match carried_review(node.notes.as_deref()) {
+            Some(review) => store.set_notes(id, &format!("{review}\n\n{report}")).await?,
+            None => store.set_notes(id, &report).await?,
+        }
         let why = format!("{cap} ended the run; the card continues in a fresh session");
         let turns = session.cap.map_or_else(|| session.turns.to_string(), |limit| format!("{}/{limit}", session.turns));
         let mut last = handoff("continues", &format!("no check: {why}"), &report, changed);
@@ -4304,7 +4304,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         None => Ok(None),
     };
     // a wait that ran out is the check's failure, named as the output a timed-out check leaves
-    let (_target, checks) = match waited {
+    let (_target, mut checks) = match waited {
         Ok(guard) => {
             let checks = run_checks(&toolbox, &commands, &orchestrated).await;
             (guard, checks)
@@ -4313,11 +4313,28 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             let command = commands.iter().find(|c| c.trim_start().starts_with("cargo")).cloned().unwrap_or_default();
             tracing::info!(target: crate::trace::PROGRESS, "check failed: {command} · {text}");
             // not a setup failure: a rerun once the holder is done can move the card
-            let run =
-                CheckRun { command, passed: false, exit: text.clone(), first_error: text.clone(), text, failed_tests: 0, setup: false };
+            let run = CheckRun {
+                command,
+                passed: false,
+                exit: text.clone(),
+                first_error: text.clone(),
+                text,
+                failed_tests: 0,
+                failures: Vec::new(),
+                setup: false,
+            };
             (None, vec![run])
         }
     };
+    // a failure the base gives too is not the card's: in a worktree the failed command runs
+    // once more on the project's tree, and the failures the two share are marked, so the rerun
+    // does not spend its turns on what it did not break
+    if workspace_dir.is_some()
+        && let Some(failed) = checks.iter_mut().find(|run| !run.passed && !run.failures.is_empty())
+    {
+        let base = base_failures(worker, &root, &failed.command, timeout).await;
+        failed.failures = ra_context::marked_on_base(&failed.failures, &base);
+    }
     let status_after = git_status(&acting).await;
     // the card's own set: on a tree other hands share, a dirty file joins it only when the run
     // wrote to it and the report or an earlier handoff names it (#157 lost a named file, #185
@@ -4494,9 +4511,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     };
     let mut last = handoff(outcome, check_line.trim(), &handed, changed);
     last.warnings = lint_warnings;
-    // a run sent back by its check hands on what it read, as a capped one does
+    // a run sent back by its check hands on what it read, as a capped one does, and every
+    // failure of the check whole, which the clipped output in the notes may not hold
     if !passed {
         last.read = ra_context::read_set(&session.reads);
+        last.failures = checks.iter().find(|run| !run.passed).map(|run| run.failures.clone()).unwrap_or_default();
     }
     task.record(last);
     save_context(store, &root, &task).await;
@@ -4808,8 +4827,9 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let Prepared { workspace, root, task, project, budget, caps, effort } = prepare(store, &node, worker, false).await?;
     let harness = provider.as_ref().map_or(worker.route() == Route::ClaudeCode, |p| p.has_own_tools());
     let checks = checks_of(&root, &node);
-    let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
-    let resume = resume_of(&node, unix_now());
+    let acting = workspace.clone().unwrap_or_else(|| root.clone());
+    let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node, &acting, &root) } else { None };
+    let resume = rerun_resume(&node, rerun.is_some(), unix_now());
     let messages = if harness {
         harness_messages(&task, node.acceptance.as_deref(), rerun.as_deref(), &project, &root, worker.debug)
     } else {
@@ -4983,7 +5003,7 @@ async fn save_context(store: &Store, root: &Path, task: &ra_context::TaskContext
     if let Ok(nodes) = store.all().await {
         let open: Vec<i64> =
             nodes.iter().filter(|n| !matches!(n.state, TaskState::Accepted | TaskState::Cancelled)).map(|n| n.id).collect();
-        ra_context::TaskContext::prune(root, &open);
+        let _ = ra_context::TaskContext::prune(root, &open);
     }
 }
 
@@ -5279,6 +5299,9 @@ struct CheckRun {
     /// short tail of a passed one.
     text: String,
     failed_tests: usize,
+    /// The failures of a failed command, read from its whole output by
+    /// [`ra_context::failures_of`]; the next run reads them where the tail would have cut them.
+    failures: Vec<String>,
     /// The first line of a failed command's output that reads as its error, else its first
     /// line; empty for a passed one. The fingerprint and the reason of a block name it.
     first_error: String,
@@ -5407,6 +5430,7 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                 exit: output.lines().last().unwrap_or_default().to_owned(),
                 text: last_lines(&output, kept),
                 failed_tests: 0,
+                failures: Vec::new(),
                 first_error: String::new(),
                 setup: false,
             },
@@ -5418,6 +5442,7 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                     exit: output.lines().last().unwrap_or_default().to_owned(),
                     text: failure.text,
                     failed_tests: failure.failed,
+                    failures: ra_context::failures_of(&output),
                     first_error: first_error(&output),
                     setup: is_setup_failure(&output),
                 }
@@ -5432,6 +5457,7 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                     setup: is_setup_failure(&text),
                     text,
                     failed_tests: 0,
+                    failures: Vec::new(),
                 }
             }
         };
@@ -5449,6 +5475,25 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
         }
     }
     runs
+}
+
+/// The failures the project's own tree gives for `command`: the base a card's worktree started
+/// from. None when the command passes there or cannot run.
+async fn base_failures(worker: &Worker, root: &Path, command: &str, timeout: std::time::Duration) -> Vec<String> {
+    let Ok(toolbox) = worker.toolbox(root).map(|toolbox| toolbox.with_timeout(timeout)) else { return Vec::new() };
+    // a wait on the project's target that ran out leaves the failures unmarked, not the check failed
+    let _target = if command.trim_start().starts_with("cargo") {
+        match guard_target(root, root, &crate::hub::cargo_target(root), timeout).await {
+            Ok(guard) => guard,
+            Err(_) => return Vec::new(),
+        }
+    } else {
+        None
+    };
+    match toolbox.check_acceptance(command).await {
+        Ok((false, output)) => ra_context::failures_of(&output),
+        _ => Vec::new(),
+    }
 }
 
 /// The names of the tests a failed cargo or gradle output marks `FAILED`: `test name ... FAILED`,
@@ -6514,21 +6559,6 @@ fn hash_fields<'a>(fields: impl IntoIterator<Item = &'a str>) -> String {
 /// How long a session is resumed: past a day its context is older than the work around it.
 const SESSION_LIFE: u64 = 24 * 60 * 60;
 
-/// The largest turn a session may have run to and still be resumed by a rerun.
-const RERUN_RESUME_LIMIT: u64 = 80_000;
-
-/// The largest turn of the card's last run, in tokens, read off its handoff's check line
-/// (`… largest 134k …`); `None` when the line does not say.
-fn last_largest_turn(task: &ra_context::TaskContext) -> Option<u64> {
-    let check = &task.handoffs.last()?.check;
-    let rest = check.split("largest ").nth(1)?;
-    let word: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == 'k').collect();
-    match word.strip_suffix('k') {
-        Some(thousands) => thousands.parse::<f64>().ok().map(|k| (k * 1000.0) as u64),
-        None => word.parse().ok(),
-    }
-}
-
 /// The session a run of `node` resumes at `now`: `Ok(None)` when the node has none, `Err` with
 /// the reason when it has one the run must not resume, since a session older than a day or made
 /// for other text of the card would lead the harness by what it no longer is.
@@ -6649,8 +6679,8 @@ fn capped_reading_in(task: &ra_context::TaskContext) -> bool {
 }
 
 /// Whether a run of `node` is a rerun: the card came back from its check or its reviewer, or a
-/// fix pass is on it. A rerun resumes the card's session like any run and reads the verdict
-/// as its new prompt, not the handoffs. The walk reruns a first rejection and the first two
+/// fix pass is on it. A rerun reads the rerun block as its prompt, not the handoffs, in a fresh
+/// session unless the card is absolute ([`rerun_resume`]). The walk reruns a first rejection and the first two
 /// failed checks by itself; past that the person re-queues the card with `rc set <id> defined`,
 /// which erases the state but not the reviewer's block at the head of the notes,
 /// which stands until the next run writes its report: a card whose notes open with a
@@ -6667,12 +6697,34 @@ fn is_rerun(node: &Node, worker: &Worker) -> bool {
 /// past this is the noise around them.
 const RERUN_CHECK_LINES: usize = 30;
 
+/// The session a run resumes: [`resume_of`]'s, except that a rerun of a card that is not
+/// absolute starts fresh. The rerun block carries what the rerun needs, and a resumed session
+/// paid its whole transcript every turn of a one-line answer (#210: about 990 heavy-turn lines
+/// at 26k to 86k tokens a turn); an absolute card keeps its session, its work being one run.
+fn rerun_resume(node: &Node, rerun: bool, now: u64) -> Result<Option<String>, String> {
+    match resume_of(node, now) {
+        Ok(Some(_)) if rerun && !node.is_absolute() => Err("a rerun starts a fresh session".to_owned()),
+        other => other,
+    }
+}
+
+/// How many lines of the last run's report a rerun reads.
+const RERUN_REPORT_LINES: usize = 20;
+
+/// What a rerun reads in place of the handoffs, from [`rerun_text`], with what changed in the
+/// tree it acts in and in the run's environment since the last run.
+fn rerun_block(task: &ra_context::TaskContext, node: &Node, acting: &Path, root: &Path) -> Option<String> {
+    let since = task.handoffs.last().map(|last| since_last_run(acting, root, node.id, last.when)).unwrap_or_default();
+    rerun_text(task, node, &since)
+}
+
 /// What a rerun reads in place of the handoffs: the last run's check line, its verdict and the
-/// files it changed, then from the head of the notes the failing check's output, clipped; the
-/// reviewer's points ride in the context's Review section. The reports of the earlier runs stay
-/// in the file: the resumed session holds them, and a rerun without one reads the judgment, not
-/// the transcript. `None` when no run is behind the card.
-fn rerun_block(task: &ra_context::TaskContext, node: &Node) -> Option<String> {
+/// files it changed; every failure of the failed check whole, as the handoff kept them from the
+/// whole output, each marked when the base fails it too; the failing check's tail from the head
+/// of the notes, clipped; what changed since (`since`); and the last run's own report. The
+/// reviewer's points ride verbatim in the context's Review section. `None` when no run is
+/// behind the card.
+fn rerun_text(task: &ra_context::TaskContext, node: &Node, since: &[String]) -> Option<String> {
     let last = task.handoffs.last()?;
     let mut text = format!("The last run of this card came back; take it up on these lines, not afresh:\ncheck: {}\n", last.check.trim());
     if let Some(verdict) = &last.verdict {
@@ -6681,6 +6733,15 @@ fn rerun_block(task: &ra_context::TaskContext, node: &Node) -> Option<String> {
     if !last.changed.is_empty() {
         writeln!(text, "changed: {}", last.changed.join(" ")).unwrap();
     }
+    if !last.failures.is_empty() {
+        writeln!(
+            text,
+            "\nThe failures of the check, every one, read from its whole output; a name marked \"{}\" fails on the project's tree too, so it is not this card's to fix:\n{}",
+            ra_context::ON_BASE.trim_start_matches(" · "),
+            last.failures.join("\n\n")
+        )
+        .unwrap();
+    }
     // the reviewer's block is the task context's Review section, quoted whole; the failing
     // check's output goes here
     for block in judgment_of(node.notes.as_deref().unwrap_or_default()) {
@@ -6688,7 +6749,132 @@ fn rerun_block(task: &ra_context::TaskContext, node: &Node) -> Option<String> {
             writeln!(text, "\n{block}").unwrap();
         }
     }
+    if !since.is_empty() {
+        let lines: Vec<String> = since.iter().map(|line| format!("- {line}")).collect();
+        writeln!(text, "\nWhat changed since the last run:\n{}", lines.join("\n")).unwrap();
+    }
+    let report = without_judgment(&last.report);
+    let lines: Vec<&str> = report.lines().collect();
+    if !lines.is_empty() {
+        let shown = &lines[..lines.len().min(RERUN_REPORT_LINES)];
+        writeln!(text, "\nThe last run's report:\n{}", shown.join("\n")).unwrap();
+        if lines.len() > shown.len() {
+            writeln!(text, "… {} more lines in the notes of the card", lines.len() - shown.len()).unwrap();
+        }
+    }
     Some(text)
+}
+
+/// A report without the judgment at its head: the reviewer's block and the checks' output,
+/// which the rerun block gives on its own lines.
+fn without_judgment(report: &str) -> String {
+    let lines: Vec<&str> = report.lines().collect();
+    let mut at = 0;
+    loop {
+        while lines.get(at).is_some_and(|l| l.trim().is_empty()) {
+            at += 1;
+        }
+        let Some(line) = lines.get(at) else { break };
+        if line.starts_with("review by ") {
+            at += 1;
+            while lines.get(at).is_some_and(|l| l.starts_with("- ")) {
+                at += 1;
+            }
+        } else if line.starts_with("check failed: ") || line.starts_with("check passed: ") {
+            // a check's output runs to its exit line; one that could not run, to its blank line
+            let rest = &lines[at..];
+            let exit = rest.iter().position(|l| l.starts_with("exit code ") || l.starts_with("timed out after "));
+            let blank = rest.iter().position(|l| l.trim().is_empty());
+            at += exit.map(|e| e + 1).or(blank).unwrap_or(rest.len());
+        } else {
+            break;
+        }
+    }
+    lines[at..].join("\n").trim().to_owned()
+}
+
+/// The file of a card's run environment: the PATH and the project's allowlist as the last run
+/// had them, for the next run to say what moved.
+fn stamp_path(root: &Path, id: i64) -> PathBuf {
+    root.join(ra_context::CONTEXT_DIR).join(format!("{id}.env"))
+}
+
+/// The run environment now: `PATH=…` and `allow=…`, one line each.
+fn environment_stamp(root: &Path) -> String {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let allow = crate::router::Router::load(root).map(|router| router.worker.allow.join("\u{1f}")).unwrap_or_default();
+    format!("PATH={path}\nallow={allow}\n")
+}
+
+/// Keeps the run environment of card `id` for its next run; a stamp not written only costs
+/// that run its environment lines.
+fn save_stamp(root: &Path, id: i64) {
+    let path = stamp_path(root, id);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, environment_stamp(root)) {
+        tracing::warn!("the run environment of #{id} was not kept: {e:#}");
+    }
+}
+
+/// What changed since the last run of card `id`, which ended at `when`: the merges, resets and
+/// rebases of the tree it acts in, from its reflog, and the PATH entries and allow rules the
+/// run environment gained or lost since its stamp.
+fn since_last_run(acting: &Path, root: &Path, id: i64, when: u64) -> Vec<String> {
+    let mut lines = Vec::new();
+    let reflog = std::process::Command::new("git")
+        .args(["log", "-g", "--date=unix", "--format=%gd %gs", "-n", "50"])
+        .current_dir(acting)
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    lines.extend(reflog_since(&reflog, when));
+    if let Ok(stamp) = std::fs::read_to_string(stamp_path(root, id)) {
+        lines.extend(environment_moved(&stamp, &environment_stamp(root)));
+    }
+    lines
+}
+
+/// The entries of a `git log -g --date=unix --format="%gd %gs"` output after `when` that move
+/// the tree under a run: a merge, a reset, a rebase, a pull; oldest first.
+fn reflog_since(reflog: &str, when: u64) -> Vec<String> {
+    const MOVES: [&str; 4] = ["merge", "reset", "rebase", "pull"];
+    let mut moved: Vec<String> = reflog
+        .lines()
+        .filter_map(|line| {
+            let (selector, subject) = line.split_once(' ')?;
+            let at: u64 = selector.split_once("@{")?.1.strip_suffix('}')?.parse().ok()?;
+            (at > when && MOVES.iter().any(|word| subject.starts_with(word))).then(|| subject.trim().to_owned())
+        })
+        .collect();
+    moved.reverse();
+    moved
+}
+
+/// What moved between the stamp of the last run and the one now: the PATH entries and the
+/// allow rules gained and lost, one line each.
+fn environment_moved(before: &str, now: &str) -> Vec<String> {
+    let field = |stamp: &str, key: &str| -> Vec<String> {
+        let value = stamp.lines().find_map(|line| line.strip_prefix(key)).unwrap_or_default();
+        match key {
+            "PATH=" => std::env::split_paths(value).map(|p| p.display().to_string()).filter(|p| !p.is_empty()).collect(),
+            _ => value.split('\u{1f}').filter(|rule| !rule.is_empty()).map(str::to_owned).collect(),
+        }
+    };
+    let mut lines = Vec::new();
+    for (key, what) in [("PATH=", "the PATH"), ("allow=", "the allowlist")] {
+        let (old, new) = (field(before, key), field(now, key));
+        let gained: Vec<&str> = new.iter().filter(|e| !old.contains(*e)).map(String::as_str).collect();
+        let lost: Vec<&str> = old.iter().filter(|e| !new.contains(*e)).map(String::as_str).collect();
+        if !gained.is_empty() {
+            lines.push(format!("{what} gained {}", gained.join(", ")));
+        }
+        if !lost.is_empty() {
+            lines.push(format!("{what} lost {}", lost.join(", ")));
+        }
+    }
+    lines
 }
 
 /// The latest reviewer's block at the head of a card's notes, which a run that fails its check
@@ -6758,7 +6944,7 @@ fn first_line(text: &str) -> String {
 
 /// The system prompt of a worker session. A harness with tools implements in the workspace; a
 /// bare model answers with the plan and the changes.
-const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory and answer with a short report of what you changed, naming the file each change landed in in backticks, and what you verified. The code comes first and the report is the deliverable: the orchestrator compiles and checks your change after your report, on a build slot of its own, and a failure comes back to you with its output as a rerun of the same session. So do not build to explore, do not build before you have changed anything, and do not build at all when reading the code you changed and what it calls tells you it is right; build once, at the end, only when a compile is in doubt (a new API, a type you did not see defined, a generic bound), and never more than twice in a session. A change that is right by reading, reported without a build, is the normal case, not a shortcut; say in the report what you verified by reading and what the check will prove. Bash and PowerShell both run the build tools, the read-only git commands and the read-only listing commands; pipe a long output through tail. After your report the orchestrator lints the files you changed, and any warning comes back to you; do not hunt warnings yourself. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
+const SYSTEM: &str = "You are an implementation worker of a roadmap-driven orchestrator. You receive one task with its objective, acceptance criteria and related context. When you have tools, implement the task in the working directory and answer with a short report of what you changed, naming the file each change landed in in backticks, and what you verified. The code comes first and the report is the deliverable: the orchestrator compiles and checks your change after your report, on a build slot of its own, and a failure comes back to you with its failures and the review's points as a rerun. So do not build to explore, do not build before you have changed anything, and do not build at all when reading the code you changed and what it calls tells you it is right; build once, at the end, only when a compile is in doubt (a new API, a type you did not see defined, a generic bound), and never more than twice in a session. A change that is right by reading, reported without a build, is the normal case, not a shortcut; say in the report what you verified by reading and what the check will prove. Bash and PowerShell both run the build tools, the read-only git commands and the read-only listing commands; pipe a long output through tail. After your report the orchestrator lints the files you changed, and any warning comes back to you; do not hunt warnings yourself. Without tools, answer with a plan of the implementation and the code or the changes it names, nothing else.";
 
 /// What a worker is told in a project whose `[worker] builds` is zero: the orchestrator builds,
 /// the worker writes.

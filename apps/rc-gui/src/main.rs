@@ -1098,7 +1098,7 @@ impl App {
             let (mut prompt, mut completion, mut cost, mut cached) = (0u64, 0u64, 0f64, 0u64);
             let (mut all_cost, mut all_calls, mut any_ledger) = (0f64, 0u64, false);
             for t in &self.tabs {
-                let session = t.ledger.session.clone().unwrap_or_else(|| t.worker.tally());
+                let session = t.ledger.session.unwrap_or_else(|| t.worker.tally());
                 prompt += session.prompt_tokens;
                 cached += session.cached_tokens;
                 completion += session.completion_tokens;
@@ -4681,6 +4681,7 @@ fn waiting_subtree(
     let Some(children) = waiting.get(&id) else { return };
     let children: Vec<i64> = children.iter().copied().filter(|c| !placed.contains(c)).collect();
     let shown = children.len().min(WAITING_SHOWN);
+    let indent = 4.0 + 16.0 * (f32::from(u16::try_from(depth).unwrap_or(u16::MAX)) - 1.0);
     for (i, child) in children.iter().take(shown).enumerate() {
         placed.insert(*child);
         let Some(node) = nodes.iter().find(|n| n.id == *child) else { continue };
@@ -4689,7 +4690,7 @@ fn waiting_subtree(
             ui.spacing_mut().item_spacing.x = 4.0;
             // the tree's indent and connector, then the row drawn as every queue row is: its
             // jewel, its title cut to the column, its dots and state, and the card's tooltip
-            ui.add_space(4.0 + 16.0 * (depth as f32 - 1.0));
+            ui.add_space(indent);
             ui.label(RichText::new(if last { "└─" } else { "├─" }).monospace().color(theme::rule()));
             ui.vertical(|ui| {
                 ui.set_max_width(ui.available_width());
@@ -4701,12 +4702,13 @@ fn waiting_subtree(
     }
     if children.len() > shown {
         ui.horizontal(|ui| {
-            ui.add_space(4.0 + 16.0 * (depth as f32 - 1.0));
+            ui.add_space(indent);
             ui.label(RichText::new(format!("└─ +{} more waiting", children.len() - shown)).small().color(theme::dim()).italics());
         });
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node], lane: Color32, walk: &Walk, out: &mut Walked) {
     let has_children = !children.is_empty();
     let selected = walk.selected == Some(node.id);

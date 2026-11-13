@@ -157,6 +157,7 @@ fn a_rule_with_rejections_fits_after_the_first_rejection() {
         report: String::new(),
         warnings: Vec::new(),
         read: Vec::new(),
+        failures: Vec::new(),
     };
     let mut context = ra_context::TaskContext::open(dir.path(), node.id);
     context.record(handoff(None));

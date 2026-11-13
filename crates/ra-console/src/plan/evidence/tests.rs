@@ -35,6 +35,7 @@ fn run(outcome: &str, verdict: Option<&str>) -> Handoff {
         report: "done".to_owned(),
         warnings: vec![],
         read: vec![],
+        failures: vec![],
     }
 }
 

@@ -323,22 +323,19 @@ pub(crate) fn builder(ui: &mut Ui, index: usize, held: Option<(&str, u64)>, shar
         ui.set_max_width(inner);
         ui.horizontal(|ui| {
             ui.set_width(inner);
-            match held {
-                // a busy slot is its holder: who, how long and the share, on a light glow that
-                // fills the slot, with no label and no badge in it (the person, 2026-11-12)
-                Some((who, secs)) => {
-                    ui.label(RichText::new(who).small().strong().color(color));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(format!("{share}% cpu")).small().strong().color(color));
-                        ui.label(RichText::new(format!("{}:{:02}", secs / 60, secs % 60)).small().color(color));
-                    });
-                }
-                None => {
-                    ui.label(RichText::new(format!("WORKER {}", index + 1)).small().strong().color(theme::dim()));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("idle").small().color(theme::dim()));
-                    });
-                }
+            // a busy slot is its holder: who, how long and the share, on a light glow that
+            // fills the slot, with no label and no badge in it (the person, 2026-11-12)
+            if let Some((who, secs)) = held {
+                ui.label(RichText::new(who).small().strong().color(color));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(format!("{share}% cpu")).small().strong().color(color));
+                    ui.label(RichText::new(format!("{}:{:02}", secs / 60, secs % 60)).small().color(color));
+                });
+            } else {
+                ui.label(RichText::new(format!("WORKER {}", index + 1)).small().strong().color(theme::dim()));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new("idle").small().color(theme::dim()));
+                });
             }
         });
     });

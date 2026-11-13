@@ -498,10 +498,10 @@ pub fn waiting_of(nodes: &[ra_roadmap::model::Node], feed: &[String]) -> Vec<Wai
         .filter_map(|node| {
             let id = node.id;
             let noted = node.notes.as_deref().and_then(|n| n.lines().map(str::trim).find(|l| !l.is_empty())).map(str::to_owned);
-            let fed = feed_reason(feed, id);
+            let said = feed_reason(feed, id);
             let reason = match node.state {
-                TaskState::Blocked => noted.or(fed),
-                TaskState::NeedsRevision => fed.or(noted),
+                TaskState::Blocked => noted.or(said),
+                TaskState::NeedsRevision => said.or(noted),
                 TaskState::Implemented => {
                     let not_landed = format!("#{id} not landed");
                     let (landed, start) = (format!("landed #{id} "), format!("start #{id} "));
@@ -509,7 +509,7 @@ pub fn waiting_of(nodes: &[ra_roadmap::model::Node], feed: &[String]) -> Vec<Wai
                     if !last.starts_with(&not_landed) {
                         return None;
                     }
-                    fed.or(noted)
+                    said.or(noted)
                 }
                 _ => return None,
             };
