@@ -4529,7 +4529,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let mut lint_lines = Vec::new();
     let mut lint_warnings = Vec::new();
     if passed && let Ok(toolbox) = &toolbox {
-        let lint = lint_changed(toolbox, &acting, &changed, project_lint.as_deref()).await;
+        let base = diff_base(&root, &acting).await;
+        let lint = lint_changed(toolbox, &acting, &changed, project_lint.as_deref(), &base).await;
         for skipped in &lint.skipped {
             lint_lines.push(format!("  lint skipped: {skipped}"));
         }
@@ -4880,12 +4881,8 @@ fn digest_block(lines: &[String]) -> String {
 /// The task of a bare model, which reads the project context at the head of it and, in debug
 /// mode, the ask for its look back at the end.
 fn bare_context(task: &ra_context::TaskContext, rerun: Option<&str>, project: &str, debug: bool) -> String {
-    let mut context = task_text(task, rerun);
-    // a harness reads the last lint's warnings in its system messages; a bare model read them
-    // in the handoff, which a rerun leaves out, so they ride after the verdict instead
-    if rerun.is_some() && !task.last_warnings().is_empty() {
-        writeln!(context, "\n{}", warnings_note(task)).unwrap();
-    }
+    // the rerun block carries the last lint's warnings, which the handoffs a rerun leaves out held
+    let context = task_text(task, rerun);
     let mut text = if project.is_empty() { context } else { format!("The project:\n{project}\n\n{context}") };
     if debug {
         text.push_str("\n\n");
@@ -5037,8 +5034,10 @@ struct Lint {
 /// counts), not the warnings its files had before. Without a `project` lint, clippy runs over
 /// each crate that owns a changed file; an empty one is no lint at all; any other is the
 /// project's command, run as a check is, outside the shell allowlist. Clippy exits 0 on a
-/// warning, so the output decides, not the exit code.
-async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[String], project: Option<&str>) -> Lint {
+/// warning, so the output decides, not the exit code. `base` is what the card's lines are read
+/// against: `HEAD` in the project's own tree, the merge base in a worktree, so the card's
+/// committed checkpoints count as its lines and the lines the catch-up merge brought in do not.
+async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[String], project: Option<&str>, base: &str) -> Lint {
     let command = match project {
         Some("") => return Lint::default(),
         Some(command) if !changed.is_empty() => command.to_owned(),
@@ -5059,7 +5058,7 @@ async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[Strin
         }
     };
     let mut lint = Lint { command, ..Lint::default() };
-    let diff = match toolbox.check(&format!("git diff -U0 HEAD -- {}", changed.join(" "))).await {
+    let diff = match toolbox.check(&format!("git diff -U0 {base} -- {}", changed.join(" "))).await {
         Ok((_, output)) => output,
         Err(e) => {
             lint.skipped.push(format!("git diff · {e:#}"));
@@ -6994,6 +6993,11 @@ fn rerun_text(task: &ra_context::TaskContext, node: &Node, since: &[String]) -> 
             last.failures.join("\n\n")
         )
         .unwrap();
+    }
+    // the lint's warnings sit in the card's own lines on the merged branch; a worktree cannot
+    // read the notes where they were first, so each rides here whole, file, line and message
+    if !last.warnings.is_empty() {
+        writeln!(text, "\nThe lint's warnings in the lines this card changed, every one:\n{}", last.warnings.join("\n\n")).unwrap();
     }
     // the reviewer's block is the task context's Review section, quoted whole; the failing
     // check's output goes here

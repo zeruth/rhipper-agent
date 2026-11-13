@@ -288,6 +288,89 @@ fn a_rerun_prompt_holds_every_failing_cargo_test_with_its_error_lines() {
     assert!(prompt.contains("What changed since the last run:\n- merge main: Fast-forward\n"), "{prompt}");
 }
 
+#[tokio::test]
+async fn lint_scope_keeps_the_warning_on_the_cards_line_and_drops_the_merged_in_one() {
+    let clippy = "warning: unused variable: `x`\n --> src/a.rs:11:9\n  |\n11 |     let x = 1;\n  |         ^\n\nwarning: unused variable: `y`\n --> src/a.rs:40:9\n  |\n40 |     let y = 2;\n  |         ^\n\n";
+    let diff =
+        "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -10,0 +11,2 @@ fn a() {\n+    let x = 1;\n+    let z = 3;\n";
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let script: ra_tools::Script = Arc::new(move |command: &str| {
+        log.lock().unwrap().push(command.to_owned());
+        Ok((0, if command.starts_with("git diff") { diff.to_owned() } else { clippy.to_owned() }))
+    });
+    let toolbox = ra_tools::Toolbox::new(Path::new(".")).unwrap().with_script(script);
+    let lint = lint_changed(&toolbox, Path::new("."), &["src/a.rs".to_owned()], Some("cargo clippy -p probe"), "abc123").await;
+    // the diff reads the card's base, not HEAD, so the merge's lines are not the card's
+    assert_eq!(seen.lock().unwrap()[0], "git diff -U0 abc123 -- src/a.rs");
+    assert_eq!(lint.warnings.len(), 1, "{:?}", lint.warnings);
+    assert!(lint.warnings[0].contains("`x`") && lint.warnings[0].contains("--> src/a.rs:11:9"), "{:?}", lint.warnings);
+}
+
+/// Runs git in `dir` with a throwaway identity and returns its output, trimmed.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[tokio::test]
+async fn lint_scope_reads_a_worktree_against_its_merge_base_so_the_catch_up_merge_is_not_the_cards() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    git_in(&project, &["init", "-q", "-b", "main"]);
+    std::fs::write(project.join("a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(project.join("b.rs"), "fn b() {}\n").unwrap();
+    git_in(&project, &["add", "-A"]);
+    git_in(&project, &["commit", "-q", "-m", "start"]);
+    let tree = dir.path().join("wt");
+    git_in(&project, &["worktree", "add", "-q", "-b", "card/1", tree.to_str().unwrap()]);
+    // a checkpoint of the card, then a commit on main the catch-up merge brings in
+    std::fs::write(tree.join("a.rs"), "fn a() {}\nfn card() {}\n").unwrap();
+    git_in(&tree, &["commit", "-q", "-am", "checkpoint"]);
+    std::fs::write(project.join("b.rs"), "fn b() {}\nfn merged() {}\n").unwrap();
+    git_in(&project, &["commit", "-q", "-am", "on main"]);
+    git_in(&tree, &["merge", "-q", "--no-edit", "main"]);
+
+    assert_eq!(diff_base(&project, &project).await, "HEAD");
+    let base = diff_base(&project, &tree).await;
+    assert_eq!(base, git_in(&project, &["rev-parse", "main"]));
+    let diff = git_in(&tree, &["diff", "-U0", &base]);
+    assert!(diff.contains("+fn card() {}"), "{diff}");
+    assert!(!diff.contains("merged"), "{diff}");
+}
+
+#[test]
+fn lint_scope_puts_each_kept_warning_whole_in_the_rerun_prompt() {
+    let mut node = ra_roadmap::markdown::parse("- 2 ‹task› T\n    objective: a goal\n").unwrap().remove(0);
+    node.state = TaskState::NeedsRevision;
+    let dir = tempfile::tempdir().unwrap();
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    task.brief = "Task #2: T\n".to_owned();
+    let warning = "warning: unused variable: `x`\n --> src/a.rs:11:9\n  |\n11 |     let x = 1;\n  |         ^".to_owned();
+    task.record(ra_context::Handoff {
+        when: 1,
+        model: "m".into(),
+        outcome: "needs revision".into(),
+        check: "check passed: cargo test -q · lint: 1 warning(s)".into(),
+        verdict: None,
+        changed: vec!["src/a.rs".into()],
+        report: "did it".into(),
+        warnings: vec![warning.clone()],
+        read: vec![],
+        failures: vec![],
+    });
+    let block = rerun_text(&task, &node, &[]).expect("a run is behind the card");
+    let prompt = task_text(&task, Some(&block));
+    assert!(prompt.contains(&format!("{warning}\n")), "{prompt}");
+}
+
 #[test]
 fn a_rerun_prompt_holds_every_failing_gradle_test_and_marks_those_failing_on_the_base() {
     let output = "> Task :app:test\n\nGreeterTest > greetsByName() FAILED\n    org.opentest4j.AssertionFailedError: expected: <hi> but was: <ho>\n        at app//GreeterTest.greetsByName(GreeterTest.java:12)\n\nClockTest > ticks() FAILED\n    java.lang.IllegalStateException: no clock\n\n2 tests completed, 2 failed\n\n> Task :app:test FAILED\nexit code 1";
