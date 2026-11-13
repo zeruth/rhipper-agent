@@ -16,6 +16,7 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
         session_at: None,
         session_of: None,
         depends_on: Vec::new(),
+        needs: Vec::new(),
         state: TaskState::Defined,
         assignee: None,
         complexity: 3,
@@ -74,6 +75,20 @@ fn round_trips_three_gambits_and_a_priority() {
     assert_eq!(render_file(&parsed), text);
     // the node-only reads leave the gambits aside
     assert_eq!(parse(&text).unwrap(), roadmap.nodes);
+}
+
+#[test]
+fn round_trips_the_needs_of_a_card_and_leaves_none_out() {
+    let mut task = node(4, None, NodeKind::Task, "Port the text model");
+    task.needs = vec!["third-party/jdk8u".into(), "upx".into()];
+    let nodes = vec![task, node(5, None, NodeKind::Task, "Plain")];
+    let text = render(&nodes);
+    assert!(text.contains("\n    needs: third-party/jdk8u upx\n"), "{text}");
+    assert_eq!(text.matches("needs:").count(), 1, "a card without needs writes no line:\n{text}");
+    let parsed = parse(&text).unwrap();
+    assert_eq!(parsed, nodes);
+    assert_eq!(parsed[0].needs, ["third-party/jdk8u", "upx"]);
+    assert_eq!(render(&parsed), text);
 }
 
 #[test]

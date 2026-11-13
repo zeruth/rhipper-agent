@@ -21,6 +21,7 @@
 //!         acceptance: ...
 //!         files: crates/ra-roadmap/src/store.rs crates/ra-console/src/agent.rs
 //!         waits-on: 2 7
+//!         needs: third-party/jdk8u upx
 //!         effort: high
 //!         estimate: 40k tokens, 12 turns
 //!         priority: 5
@@ -40,6 +41,9 @@
 //!
 //! `files:` lists the workspace-relative paths a task touches, space-separated, so a worker reads
 //! them first. A path holds no space.
+//!
+//! `needs:` lists what a card needs on the machine before the walk starts it, space-separated:
+//! a project-relative path, or a tool the walk runs to prove it is there.
 //!
 //! `effort:` is `low`, `medium` or `high`, what a run asks of the model; a card without the line
 //! runs at medium, so the line is written only for another level.
@@ -206,6 +210,9 @@ fn detail_lines(node: &Node, level: usize) -> Vec<String> {
         let ids: Vec<String> = node.depends_on.iter().map(|id| id.to_string()).collect();
         lines.push(format!("{indent}waits-on: {}", ids.join(" ")));
     }
+    if !node.needs.is_empty() {
+        lines.push(format!("{indent}needs: {}", node.needs.join(" ")));
+    }
     if node.effort != Effort::default() {
         lines.push(format!("{indent}effort: {}", node.effort));
     }
@@ -291,6 +298,7 @@ pub fn parse_file(text: &str) -> anyhow::Result<Roadmap> {
             "evidence" => node.evidence = Some(value),
             "saving" => node.saving = Some(value),
             "files" => node.files = value.split_whitespace().map(str::to_owned).collect(),
+            "needs" => node.needs = value.split_whitespace().map(str::to_owned).collect(),
             "session" => {
                 let mut words = value.split_whitespace();
                 node.session = words.next().map(str::to_owned);
@@ -395,6 +403,7 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         session_at: None,
         session_of: None,
         depends_on: Vec::new(),
+        needs: Vec::new(),
         state,
         assignee,
         complexity,

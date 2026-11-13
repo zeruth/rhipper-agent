@@ -351,7 +351,7 @@ async fn lint_scope_keeps_the_warning_on_the_cards_line_and_drops_the_merged_in_
 /// Runs git in `dir` with a throwaway identity and returns its output, trimmed.
 fn git_in(dir: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
-        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(dir)
         .output()
@@ -702,6 +702,64 @@ fn a_whole_file_read_of_a_long_file_is_answered_with_the_outline_once_per_run() 
     // a new run forgets what the last one said
     assert!(hint_of(root, &read_event(root, "src/big.rs", None, None), Some(7)).is_some());
     unsafe { std::env::remove_var(CARD_VAR) };
+}
+
+#[tokio::test]
+async fn a_card_waits_on_prerequisites_until_its_dependency_is_in_its_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_in(root, &["init", "-q"]);
+    git_in(root, &["commit", "-q", "--allow-empty", "-m", "start"]);
+    // #7's work is on its branch, not yet merged into the project's
+    git_in(root, &["checkout", "-q", "-b", "card/7"]);
+    git_in(root, &["commit", "-q", "--allow-empty", "-m", "Checkpoint: seven\n\nCard: #7"]);
+    git_in(root, &["checkout", "-q", "-"]);
+    let card = ra_roadmap::markdown::parse("- 9 ‹task› Dependent\n    waits-on: 7\n").unwrap().remove(0);
+    let why = prerequisites_missing(root, &card).await.expect("held for #7");
+    assert!(why.contains("#7") && why.contains("card/7"), "{why}");
+    // once landed and its branch gone, the trailer in HEAD says it is in the base
+    git_in(root, &["merge", "-q", "--no-ff", "-m", "Land seven (#7)\n\nCard: #7", "card/7"]);
+    git_in(root, &["branch", "-q", "-D", "card/7"]);
+    assert_eq!(prerequisites_missing(root, &card).await, None);
+    // a landing on another branch only is not in the base
+    git_in(root, &["checkout", "-q", "-b", "elsewhere"]);
+    git_in(root, &["commit", "-q", "--allow-empty", "-m", "Land eight (#8)\n\nCard: #8"]);
+    git_in(root, &["checkout", "-q", "-"]);
+    let later = ra_roadmap::markdown::parse("- 10 ‹task› Later\n    waits-on: 8\n").unwrap().remove(0);
+    let why = prerequisites_missing(root, &later).await.expect("held for #8");
+    assert!(why.contains("#8") && why.contains("not in HEAD"), "{why}");
+    // a card git knows nothing of holds nothing
+    let old = ra_roadmap::markdown::parse("- 11 ‹task› Old\n    waits-on: 3\n").unwrap().remove(0);
+    assert_eq!(prerequisites_missing(root, &old).await, None);
+}
+
+#[tokio::test]
+async fn a_card_waits_on_prerequisites_while_a_tool_or_a_path_it_needs_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let card = ra_roadmap::markdown::parse("- 4 ‹task› Pack\n    needs: git rhipper-no-such-tool-211\n").unwrap().remove(0);
+    let why = prerequisites_missing(root, &card).await.expect("held for the tool");
+    assert!(why.contains("`rhipper-no-such-tool-211`") && why.contains("tool"), "{why}");
+    let card = ra_roadmap::markdown::parse("- 5 ‹task› Port\n    needs: git third-party/jdk8u\n").unwrap().remove(0);
+    let why = prerequisites_missing(root, &card).await.expect("held for the path");
+    assert!(why.contains("`third-party/jdk8u`"), "{why}");
+    std::fs::create_dir_all(root.join("third-party/jdk8u")).unwrap();
+    assert_eq!(prerequisites_missing(root, &card).await, None, "git runs and the path is there");
+}
+
+#[tokio::test]
+async fn an_acceptance_command_whose_program_is_missing_cannot_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let why = unrunnable(root, "rhipper-no-such-tool-211 test").await.expect("no such program");
+    assert!(why.contains("not on the path"), "{why}");
+    let why = unrunnable(root, "./tools/check.sh").await.expect("no such script");
+    assert!(why.contains("not in the project"), "{why}");
+    assert_eq!(unrunnable(root, "git status").await, None);
+    let nodes = ra_roadmap::markdown::parse("- 1 ‹task› T\n    acceptance: `./tools/check.sh` passes\n").unwrap();
+    let faults = unrunnable_checks(root, &nodes).await;
+    assert_eq!(faults.len(), 1, "{faults:?}");
+    assert!(faults[0].starts_with("#1 T: its check cannot run"), "{faults:?}");
 }
 
 #[test]

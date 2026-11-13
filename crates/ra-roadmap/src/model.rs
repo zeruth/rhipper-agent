@@ -285,6 +285,13 @@ pub struct Node {
     pub session_of: Option<String>,
     /// The nodes that must be accepted first.
     pub depends_on: Vec<i64>,
+    /// What the card needs on the machine before it starts: project-relative paths (a word with
+    /// a path separator, or one that names a file or directory there) and the tools it runs, a
+    /// bare word the walk runs to prove it is on the path. A card whose need is missing waits
+    /// with the missing one named, rather than running on without it (runelite #80 ran 38 times
+    /// without `third-party/jdk8u`; asm #53 needed `upx`).
+    #[serde(default)]
+    pub needs: Vec<String>,
     pub state: TaskState,
     pub assignee: Option<Assignment>,
     /// Complexity 1..=5, for the router and the cost model.

@@ -2665,6 +2665,8 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     // the cards past their reruns in this walk
     let mut parked: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut sent: std::collections::HashMap<i64, (usize, usize)> = std::collections::HashMap::new();
+    // the cards held for a missing prerequisite, and the reason last told
+    let mut held: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     // one walk per project: the lock is held for the whole of it, and a walk moving to a newer
     // install hands it to its successor as it exits
     let lock = match take_walk_lock(&workspace_of(store)) {
@@ -2703,10 +2705,21 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         // took the card meanwhile has the say
         let retried = retry.take().filter(|id| roadmap.nodes.iter().any(|n| n.id == *id && n.state == TaskState::NeedsRevision));
         // a card past its reruns in this walk waits for the next walk: the queue counts a card
-        // sent back as ready, and without this the one-at-a-time walk took the same card again
-        let Some(id) = retried
-            .or_else(|| ready_cards(&roadmap.nodes, &roadmap.gambits, tight).into_iter().find(|n| !parked.contains(&n.id)).map(|n| n.id))
-        else {
+        // sent back as ready, and without this the one-at-a-time walk took the same card again;
+        // a card whose prerequisites are missing waits too, named
+        let mut picked = None;
+        if retried.is_none() {
+            for node in ready_cards(&roadmap.nodes, &roadmap.gambits, tight).into_iter().filter(|n| !parked.contains(&n.id)) {
+                match prerequisites_missing(&root, node).await {
+                    None => {
+                        picked = Some(node.id);
+                        break;
+                    }
+                    Some(why) => lines.extend(say_held(&root, node, &why, &mut held)),
+                }
+            }
+        }
+        let Some(id) = retried.or(picked) else {
             // a `plan-next` gambit lets the planner fill the next empty milestone; its cards
             // are the next picks
             if !planned && crate::commands::run::plans_next(&roadmap.gambits) {
@@ -3108,6 +3121,154 @@ fn ready_cards<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Vec
         ready.sort_by_key(|n| n.complexity);
     }
     ready
+}
+
+/// How long a tool a card needs may take to answer `--version`: one that started is on the
+/// path, whatever it makes of the flag, so the wait only bounds a tool that never exits.
+const NEED_PROBE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What holds card `node` from starting in the project at `root`, named, or `None` when it can
+/// start: a card it waits on whose landing is not in the project's HEAD, the base its worktree
+/// starts from and every catch-up merges in, or a need of its own that is missing on the
+/// machine. Runelite #80 ran 38 times on a base without its dependency's merge and without
+/// `third-party/jdk8u`, and asm #53 needed `upx` (2026-11-12): a card the walk cannot finish
+/// waits with the missing one named, rather than spend runs.
+pub async fn prerequisites_missing(root: &Path, node: &Node) -> Option<String> {
+    for dep in &node.depends_on {
+        if let Some(why) = dependency_outside_base(root, *dep).await {
+            return Some(why);
+        }
+    }
+    for need in &node.needs {
+        if let Some(why) = missing_need(root, need).await {
+            return Some(why);
+        }
+    }
+    None
+}
+
+/// Why the work of card `dep` is not in the project's HEAD, or `None` when it is. The card's
+/// branch, while it exists, must be an ancestor of HEAD; once a landing removed the branch, a
+/// commit naming the card (`Card: #<dep>`, the trailer every landing and checkpoint carries)
+/// must be in HEAD when one is anywhere in the repository. A card with neither, landed by hand
+/// or before the trailer, or a project without git, holds nothing.
+async fn dependency_outside_base(root: &Path, dep: i64) -> Option<String> {
+    let branch = worktree_branch(dep);
+    if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).await.is_ok() {
+        let merged = git(root, &["merge-base", "--is-ancestor", &branch, "HEAD"]).await.is_ok();
+        return (!merged).then(|| format!("waits on #{dep}, whose branch {branch} is not merged into HEAD"));
+    }
+    let trailer = format!("^Card: #{dep}$");
+    let anywhere = git(root, &["log", "--all", "-n", "1", "--format=%H", "--grep", &trailer]).await.ok()?;
+    if anywhere.is_empty() {
+        return None;
+    }
+    let here = git(root, &["log", "HEAD", "-n", "1", "--format=%H", "--grep", &trailer]).await.ok()?;
+    here.is_empty().then(|| format!("waits on #{dep}, whose landing is not in HEAD"))
+}
+
+/// Why `need` is missing in the project at `root`, or `None` when it is there: a path that
+/// exists under the project (or an absolute one), else a bare word that runs as a tool.
+async fn missing_need(root: &Path, need: &str) -> Option<String> {
+    if root.join(need).exists() {
+        return None;
+    }
+    if need.contains(['/', '\\']) {
+        return Some(format!("needs `{need}`, which is not in the project"));
+    }
+    (!tool_runs(root, need).await).then(|| format!("needs the tool `{need}`, which does not run here"))
+}
+
+/// Whether `tool` starts in `dir`: it is run with `--version`, its output dropped.
+async fn tool_runs(dir: &Path, tool: &str) -> bool {
+    let mut command = tokio::process::Command::new(tool);
+    command
+        .arg("--version")
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    match command.spawn() {
+        Ok(mut child) => {
+            let _ = tokio::time::timeout(NEED_PROBE, child.wait()).await;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Tells once a walk, and again when the reason changes, that card `node` waits on `why`: a
+/// progress line the window shows and an event on the feed. The line, when it is news.
+fn say_held(root: &Path, node: &Node, why: &str, said: &mut std::collections::HashMap<i64, String>) -> Option<String> {
+    if said.get(&node.id).is_some_and(|w| w == why) {
+        return None;
+    }
+    said.insert(node.id, why.to_owned());
+    let text = format!("waits #{} {} · {why}", node.id, node.title);
+    tracing::info!(target: crate::trace::PROGRESS, "{text}");
+    crate::pair::event(root, &text);
+    Some(text)
+}
+
+/// Why the acceptance command `command` cannot run in the project at `root`, or `None` when it
+/// can: its program is a path that is not in the project, or a word not on the path; and for
+/// cargo, a `-p` that names no package cargo knows. A card whose check cannot run fails every
+/// run for a reason no worker can fix, so a card is checked as it is written and `rc check`
+/// reports it.
+pub async fn unrunnable(root: &Path, command: &str) -> Option<String> {
+    let mut words = command.split_whitespace();
+    let program = words.next()?;
+    if program.contains(['/', '\\']) {
+        return (!root.join(program).exists()).then(|| format!("`{command}`: `{program}` is not in the project"));
+    }
+    if !on_path(program) {
+        return Some(format!("`{command}`: `{program}` is not on the path"));
+    }
+    if program == "cargo" {
+        let args: Vec<&str> = words.collect();
+        let package = args.windows(2).find(|w| matches!(w[0], "-p" | "--package")).map(|w| w[1]);
+        if let Some(package) = package
+            && probe("cargo", &["pkgid", package], root).await.is_ok_and(|o| !o.status.success())
+        {
+            return Some(format!("`{command}`: cargo knows no package `{package}`"));
+        }
+    }
+    None
+}
+
+/// Whether `program` is a file in a directory of the path, as the shell would find it: on
+/// Windows with one of the `PATHEXT` extensions too.
+fn on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else { return false };
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned()).split(';').map(str::to_owned).collect()
+    } else {
+        Vec::new()
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let file = dir.join(program);
+        file.is_file()
+            || extensions.iter().filter(|e| !e.is_empty()).any(|e| {
+                let mut name = file.clone().into_os_string();
+                name.push(e);
+                Path::new(&name).is_file()
+            })
+    })
+}
+
+/// The acceptance commands of the open cards that cannot run in the project at `root`, one line
+/// each, for `rc check`.
+pub async fn unrunnable_checks(root: &Path, nodes: &[Node]) -> Vec<String> {
+    let mut faults = Vec::new();
+    for node in nodes.iter().filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.state != TaskState::Accepted) {
+        for command in named_checks(node.acceptance.as_deref()) {
+            if let Some(why) = unrunnable(root, &command).await {
+                faults.push(format!("#{} {}: its check cannot run: {why}", node.id, node.title));
+            }
+        }
+    }
+    faults
 }
 
 /// Where the worktrees of the cards live, under the project's `var/`.
@@ -4444,8 +4605,8 @@ type InFlight<'a> = std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<Str
 /// Runs the ready cards `width` at a time, each in its own worktree, in waves: the ready cards
 /// are read, up to `width` of them run together, and readiness is read again once the wave
 /// ends, until no card is ready, a run fails, or with `stop_on_revision` a card needs revision.
-/// A dependent of a card the batch implemented runs from HEAD like the rest: its dependency's
-/// changes are on a branch until the person merges them.
+/// A dependent starts only once its dependency's landing is in HEAD, the base its worktree
+/// starts from, and its needs are on the machine ([`prerequisites_missing`]).
 ///
 /// # Errors
 /// When the roadmap cannot be read between waves, or a worktree cannot be made.
@@ -4485,6 +4646,8 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     // the cards parked past [`RERUNS_A_WALK`] or failed in this walk; the count of the rounds is
     // the card's context's, so a restarted window counts on
     let mut parked: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    // the cards held for a missing prerequisite, and the reason last told
+    let mut held: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     // the held-back cards already said on the feed, so a wait is said once, not every tick
     let mut said_waiting: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
     loop {
@@ -4510,11 +4673,17 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             let width = router.worker.parallel.and_then(|n| usize::try_from(n.max(1)).ok()).unwrap_or(width);
             let in_flight: std::collections::HashSet<i64> = flight.iter().map(|(id, _, _)| *id).collect();
             let others = other_walks(&root);
-            let ready: Vec<Node> = ready_cards(&roadmap.nodes, &roadmap.gambits, plan_tight(&root))
+            let mut ready: Vec<Node> = Vec::new();
+            for node in ready_cards(&roadmap.nodes, &roadmap.gambits, plan_tight(&root))
                 .into_iter()
                 .filter(|n| !in_flight.contains(&n.id) && !parked.contains(&n.id))
-                .cloned()
-                .collect();
+            {
+                // a card whose prerequisites are missing waits, named, rather than spend runs
+                match prerequisites_missing(&root, node).await {
+                    None => ready.push(node.clone()),
+                    Some(why) => lines.extend(say_held(&root, node, &why, &mut held)),
+                }
+            }
             // the builders first, and a card with a brief before one without: the
             // investigators run ahead down the queue, so a builder opens on a brief rather
             // than on the bare card. A card an investigator is in waits for its brief unless

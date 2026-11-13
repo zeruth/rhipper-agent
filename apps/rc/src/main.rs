@@ -1444,7 +1444,10 @@ async fn route(id: i64) -> anyhow::Result<()> {
 /// gate on a clean roadmap.
 async fn check() -> anyhow::Result<()> {
     let store = open_store().await?;
-    let mut faults = tree::lint(&store.all().await?);
+    let nodes = store.all().await?;
+    let mut faults = tree::lint(&nodes);
+    // a check that cannot run fails every run of its card for a reason no worker can fix
+    faults.extend(ra_console::agent::unrunnable_checks(&ra_console::agent::workspace_of(&store), &nodes).await);
     // a command the tool rejects is a fault of the card's text, found before a walk holds it
     faults.extend(ra_console::agent::preflight_faults(&store).await?);
     if faults.is_empty() {
@@ -1477,6 +1480,13 @@ async fn add(kind: NodeKind, title: &str, parent: Option<i64>, card: &Card<'_>) 
     }
     if !card.waits_on.is_empty() {
         println!("    waits on: {}", card.waits_on.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" "));
+    }
+    // the card's check is proved runnable as it is written, not on its first run
+    let root = ra_console::agent::workspace_of(&store);
+    for command in ra_console::agent::check_commands(card.acceptance) {
+        if let Some(why) = ra_console::agent::unrunnable(&root, &command).await {
+            eprintln!("    its check cannot run: {why}");
+        }
     }
     Ok(())
 }
