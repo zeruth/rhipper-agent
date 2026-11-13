@@ -7,6 +7,7 @@
 //! and acceptance; it lives in another crate.
 
 pub mod check;
+pub mod contract;
 pub mod history;
 pub mod markdown;
 pub mod model;
