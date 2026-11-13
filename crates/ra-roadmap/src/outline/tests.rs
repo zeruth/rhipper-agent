@@ -83,6 +83,20 @@ async fn a_plain_outline_of_two_headings_and_five_bullets_adds_seven_nodes() {
 }
 
 #[tokio::test]
+async fn outline_waits_resolve_above_a_title_and_report_a_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Demo").await.unwrap();
+    let text = "## M\n- Alpha card\n- Beta card\n  waits: above\n- Gamma card\n  waits: alpha, nothing here\n";
+    let (ids, faults) = store.import_checked(1, &parse(text).unwrap()).await.unwrap();
+    let nodes = store.all().await.unwrap();
+    let depends = |id: i64| nodes.iter().find(|n| n.id == id).unwrap().depends_on.clone();
+    assert_eq!(depends(ids[2]), [ids[1]], "above names the card before it");
+    assert_eq!(depends(ids[3]), [ids[1]], "a title start names the first card");
+    assert_eq!(faults.len(), 1, "{faults:?}");
+    assert!(faults[0].contains("nothing here"));
+}
+
+#[tokio::test]
 async fn an_import_nests_the_items_under_the_root_and_names_the_project() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Untitled").await.unwrap();

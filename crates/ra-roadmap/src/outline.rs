@@ -12,6 +12,7 @@
 //!   objective: ...
 //!   acceptance: `cargo test -p x` passes
 //!   files: src/a.rs src/b.rs
+//!   waits: above, #12, start of another title
 //!   - A subtask [done]
 //! ```
 //!
@@ -34,9 +35,11 @@ pub struct Item {
     pub objective: Option<String>,
     pub acceptance: Option<String>,
     pub files: Vec<String>,
+    /// What the item waits for: `above`, `#N`, or the start of another title in the outline.
+    pub waits: Vec<String>,
 }
 
-/// An outline: the project's title when the text names one, and its items in order.
+/// An outline:the project's title when the text names one, and its items in order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outline {
     pub title: Option<String>,
@@ -129,17 +132,27 @@ pub fn parse(text: &str) -> anyhow::Result<Outline> {
             if title.is_empty() {
                 continue;
             }
-            outline.items.push(Item { kind, title, complexity, done, objective: None, acceptance: None, files: Vec::new() });
+            outline.items.push(Item {
+                kind,
+                title,
+                complexity,
+                done,
+                objective: None,
+                acceptance: None,
+                files: Vec::new(),
+                waits: Vec::new(),
+            });
             continue;
         }
         if let Some((field, value)) = trimmed.split_once(':')
-            && matches!(field.trim().to_ascii_lowercase().as_str(), "objective" | "acceptance" | "accept" | "files")
+            && matches!(field.trim().to_ascii_lowercase().as_str(), "objective" | "acceptance" | "accept" | "files" | "waits")
         {
             let item = outline.items.last_mut().with_context(|| format!("line {number}: a field with no item above it"))?;
             let value = value.trim();
             match field.trim().to_ascii_lowercase().as_str() {
                 "objective" => item.objective = Some(value.to_owned()),
                 "acceptance" | "accept" => item.acceptance = Some(value.to_owned()),
+                "waits" => item.waits = value.split(',').map(|w| w.trim().to_owned()).filter(|w| !w.is_empty()).collect(),
                 _ => item.files = value.split_whitespace().map(|f| f.trim_matches('`').to_owned()).collect(),
             }
             continue;

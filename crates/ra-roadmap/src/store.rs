@@ -264,9 +264,26 @@ impl Store {
     /// under the last milestone, a task under the last section or milestone, a subtask under the
     /// last task. When the parent is the project and the outline names a title, the project
     /// takes it. Returns the ids added, in order.
+    ///
+    /// # Errors
+    /// When the parent is not there or the file cannot be written.
     pub async fn import(&self, parent: i64, outline: &crate::outline::Outline) -> anyhow::Result<Vec<i64>> {
+        let (ids, faults) = self.import_checked(parent, outline).await?;
+        for fault in faults {
+            eprintln!("{fault}");
+        }
+        Ok(ids)
+    }
+
+    /// `import`, also returning the faults of the `waits:` lines: a name that matches nothing or
+    /// two items. The card is written without that wait.
+    ///
+    /// # Errors
+    /// When the parent is not there or the file cannot be written.
+    pub async fn import_checked(&self, parent: i64, outline: &crate::outline::Outline) -> anyhow::Result<(Vec<i64>, Vec<String>)> {
         use crate::outline::Item;
         let root = self.read(parent).await?;
+        let known = self.all().await?;
         if let Some(title) = &outline.title
             && root.kind == NodeKind::Project
         {
@@ -274,7 +291,9 @@ impl Store {
         }
         let (mut milestone, mut section, mut task) = (None, None, None);
         let mut ids = Vec::new();
-        for Item { kind, title, complexity, done, objective, acceptance, files } in &outline.items {
+        let mut last_under: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        let mut pending = Vec::new();
+        for Item { kind, title, complexity, done, objective, acceptance, files, waits } in &outline.items {
             let under = match kind {
                 NodeKind::Project | NodeKind::Milestone => parent,
                 NodeKind::Section => milestone.unwrap_or(parent),
@@ -295,9 +314,42 @@ impl Store {
                 NodeKind::Task => task = Some(id),
                 _ => {}
             }
+            let above = last_under.insert(under, id);
+            if !waits.is_empty() {
+                pending.push((id, above, title, waits));
+            }
             ids.push(id);
         }
-        Ok(ids)
+        let mut faults = Vec::new();
+        for (id, above, title, waits) in pending {
+            for name in waits {
+                let name = name.trim();
+                let found: Result<i64, String> = if name.eq_ignore_ascii_case("above") {
+                    above.ok_or_else(|| "there is no item above it in its section".to_owned())
+                } else if let Some(number) = name.strip_prefix('#') {
+                    match number.parse::<i64>() {
+                        Ok(n) if known.iter().any(|k| k.id == n) => Ok(n),
+                        _ => Err("no such node in the roadmap".to_owned()),
+                    }
+                } else {
+                    let lower = name.to_lowercase();
+                    let titles: Vec<(i64, String)> =
+                        ids.iter().zip(&outline.items).filter(|(i, _)| **i != id).map(|(i, it)| (*i, it.title.to_lowercase())).collect();
+                    let exact: Vec<i64> = titles.iter().filter(|(_, t)| *t == lower).map(|(i, _)| *i).collect();
+                    let starts: Vec<i64> = titles.iter().filter(|(_, t)| t.starts_with(&lower)).map(|(i, _)| *i).collect();
+                    match (exact.as_slice(), starts.as_slice()) {
+                        ([one], _) | ([], [one]) => Ok(*one),
+                        ([], []) => Err("matches no title in the outline".to_owned()),
+                        _ => Err("matches more than one title in the outline".to_owned()),
+                    }
+                };
+                match found {
+                    Ok(waits_for) => self.depend_on(id, waits_for).await?,
+                    Err(why) => faults.push(format!("waits: `{name}` of \"{title}\" {why}; the card is written without it")),
+                }
+            }
+        }
+        Ok((ids, faults))
     }
 
     /// Adds a dependency: `id` waits for `waits_for`.
