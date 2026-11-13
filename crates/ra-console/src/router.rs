@@ -201,6 +201,7 @@ impl fmt::Display for Rule {
 /// ```toml
 /// [worker]
 /// allow = ["rhtest", "Bash(ninja *)"]   # commands the worker may run here, on top of the defaults
+/// binaries = ["testdata/rhtest/*.exe"]  # test binaries of the project a worker may run natively
 /// check = ".\\gw.ps1 :core:test"         # the check of a card whose acceptance names none
 /// lint = ""                             # the lint after a passed check; empty is none, absent is clippy
 /// turns = 20                            # a run ends after this many turns and the card goes on in a fresh session
@@ -221,6 +222,11 @@ pub struct WorkerConfig {
     /// prefix such as `rhtest`, which stands for the command and its arguments in both shells.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Path globs of the project's own test binaries a worker may run, such as
+    /// `testdata/rhtest/*.exe`: relative to the project, `*` inside one segment. Any other
+    /// executable stays refused.
+    #[serde(default)]
+    pub binaries: Vec<String>,
     /// The environment the worker's harness runs with, on top of the agent's own.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
@@ -386,6 +392,18 @@ impl WorkerConfig {
             .iter()
             .filter_map(|e| prefix_of(e))
             .any(|prefix| command.starts_with(&prefix) && command[prefix.len()..].chars().next().is_none_or(char::is_whitespace))
+            || self.runs_listed_binary(command)
+    }
+
+    /// Whether the command's program is a test binary the project listed in `binaries`.
+    fn runs_listed_binary(&self, command: &str) -> bool {
+        let program = command.split_whitespace().next().unwrap_or("").trim_matches(['"', '\'']).replace('\\', "/");
+        let program = program.strip_prefix("./").unwrap_or(&program);
+        // a path that leaves the project is no listed binary, whatever its glob says
+        if program.is_empty() || program.starts_with('/') || program.contains(':') || program.split('/').any(|part| part == "..") {
+            return false;
+        }
+        self.binaries.iter().any(|glob| glob_matches(glob, program))
     }
 }
 

@@ -260,6 +260,18 @@ fn a_status_card_line_carries_the_cost_and_the_tokens_a_turn_and_is_blank_before
 }
 
 #[test]
+fn gate_allows_listed_test_binary() {
+    let worker = ra_console::router::WorkerConfig { binaries: vec!["testdata/rhtest/*.exe".to_owned()], ..Default::default() };
+    assert!(worker.allows("testdata/rhtest/stl64.exe --out var/x.txt"));
+    assert!(worker.allows("./testdata\\rhtest\\stl64.exe"));
+    assert!(!worker.allows("testdata/rhtest/sub/stl64.exe"), "a star stays inside one segment");
+    assert!(!worker.allows("testdata/other/stl64.exe"));
+    assert!(!worker.allows("testdata/rhtest/../../evil.exe"));
+    assert!(!worker.allows("C:/testdata/rhtest/stl64.exe"));
+    assert!(!worker.allows("curl http://x"));
+}
+
+#[test]
 fn rewrite_keeps_the_whole_tool_input_and_the_higher_timeout() {
     let call = serde_json::json!({"tool_input": {"command": "cargo build", "description": "build", "timeout": 300_000}});
     let input = rewritten_input(&call, "rc hold -- cargo build".to_string());
