@@ -1700,6 +1700,45 @@ async fn run_parallel_runs_two_cards_at_once_in_two_worktrees_that_both_end_impl
     assert_eq!(crate::agent::worktree_list(dir.path()).unwrap(), ["no worktree"]);
 }
 
+#[tokio::test]
+async fn a_one_runner_walk_runs_its_card_in_a_worktree_and_lands_without_touching_the_projects_uncommitted_files() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    std::fs::write(dir.path().join("notes.txt"), "committed\n").unwrap();
+    git_ok(dir.path(), &["init", "-q"]);
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "probe"]);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task A parent 1", &store, &worker()).await.unwrap();
+    // what the person or a pairing session has in the tree, uncommitted: an edit and a new file
+    std::fs::write(dir.path().join("notes.txt"), "the person's edit\n").unwrap();
+    std::fs::write(dir.path().join("draft.txt"), "a pairing session's draft\n").unwrap();
+    let script = std::sync::Arc::new(ByTurn { seen: parking_lot::Mutex::new(0) });
+    let check: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(check);
+
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    assert_eq!(implemented(&out).len(), 1, "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 1 card(s) · no card is ready");
+    // the run acted in the card's worktree on its branch, and the landing squashed that branch
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Accepted, "{out:?}");
+    assert!(out.iter().any(|l| l.contains("branch card/2")), "{out:?}");
+    assert!(out.iter().any(|l| l == "committed 1 file(s) on card/2"), "{out:?}");
+    assert!(out.iter().any(|l| l.starts_with("squashed card/2 into ")), "{out:?}");
+    assert_eq!(std::fs::read_to_string(dir.path().join("made.txt")).unwrap().trim_end(), "by the worker");
+    // the project's uncommitted files are as they were, and no commit of the walk carries them
+    assert_eq!(std::fs::read_to_string(dir.path().join("notes.txt")).unwrap(), "the person's edit\n");
+    assert_eq!(std::fs::read_to_string(dir.path().join("draft.txt")).unwrap(), "a pairing session's draft\n");
+    let status = git_ok(dir.path(), &["status", "--porcelain", "--", "notes.txt", "draft.txt"]);
+    // `git_ok` trims, so the first line's leading blank is gone
+    assert!(status.contains("M notes.txt") && status.contains("?? draft.txt"), "{status}");
+    assert_eq!(git_ok(dir.path(), &["show", "HEAD:notes.txt"]).trim_end(), "committed");
+    let landed = git_ok(dir.path(), &["log", "--name-only", "--format=", "HEAD~1..HEAD", "-m", "--first-parent"]);
+    assert!(!landed.lines().any(|f| f == "draft.txt" || f == "notes.txt"), "{landed}");
+    assert!(!dir.path().join("var").join("worktrees").join("2").join(".git").exists(), "the worktree was not cleared");
+    assert_eq!(*script.seen.lock(), 3);
+}
+
 /// A provider that answers by the turn of the request: a `write_file` of `made.txt` on the
 /// first turn of a run, `done` once a tool result is in the messages, `accepted` to a review
 /// (which comes without tools); it counts the requests.

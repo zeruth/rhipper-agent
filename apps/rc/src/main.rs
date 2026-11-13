@@ -250,7 +250,9 @@ enum Command {
         /// names the branch, and merging it is yours (`rc worktree list|drop`).
         #[arg(long, conflicts_with_all = ["dry", "next", "all"])]
         worktree: bool,
-        /// With --all: runs that many ready cards at once, each in its own worktree.
+        /// With --all: runs that many ready cards at once; one at a time when left out. Either
+        /// way each card runs in its own worktree, var/worktrees/<id> on card/<id>, and lands
+        /// from there, so a landing never commits what is uncommitted in the project's tree.
         #[arg(long, requires = "all", value_name = "N")]
         parallel: Option<usize>,
         /// Spends the plan past its week threshold (90%, or `[plan] threshold` of rhipper.toml):
@@ -702,7 +704,8 @@ async fn run_main() -> anyhow::Result<()> {
                     if let Some(width) = parallel {
                         ra_console::agent::run_parallel(&store, &worker, width, stop_on_revision).await?
                     } else {
-                        // the walk moves to a newer rc that `rc install` put on the path, between cards
+                        // one card at a time, each in its worktree as the parallel walk's are; the
+                        // walk moves to a newer rc that `rc install` put on the path, between cards
                         let worker = worker.with_install(Some(ra_console::install::default_dir()));
                         ra_console::agent::run_all(&store, &worker, stop_on_revision).await?
                     }

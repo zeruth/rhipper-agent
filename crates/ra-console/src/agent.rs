@@ -2444,7 +2444,9 @@ pub async fn adopt(
 /// past that it waits for the person, and with `stop_on_revision` it stops the batch too.
 /// When none is ready and an active gambit says `plan-next`, the planner fills the next empty
 /// milestone first ([`crate::commands::run::plan_next`]) and the walk goes on with its cards.
-/// Each run is its own bubble and its own handoff, through [`run`]. A failed run ends the batch
+/// Each run is its own bubble and its own handoff, through [`run`], in the card's worktree as a
+/// parallel walk's are ([`walk_runner`]): a landing commits the card's work and nothing of the
+/// project's tree (#202's commit swept in a pairing session's edits, 2026-11-12). A failed run ends the batch
 /// with its reason on the last line rather than as an error, so the runs before it keep their
 /// lines.
 ///
@@ -2558,7 +2560,17 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             Some(ledger) => ledger.last_id().await.ok(),
             None => None,
         };
-        match run_picked(store, id, worker, tight && retried.is_none()).await {
+        let runner = match walk_runner(store, &root, id, worker).await {
+            Ok((runner, caught_up)) => {
+                lines.extend(caught_up);
+                runner
+            }
+            Err(error) => {
+                done(&mut lines, format!("ran {ran} card(s) · stopped: the worktree of #{id} could not be made: {error:#}")).await;
+                return Ok(lines);
+            }
+        };
+        match run_picked(store, id, &runner, tight && retried.is_none()).await {
             Ok(run_lines) => lines.extend(run_lines),
             Err(error) => {
                 done(&mut lines, format!("ran {ran} card(s) · stopped: the run of #{id} failed: {error:#}")).await;
@@ -2575,8 +2587,10 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         // a card the reviewer accepted lands now: committed, proved and cleared; one the landing
         // sent back is counted below as any card sent back
         if node.state == TaskState::Implemented {
-            lines.extend(land_or_say(store, id, worker).await);
+            lines.extend(land_or_say(store, id, &runner).await);
             node = store.read(id).await?;
+        } else {
+            lines.extend(checkpoint_worktree(&root, &node).await);
         }
         if node.state == TaskState::NeedsRevision {
             // the first rejection and the first two check failures are rerun on the card's
@@ -2639,6 +2653,24 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
 /// How many runs in a row a walk gives one card before it stops: a card the project's turn cap
 /// ends this often is too large for the cap.
 const RESTARTS: usize = 5;
+
+/// The worker a one-at-a-time walk runs card `id` with: in `var/worktrees/<id>` on
+/// `card/<id>`, the project's branch merged in first, so the run, its checkpoint and its
+/// landing touch nothing the person or a pairing session left uncommitted in the project's
+/// tree; the lines the catch-up said. A project that is no git checkout, or one with no
+/// commit to branch from, has no worktree to make, and its cards run in its own tree.
+///
+/// # Errors
+/// When the card is not there, or git cannot add the worktree.
+async fn walk_runner(store: &Store, root: &Path, id: i64, worker: &Worker) -> anyhow::Result<(Worker, Vec<String>)> {
+    if !root.join(".git").exists() || git(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).await.is_err() {
+        return Ok((worker.clone(), Vec::new()));
+    }
+    let node = store.read(id).await?;
+    let (path, branch) = worktree_add(root, id).await?;
+    let caught_up = catch_up_worktree(root, &path, &node).await;
+    Ok((worker.clone().with_worktree(path, branch), caught_up.into_iter().collect()))
+}
 
 /// How many times a walk reruns a card whose check (or lint) failed before it leaves the card
 /// to the person: the third failure waits.

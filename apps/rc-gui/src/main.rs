@@ -4764,64 +4764,8 @@ fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node]
             }
             ui.label(RichText::new(cards::kind_mark(node.kind)).color(lane));
             ui.label(RichText::new(format!("#{}", node.id)).color(theme::dim()).small());
-            let title = RichText::new(&node.title).color(if selected { theme::text() } else { theme::mix(theme::text(), lane, 0.45) });
-            let title = match node.kind {
-                NodeKind::Project => title.strong().size(16.0),
-                NodeKind::Milestone => title.strong().size(15.0),
-                NodeKind::Section => title.strong(),
-                _ => title,
-            };
-            // a column dragged narrow clips the title to its room with an ellipsis, rather than
-            // wrapping the row or running under the badges; the tooltip has the whole of it.
-            // The room keeps what the badges at the right take, so a long title stops short
-            // of them in a column that was not measured for it (the dashboard's)
-            let reserve = 200.0
-                + walk.cost_width
-                + if node.assignee.is_some() { 110.0 } else { 0.0 }
-                + if node.is_final() { 50.0 } else { 0.0 }
-                + if selected { 70.0 } else { 0.0 };
-            let room = (ui.available_width() - reserve).max(80.0);
-            ui.scope(|ui| {
-                ui.set_max_width(room);
-                ui.add(egui::Label::new(title).truncate());
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                cost_cell(ui, nodes, node, walk);
-                state_badges(ui, nodes, node);
-                if node.is_final() {
-                    cards::badge(ui, "final", theme::warn());
-                }
-                if let Some(a) = &node.assignee {
-                    cards::badge_marked(ui, "◉", short(&a.model), theme::trace()).on_hover_text(&a.model);
-                }
-                if matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
-                    cards::priority(ui, node.complexity);
-                    if node.is_absolute() {
-                        cards::badge(ui, "absolute", theme::lane(2)).on_hover_text("works until it is done: no cap, no rerun limit");
-                    }
-                } else {
-                    // the progress of a bubble: the cards accepted of the cards under it
-                    let cards_under: Vec<&Node> = tree::subtree(nodes, node.id)
-                        .into_iter()
-                        .filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask))
-                        .collect();
-                    if !cards_under.is_empty() {
-                        let done = cards_under.iter().filter(|n| n.state == TaskState::Accepted).count();
-                        let color = if done == cards_under.len() { theme::online() } else { theme::dim() };
-                        ui.label(RichText::new(format!("{done}/{}", cards_under.len())).small().color(color))
-                            .on_hover_text("cards accepted of the cards under it");
-                    }
-                }
-                if selected && node.kind != NodeKind::Project {
-                    if ui.small_button(RichText::new("▶").color(theme::accent())).on_hover_text("run this card").clicked() {
-                        out.command = Some(format!("/run {}", node.id));
-                    }
-                    if ui.small_button(RichText::new("↻").color(theme::warn_text())).on_hover_text("reassess this card").clicked() {
-                        out.command = Some(format!("/reassess {}", node.id));
-                    }
-                }
-                add_button(ui, node, row_id, out);
-            });
+            row_title(ui, node, lane, selected, walk);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| row_badges(ui, nodes, node, selected, row_id, walk, out));
         });
     });
     let row = inner.response.rect;
@@ -4835,38 +4779,7 @@ fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node]
     if response.drag_started() && node.kind != NodeKind::Project {
         out.drag_started = Some(node.id);
     }
-    // while another row is dragged, this one lights where the pointer would drop it: a filled
-    // frame to take it as a child, a line along its top or bottom edge to take it as a sibling;
-    // the project has no siblings, so it only takes children
-    if let Some(dragging) = walk.dragging
-        && dragging != node.id
-        && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
-        && row.contains(pointer)
-    {
-        let band = (row.height() * 0.25).min(8.0);
-        let slot = if node.kind == NodeKind::Project {
-            DropSlot::Onto
-        } else if pointer.y < row.top() + band {
-            DropSlot::Before
-        } else if pointer.y > row.bottom() - band {
-            DropSlot::After
-        } else {
-            DropSlot::Onto
-        };
-        let accent = theme::accent();
-        match slot {
-            DropSlot::Onto => {
-                painter.rect(row, CornerRadius::same(7), cards::alpha(accent, 40), Stroke::new(1.5, accent), egui::StrokeKind::Inside);
-            }
-            DropSlot::Before => {
-                painter.hline(row.x_range(), row.top(), Stroke::new(2.0, accent));
-            }
-            DropSlot::After => {
-                painter.hline(row.x_range(), row.bottom(), Stroke::new(2.0, accent));
-            }
-        }
-        out.drop = Some((node.id, slot));
-    }
+    drop_target(ui, &painter, node, row, walk, out);
     if egui::Tooltip::was_tooltip_open_last_frame(ui.ctx(), response.id) {
         out.tooltip_row = Some(response.rect);
     }
@@ -4886,6 +4799,103 @@ fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node]
     if response.double_clicked() && has_children {
         out.toggled = Some(node.id);
     }
+}
+
+/// A row's title, sized by the node's kind and tinted by its lane unless the row is selected.
+fn row_title(ui: &mut egui::Ui, node: &Node, lane: Color32, selected: bool, walk: &Walk) {
+    let title = RichText::new(&node.title).color(if selected { theme::text() } else { theme::mix(theme::text(), lane, 0.45) });
+    let title = match node.kind {
+        NodeKind::Project => title.strong().size(16.0),
+        NodeKind::Milestone => title.strong().size(15.0),
+        NodeKind::Section => title.strong(),
+        _ => title,
+    };
+    // a column dragged narrow clips the title to its room with an ellipsis, rather than
+    // wrapping the row or running under the badges; the tooltip has the whole of it.
+    // The room keeps what the badges at the right take, so a long title stops short
+    // of them in a column that was not measured for it (the dashboard's)
+    let reserve = 200.0
+        + walk.cost_width
+        + if node.assignee.is_some() { 110.0 } else { 0.0 }
+        + if node.is_final() { 50.0 } else { 0.0 }
+        + if selected { 70.0 } else { 0.0 };
+    let room = (ui.available_width() - reserve).max(80.0);
+    ui.scope(|ui| {
+        ui.set_max_width(room);
+        ui.add(egui::Label::new(title).truncate());
+    });
+}
+
+/// The right end of a row, laid out right to left: the cost, the state, the badges, a
+/// bubble's progress, and on the selected row the run and reassess buttons.
+fn row_badges(ui: &mut egui::Ui, nodes: &[Node], node: &Node, selected: bool, row_id: egui::Id, walk: &Walk, out: &mut Walked) {
+    cost_cell(ui, nodes, node, walk);
+    state_badges(ui, nodes, node);
+    if node.is_final() {
+        cards::badge(ui, "final", theme::warn());
+    }
+    if let Some(a) = &node.assignee {
+        cards::badge_marked(ui, "◉", short(&a.model), theme::trace()).on_hover_text(&a.model);
+    }
+    if matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
+        cards::priority(ui, node.complexity);
+        if node.is_absolute() {
+            cards::badge(ui, "absolute", theme::lane(2)).on_hover_text("works until it is done: no cap, no rerun limit");
+        }
+    } else {
+        // the progress of a bubble: the cards accepted of the cards under it
+        let cards_under: Vec<&Node> =
+            tree::subtree(nodes, node.id).into_iter().filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask)).collect();
+        if !cards_under.is_empty() {
+            let done = cards_under.iter().filter(|n| n.state == TaskState::Accepted).count();
+            let color = if done == cards_under.len() { theme::online() } else { theme::dim() };
+            ui.label(RichText::new(format!("{done}/{}", cards_under.len())).small().color(color))
+                .on_hover_text("cards accepted of the cards under it");
+        }
+    }
+    if selected && node.kind != NodeKind::Project {
+        if ui.small_button(RichText::new("▶").color(theme::accent())).on_hover_text("run this card").clicked() {
+            out.command = Some(format!("/run {}", node.id));
+        }
+        if ui.small_button(RichText::new("↻").color(theme::warn_text())).on_hover_text("reassess this card").clicked() {
+            out.command = Some(format!("/reassess {}", node.id));
+        }
+    }
+    add_button(ui, node, row_id, out);
+}
+
+/// While another row is dragged, this one lights where the pointer would drop it: a filled
+/// frame to take it as a child, a line along its top or bottom edge to take it as a sibling;
+/// the project has no siblings, so it only takes children.
+fn drop_target(ui: &egui::Ui, painter: &egui::Painter, node: &Node, row: Rect, walk: &Walk, out: &mut Walked) {
+    let Some(dragging) = walk.dragging else { return };
+    let Some(hover) = ui.input(|i| i.pointer.hover_pos()) else { return };
+    if dragging == node.id || !row.contains(hover) {
+        return;
+    }
+    let band = (row.height() * 0.25).min(8.0);
+    let slot = if node.kind == NodeKind::Project {
+        DropSlot::Onto
+    } else if hover.y < row.top() + band {
+        DropSlot::Before
+    } else if hover.y > row.bottom() - band {
+        DropSlot::After
+    } else {
+        DropSlot::Onto
+    };
+    let accent = theme::accent();
+    match slot {
+        DropSlot::Onto => {
+            painter.rect(row, CornerRadius::same(7), cards::alpha(accent, 40), Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+        }
+        DropSlot::Before => {
+            painter.hline(row.x_range(), row.top(), Stroke::new(2.0, accent));
+        }
+        DropSlot::After => {
+            painter.hline(row.x_range(), row.bottom(), Stroke::new(2.0, accent));
+        }
+    }
+    out.drop = Some((node.id, slot));
 }
 
 /// The cost column's cell at the right end of a row, while the column is on: the subtree's cost
