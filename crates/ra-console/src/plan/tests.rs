@@ -351,6 +351,21 @@ async fn split_after_cap_replaces_the_fourth_continuation_with_a_proposal_on_the
 }
 
 #[tokio::test]
+async fn a_parallel_walk_plans_a_split_of_a_card_the_cap_ended_three_times() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    let id = store.insert_card(Some(1), NodeKind::Task, "Too big", &Card::new()).await.unwrap();
+    capped_runs(dir.path(), id, 3);
+    let provider = Scripted::new(vec![says("- Walk {c2}\n  acceptance: `cargo test -p x`\n", vec![])]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+    let out = crate::agent::run_parallel(&store, &worker, 2, false).await.unwrap();
+    assert!(out[0].starts_with(&format!("split #{id} Too big: 3 runs ended on the context cap · split proposed:")), "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 0 card(s) · no card is ready");
+    assert_eq!(provider.seen.lock().len(), 1, "only the planner was called");
+    assert_eq!(store.read(id).await.unwrap().state, TaskState::Blocked);
+}
+
+#[tokio::test]
 async fn split_after_cap_leaves_an_absolute_card_and_a_card_under_three_caps_to_continue() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();

@@ -1618,6 +1618,31 @@ async fn a_walk_with_nothing_ready_plans_the_next_milestone_when_a_gambit_says_s
 }
 
 #[tokio::test]
+async fn a_parallel_walk_plans_the_next_milestone_when_nothing_is_ready_and_starts_its_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = empty_milestone(dir.path()).await;
+    git_ok(dir.path(), &["init", "-q"]);
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "probe"]);
+    let g1 = store.add_gambit("Keep the roadmap full", 3, &[]).await.unwrap();
+    store.set_gambit_plan_next(g1, true).await.unwrap();
+    let script = Scripted::new(vec![says(PLANNED_CARD, vec![]), says("wrote it", vec![]), says("accepted", vec![])]);
+    let check: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(check);
+    let out = crate::agent::run_parallel(&store, &runner, 2, false).await.unwrap();
+    assert!(out.iter().any(|l| l == "planned #2 M: 1 task added as defined by glm-5.3-flash"), "{out:?}");
+    assert!(out.last().unwrap().starts_with("ran "), "{out:?}");
+    let card = store.read(3).await.unwrap();
+    assert_eq!((card.parent, card.title.as_str()), (Some(2), "Write the greeting"));
+    // the planner was the first call and read the milestone; the walk then started its card
+    assert!(script.seen.lock()[0].messages[1].content.contains("ship the greeting"));
+    let feed = crate::pair::recent(dir.path(), 20);
+    let planned = feed.iter().position(|l| l == "planned #2 M: 1 task added as defined by glm-5.3-flash").expect(&format!("{feed:?}"));
+    let started = feed.iter().position(|l| l.starts_with("start #3")).expect(&format!("{feed:?}"));
+    assert!(planned < started, "{feed:?}");
+}
+
+#[tokio::test]
 async fn a_walk_with_nothing_ready_and_no_plan_next_gambit_ends_as_before() {
     let dir = tempfile::tempdir().unwrap();
     let store = empty_milestone(dir.path()).await;

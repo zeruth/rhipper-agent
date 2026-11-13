@@ -4873,6 +4873,9 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     let mut lines = Vec::new();
     // the cards a killed walk left in progress go back on the queue before this one reads it
     lines.extend(requeue_orphans(store, &root).await);
+    // the planned cards done a day ago are read back first: the day since them against the
+    // day before, so the plan's claims are judged before the walk spends the next day
+    lines.extend(crate::commands::plan::read_back(store, &root, worker).await);
     // the cards the reviewer accepted that a walk stopped before they landed: landed first, so
     // a restart never strands accepted work (runelite #21 and #35, 2026-11-12)
     for node in store.all().await? {
@@ -4902,6 +4905,9 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     let mut held: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     // the held-back cards already said on the feed, so a wait is said once, not every tick
     let mut said_waiting: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+    // whether the planner filled the roadmap since the last run landed: it plans once between
+    // runs, so a plan that leaves no card ready ends the walk rather than plan the next milestone too
+    let mut planned = false;
     loop {
         // `stop` from the console or the window: nothing new starts, and the walk ends when
         // the runs it is in have ended
@@ -4913,10 +4919,16 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
         // the walk starts no more than its share allows; a walk with nothing in flight and
         // no slot to take waits for one rather than end
         let mut starved = false;
+        // the cards the context cap ended three times in a row, split rather than started a
+        // fourth time once nothing is in flight; and whether a gambit lets the planner fill
+        // the next empty milestone when nothing is ready
+        let mut due: Vec<i64> = Vec::new();
+        let mut plans = false;
         if stopped.is_none() {
             // the cards that wait on a red main are ready again once main moves
             lines.extend(requeue_red_main(store, &root).await);
             let roadmap = store.load().await?;
+            plans = crate::commands::run::plans_next(&roadmap.gambits);
             let router = crate::router::Router::load(&root).unwrap_or_default();
             // the runners as the table says now: the dashboard's `+`/`-` changes them while the
             // walk runs, and a lower number lets the runs in flight end without starting more
@@ -4928,6 +4940,10 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 .into_iter()
                 .filter(|n| !in_flight.contains(&n.id) && !parked.contains(&n.id))
             {
+                if crate::plan::split::due(&root, node) {
+                    due.push(node.id);
+                    continue;
+                }
                 // a card whose prerequisites are missing waits, named, rather than spend runs
                 match prerequisites_missing(&root, node).await {
                     None => ready.push(node.clone()),
@@ -5006,6 +5022,11 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                                 }
                                 None => Vec::new(),
                             };
+                            // the ledger's mark before the run: the rows after it are the runs'
+                            let mark = match runner.ledger() {
+                                Some(ledger) => ledger.last_id().await.ok(),
+                                None => None,
+                            };
                             out.extend(run(store, id, &runner).await?);
                             // what follows the run happens inside its own future, so the
                             // other runs are read while it merges and compiles: a landing
@@ -5013,6 +5034,10 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                             // runelite walk, half an hour, 2026-11-12). The landings and the
                             // checkpoints take the project's git lock one at a time
                             let node = store.read(id).await?;
+                            // the card's claimed saving is judged on its own rows, as it lands
+                            if let (Some(mark), Some(ledger)) = (mark, runner.ledger()) {
+                                out.extend(crate::retro::landed(root_ref, &node, ledger, mark).await);
+                            }
                             let git_guard = git_lock.lock().await;
                             if node.state == TaskState::Implemented {
                                 out.extend(land_or_say(store, id, &runner).await);
@@ -5050,12 +5075,43 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             flight.push((LOOKBACK_SEAT, Box::pin(async move { crate::lookback::pass(store, &planner).await }), Seat::Investigate));
         }
         if flight.is_empty() {
+            // a card due a split is split here, with no run in flight to stall: the planner
+            // proposes the remaining work as cards and the card is blocked with it
+            if !due.is_empty() {
+                for id in due {
+                    match crate::plan::split::split(store, &root, id, worker).await {
+                        Ok(line) => lines.push(line),
+                        Err(error) => {
+                            let line = format!("the split of #{id} failed and it waits for a person: {error:#}");
+                            tracing::warn!("{line}");
+                            crate::pair::event(&root, &line);
+                            lines.push(line);
+                        }
+                    }
+                    parked.insert(id);
+                }
+                continue;
+            }
             if starved && stopped.is_none() {
                 // every slot of the kind is another project's: wait for one
                 tokio::time::sleep(WALK_TICK).await;
                 continue;
             }
-            let text = format!("ran {ran} card(s) · {}", stopped.unwrap_or_else(|| "no card is ready".to_owned()));
+            let mut why = "no card is ready".to_owned();
+            // a `plan-next` gambit lets the planner fill the next empty milestone; its cards
+            // are the next picks
+            if stopped.is_none() && plans && !planned {
+                planned = true;
+                match crate::commands::run::plan_next(store, &root, worker).await {
+                    Ok(Some(plan_lines)) => {
+                        lines.extend(plan_lines);
+                        continue;
+                    }
+                    Ok(None) => "no card is ready and no milestone is left to plan".clone_into(&mut why),
+                    Err(error) => why = format!("no card is ready · planning the next milestone failed: {error:#}"),
+                }
+            }
+            let text = format!("ran {ran} card(s) · {}", stopped.unwrap_or(why));
             // on the feed as well: a detached walk's own lines go nowhere, and walks stopped by
             // the plan's week read as dying with no word (asm and runelite, 2026-11-12)
             crate::pair::event(&root, &format!("walk {text}"));
@@ -5082,6 +5138,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // the checkpoint or the landing already happened inside the run's future
                 lines.extend(run_lines);
                 ran += 1;
+                planned = false;
                 let sent_back = store.read(id).await?.state == TaskState::NeedsRevision;
                 if stop_on_revision && stopped.is_none() && sent_back {
                     stopped = Some(format!("stopped: #{id} needs revision"));
