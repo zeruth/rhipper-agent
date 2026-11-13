@@ -1138,6 +1138,59 @@ async fn a_saving_line_compares_the_card_to_the_median() {
     assert!(crate::retro::landed(tempfile::tempdir().unwrap().path(), &node, &empty, 0).await.is_empty());
 }
 
+/// The `[saving]` verdict on a landed card of `card` whose run took 3 turns at 110 tokens a
+/// turn, against three cards before it at a median of 1000, read back from its retro.log.
+async fn saving_of(card: &ra_roadmap::store::Card<'_>) -> (i64, Vec<String>, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    let id = store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, "Landed", card).await.unwrap();
+    run(&format!("/set {id} implemented"), &store, &worker()).await.unwrap();
+    let node = store.read(id).await.unwrap();
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    let row = |node: i64, turns: u64, prompt_tokens: u64| ra_usage::Entry {
+        model: "claude-opus-5-5".to_owned(),
+        role: None,
+        node: Some(node),
+        prompt_tokens,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        cost_usd: None,
+        cost_computed: false,
+        turns,
+        read_in: 0,
+    };
+    for (other, turns, tokens) in [(11, 2, 600), (12, 4, 4000), (13, 1, 5000)] {
+        ledger.record(&row(other, turns, tokens)).await.unwrap();
+    }
+    let mark = ledger.last_id().await.unwrap();
+    ledger.record(&row(id, 3, 330)).await.unwrap();
+    let lines = crate::retro::landed(dir.path(), &node, &ledger, mark).await;
+    let logged = crate::retro::recent(dir.path(), 5).into_iter().filter(|n| n.node == Some(id)).map(|n| n.text).collect();
+    (id, lines, logged)
+}
+
+#[tokio::test]
+async fn a_landed_card_without_a_saving_field_is_judged_by_its_objective() {
+    let objective = "Make the walk judge every card. [saving] one verdict line instead of rc usage. The rest is detail.";
+    let card = ra_roadmap::store::Card { objective: Some(objective), ..ra_roadmap::store::Card::new() };
+    let (id, lines, logged) = saving_of(&card).await;
+    let held = format!("[saving] #{id} held: 3 turns, 110 tokens/turn vs median 1000; claimed \"one verdict line instead of rc usage\"");
+    assert_eq!((lines, logged), (vec![held.clone()], vec![held]));
+    // the other spelling the Phase P/Q cards used reads the same
+    let card = ra_roadmap::store::Card { objective: Some("Smaller reads.\nSaving: fewer tokens a turn"), ..ra_roadmap::store::Card::new() };
+    let (id, _, logged) = saving_of(&card).await;
+    assert_eq!(logged, vec![format!("[saving] #{id} held: 3 turns, 110 tokens/turn vs median 1000; claimed \"fewer tokens a turn\"")]);
+}
+
+#[tokio::test]
+async fn a_landed_card_without_any_claim_is_judged_by_its_estimate() {
+    let card = ra_roadmap::store::Card { objective: Some("Make the walk judge every card."), ..ra_roadmap::store::Card::new() };
+    let (id, lines, logged) = saving_of(&card).await;
+    // a c3 card: 120k tokens over 15 turns
+    let held = format!("[saving] #{id} held: 3 turns, 110 tokens/turn vs median 1000; claimed by estimate of 8000 tokens/turn");
+    assert_eq!((lines, logged), (vec![held.clone()], vec![held]));
+}
+
 #[tokio::test]
 async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_dependency() {
     let dir = tempfile::tempdir().unwrap();
