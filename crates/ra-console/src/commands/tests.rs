@@ -1205,6 +1205,17 @@ async fn a_status_line_shows_the_waiting_count() {
 }
 
 #[test]
+fn context_names_background_build() {
+    let base = tempfile::tempdir().unwrap();
+    let task = ra_context::TaskContext::open(base.path(), 1);
+    let messages = crate::agent::harness_messages(&task, None, None, "", base.path(), false, None);
+    let system: String = messages.iter().filter(|m| m.role == "system").map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
+    assert!(system.contains("120 s foreground limit"), "{system}");
+    assert!(system.contains("`run_in_background`"), "{system}");
+    assert!(system.contains("task notification"), "{system}");
+}
+
+#[test]
 fn a_report_is_a_placeholder_when_it_names_no_file_and_says_nothing_beyond_the_check() {
     assert!(crate::agent::is_empty_handoff(""));
     assert!(crate::agent::is_empty_handoff("the suite is still running"));
