@@ -73,6 +73,10 @@ pub struct Run {
     pub pid: Option<u32>,
     /// When the run last had a step or began.
     pub touched: std::time::Instant,
+    /// The turns the worker has taken so far, from its turn lines.
+    pub turns: u32,
+    /// The input of the worker's last turn, in tokens: the context it carries now.
+    pub context: u64,
 }
 
 /// The title of a run that untagged lines opened without a start marker.
@@ -166,7 +170,13 @@ impl Sink {
             };
             let Some(id) = id else { return };
             if let Some(run) = self.inner.runs.lock().0.get_mut(&id) {
-                run.steps.push(text.to_owned());
+                // a turn line counts, it is not a step
+                if let Some((turns, context)) = ra_providers::claude_code::parse_turn_line(text) {
+                    run.turns = turns;
+                    run.context = context;
+                } else {
+                    run.steps.push(text.to_owned());
+                }
                 run.touched = std::time::Instant::now();
             }
             self.bump();
@@ -188,6 +198,8 @@ impl Sink {
                 folded: None,
                 pid: None,
                 touched: std::time::Instant::now(),
+                turns: 0,
+                context: 0,
             };
             runs.0.insert(id, run);
             id
@@ -476,6 +488,17 @@ mod tests {
             assert_eq!(kinds, [Kind::Run, Kind::Output, Kind::Output, Kind::Run]);
             assert_eq!(lines[3].text, "#16 Next · opus-5-5");
         });
+    }
+
+    #[test]
+    fn a_turn_line_sets_the_turns_and_the_context_and_adds_no_step() {
+        let sink = Sink::new();
+        sink.progress(&format!("{RUN_START}#15 Files · opus-5-5"));
+        sink.progress("Read crates/store.rs");
+        sink.progress(&ra_providers::claude_code::turn_line(12, 61_000));
+        let run = sink.run(sink.live_run().unwrap()).unwrap();
+        assert_eq!((run.turns, run.context), (12, 61_000));
+        assert_eq!(run.steps, ["Read crates/store.rs"]);
     }
 
     #[test]

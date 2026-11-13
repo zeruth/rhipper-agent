@@ -410,7 +410,9 @@ impl ClaudeCode {
                 for step in progress_of(&line, request.workspace.as_deref()) {
                     tracing::info!(target: "ra::progress", "{step}");
                 }
-                turns.note(&line);
+                if let Some(turn) = turns.turn_progress(&line) {
+                    tracing::info!(target: "ra::progress", "{turn}");
+                }
                 if let Some(size) = watch.note(&line, &turns) {
                     // the turns past this one would each read the whole context again: the
                     // child stops here and the caller continues the task in a fresh session
@@ -570,7 +572,31 @@ struct TurnTally {
 /// The tools whose call is the run acting rather than reading in.
 const EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
+/// What a turn line starts with: the sink reads the turns and the context off it instead of
+/// showing it as a step.
+pub const TURN_MARK: &str = "\u{23f1} turns ";
+
+/// The progress line of a run `turns` turns in, the last of which read `input` tokens.
+#[must_use]
+pub fn turn_line(turns: usize, input: u64) -> String {
+    format!("{TURN_MARK}{turns} \u{b7} {input} tokens")
+}
+
+/// The turns and the last turn's input a [`turn_line`] carries; `None` for any other line.
+#[must_use]
+pub fn parse_turn_line(text: &str) -> Option<(u32, u64)> {
+    let (turns, input) = text.strip_prefix(TURN_MARK)?.split_once(" \u{b7} ")?;
+    Some((turns.trim().parse().ok()?, input.strip_suffix(" tokens")?.trim().parse().ok()?))
+}
+
 impl TurnTally {
+    /// Books one stream event, and gives the turn line when it began a new turn.
+    fn turn_progress(&mut self, line: &str) -> Option<String> {
+        let before = self.turns.len();
+        self.note(line);
+        if self.turns.len() > before { Some(turn_line(self.turns.len(), self.last_input()?)) } else { None }
+    }
+
     /// Books the turn one stream event belongs to; any other event is passed over.
     fn note(&mut self, line: &str) {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { return };

@@ -280,6 +280,23 @@ fn the_stream_tallies_the_tokens_of_each_turn() {
 }
 
 #[test]
+fn turn_progress_gives_one_line_a_turn_whatever_the_events_of_it() {
+    let stream = [
+        r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"cache_read_input_tokens":1000,"output_tokens":40},"content":[{"type":"text","text":"a"}]}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+        r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":5,"cache_read_input_tokens":1200,"output_tokens":10},"content":[{"type":"text","text":"b"}]}}"#,
+        r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":5,"cache_read_input_tokens":1200,"output_tokens":90},"content":[{"type":"tool_use","name":"Edit","input":{}}]}}"#,
+        r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":7,"cache_read_input_tokens":1500,"output_tokens":25},"content":[{"type":"text","text":"c"}]}}"#,
+    ];
+    let mut tally = TurnTally::default();
+    let lines: Vec<String> = stream.iter().filter_map(|line| tally.turn_progress(line)).collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[2], turn_line(3, 1507));
+    assert_eq!(parse_turn_line(&lines[2]), Some((3, 1507)));
+    assert_eq!(parse_turn_line("Read src/lib.rs"), None);
+}
+
+#[test]
 fn the_stream_tallies_the_read_in_through_the_first_edit_and_the_files_read_whole() {
     // two turns: the first reads three files, two of them whole and one twice; the second
     // edits. the read-in is both turns' input; a third turn after the edit is not in it
