@@ -2794,7 +2794,9 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             lines.extend(land_or_say(store, id, &runner).await);
             node = store.read(id).await?;
         } else {
-            lines.extend(checkpoint_worktree(&root, &node).await);
+            // the walk runs one card at a time: the git lock is its own
+            let lock = tokio::sync::Mutex::new(());
+            lines.extend(checkpoint_and_prove(&root, &node, &runner, lock.lock().await).await);
         }
         if node.state == TaskState::NeedsRevision {
             // the first rejection and the first two check failures are rerun on the card's
@@ -2872,8 +2874,16 @@ async fn walk_runner(store: &Store, root: &Path, id: i64, worker: &Worker) -> an
     }
     let node = store.read(id).await?;
     let (path, branch) = worktree_add(root, id).await?;
-    let caught_up = catch_up_worktree(root, &path, &node).await;
-    Ok((worker.clone().with_worktree(path, branch), caught_up.into_iter().collect()))
+    let runner = worker.clone().with_worktree(path.clone(), branch);
+    let mut lines = Vec::new();
+    // a clean merge is proven before the worker gets the tree; a failure is the run's first job
+    if let Some((line, merge_base)) = catch_up_worktree(root, &path, &node).await {
+        lines.push(line);
+        if let Some(merge_base) = merge_base {
+            lines.extend(prove_tree(root, &path, &node, &runner, &merge_base, "the merge of the project's branch").await);
+        }
+    }
+    Ok((runner, lines))
 }
 
 /// How many times a walk reruns a card whose check (or lint) failed before it leaves the card
@@ -3566,36 +3576,39 @@ fn landing_message(node: &Node, handoff: Option<&ra_context::Handoff>) -> String
 /// the tree with its markers, for the worker to resolve first ([`conflicts_block`] puts the
 /// files at the head of the brief), and the checkpoint after the run completes the merge.
 /// Twenty-one runelite branches from one old base conflicted with main on 2026-11-12 and
-/// could not land; from here a branch is never more than one run behind.
-async fn catch_up_worktree(root: &Path, path: &Path, node: &Node) -> Option<String> {
+/// could not land; from here a branch is never more than one run behind. With the line comes
+/// the commit the branch stood on before a clean merge, for [`prove_tree`].
+async fn catch_up_worktree(root: &Path, path: &Path, node: &Node) -> Option<(String, Option<String>)> {
     let id = node.id;
     let (main, outcome) = catch_up(root, path, node).await?;
     Some(match outcome {
-        CatchUp::Merged(behind) => format!("  #{id}: {main} merged into {}, {behind} commit(s) behind", worktree_branch(id)),
+        CatchUp::Merged(behind, base) => (format!("  #{id}: {main} merged into {}, {behind} commit(s) behind", worktree_branch(id)), base),
         CatchUp::Conflicts(files) => {
-            format!("  #{id}: {main} merged into {} with conflicts in {files}; the worker resolves them first", worktree_branch(id))
+            (format!("  #{id}: {main} merged into {} with conflicts in {files}; the worker resolves them first", worktree_branch(id)), None)
         }
-        CatchUp::Refused(why) => {
-            format!("  #{id}: {main} could not be merged into {}: {}; the run goes on without it", worktree_branch(id), quote_git(&why))
-        }
+        CatchUp::Refused(why) => (
+            format!("  #{id}: {main} could not be merged into {}: {}; the run goes on without it", worktree_branch(id), quote_git(&why)),
+            None,
+        ),
     })
 }
 
 /// What merging the project's branch into a card's worktree came to.
 enum CatchUp {
-    /// A clean merge of this many commits of the project's branch.
-    Merged(String),
+    /// A clean merge of this many commits of the project's branch, and the commit the card's
+    /// branch stood on before it, for [`prove_tree`].
+    Merged(String, Option<String>),
     /// Conflicts left in this many files, in the tree with their markers.
     Conflicts(usize),
     /// A merge git refused without naming a conflict, with git's own message; it was aborted.
     Refused(String),
 }
 
-/// One merge of `main` into the tree at `path`, `behind` commits of it: a refusal without an
-/// unmerged file is aborted and carries git's message.
-async fn merge_in(path: &Path, main: &str, behind: &str) -> CatchUp {
+/// One merge of `main` into the tree at `path`, `behind` commits of it, the branch standing on
+/// `base` before it: a refusal without an unmerged file is aborted and carries git's message.
+async fn merge_in(path: &Path, main: &str, behind: &str, base: Option<String>) -> CatchUp {
     match git(path, &["merge", "--no-edit", main]).await {
-        Ok(_) => CatchUp::Merged(behind.to_owned()),
+        Ok(_) => CatchUp::Merged(behind.to_owned(), base),
         Err(e) => {
             let conflicts = git(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
             if conflicts.trim().is_empty() {
@@ -3678,14 +3691,15 @@ async fn catch_up(root: &Path, path: &Path, node: &Node) -> Option<(String, Catc
         let _ = git(path, &["add", "-A"]).await;
         let _ = git(path, &["commit", "-q", "-m", &message]).await;
     }
-    let mut outcome = merge_in(path, &main, behind.trim()).await;
+    let base = git(path, &["rev-parse", "HEAD"]).await.ok();
+    let mut outcome = merge_in(path, &main, behind.trim(), base.clone()).await;
     // a refusal is not a conflict and never the worker's: what can be settled is, and the
     // merge is tried once more (#211, #213 and #216 went back to workers with nothing to resolve)
     if let CatchUp::Refused(why) = &outcome
         && let Some(settled) = settle_refusal(path, &main, why).await
     {
         tracing::info!(target: crate::trace::PROGRESS, "#{}: {settled}; merging {main} again", node.id);
-        outcome = merge_in(path, &main, behind.trim()).await;
+        outcome = merge_in(path, &main, behind.trim(), base).await;
     }
     Some((main, outcome))
 }
@@ -3720,7 +3734,7 @@ async fn catch_up_for_review(store: &Store, id: i64, worker: &Worker) -> Result<
     let branch = worktree_branch(id);
     let Some((main, outcome)) = catch_up(&root, &path, &node).await else { return Ok(None) };
     let caught = match outcome {
-        CatchUp::Merged(behind) => format!("  #{id}: caught up: {behind} commit(s) merged from {main} into {branch}"),
+        CatchUp::Merged(behind, _) => format!("  #{id}: caught up: {behind} commit(s) merged from {main} into {branch}"),
         // git refused without naming a file, and the one retry did not take: the person's, with
         // git's own words, never a worker's rerun with nothing to resolve
         CatchUp::Refused(why) => {
@@ -3907,6 +3921,137 @@ fn outside_note(root: &Path, id: i64, command: &str, outside: &str) -> String {
     format!("check failed outside the card on the merged tree: {outside}; noted for the project")
 }
 
+/// Where the failed proof of a card's tree waits for the card's next run, under the project.
+const PROOFS_DIR: &str = "var/proofs";
+
+fn proof_path(root: &Path, id: i64) -> PathBuf {
+    root.join(PROOFS_DIR).join(format!("{id}.md"))
+}
+
+/// The block at the head of a worker's brief when the last merge or checkpoint of its branch
+/// failed its proof: the markers or the compile's failure, as [`prove_tree`] left them.
+fn proof_block(root: &Path, id: i64) -> Option<String> {
+    std::fs::read_to_string(proof_path(root, id)).ok().filter(|text| !text.trim().is_empty())
+}
+
+/// Whether a text holds a line git writes for a conflict: `<<<<<<<`, `|||||||` or `>>>>>>>`,
+/// alone or before a space. The `=======` between the sides is left out: a markdown heading
+/// underlines with it.
+fn has_conflict_marker(text: &str) -> bool {
+    text.lines().any(|line| {
+        ["<<<<<<<", "|||||||", ">>>>>>>"]
+            .iter()
+            .any(|marker| line.strip_prefix(marker).is_some_and(|rest| rest.is_empty() || rest.starts_with(' ')))
+    })
+}
+
+/// The files changed on the tree's branch since `base` that hold a conflict marker.
+async fn marked_files(tree: &Path, base: &str) -> Vec<String> {
+    let Ok(changed) = git(tree, &["diff", "--name-only", "--diff-filter=d", base, "HEAD"]).await else {
+        return Vec::new();
+    };
+    changed
+        .lines()
+        .map(str::trim)
+        .filter(|file| !file.is_empty())
+        .filter(|file| std::fs::read_to_string(tree.join(file)).is_ok_and(|text| has_conflict_marker(&text)))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The compile of a check command: what builds everything the check would run, without running
+/// it. `cargo test` gains `--no-run` (its test arguments mean nothing then); a gradle `test`
+/// task becomes `testClasses`, without its `--tests` filter; any other check is its own compile.
+fn compile_of(command: &str) -> String {
+    let head = command.split_once(" -- ").map_or(command, |(head, _)| head).trim_end();
+    let words: Vec<&str> = head.split_whitespace().collect();
+    if words.first() == Some(&"cargo") && words.get(1) == Some(&"test") {
+        return if words.contains(&"--no-run") { head.to_owned() } else { format!("{head} --no-run") };
+    }
+    let first: &str = words.first().copied().unwrap_or_default();
+    let program = first.rsplit(['/', '\\']).next().unwrap_or(first).split('.').next().unwrap_or_default();
+    if matches!(program, "gradle" | "gradlew" | "gw") {
+        let mut out = Vec::new();
+        let mut rest = words.iter();
+        while let Some(word) = rest.next() {
+            if *word == "--tests" {
+                rest.next();
+            } else if !word.starts_with("--tests=") {
+                out.push(if *word == "test" {
+                    "testClasses".to_owned()
+                } else if let Some(project) = word.strip_suffix(":test") {
+                    format!("{project}:testClasses")
+                } else {
+                    (*word).to_owned()
+                });
+            }
+        }
+        return out.join(" ");
+    }
+    command.to_owned()
+}
+
+/// Proves what was just committed on a card's branch in `tree` since `base` (a merge of the
+/// project's branch, or a checkpoint) before a worker gets the tree: no changed file holds a
+/// conflict marker, and the project's compile passes on a build slot. A failure is written to
+/// [`proof_path`], which the card's next run reads first ([`proof_block`]); a pass clears it.
+/// Conflict markers reached checkpoint commits, and a clean auto-merge duplicated members in
+/// runelite (#45): a merge git calls clean is not yet a tree that builds.
+async fn prove_tree(root: &Path, tree: &Path, node: &Node, worker: &Worker, base: &str, what: &str) -> Vec<String> {
+    let id = node.id;
+    let branch = worktree_branch(id);
+    let marked = marked_files(tree, base).await;
+    let mut compiles: Vec<String> = Vec::new();
+    let failure = if marked.is_empty() {
+        let Checks { commands, timeout, .. } = checks_of(root, node);
+        for compile in commands.iter().map(|c| compile_of(c)) {
+            if !compiles.contains(&compile) {
+                compiles.push(compile);
+            }
+        }
+        // the worktree's own target, as the merged tree's check builds in
+        let own_target = ra_providers::claude_code::shared_target(tree);
+        let toolbox = worker
+            .toolbox(tree)
+            .map(|t| t.with_timeout(timeout).with_env(own_target.iter().map(|t| ("CARGO_TARGET_DIR".to_owned(), t.display().to_string()))));
+        let _slot = hold_build(root, tree).await;
+        run_checks(&toolbox, &compiles, &[]).await.into_iter().find(|r| !r.passed).map(|failed| {
+            (
+                format!("the compile `{}` failed ({})", failed.command, failed.exit),
+                format!(
+                    "The compile `{}` fails on the tree ({}): fix it so the tree builds, keeping both the project's change and this card's:\n\n{}",
+                    failed.command, failed.exit, failed.text
+                ),
+            )
+        })
+    } else {
+        // the compile would only say what the markers do: they are fixed first
+        Some((
+            format!("conflict markers in {} file(s)", marked.len()),
+            format!(
+                "Conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) were committed in these files; remove every one, keeping both sides' change:\n{}",
+                marked.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+            ),
+        ))
+    };
+    let path = proof_path(root, id);
+    let Some((short, text)) = failure else {
+        let _ = std::fs::remove_file(&path);
+        return vec![format!("  proof: {what} on {branch} is clean and compiles: {}", compiles.join(" · "))];
+    };
+    let block = format!(
+        "FIRST: {what} on this card's branch ({branch}) was proven before this run and failed.\n{text}\nFix this before anything else, then go on with the card. Do not commit: the orchestrator commits after your report.\n"
+    );
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, block);
+    let line = format!("  proof: {what} on {branch} failed, {short}; the next run fixes it first");
+    tracing::warn!("#{id} {}", line.trim_start());
+    crate::pair::event(root, &format!("#{id} {}", line.trim_start()));
+    vec![line]
+}
+
 /// The block at the head of a worker's brief when its tree has unmerged files: the merge of
 /// the project's branch left them, and the card goes nowhere until they are whole.
 async fn conflicts_block(acting: &Path) -> Option<String> {
@@ -4038,7 +4183,7 @@ async fn resolve_landing(store: &Store, id: i64, worker: &Worker) -> Result<Stri
     let (path, branch) = worktree_add(&root, id).await.map_err(said)?;
     match catch_up(&root, &path, &node).await {
         Some((_, CatchUp::Conflicts(_))) => conflict_pass(&root, &path, &node, worker).await,
-        Some((main, CatchUp::Merged(behind))) => Ok(format!("{behind} commit(s) of {main} merged into {branch} clean")),
+        Some((main, CatchUp::Merged(behind, _))) => Ok(format!("{behind} commit(s) of {main} merged into {branch} clean")),
         Some((main, CatchUp::Refused(why))) => Err(format!("git refused to merge {main} into {branch}: {}", quote_git(&why))),
         None => Err(format!("{branch} has every commit of the project's branch, and still conflicts")),
     }
@@ -4048,8 +4193,9 @@ async fn resolve_landing(store: &Store, id: i64, worker: &Worker) -> Result<Stri
 /// work is on the branch from its first run, not only in a working tree a crash or a removed
 /// worktree would lose, and `git log card/<id>` reads as the card's story. The reviewer reads
 /// the diff from the merge base ([`diff_base`]), so a checkpoint hides nothing from it. A
-/// line when something was committed; nothing when the tree was clean or git refused.
-async fn checkpoint_worktree(root: &Path, node: &Node) -> Option<String> {
+/// line when something was committed, with the commit the branch stood on before it for
+/// [`prove_tree`]; nothing when the tree was clean or git refused.
+async fn checkpoint_worktree(root: &Path, node: &Node) -> Option<(String, String)> {
     let id = node.id;
     let path = root.join(WORKTREES_DIR).join(id.to_string());
     // a merge the worker has not resolved stays open: committed, its markers would be the
@@ -4061,11 +4207,25 @@ async fn checkpoint_worktree(root: &Path, node: &Node) -> Option<String> {
     if dirty.trim().is_empty() {
         return None;
     }
+    let base = git(&path, &["rev-parse", "HEAD"]).await.ok()?;
     let task = ra_context::TaskContext::open(root, id);
     let message = card_commit_message(node, task.handoffs.last(), CommitKind::Checkpoint, dirty.lines().count());
     git(&path, &["add", "-A"]).await.ok()?;
     git(&path, &["commit", "-q", "-m", &message]).await.ok()?;
-    Some(format!("  checkpoint: {} file(s) committed on {}", dirty.lines().count(), worktree_branch(id)))
+    Some((format!("  checkpoint: {} file(s) committed on {}", dirty.lines().count(), worktree_branch(id)), base))
+}
+
+/// [`checkpoint_worktree`], then [`prove_tree`] over what it committed, with the project's git
+/// lock let go between them: the compile takes minutes and the other cards' landings wait on
+/// the lock, not on this card's build.
+async fn checkpoint_and_prove(root: &Path, node: &Node, worker: &Worker, git_lock: tokio::sync::MutexGuard<'_, ()>) -> Vec<String> {
+    let checkpoint = checkpoint_worktree(root, node).await;
+    drop(git_lock);
+    let Some((line, base)) = checkpoint else { return Vec::new() };
+    let tree = root.join(WORKTREES_DIR).join(node.id.to_string());
+    let mut lines = vec![line];
+    lines.extend(prove_tree(root, &tree, node, worker, &base, "the checkpoint").await);
+    lines
 }
 
 /// How old an entry under the system temp directory is before a landing's sweep removes it:
@@ -4404,7 +4564,8 @@ async fn say_landing(store: &Store, id: i64, landed: anyhow::Result<Vec<String>>
 }
 
 /// What a landed card leaves behind, removed: its worktree and branch, its target directory
-/// under the project's, its research brief, and the old entries of the project's temp names.
+/// under the project's, its research brief and its proof, and the old entries of the project's
+/// temp names.
 /// Each step says what it did or could not; none of them fails the landing.
 async fn clean_after(root: &Path, id: i64, has_branch: bool) -> Vec<String> {
     let mut lines = Vec::new();
@@ -4431,6 +4592,9 @@ async fn clean_after(root: &Path, id: i64, has_branch: bool) -> Vec<String> {
         }
     }
     let _ = std::fs::remove_file(brief_path(root, id));
+    // a proof that failed and was fixed in a run that ran no proof after it would open a
+    // later card of the same id, or a reopened one, on a job that is done
+    let _ = std::fs::remove_file(proof_path(root, id));
     let names = crate::router::Router::load(root).map(|r| r.worker.temp).unwrap_or_default();
     if !names.is_empty() {
         let (count, bytes) = sweep_temp(&names, TEMP_SWEEP_AGE);
@@ -4778,7 +4942,15 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // the project's branch comes into the card's before the run: a card that
                 // started from an older main lands without a conflict later, and a conflict
                 // there is now is the worker's first job (the brief names the files)
-                lines.extend(catch_up_worktree(&root, &path, node).await);
+                let merged = match catch_up_worktree(&root, &path, node).await {
+                    Some((line, merge_base)) => {
+                        lines.push(line);
+                        merge_base
+                    }
+                    None => None,
+                };
+                let tree = path.clone();
+                let proved = node.clone();
                 let runner = worker.clone().with_worktree(path, branch);
                 // the card's span: every progress line of the run carries the card, so six
                 // runs' steps stay apart in the activity file and on the window's cards
@@ -4791,18 +4963,28 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                     Box::pin(
                         async move {
                             let _slot = slot;
-                            let mut out = run(store, id, &runner).await?;
+                            // a clean merge is proven before the worker gets the tree, inside
+                            // the run's future so its compile stalls no other card; a failure
+                            // is the run's first job
+                            let mut out = match &merged {
+                                Some(merge_base) => {
+                                    prove_tree(root_ref, &tree, &proved, &runner, merge_base, "the merge of the project's branch").await
+                                }
+                                None => Vec::new(),
+                            };
+                            out.extend(run(store, id, &runner).await?);
                             // what follows the run happens inside its own future, so the
                             // other runs are read while it merges and compiles: a landing
                             // awaited in the walk's loop stalled every worker behind it (the
                             // runelite walk, half an hour, 2026-11-12). The landings and the
                             // checkpoints take the project's git lock one at a time
                             let node = store.read(id).await?;
-                            let _git = git_lock.lock().await;
+                            let git_guard = git_lock.lock().await;
                             if node.state == TaskState::Implemented {
                                 out.extend(land_or_say(store, id, &runner).await);
+                                drop(git_guard);
                             } else {
-                                out.extend(checkpoint_worktree(&root_ref, &node).await);
+                                out.extend(checkpoint_and_prove(root_ref, &node, &runner, git_guard).await);
                             }
                             Ok(out)
                         }
@@ -5176,6 +5358,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let acting = workspace_dir.clone().unwrap_or_else(|| root.clone());
     // a merge of the project's branch that left conflicts in the tree is the run's first job
     if let Some(block) = conflicts_block(&acting).await {
+        task.brief = format!("{block}\n{}", task.brief);
+    }
+    // and so is a merge or a checkpoint of the branch that failed its proof
+    if let Some(block) = proof_block(&root, id) {
         task.brief = format!("{block}\n{}", task.brief);
     }
     // what happened to the tree since the last run left it, a merge, a reset or commits on top:
@@ -7099,7 +7285,8 @@ fn failed_test_names(output: &str, gradle: bool) -> Vec<String> {
 /// exactly, or the gradle wrapper with a `--tests` per name. `None` for any other command.
 fn rerun_words(words: &[String], names: &[String]) -> Option<Vec<String>> {
     let program = words.first()?.rsplit(['/', '\\']).next()?.to_lowercase();
-    if names.is_empty() {
+    // a compile ([`compile_of`]) runs no test: a failure in it has none to run alone
+    if names.is_empty() || words.iter().any(|word| word == "--no-run" || word.ends_with("testClasses")) {
         return None;
     }
     if program.starts_with("cargo") && words.get(1).is_some_and(|word| word == "test") {

@@ -715,6 +715,112 @@ fn a_whole_file_read_of_a_long_file_is_answered_with_the_outline_once_per_run() 
     unsafe { std::env::remove_var(CARD_VAR) };
 }
 
+/// One git command in `dir`, which must succeed.
+fn git_ok(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// A project with one commit and card #2's worktree on `card/2`, with an identity of its own
+/// so the orchestrator's commits need none on the machine.
+fn project_with_worktree(root: &Path) -> PathBuf {
+    git_ok(root, &["init", "-q"]);
+    git_ok(root, &["config", "user.name", "test"]);
+    git_ok(root, &["config", "user.email", "test@example.com"]);
+    std::fs::write(root.join("lib.rs"), "pub struct S {\n    a: u8,\n}\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "var/\n").unwrap();
+    git_ok(root, &["add", "-A"]);
+    git_ok(root, &["commit", "-q", "-m", "base"]);
+    let tree = root.join(WORKTREES_DIR).join("2");
+    git_ok(root, &["worktree", "add", "-q", "-b", "card/2", tree.to_str().unwrap()]);
+    tree
+}
+
+/// A worker whose every command answers `code` and `text`, and the commands it was given.
+fn scripted(code: i32, text: &'static str) -> (Worker, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let script: ra_tools::Script = Arc::new(move |command: &str| {
+        log.lock().push(command.to_owned());
+        Ok((code, text.to_owned()))
+    });
+    (Worker::new("z-ai/glm-5.3-flash").with_script(script), seen)
+}
+
+fn card() -> Node {
+    ra_roadmap::markdown::parse("- 2 ‹task› T\n    objective: a goal\n    files: lib.rs\n").unwrap().remove(0)
+}
+
+#[tokio::test]
+async fn a_checkpoint_holding_a_conflict_marker_is_caught_by_the_merge_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let tree = project_with_worktree(root);
+    std::fs::write(tree.join("lib.rs"), "pub struct S {\n<<<<<<< HEAD\n    a: u8,\n=======\n    b: u8,\n>>>>>>> main\n}\n").unwrap();
+    let (worker, seen) = scripted(0, "ok\n");
+    let lock = tokio::sync::Mutex::new(());
+    let lines = checkpoint_and_prove(root, &card(), &worker, lock.lock().await).await;
+    assert_eq!(lines[0], "  checkpoint: 1 file(s) committed on card/2", "{lines:?}");
+    assert!(lines[1].contains("failed, conflict markers in 1 file(s)"), "{lines:?}");
+    // the markers are the next run's first job, and no compile was spent on them
+    let block = proof_block(root, 2).expect("the failed proof waits for the next run");
+    assert!(block.starts_with("FIRST: the checkpoint on this card's branch (card/2)"), "{block}");
+    assert!(block.contains("- lib.rs"), "{block}");
+    assert!(seen.lock().is_empty(), "{:?}", seen.lock());
+    // the lock was given back with the checkpoint
+    assert!(lock.try_lock().is_ok());
+}
+
+#[tokio::test]
+async fn a_merge_whose_compile_fails_reaches_the_next_prompt_by_the_merge_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let tree = project_with_worktree(root);
+    // the project moves on; git merges it in cleanly, and the tree no longer builds
+    std::fs::write(root.join("more.rs"), "impl S { fn a(&self) {} }\n").unwrap();
+    git_ok(root, &["add", "-A"]);
+    git_ok(root, &["commit", "-q", "-m", "more"]);
+    let node = card();
+    let (line, base) = catch_up_worktree(root, &tree, &node).await.expect("the branch was behind");
+    assert!(line.contains("merged into card/2, 1 commit(s) behind"), "{line}");
+    let base = base.expect("a clean merge is proven");
+    let (failing, seen) = scripted(1, "error[E0124]: field `a` is already declared\n");
+    let lines = prove_tree(root, &tree, &node, &failing, &base, "the merge of the project's branch").await;
+    assert!(lines[0].contains("failed, the compile `cargo test --workspace -q --no-run` failed"), "{lines:?}");
+    assert_eq!(*seen.lock(), ["cargo test --workspace -q --no-run"]);
+    let block = proof_block(root, 2).expect("the failed compile waits for the next run");
+    assert!(block.starts_with("FIRST: the merge of the project's branch on this card's branch (card/2)"), "{block}");
+    assert!(block.contains("error[E0124]: field `a` is already declared"), "{block}");
+    // a proof that passes clears it: the run after the fix opens on the card again
+    let (passing, _) = scripted(0, "ok\n");
+    let lines = prove_tree(root, &tree, &node, &passing, &base, "the checkpoint").await;
+    assert!(lines[0].contains("is clean and compiles"), "{lines:?}");
+    assert_eq!(proof_block(root, 2), None);
+}
+
+#[test]
+fn the_merge_proof_compiles_a_check_without_running_it() {
+    assert_eq!(compile_of("cargo test -p ra-console -q merge_proof"), "cargo test -p ra-console -q merge_proof --no-run");
+    assert_eq!(compile_of("cargo test --workspace -- --nocapture"), "cargo test --workspace --no-run");
+    assert_eq!(compile_of(r".\gw.ps1 :core:test --tests Foo"), r".\gw.ps1 :core:testClasses");
+    assert_eq!(compile_of("./gradlew test"), "./gradlew testClasses");
+    assert_eq!(compile_of("python tools/check.py"), "python tools/check.py");
+    assert!(has_conflict_marker("a\n>>>>>>> main\n"));
+    assert!(!has_conflict_marker("Title\n=======\n<<<<<<<<<< not one\n"));
+}
+
+#[tokio::test]
+async fn a_landing_clears_the_merge_proof_its_last_run_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let path = proof_path(root, 2);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "FIRST: the checkpoint on this card's branch (card/2) failed.\n").unwrap();
+    clean_after(root, 2, false).await;
+    assert_eq!(proof_block(root, 2), None);
+}
+
 #[tokio::test]
 async fn a_card_waits_on_prerequisites_until_its_dependency_is_in_its_base() {
     let dir = tempfile::tempdir().unwrap();
