@@ -1717,23 +1717,93 @@ async fn a_claude_run_past_the_weeks_threshold_is_refused_with_the_room_and_the_
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     week_at(dir.path(), 0.95);
     let script = Scripted::new(vec![says("did it", vec![])]);
-    // a claude-* pick past 90%: refused before any token goes, naming the room and the reset
+    // a claude-* pick past 90%: held before any token goes, naming the room and the reset
     let runner = Worker::new("claude-sonnet-5-5").with_provider(script.clone());
     let err = format!("{:#}", crate::agent::run(&store, 2, &runner).await.unwrap_err());
-    assert!(err.contains("week is at 95%") && err.contains("past the 90% threshold"), "{err}");
+    assert!(err.contains("week at 95%") && err.contains("past the 90% mark of ladder 3 for c3"), "{err}");
     assert!(err.contains("5% left · resets in 6d 0h") && err.contains("--force"), "{err}");
     assert!(script.seen.lock().is_empty());
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
+    let node = store.read(2).await.unwrap();
     // another route is not the plan's
-    assert!(Worker::new("z-ai/glm-5.3-flash").steered_by_plan(dir.path()).await.is_ok());
-    // the project's own threshold stands above the week: room
+    assert!(Worker::new("z-ai/glm-5.3-flash").steered_by_plan(dir.path(), &node).await.is_ok());
+    // the project's own threshold stands above the week: the c3 stands on the Haiku rung
     std::fs::write(dir.path().join("rhipper.toml"), "[plan]\nthreshold = 0.97\n").unwrap();
     assert_eq!(crate::agent::plan_threshold(dir.path()), 0.97);
-    assert!(runner.steered_by_plan(dir.path()).await.is_ok());
+    assert_eq!(runner.steered_by_plan(dir.path(), &node).await.unwrap().model, "claude-haiku-4-5");
     // forced, the run goes ahead on the badge model
     std::fs::remove_file(dir.path().join("rhipper.toml")).unwrap();
-    assert!(runner.steered_by_plan(dir.path()).await.is_err());
-    assert_eq!(runner.clone().with_force(true).steered_by_plan(dir.path()).await.unwrap().model, "claude-sonnet-5-5");
+    assert!(runner.steered_by_plan(dir.path(), &node).await.is_err());
+    assert_eq!(runner.clone().with_force(true).steered_by_plan(dir.path(), &node).await.unwrap().model, "claude-sonnet-5-5");
+}
+
+/// A card of `complexity` and `priority` in a fresh project whose week is at `week`.
+async fn card_in_week(dir: &std::path::Path, week: f64, complexity: u8, priority: Option<u8>) -> ra_roadmap::model::Node {
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    week_at(dir, week);
+    let mut node = store.read(2).await.unwrap();
+    node.complexity = complexity;
+    node.priority = priority;
+    node
+}
+
+#[tokio::test]
+async fn the_ladder_moves_a_small_card_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = Worker::new("claude-sonnet-5-5");
+    // at 76% the c2 stands on the Haiku rung, the highest it has passed; the c4 stays
+    let small = card_in_week(dir.path(), 0.76, 2, None).await;
+    assert_eq!(runner.steered_by_plan(dir.path(), &small).await.unwrap().model, "claude-haiku-4-5");
+    let big = ra_roadmap::model::Node { complexity: 4, ..small.clone() };
+    assert_eq!(runner.steered_by_plan(dir.path(), &big).await.unwrap().model, "claude-sonnet-5-5");
+    // at 55% only the c1–2 leave, for the local server, which no test has up
+    week_at(dir.path(), 0.55);
+    let err = format!("{:#}", runner.steered_by_plan(dir.path(), &small).await.err().unwrap());
+    assert!(err.contains("past the 50% mark of ladder 1 for c2") && err.contains("no local route is up"), "{err}");
+    let middle = ra_roadmap::model::Node { complexity: 3, ..small.clone() };
+    assert_eq!(runner.steered_by_plan(dir.path(), &middle).await.unwrap().model, "claude-sonnet-5-5");
+    // the project's own ladder, its spans written as text
+    std::fs::write(
+        dir.path().join("rhipper.toml"),
+        "[plan]\nladder = [{ at = 0.5, span = \"1-2\", to = \"claude-haiku-4-5\" }, { at = 0.6, span = \"3\", to = \"local\" }]\n",
+    )
+    .unwrap();
+    assert_eq!(runner.steered_by_plan(dir.path(), &small).await.unwrap().model, "claude-haiku-4-5");
+    assert_eq!(runner.steered_by_plan(dir.path(), &middle).await.unwrap().model, "claude-sonnet-5-5");
+}
+
+#[tokio::test]
+async fn a_priority_one_card_runs_past_the_hold_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = Worker::new("claude-sonnet-5-5");
+    let plain = card_in_week(dir.path(), 0.95, 4, None).await;
+    let err = format!("{:#}", runner.steered_by_plan(dir.path(), &plain).await.err().unwrap());
+    assert!(err.starts_with("hold: ") && err.contains("ladder 3 for c4"), "{err}");
+    // a priority card passes the hold and no lower rung is for a c4
+    let urgent = ra_roadmap::model::Node { priority: Some(1), ..plain.clone() };
+    assert_eq!(runner.steered_by_plan(dir.path(), &urgent).await.unwrap().model, "claude-sonnet-5-5");
+    // a small priority card passes the hold onto the rung below it
+    let small = ra_roadmap::model::Node { complexity: 3, ..urgent };
+    assert_eq!(runner.steered_by_plan(dir.path(), &small).await.unwrap().model, "claude-haiku-4-5");
+}
+
+#[test]
+fn without_a_ladder_the_old_threshold_is_the_last_rung() {
+    use crate::router::{Mark, Router, Span, TO_HOLD};
+    let written = Router::parse(
+        "[plan]\nladder = [\n  { at = 0.5, span = \"1-2\", to = \"local\" },\n  { at = 0.75, span = \"1-3\", to = \"claude-haiku-4-5\" },\n  { at = 0.9, span = \"1-5\", to = \"hold\", except_priority = 1 },\n]\n",
+    )
+    .unwrap();
+    let default = Router::default().plan.marks();
+    assert_eq!(default, written.plan.marks());
+    let last =
+        Mark { at: ra_providers::limits::DEFAULT_THRESHOLD, span: Span::Between(1, 5), to: TO_HOLD.to_owned(), except_priority: Some(1) };
+    assert_eq!(default.last(), Some(&last));
+    // the project's threshold moves the last rung, and only it
+    let moved = Router::parse("[plan]\nthreshold = 0.97\n").unwrap().plan.marks();
+    assert_eq!(moved.last().map(|mark| mark.at), Some(0.97));
+    assert_eq!(moved[..2], default[..2]);
 }
 
 #[tokio::test]
