@@ -753,6 +753,23 @@ fn card() -> Node {
 }
 
 #[tokio::test]
+async fn the_outline_of_the_worktree_is_what_prepare_sends_and_not_the_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let tree = project_with_worktree(root);
+    std::fs::write(tree.join("lib.rs"), "pub fn moved() {}\n\npub struct S {\n    a: u8,\n}\n").unwrap();
+    let store = ra_roadmap::store::Store::open(&root.join("rhipper.md"), "Rhipper").await.unwrap();
+    let files = ["lib.rs".to_owned()];
+    let card = ra_roadmap::store::Card { files: &files, ..ra_roadmap::store::Card::new() };
+    let id = store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, "T", &card).await.unwrap();
+    let node = store.read(id).await.unwrap();
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_worktree(tree, "card/2");
+    let prepared = prepare(&store, &node, &worker, false).await.unwrap();
+    let outline = prepared.task.outlines;
+    assert!(outline.contains("pub fn moved()") && outline.contains("lib.rs (5 lines)"), "{outline}");
+}
+
+#[tokio::test]
 async fn a_checkpoint_holding_a_conflict_marker_is_caught_by_the_merge_proof() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

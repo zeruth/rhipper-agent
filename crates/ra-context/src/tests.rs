@@ -83,12 +83,12 @@ fn a_rust_outline_names_the_items_with_their_lines() {
     assert_eq!(
         rest,
         [
-            "6  pub struct Store",
-            "10  impl Store",
-            "11  pub async fn open(path: &Path) -> anyhow::Result<Self>",
-            "15  fn write(&self)",
-            "18  pub(crate) fn helper<T>(x: T) -> T",
-            "25  const ROOM: usize = 3",
+            "6-9  pub struct Store",
+            "10-10  impl Store",
+            "11-14  pub async fn open(path: &Path) -> anyhow::Result<Self>",
+            "15-17  fn write(&self)",
+            "18-24  pub(crate) fn helper<T>(x: T) -> T",
+            "25-28  const ROOM: usize = 3",
         ]
     );
     // a body two levels in is not an item; a use is not; the tests module is not
@@ -97,20 +97,30 @@ fn a_rust_outline_names_the_items_with_their_lines() {
     assert!(!text.contains("mod tests"));
     // an inline tests module hides its functions, and the file goes on after it
     let inline = "fn real() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn a_test() {}\n}\n\nfn after() {}\n";
-    assert_eq!(outline(Path::new("x.rs"), inline), "x.rs (11 lines)\n      1  fn real()\n     11  fn after()\n");
+    assert_eq!(outline(Path::new("x.rs"), inline), "x.rs (11 lines)\n         1-10  fn real()\n        11-11  fn after()\n");
+}
+
+#[test]
+fn outline_rows_give_a_start_and_an_end_and_an_item_opens_on_its_doc_comment_and_attributes() {
+    let text = "use a;\n\n/// Doc one.\n/// Doc two.\n#[must_use]\npub fn first() {}\n\n#[derive(Debug)]\nstruct Second;\n";
+    let rows: Vec<String> =
+        outline(Path::new("a.rs"), text).lines().skip(1).map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+    assert_eq!(rows, ["3-7 pub fn first()", "8-9 struct Second"]);
+    let ranges = item_ranges(Path::new("a.rs"), text);
+    assert_eq!(ranges, ["first 3-7", "Second 8-9"]);
 }
 
 #[test]
 fn other_files_outline_their_headings_tables_or_definitions_and_a_long_one_is_counted() {
     assert_eq!(
         outline(Path::new("README.md"), "# Title\n\ntext\n\n## Part\n"),
-        "README.md (5 lines)\n      1  # Title\n      5  ## Part\n"
+        "README.md (5 lines)\n          1-4  # Title\n          5-5  ## Part\n"
     );
     assert_eq!(
         outline(Path::new("Cargo.toml"), "[package]\nname = \"x\"\n\n[dependencies]\n"),
-        "Cargo.toml (4 lines)\n      1  [package]\n      4  [dependencies]\n"
+        "Cargo.toml (4 lines)\n          1-3  [package]\n          4-4  [dependencies]\n"
     );
-    assert_eq!(outline(Path::new("run.ps1"), "function Go {\n  x\n}\n"), "run.ps1 (3 lines)\n      1  function Go\n");
+    assert_eq!(outline(Path::new("run.ps1"), "function Go {\n  x\n}\n"), "run.ps1 (3 lines)\n          1-3  function Go\n");
     let many: String = (0..70).map(|i| format!("fn f{i}() {{}}\n")).collect();
     let text = outline(Path::new("a.rs"), &many);
     assert_eq!(text.lines().count(), 1 + 60 + 1, "{text}");
@@ -122,8 +132,12 @@ fn an_outline_marks_the_items_that_hold_a_changed_line_and_no_others() {
     // `open` owns lines 11-14, `write` 15-17, `helper` 18-24, `ROOM` 25 to the end
     let text = outline_marked(Path::new("store.rs"), SOURCE, &[(12, 12), (25, 27)]);
     let marked: Vec<&str> = text.lines().filter(|l| l.starts_with('*')).map(str::trim).collect();
-    assert_eq!(marked, ["*    11  pub async fn open(path: &Path) -> anyhow::Result<Self>", "*    25  const ROOM: usize = 3"], "{text}");
-    assert!(text.contains("\n     15  fn write(&self)\n"), "{text}");
+    assert_eq!(
+        marked,
+        ["*       11-14  pub async fn open(path: &Path) -> anyhow::Result<Self>", "*       25-28  const ROOM: usize = 3"],
+        "{text}"
+    );
+    assert!(text.contains("\n        15-17  fn write(&self)\n"), "{text}");
     assert_eq!(outline_marked(Path::new("store.rs"), SOURCE, &[]), outline(Path::new("store.rs"), SOURCE));
 }
 
@@ -180,7 +194,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
     assert!(task.handoffs.is_empty());
     task.brief = "Task #7: a thing\nObjective: do it\n".to_owned();
     task.outlines = outline_files(root, &["src/lib.rs".to_owned(), "src/missing.rs".to_owned()], &ChangedLines::new());
-    assert!(task.outlines.contains("src/lib.rs (1 lines)\n      1  pub fn one()\n"), "{}", task.outlines);
+    assert!(task.outlines.contains("src/lib.rs (1 lines)\n          1-1  pub fn one()\n"), "{}", task.outlines);
     assert!(task.outlines.contains("src/missing.rs (not in the workspace yet)"), "{}", task.outlines);
     // the first prompt carries no handoff
     assert!(!task.prompt().contains("Earlier runs"));

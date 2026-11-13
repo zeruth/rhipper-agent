@@ -348,10 +348,10 @@ pub fn outline_marked(path: &Path, text: &str, changed: &[(usize, usize)]) -> St
     out.push('\n');
     for (start, end, item) in items.iter().take(OUTLINE_ROOM) {
         let mark = if changed.iter().any(|&(from, to)| from <= *end && to >= *start) { '*' } else { ' ' };
-        let _ = writeln!(out, "{mark} {start:>5}  {}", clip(item, 110));
+        let _ = writeln!(out, "{mark} {:>11}  {}", format!("{start}-{end}"), clip(item, 110));
     }
     if hidden > 0 {
-        let _ = writeln!(out, "         … and {hidden} more");
+        let _ = writeln!(out, "  {:>11}  … and {hidden} more", "");
     }
     out
 }
@@ -384,7 +384,12 @@ pub fn items(path: &Path, text: &str) -> Vec<(usize, usize, String)> {
             _ => generic_item(line),
         };
         let Some(item) = item else { continue };
-        items.push((number + 1, item));
+        // an item opens on its doc comment and attributes, so a read of its range holds them
+        let mut first = number;
+        while extension == "rs" && first > 0 && ["///", "#["].iter().any(|p| lines[first - 1].trim_start().starts_with(p)) {
+            first -= 1;
+        }
+        items.push((first + 1, item));
     }
     let ends: Vec<usize> = (0..items.len()).map(|i| items.get(i + 1).map_or(lines.len().max(items[i].0), |(next, _)| next - 1)).collect();
     items.into_iter().zip(ends).map(|((start, item), end)| (start, end, item)).collect()

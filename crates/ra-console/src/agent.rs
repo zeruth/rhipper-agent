@@ -6112,14 +6112,17 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // the commands of the acceptance the worker may not run, or that outlive its turn, are
     // named under the card, so the session spends no turn on a refusal or a wait
     task.brief = format!("{}{}", brief.text, orchestrated_line(&checks_of(&root, node)));
-    task.outlines = ra_context::outline_files(&root, &brief.files, &last_change(&root, node, &task).await);
+    // the outline is read from the tree the worker acts in, as its regions are, so a rerun in a
+    // worktree gets the line numbers the file has there
+    let acts_in = workspace.as_deref().unwrap_or(&root);
+    task.outlines = ra_context::outline_files(acts_in, &brief.files, &last_change(acts_in, node, &task).await);
     // a card sent back by its reviewer carries the verdict's points in its context: the notes
     // that hold them are in the roadmap, which the worker does not read
     task.review = if is_rerun(node, worker) { ra_context::review_of(node.notes.as_deref().unwrap_or_default()) } else { None };
     // the regions the last session read open this one, read from the tree it acts in, so the
     // worker reads the ranges it still needs and not the same files again
     if let Some(last) = task.handoffs.last().filter(|last| !last.read.is_empty()) {
-        task.regions = ra_context::regions(workspace.as_deref().unwrap_or(&root), &last.read);
+        task.regions = ra_context::regions(acts_in, &last.read);
     }
     let project =
         if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
