@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod allocation;
+pub mod channel;
 pub mod clock;
 pub mod commands;
 pub mod hub;
@@ -25,6 +26,7 @@ pub mod setup;
 pub mod theme;
 pub mod trace;
 pub mod ui;
+pub mod walk;
 
 /// The version, `0.2.<n>`: `n` the commits of the tree the build is of, `+` after it when
 /// the sources had changes past that commit.
