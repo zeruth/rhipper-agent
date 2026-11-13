@@ -10,6 +10,7 @@ pub mod check;
 pub mod contract;
 pub mod history;
 pub mod markdown;
+pub mod missing_machinery;
 pub mod model;
 pub mod outline;
 pub mod store;

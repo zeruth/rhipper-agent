@@ -14,6 +14,7 @@ mod input;
 mod markdown;
 mod metrics;
 mod report;
+mod since;
 #[cfg(test)]
 mod tests;
 mod theme;
@@ -955,6 +956,9 @@ impl App {
             self.dashboard = false;
         }
         if let Some(i) = switch {
+            // the person looked at the project: its band counts from here
+            since::mark_now(&self.tabs[i].root);
+            self.tabs[i].allocation_at = None;
             self.active = i;
             self.dashboard = false;
             self.report = false;
@@ -1391,6 +1395,8 @@ impl App {
             }
         });
         if let Some(i) = open {
+            since::mark_now(&self.tabs[i].root);
+            self.tabs[i].allocation_at = None;
             self.active = i;
             self.dashboard = false;
         }
@@ -1446,6 +1452,8 @@ struct Workspace {
     allocation_at: Option<Instant>,
     /// The cards landed toward the next look-back pass, and whether one is running now.
     lookback: (u32, bool),
+    /// What changed since the person last looked, read with the allocation.
+    since: since::Since,
     /// The cards that wait on the person, read with the allocation.
     waiting: Vec<ra_console::hub::Waiting>,
     /// The cards landed today and their cost, read with the allocation.
@@ -1667,6 +1675,7 @@ impl Workspace {
             allocation: (None, 1, None),
             allocation_at: None,
             lookback: (0, false),
+            since: since::Since::default(),
             waiting: Vec::new(),
             landed: (0, None),
             job_tx,
@@ -4082,9 +4091,11 @@ impl Workspace {
             self.waiting = ra_console::hub::waiting(&self.root, &nodes);
             self.landed = ra_console::allocation::landed(&self.root);
             self.lookback = (ra_console::lookback::landed_since(&self.root), ra_console::lookback::running(&self.root));
+            self.since = since::of(&self.root, u32::try_from(self.waiting.len()).unwrap_or(u32::MAX));
             self.allocation_at = Some(Instant::now());
         }
         let waiting = self.waiting.clone();
+        let since_band = self.since.clone();
         let landed = self.landed;
         let (implementer, runners, place) = self.allocation.clone();
         let root = self.root.clone();
@@ -4120,6 +4131,7 @@ impl Workspace {
         };
         let mut out = Walked::default();
         let mut open = false;
+        let mut seen_pressed = false;
         let drawn = cards::bubble(ui, lane, live.is_some(), |ui| {
             // the card's widgets are the project's: a queue row's id is its card number, and
             // two projects whose queues both show a #39 drew the same id twice (egui's red
@@ -4207,6 +4219,10 @@ impl Workspace {
                         }
                     });
                 });
+                // what changed since the person last looked, under the header whether or not a
+                // run is live: an idle project's news is what the person comes back for
+                let waiting_lines: Vec<String> = waiting.iter().map(|w| w.line().trim_start().to_owned()).collect();
+                seen_pressed = crate::since::band(ui, &since_band, &waiting_lines);
                 // a project with nothing running is its header line: the queue and the run card
                 // wait for a run, and the room is the working projects'
                 if live.is_none() {
@@ -4308,6 +4324,10 @@ impl Workspace {
         // the card's height, outer margins included, for next frame's sharing of the window
         self.dash_height = drawn.response.rect.height() + 6.0;
         // a control the person used shows its new value on the next frame, not a second later
+        if seen_pressed {
+            since::mark_now(&self.root);
+            changed = true;
+        }
         if changed {
             self.allocation_at = None;
         }
