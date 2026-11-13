@@ -13,7 +13,7 @@
 //! table that also writes the worker's allowlist and the rules of its prompt.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use regex::Regex;
@@ -151,8 +151,9 @@ pub struct Catalogue {
 /// What the machine looks like right now, for the remedies that depend on it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Conditions<'a> {
-    /// A console holds the binary.
-    pub console_running: bool,
+    /// The packages whose binary a running process holds ([`held_packages`]): a workspace build
+    /// cannot relink them, so the `binary-held` rewrite excludes each by name.
+    pub held_packages: &'a [String],
     /// The project's check is the full suite ([`is_suite`]): the orchestrator runs it after the
     /// report, so a worker that runs it too only waits.
     pub suite_check: bool,
@@ -214,6 +215,96 @@ fn package_of(workspace: &Path, path: &Path) -> Option<String> {
         let manifest: toml::Table = toml::from_str(&text).ok()?;
         manifest.get("package")?.get("name")?.as_str().map(str::to_owned)
     })
+}
+
+/// The packages of `workspace` whose binary a running process holds: a process whose image lies
+/// under the workspace's target directory, by the package that builds it. A running image cannot
+/// be replaced, so a workspace build that would relink it fails; these are what it excludes, in
+/// whatever project the workspace is, not by the agent's own binary names.
+#[must_use]
+pub fn held_packages(workspace: &Path) -> Vec<String> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    // a machine whose processes cannot be listed holds nothing the hook can name
+    let Ok(mut system) = System::new() else { return Vec::new() };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_exe(UpdateKind::Always));
+    let images: Vec<PathBuf> = system.processes().values().filter_map(|p| p.exe().map(Path::to_path_buf)).collect();
+    packages_holding(workspace, &target_dir(workspace), &images)
+}
+
+/// The packages of `workspace` that build one of `images`, sorted: an image outside `target`,
+/// where the workspace builds, is another project's, or no build's at all.
+#[must_use]
+pub fn packages_holding(workspace: &Path, target: &Path, images: &[PathBuf]) -> Vec<String> {
+    let target = path_key(target);
+    let target = format!("{}/", target.trim_end_matches('/'));
+    let held: Vec<String> = images
+        .iter()
+        .filter(|image| path_key(image).starts_with(&target))
+        .filter_map(|image| image.file_stem().and_then(|s| s.to_str()).map(binary_name))
+        .collect();
+    if held.is_empty() {
+        return Vec::new();
+    }
+    let mut packages: Vec<String> =
+        binaries_of(workspace).into_iter().filter(|(binary, _)| held.contains(binary)).map(|(_, package)| package).collect();
+    packages.sort();
+    packages.dedup();
+    packages
+}
+
+/// Where cargo builds `workspace`: `CARGO_TARGET_DIR`, against the workspace when relative, or
+/// its `target`.
+fn target_dir(workspace: &Path) -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR").filter(|d| !d.is_empty()).map_or_else(|| workspace.join("target"), |d| workspace.join(d))
+}
+
+/// A path as it compares: forward slashes, no verbatim prefix, and on Windows no case.
+fn path_key(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text);
+    if cfg!(windows) { text.to_lowercase() } else { text.to_owned() }
+}
+
+/// The binary an image's file stem names: a test binary's hash suffix dropped, and its
+/// underscores read as the hyphens of the package name they came from.
+fn binary_name(stem: &str) -> String {
+    let name = match stem.rsplit_once('-') {
+        Some((name, hash)) if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => name,
+        _ => stem,
+    };
+    name.replace('_', "-")
+}
+
+/// Every binary the packages of `workspace` build, as [`binary_name`] reads it, with its
+/// package: the package's own name (its main binary, its tests), its `[[bin]]` names and its
+/// `src/bin` files; the manifests a few directories down, past `target`, `var` and the hidden.
+fn binaries_of(workspace: &Path) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut dirs = vec![(workspace.to_path_buf(), 0)];
+    while let Some((dir, depth)) = dirs.pop() {
+        if let Some(manifest) = std::fs::read_to_string(dir.join("Cargo.toml")).ok().and_then(|t| toml::from_str::<toml::Table>(&t).ok())
+            && let Some(package) = manifest.get("package").and_then(|p| p.get("name")).and_then(toml::Value::as_str)
+        {
+            let mut names = vec![package.to_owned()];
+            let bins = manifest.get("bin").and_then(toml::Value::as_array).into_iter().flatten();
+            names.extend(bins.filter_map(|b| b.get("name").and_then(toml::Value::as_str).map(str::to_owned)));
+            let files = std::fs::read_dir(dir.join("src/bin")).into_iter().flatten().flatten();
+            names.extend(files.filter_map(|f| f.path().file_stem().and_then(|s| s.to_str()).map(str::to_owned)));
+            found.extend(names.iter().map(|n| (binary_name(n), package.to_owned())));
+        }
+        if depth >= 3 {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) && !name.starts_with('.') && !matches!(&*name, "target" | "var" | "node_modules")
+            {
+                dirs.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    found
 }
 
 /// What the pre-tool hook does with a command.
@@ -310,9 +401,9 @@ impl Catalogue {
     /// the changed crates are read from the work tree only for a full suite while it is the
     /// project's check, as they cost a `git status`.
     #[must_use]
-    pub fn command_in(&self, workspace: &Path, command: &str, console_running: bool, suite_check: bool, allowed: bool) -> Verdict {
+    pub fn command_in(&self, workspace: &Path, command: &str, held_packages: &[String], suite_check: bool, allowed: bool) -> Verdict {
         let changed = if suite_check && is_suite(command) { changed_crates(workspace) } else { Vec::new() };
-        self.command(command, Conditions { console_running, suite_check, changed_crates: &changed, allowed })
+        self.command(command, Conditions { held_packages, suite_check, changed_crates: &changed, allowed })
     }
 
     /// What to do with a command about to run: the first hint or allow that matches decides;
@@ -350,15 +441,18 @@ impl Catalogue {
                 Remedy::Hint => return Verdict::Deny { id: gotcha.id.clone(), reason: gotcha.message.clone() },
                 Remedy::Allow => break,
                 Remedy::Rewrite { insert, after, append, unless, when } => {
+                    // `console-running` is the name a project's catalogue from before #214 has
+                    let held = matches!(when.as_deref(), Some("binary-held" | "console-running"));
                     let applies = match when.as_deref() {
-                        Some("console-running") => conditions.console_running,
+                        _ if held => !conditions.held_packages.is_empty(),
                         Some(_) => false,
                         None => true,
                     };
                     if !applies || unless.as_ref().is_some_and(|u| u.is_match(&current)) {
                         continue;
                     }
-                    current = if *append { format!("{} {insert}", current.trim_end()) } else { insert_after(&current, *after, insert) };
+                    let insert = if held { excluding(insert, conditions.held_packages) } else { insert.clone() };
+                    current = if *append { format!("{} {insert}", current.trim_end()) } else { insert_after(&current, *after, &insert) };
                 }
                 Remedy::Crates { unless } => {
                     if !conditions.suite_check
@@ -462,6 +556,25 @@ fn insert_after(command: &str, after: usize, insert: &str) -> String {
         out.push_str(&words[at..].join(" "));
     }
     out
+}
+
+/// A `binary-held` insert over the packages that are held: its own `--exclude`s, which an older
+/// catalogue wrote as the agent's binary names, give way to one for each of `held`.
+fn excluding(insert: &str, held: &[String]) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut skip_next = false;
+    for word in insert.split_whitespace() {
+        if std::mem::take(&mut skip_next) || word.starts_with("--exclude=") {
+            continue;
+        }
+        if word == "--exclude" {
+            skip_next = true;
+            continue;
+        }
+        words.push(word.to_owned());
+    }
+    words.extend(held.iter().map(|p| format!("--exclude {p}")));
+    words.join(" ")
 }
 
 /// The command with its first two words followed by a `-p` for each of `crates`, and its

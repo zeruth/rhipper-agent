@@ -933,19 +933,13 @@ fn hook_pre(
     // a worker's own `rc hold -- <command>` is the command inside, as the catalogue judges it
     let judged = ra_gotchas::self_held(command).unwrap_or(command);
     let own = worker.is_some_and(|w| w.allows(judged));
-    // a running console or window holds its binary only while it runs from target/; an
-    // installed one leaves the build free, so the lock itself is asked, not the pid file
-    let console_running = {
-        let locked = |name: &str| {
-            let path = cwd.join("target").join("debug").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-            path.exists() && std::fs::OpenOptions::new().append(true).open(&path).is_err()
-        };
-        locked("rc") || locked("rc-gui")
-    };
+    // a running process holds a workspace binary only while it runs from the target directory,
+    // whatever project it is; the processes are asked only for a cargo command
+    let held = if judged.trim_start().starts_with("cargo") { ra_gotchas::held_packages(cwd) } else { Vec::new() };
     // the full suite is the orchestrator's when it is the project's check: a worker's own run
     // of it goes to the crates the run has changed
     let suite_check = worker.is_none_or(ra_console::router::WorkerConfig::checks_the_suite);
-    let mut verdict = match catalogue.command_in(cwd, command, console_running, suite_check, own) {
+    let mut verdict = match catalogue.command_in(cwd, command, &held, suite_check, own) {
         ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. } if own && id == "shell-outside-allowlist" => {
             ra_gotchas::Verdict::Pass
         }

@@ -104,13 +104,14 @@ fn a_kill_by_pid_is_handed_to_the_person_and_a_process_listing_passes() {
 #[test]
 fn a_workspace_build_is_rewritten_only_while_a_console_runs() {
     let catalogue = Catalogue::seed();
-    let running = Conditions { console_running: true, ..Conditions::default() };
+    let consoles = ["rc".to_owned(), "rc-gui".to_owned()];
+    let running = Conditions { held_packages: &consoles, ..Conditions::default() };
     // the tail rewrite composes on the end of it; the first id names the verdict
     match catalogue.command("cargo test -q", running) {
         Verdict::Rewrite { id, command, reason } => {
             assert_eq!(id, "binary-locked");
             assert_eq!(command, held("cargo test --workspace --exclude rc --exclude rc-gui -q 2>&1 | tail -n 80"));
-            assert!(reason.contains("holds its binary") && reason.contains("; a cargo test"), "{reason}");
+            assert!(reason.contains("holds a binary") && reason.contains("; a cargo test"), "{reason}");
         }
         other => panic!("{other:?}"),
     }
@@ -154,7 +155,8 @@ fn a_full_suite_runs_the_changed_crates_only_while_the_check_is_the_suite() {
         }
     }
     // a console running brings no workspace flags back onto the narrowed command
-    let running = Conditions { console_running: true, ..suite };
+    let consoles = ["rc".to_owned()];
+    let running = Conditions { held_packages: &consoles, ..suite };
     assert!(
         matches!(catalogue.command("cargo test -q", running), Verdict::Rewrite { command, .. } if command == held("cargo test -p ra-asm-emit -p ra-gotchas -q 2>&1 | tail -n 80"))
     );
@@ -194,7 +196,7 @@ fn the_hooks_full_suite_in_a_work_tree_runs_the_crate_its_changes_fall_in() {
     std::fs::write(dir.path().join("crates/a/src/lib.rs"), "").unwrap();
     assert_eq!(changed_crates(dir.path()), ["a-crate"]);
     let catalogue = Catalogue::seed();
-    match catalogue.command_in(dir.path(), "cargo test -q 2>&1 | tail -n 80", false, true, false) {
+    match catalogue.command_in(dir.path(), "cargo test -q 2>&1 | tail -n 80", &[], true, false) {
         Verdict::Rewrite { id, command, .. } => {
             assert_eq!(id, "worker-full-suite");
             assert_eq!(command, held("cargo test -p a-crate -q 2>&1 | tail -n 80"));
@@ -203,9 +205,76 @@ fn the_hooks_full_suite_in_a_work_tree_runs_the_crate_its_changes_fall_in() {
     }
     // a per-crate command, or a project whose check is not the suite, runs as written, on its slot
     let per_crate = "cargo test -p b -q 2>&1 | tail -n 80";
-    assert!(only_held(&catalogue.command_in(dir.path(), per_crate, false, true, false), per_crate));
+    assert!(only_held(&catalogue.command_in(dir.path(), per_crate, &[], true, false), per_crate));
     let tailed = "cargo test -q 2>&1 | tail -n 80";
-    assert!(only_held(&catalogue.command_in(dir.path(), tailed, false, false, false), tailed));
+    assert!(only_held(&catalogue.command_in(dir.path(), tailed, &[], false, false), tailed));
+}
+
+/// A workspace of two packages, one building a binary under a name of its own, and its target.
+fn workspace_with_a_binary() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers = [\"apps/*\", \"crates/*\"]\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("apps/asm-cli/src")).unwrap();
+    std::fs::write(dir.path().join("apps/asm-cli/Cargo.toml"), "[package]\nname = \"asm-cli\"\n\n[[bin]]\nname = \"asmc\"\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("crates/asm-core/src")).unwrap();
+    std::fs::write(dir.path().join("crates/asm-core/Cargo.toml"), "[package]\nname = \"asm-core\"\n").unwrap();
+    // a package of the target directory's own is no package of the workspace
+    std::fs::create_dir_all(dir.path().join("target/debug/build/x")).unwrap();
+    std::fs::write(dir.path().join("target/debug/build/x/Cargo.toml"), "[package]\nname = \"asmc\"\n").unwrap();
+    dir
+}
+
+#[test]
+fn a_relink_lock_excludes_the_running_binary_by_its_own_package_name() {
+    let dir = workspace_with_a_binary();
+    let images = [
+        dir.path().join("target/debug/asmc.exe"),
+        // a running test binary of a library holds its package too
+        dir.path().join("target/debug/deps/asm_core-0123456789abcdef.exe"),
+        // a binary of the same name outside the target directory is not this build's
+        PathBuf::from("C:/tools/rc.exe"),
+    ];
+    // the target is named, as the run's own `CARGO_TARGET_DIR` is not the scratch workspace's
+    let holding = packages_holding(dir.path(), &dir.path().join("target"), &images);
+    assert_eq!(holding, ["asm-cli", "asm-core"]);
+    let catalogue = Catalogue::seed();
+    match catalogue.command_in(dir.path(), "cargo build", &holding, false, false) {
+        Verdict::Rewrite { id, command, .. } => {
+            assert_eq!(id, "binary-locked");
+            assert_eq!(command, held("cargo build --workspace --exclude asm-cli --exclude asm-core 2>&1 | tail -n 80"));
+        }
+        other => panic!("{other:?}"),
+    }
+    // a catalogue from before, with the agent's own names in its insert, excludes the held ones
+    let old = SEED.replace(
+        "insert = \"--workspace\", after = 2, unless = '(-p |--package |--exclude|--bin )', when = \"binary-held\"",
+        "insert = \"--workspace --exclude rc --exclude rc-gui\", after = 2, unless = '(-p |--package |--exclude rc|--bin )', when = \"console-running\"",
+    );
+    assert_ne!(old, SEED, "the seed's binary-locked remedy is the one replaced");
+    let held_one = ["asm-cli".to_owned()];
+    match Catalogue::parse(&old).unwrap().command("cargo test -q", Conditions { held_packages: &held_one, ..Conditions::default() }) {
+        Verdict::Rewrite { command, .. } => assert_eq!(command, held("cargo test --workspace --exclude asm-cli -q 2>&1 | tail -n 80")),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn another_project_gets_no_relink_exclude_at_all() {
+    let running = workspace_with_a_binary();
+    let other = workspace_with_a_binary();
+    // the first project's binary runs; the second's build holds nothing of its own
+    let images = [running.path().join("target/debug/asmc.exe"), running.path().join("target/debug/rc-gui.exe")];
+    let holding = packages_holding(other.path(), &other.path().join("target"), &images);
+    assert!(holding.is_empty(), "{holding:?}");
+    match Catalogue::seed().command_in(other.path(), "cargo test -q", &holding, false, false) {
+        Verdict::Rewrite { id, command, .. } => {
+            assert_eq!(id, "long-output");
+            assert_eq!(command, held("cargo test -q 2>&1 | tail -n 80"));
+        }
+        other => panic!("{other:?}"),
+    }
+    // and no process at all of this test's scratch workspace runs, whatever else does
+    assert!(held_packages(other.path()).is_empty());
 }
 
 #[test]
@@ -462,7 +531,9 @@ fn a_refresh_brings_the_seeds_new_entries_and_keeps_the_files_own() {
     // a checkout may end the seed's lines in `\r\n`; the blocks end theirs in `\n`
     let seed_text = SEED.replace("\r\n", "\n");
     assert!(seed_text.contains(&block), "the seed's blocks are its own text");
-    let own = seed_text.replacen(&format!("{block}\n"), "", 1).replace("a console or a window holds its binary", "the window holds rc.exe");
+    let own = seed_text
+        .replacen(&format!("{block}\n"), "", 1)
+        .replace("a running process holds a binary of the workspace", "the window holds rc.exe");
     assert!(Catalogue::parse(&own).unwrap().get("long-output").is_none(), "{own}");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &own).unwrap();

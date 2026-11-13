@@ -69,8 +69,9 @@ remedy = { kind = "crates", unless = '(\s-p\s*\S|\s--package\b|\s--manifest-path
 id = "binary-locked"
 where = "command"
 pattern = '^\s*cargo\s+(build|test|clippy|check|run)\b'
-message = "a console or a window holds its binary while it runs, so a workspace build cannot relink it; build and test the crates (-p) or exclude the binaries"
-remedy = { kind = "rewrite", insert = "--workspace --exclude rc --exclude rc-gui", after = 2, unless = '(-p |--package |--exclude rc|--bin )', when = "console-running" }
+message = "a running process holds a binary of the workspace, so a workspace build cannot relink it; build and test the crates (-p) or exclude the packages whose binaries run"
+# the packages a running process holds come from the processes themselves: an --exclude for each is added
+remedy = { kind = "rewrite", insert = "--workspace", after = 2, unless = '(-p |--package |--exclude|--bin )', when = "binary-held" }
 
 # a port stuck in a message loop cannot be killed from a worker; the person does that, by pid
 [[gotcha]]
@@ -110,7 +111,7 @@ remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\
 id = "binary-locked-result"
 where = "result"
 pattern = 'failed to remove file .*rc\.exe|Access is denied\. \(os error 5\)'
-message = "the binary is held by a running console; run cargo with -p <crate> or --workspace --exclude rc"
+message = "a binary of the workspace is held by a running process; run cargo with -p <crate> or --workspace --exclude <its package>"
 remedy = { kind = "hint" }
 
 [[gotcha]]

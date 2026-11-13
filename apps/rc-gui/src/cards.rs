@@ -491,7 +491,9 @@ pub(crate) fn blood_scroll_bar<R>(ui: &mut Ui, output: &egui::scroll_area::Scrol
     let thumb = egui::Rect::from_min_size(egui::pos2(track.left(), thumb_top), egui::vec2(width, thumb_height));
     let lit = response.hovered() || response.dragged();
     let painter = ui.painter();
-    let radius = CornerRadius::same(u8::try_from((width / 2.0).round() as i32).unwrap_or(4));
+    // clamped to a byte's range first, so the cast cannot truncate
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let radius = CornerRadius::same((width / 2.0).round().clamp(0.0, 255.0) as u8);
     painter.rect_filled(track, radius, theme::mix(theme::bg(), theme::deep(), 0.7));
     painter.rect_stroke(track, radius, Stroke::new(1.0, alpha(theme::accent(), 50)), egui::StrokeKind::Inside);
     // a soft glow under the thumb, then the thumb itself, brighter while held or hovered

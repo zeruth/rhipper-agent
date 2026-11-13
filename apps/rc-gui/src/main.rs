@@ -1284,7 +1284,7 @@ impl App {
             let small: Vec<bool> = self.tabs.iter().map(Workspace::dashboard_small).collect();
             // every project shows, the idle ones at their natural height (the person, again:
             // "i want the empty project bubbles in dashboard now")
-            let count = self.tabs.len().max(1) as f32;
+            let count = f32::from(u16::try_from(self.tabs.len().max(1)).unwrap_or(u16::MAX));
             let kept: f32 = self.tabs.iter().zip(&small).filter(|(_, s)| **s).map(|(t, _)| t.dash_height).sum();
             // the share of a working project weighs its run grid: a row of run cards (two
             // across) counts one, the queue beside them one more, so a project running six

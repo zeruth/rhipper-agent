@@ -310,8 +310,8 @@ impl ClaudeCode {
         let mut crossed: Option<u64> = None;
         // which tool each call id belongs to, so only a shell's output is read for gotchas
         let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        // a console holds the binary while var/console.pid is in the workspace
-        let console_running = request.workspace.as_deref().is_some_and(|w| w.join("var/console.pid").exists());
+        // the workspace binaries a running process holds, asked once as the run starts
+        let held = request.workspace.as_deref().map(ra_gotchas::held_packages).unwrap_or_default();
         let mut stream = Stream::open(request.workspace.as_deref());
         if let Some(pipe) = child.stdout.take() {
             let mut lines = tokio::io::BufReader::new(pipe).lines();
@@ -345,7 +345,7 @@ impl ClaudeCode {
                         _ => Vec::new(),
                     };
                     let conditions =
-                        Conditions { console_running, suite_check: self.suite_check, changed_crates: &changed, allowed: false };
+                        Conditions { held_packages: &held, suite_check: self.suite_check, changed_crates: &changed, allowed: false };
                     for hit in gotchas_of_event(catalogue, &line, conditions, &mut tools) {
                         // the project's own commands are past the allowlist by design: the
                         // hook lets them run, and the count leaves them alone too
