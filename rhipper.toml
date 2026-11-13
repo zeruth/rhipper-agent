@@ -58,6 +58,16 @@ model = "claude-sonnet-5-5"
 [[route]]
 model = "claude-opus-5-5"
 
+# The models a routed card climbs, the cheapest first. A c1–2 card starts one rung below its
+# route's model, and a card the reviewer sent back steps up one rung per `up_after` rejections;
+# a rule's model is the ceiling of the cards it routes, and a card's own model never moves. The
+# start line, the handoff and a dry run say `started one rung down (c2)` or `escalated to <model>
+# after 1 rejection`; `rc usage --cards` lists the models each card ran on.
+[ladder]
+models = ["haiku", "sonnet", "opus", "fable"]
+start = [{ complexity = [1, 2], down = 1 }]
+up_after = 1
+
 [role]
 # The model of each cheap role a run ends with. A key left out goes to the local server at
 # RHIPPER_LOCAL_URL (default http://127.0.0.1:8080/v1) when it answers a ping, under

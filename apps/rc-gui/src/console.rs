@@ -367,7 +367,9 @@ fn run_title(
     let model_width = model.map_or(0.0, |m| measure(ui, m) + 34.0);
     // the fold arrow, the two buttons, the badges' frames and marks, and the spacing between
     let fixed = 14.0 + if folded { 0.0 } else { 52.0 } + 34.0 + 34.0;
-    let task_room = (total - measure(ui, &status_shown) - model_width - fixed).max(40.0);
+    // the title pill never takes more than half the card: past that it pushed the badges beside
+    // it over one another (the person, 2026-11-12)
+    let task_room = (total - measure(ui, &status_shown) - model_width - fixed).min(total / 2.0 - 16.0).max(40.0);
     let task = title.rsplit_once(" · ").map_or(title, |(task, _)| task);
     let row = ui.horizontal(|ui| {
         ui.label(RichText::new(if folded { "▸" } else { "▾" }).color(theme::dim()).small());

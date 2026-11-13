@@ -175,6 +175,11 @@ pub(crate) fn badge_marked(ui: &mut Ui, mark: &str, text: &str, color: Color32) 
 /// instead of an ellipsis (the person: "the long task name marquee instead of going on
 /// forever"). A text that fits sits still.
 pub(crate) fn marquee_badge(ui: &mut Ui, mark: &str, text: &str, width: f32, color: Color32) -> egui::Response {
+    // the card's number stays put at the left; only the name after it runs
+    let (number, name) = match text.split_once(' ') {
+        Some((number, name)) if number.starts_with('#') => (Some(number), name),
+        _ => (None, text),
+    };
     Frame::new()
         .fill(alpha(color, 28))
         .stroke(Stroke::new(1.0, alpha(color, 160)))
@@ -183,7 +188,14 @@ pub(crate) fn marquee_badge(ui: &mut Ui, mark: &str, text: &str, width: f32, col
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
+                let start = ui.cursor().left();
                 ui.label(RichText::new(mark).color(color).small());
+                if let Some(number) = number {
+                    ui.label(RichText::new(number).color(color).small().strong());
+                }
+                let text = name;
+                // the pill's content keeps to `width`: what the mark and the number took comes off
+                let width = width - (ui.cursor().left() - start);
                 let font = egui::TextStyle::Small.resolve(ui.style());
                 let galley = ui.painter().layout_no_wrap(text.to_owned(), font, theme::text());
                 let room = width.max(20.0).min(galley.size().x);
