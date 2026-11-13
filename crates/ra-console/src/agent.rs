@@ -3333,7 +3333,9 @@ async fn catch_up_worktree(root: &Path, path: &Path, node: &Node) -> Option<Stri
         CatchUp::Conflicts(files) => {
             format!("  #{id}: {main} merged into {} with conflicts in {files}; the worker resolves them first", worktree_branch(id))
         }
-        CatchUp::Refused => format!("  #{id}: {main} could not be merged into {}; the run goes on without it", worktree_branch(id)),
+        CatchUp::Refused(why) => {
+            format!("  #{id}: {main} could not be merged into {}: {}; the run goes on without it", worktree_branch(id), quote_git(&why))
+        }
     })
 }
 
@@ -3343,8 +3345,72 @@ enum CatchUp {
     Merged(String),
     /// Conflicts left in this many files, in the tree with their markers.
     Conflicts(usize),
-    /// A merge git refused without naming a conflict; it was aborted.
-    Refused,
+    /// A merge git refused without naming a conflict, with git's own message; it was aborted.
+    Refused(String),
+}
+
+/// One merge of `main` into the tree at `path`, `behind` commits of it: a refusal without an
+/// unmerged file is aborted and carries git's message.
+async fn merge_in(path: &Path, main: &str, behind: &str) -> CatchUp {
+    match git(path, &["merge", "--no-edit", main]).await {
+        Ok(_) => CatchUp::Merged(behind.to_owned()),
+        Err(e) => {
+            let conflicts = git(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
+            if conflicts.trim().is_empty() {
+                let _ = git(path, &["merge", "--abort"]).await;
+                CatchUp::Refused(format!("{e:#}"))
+            } else {
+                CatchUp::Conflicts(conflicts.lines().count())
+            }
+        }
+    }
+}
+
+/// The words of a git refusal that a lock held the index or a file: another git or a scanner
+/// had it, and it goes once that one ends.
+const LOCK_WORDS: [&str; 4] = ["index.lock", "Permission denied", "being used by another process", "Unable to create"];
+
+/// How long a refused merge waits out a lock before its one retry.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Settles what it can of a merge git refused in `tree` with `text` and no conflict named, the
+/// incoming side being `rev`: untracked files in the way that are each identical to the
+/// incoming one are removed, a lock is waited out. The line of what was done, for the one
+/// retry; `None` when nothing could be settled, and the refusal is the person's.
+async fn settle_refusal(tree: &Path, rev: &str, text: &str) -> Option<String> {
+    if text.contains("would be overwritten") {
+        let named = overwritten_files(text);
+        let cleared = clear_identical(tree, rev, &named).await;
+        return (!named.is_empty() && cleared.len() == named.len())
+            .then(|| format!("cleared {} untracked file(s) identical to {rev}'s: {}", cleared.len(), cleared.join(", ")));
+    }
+    if LOCK_WORDS.iter().any(|word| text.contains(word)) {
+        tokio::time::sleep(LOCK_WAIT).await;
+        return Some(format!("waited out a lock: {}", quote_git(text)));
+    }
+    None
+}
+
+/// Removes the untracked `files` of `tree` when every one of them is identical to its copy at
+/// `rev` (line endings aside), and answers the ones removed; none when one of them differs,
+/// as that one is someone's own work.
+async fn clear_identical(tree: &Path, rev: &str, files: &[String]) -> Vec<String> {
+    let normal = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    for file in files {
+        let Ok(here) = std::fs::read(tree.join(file)) else { return Vec::new() };
+        let incoming = tokio::process::Command::new("git").args(["show", &format!("{rev}:{file}")]).current_dir(tree).output().await;
+        match incoming {
+            Ok(out) if out.status.success() && normal(&out.stdout) == normal(&here) => {}
+            _ => return Vec::new(),
+        }
+    }
+    files.iter().filter(|file| std::fs::remove_file(tree.join(file)).is_ok()).cloned().collect()
+}
+
+/// Git's message on one line for the feed: its lines trimmed and joined, clipped.
+fn quote_git(text: &str) -> String {
+    let joined = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+    joined.chars().take(300).collect()
 }
 
 /// Merges the project's branch into the card's worktree at `path`: the branch's name and what
@@ -3370,17 +3436,15 @@ async fn catch_up(root: &Path, path: &Path, node: &Node) -> Option<(String, Catc
         let _ = git(path, &["add", "-A"]).await;
         let _ = git(path, &["commit", "-q", "-m", &message]).await;
     }
-    let outcome = if git(path, &["merge", "--no-edit", &main]).await.is_ok() {
-        CatchUp::Merged(behind.trim().to_owned())
-    } else {
-        let conflicts = git(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
-        if conflicts.trim().is_empty() {
-            let _ = git(path, &["merge", "--abort"]).await;
-            CatchUp::Refused
-        } else {
-            CatchUp::Conflicts(conflicts.lines().count())
-        }
-    };
+    let mut outcome = merge_in(path, &main, behind.trim()).await;
+    // a refusal is not a conflict and never the worker's: what can be settled is, and the
+    // merge is tried once more (#211, #213 and #216 went back to workers with nothing to resolve)
+    if let CatchUp::Refused(why) = &outcome
+        && let Some(settled) = settle_refusal(path, &main, why).await
+    {
+        tracing::info!(target: crate::trace::PROGRESS, "#{}: {settled}; merging {main} again", node.id);
+        outcome = merge_in(path, &main, behind.trim()).await;
+    }
     Some((main, outcome))
 }
 
@@ -3413,25 +3477,42 @@ async fn catch_up_for_review(store: &Store, id: i64, worker: &Worker) -> Result<
     let Ok(node) = store.read(id).await else { return Ok(None) };
     let branch = worktree_branch(id);
     let Some((main, outcome)) = catch_up(&root, &path, &node).await else { return Ok(None) };
-    let behind = match outcome {
-        CatchUp::Merged(behind) => behind,
-        CatchUp::Refused => {
-            return Ok(Some(format!("  #{id}: {main} could not be merged into {branch}; the review reads the branch as it stands")));
-        }
-        CatchUp::Conflicts(files) => {
-            let text = match store.set_state_by(id, TaskState::NeedsRevision, Source::Run).await {
-                Ok(()) => format!(
-                    "#{id} not reviewed: {main} merged into {branch} with conflicts in {files} file(s); sent back to its worker to resolve them"
-                ),
-                Err(e) => format!(
-                    "#{id} not reviewed: {main} merged into {branch} with conflicts in {files} file(s); it could not be sent back ({e:#})"
-                ),
+    let caught = match outcome {
+        CatchUp::Merged(behind) => format!("  #{id}: caught up: {behind} commit(s) merged from {main} into {branch}"),
+        // git refused without naming a file, and the one retry did not take: the person's, with
+        // git's own words, never a worker's rerun with nothing to resolve
+        CatchUp::Refused(why) => {
+            let said = quote_git(&why);
+            let notes = node.notes.as_deref().map(str::trim).filter(|n| !n.is_empty());
+            let lead = format!("merge refused: {main} into {branch}: {said}");
+            let lead = notes.map_or_else(|| lead.clone(), |notes| format!("{lead}\n\n{notes}"));
+            let held = match store.set_notes(id, &lead).await {
+                Ok(()) => store.set_state_by(id, TaskState::Blocked, Source::Run).await,
+                Err(e) => Err(e),
+            };
+            let text = match held {
+                Ok(()) => format!("#{id} not reviewed: git refused to merge {main} into {branch}: {said}; the card waits for the person"),
+                Err(e) => format!("#{id} not reviewed: git refused to merge {main} into {branch}: {said}; it could not be held ({e:#})"),
             };
             crate::pair::event(&root, &text);
             return Err(vec![format!("  {text}")]);
         }
+        CatchUp::Conflicts(files) => match conflict_pass(&root, &path, &node, worker).await {
+            Ok(pass) => format!("  #{id}: caught up: {main} merged into {branch} · {pass}"),
+            Err(why) => {
+                let text = match store.set_state_by(id, TaskState::NeedsRevision, Source::Run).await {
+                    Ok(()) => format!(
+                        "#{id} not reviewed: {main} merged into {branch} with conflicts in {files} file(s); sent back to its worker to resolve them (the conflict pass: {why})"
+                    ),
+                    Err(e) => format!(
+                        "#{id} not reviewed: {main} merged into {branch} with conflicts in {files} file(s); it could not be sent back ({e:#})"
+                    ),
+                };
+                crate::pair::event(&root, &text);
+                return Err(vec![format!("  {text}")]);
+            }
+        },
     };
-    let caught = format!("  #{id}: caught up: {behind} commit(s) merged from {main} into {branch}");
     tracing::info!(target: crate::trace::PROGRESS, "{}", caught.trim_start());
     let Checks { commands, timeout, .. } = checks_of(&root, &node);
     if commands.is_empty() {
@@ -3598,6 +3679,129 @@ async fn conflicts_block(acting: &Path) -> Option<String> {
     ))
 }
 
+/// The turns a conflict pass gets: enough to edit the hunks and read around them.
+const CONFLICT_TURNS: u32 = 15;
+
+/// The lines of a file shown before and after each conflicted hunk.
+const CONFLICT_CONTEXT: usize = 3;
+
+/// The longest hunk a conflict pass's prompt shows whole; past it the pass reads the file.
+const CONFLICT_HUNK_LINES: usize = 200;
+
+/// What a conflict pass is told: the hunks are the task, nothing else is.
+const CONFLICT_INSTRUCTION: &str = "You resolve the merge conflicts of one card's branch and nothing else. The project's branch was merged into the card's and left the hunks below between `<<<<<<<`, `=======` and `>>>>>>>` markers. Edit each file so that it keeps both the project's change and the card's, with no marker left; read around a hunk only when it needs more context. Do not build, do not commit, change nothing outside the hunks, and report in a few lines how you resolved each file.";
+
+/// The conflicted hunks of a file's text with their line numbers, each with
+/// [`CONFLICT_CONTEXT`] lines around it; a long one is clipped at [`CONFLICT_HUNK_LINES`].
+fn conflict_hunks(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut hunks = Vec::new();
+    let mut at = 0;
+    while at < lines.len() {
+        if !lines[at].starts_with("<<<<<<< ") {
+            at += 1;
+            continue;
+        }
+        let end = (at..lines.len()).find(|&i| lines[i].starts_with(">>>>>>> ")).unwrap_or(lines.len() - 1);
+        let from = at.saturating_sub(CONFLICT_CONTEXT);
+        let to = (end + CONFLICT_CONTEXT + 1).min(lines.len());
+        let mut hunk = format!("lines {}-{to}:\n", from + 1);
+        for (n, line) in lines[from..to].iter().enumerate().take(CONFLICT_HUNK_LINES) {
+            let _ = writeln!(hunk, "{:>6}  {line}", from + n + 1);
+        }
+        if to - from > CONFLICT_HUNK_LINES {
+            let _ = writeln!(hunk, "        … {} line(s) more: read the file there", to - from - CONFLICT_HUNK_LINES);
+        }
+        hunks.push(hunk);
+        at = end + 1;
+    }
+    hunks
+}
+
+/// The conflict pass on the tree at `tree`, whose merge of the project's branch left unmerged
+/// files: one short session of the card's model, under [`CONFLICT_TURNS`], whose prompt holds
+/// only the conflicted hunks, the commit subjects of both sides and the card's title, not the
+/// card's brief. A pass that leaves no marker has the merge committed, and the line says so;
+/// `Err` with why not, and the caller reruns the card as before. Twenty agent reruns of
+/// 2026-11-12/13 were whole runs for a conflict a hunk's worth of reading resolves.
+async fn conflict_pass(root: &Path, tree: &Path, node: &Node, worker: &Worker) -> Result<String, String> {
+    let id = node.id;
+    let said = |e: anyhow::Error| first_line(&format!("{e:#}"));
+    let listed = git(tree, &["diff", "--name-only", "--diff-filter=U"]).await.map_err(said)?;
+    let files: Vec<&str> = listed.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if files.is_empty() {
+        return Err("git named no conflicted file".to_owned());
+    }
+    let mut hunks = String::new();
+    for file in &files {
+        let found = conflict_hunks(&std::fs::read_to_string(tree.join(file)).unwrap_or_default());
+        // a deleted or binary side has no hunk to show; the whole run is the worker's
+        if found.is_empty() {
+            return Err(format!("{file} holds no conflict marker"));
+        }
+        let _ = write!(hunks, "\n## {file}\n{}", found.join("\n"));
+    }
+    let main = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_else(|_| String::from("HEAD"));
+    let branch = worktree_branch(id);
+    let ours = git(tree, &["log", "--format=- %s", "-n", "10", &format!("{main}..HEAD")]).await.unwrap_or_default();
+    let theirs = git(tree, &["log", "--format=- %s", "-n", "10", &format!("HEAD..{main}")]).await.unwrap_or_default();
+    let prompt = format!(
+        "{CONFLICT_INSTRUCTION}\n\nThe card: {}\n\nThe card's branch {branch}, its commits:\n{ours}\n\nThe project's branch {main}, the commits merged in:\n{theirs}\n\nThe conflicted hunks, with their line numbers:\n{hunks}",
+        node.title
+    );
+    let provider = worker.provider().map_err(said)?;
+    let model = worker.model.clone();
+    tracing::info!(target: crate::trace::PROGRESS, "#{id} · conflict pass on {} in {} file(s)", short(&model), files.len());
+    if provider.has_own_tools() {
+        let answer = provider
+            .complete(CompletionRequest {
+                model: model.clone(),
+                messages: vec![Message::user(prompt)],
+                temperature: Some(0.2),
+                max_tokens: Some(4096),
+                tools: Vec::new(),
+                workspace: Some(tree.to_path_buf()),
+                budget_usd: None,
+                resume: None,
+                max_turns: Some(CONFLICT_TURNS),
+                max_context: None,
+                effort: Some(Effort::default().to_string()),
+                read_only: false,
+            })
+            .await
+            .map_err(|e| said(map_error(e)))?;
+        worker.record_as(&model, Some("conflict"), Some(id), &answer.usage, answer.turns).await;
+    } else {
+        let caps = Caps { hard: Some(CONFLICT_TURNS), ..Caps::default() };
+        tool_loop(provider.as_ref(), worker, id, prompt, Some(tree), None, caps).await.map_err(said)?;
+    }
+    let left = unresolved(tree).await;
+    if !left.is_empty() {
+        return Err(format!("markers left in {}", left.join(", ")));
+    }
+    git(tree, &["add", "-A"]).await.map_err(said)?;
+    git(tree, &["commit", "-q", "--no-edit"]).await.map_err(said)?;
+    let line = format!("conflict pass by {} resolved {}", short(&model), files.join(", "));
+    crate::pair::event(root, &format!("#{id} {line}"));
+    Ok(line)
+}
+
+/// The conflict pass for a landing that conflicted: the project's branch merged into the card's
+/// worktree (made again from the branch when it is gone), and the pass on what that left. `Ok`
+/// with the line of the pass or of a clean merge, after which the landing is tried once more.
+async fn resolve_landing(store: &Store, id: i64, worker: &Worker) -> Result<String, String> {
+    let root = workspace_of(store);
+    let said = |e: anyhow::Error| first_line(&format!("{e:#}"));
+    let node = store.read(id).await.map_err(said)?;
+    let (path, branch) = worktree_add(&root, id).await.map_err(said)?;
+    match catch_up(&root, &path, &node).await {
+        Some((_, CatchUp::Conflicts(_))) => conflict_pass(&root, &path, &node, worker).await,
+        Some((main, CatchUp::Merged(behind))) => Ok(format!("{behind} commit(s) of {main} merged into {branch} clean")),
+        Some((main, CatchUp::Refused(why))) => Err(format!("git refused to merge {main} into {branch}: {}", quote_git(&why))),
+        None => Err(format!("{branch} has every commit of the project's branch, and still conflicts")),
+    }
+}
+
 /// Commits what a run left in the card's worktree on the card's branch, as a checkpoint: the
 /// work is on the branch from its first run, not only in a working tree a crash or a removed
 /// worktree would lose, and `git log card/<id>` reads as the card's story. The reviewer reads
@@ -3727,18 +3931,20 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
                 let why = first_line(&format!("{e:#}"));
                 let text = format!("{e:#}");
                 let named = overwritten_files(&text);
-                if text.contains("would be overwritten") && !named.is_empty() {
+                let cleared =
+                    if text.contains("would be overwritten") { clear_identical(&root, &branch, &named).await } else { Vec::new() };
+                if !named.is_empty() && cleared.len() == named.len() {
+                    // the person's untracked copies are the card's own files: nothing of theirs to keep
+                    lines.push(format!("cleared {} untracked file(s) identical to {branch}'s: {why}", cleared.len()));
+                } else if text.contains("would be overwritten") && !named.is_empty() {
                     let mut args = vec!["stash", "push", "-q", "-u", "--"];
                     args.extend(named.iter().map(String::as_str));
                     git(&root, &args).await?;
                     aside = true;
                     lines.push(format!("the person's {} file(s) set aside for the squash: {why}", named.len()));
-                } else if ["index.lock", "Permission denied", "being used by another process", "Unable to create"]
-                    .iter()
-                    .any(|word| text.contains(word))
-                {
+                } else if LOCK_WORDS.iter().any(|word| text.contains(word)) {
                     lines.push(format!("a file was locked, retrying: {why}"));
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(LOCK_WAIT).await;
                 } else {
                     return Err(anyhow::anyhow!("the squash of {branch} failed without a conflict: {text}"));
                 }
@@ -3886,14 +4092,39 @@ impl std::error::Error for LandCheck {}
 /// [`land`] for a walk: the lines it answers, or the one line of why it did not, on the feed
 /// too; never an error, since a card the person must land by hand is not the walk's end.
 pub(crate) async fn land_or_say(store: &Store, id: i64, worker: &Worker) -> Vec<String> {
-    match land(store, id, worker).await {
+    let mut landed = land(store, id, worker).await;
+    // the project moved on under the card: a conflict pass in the card's worktree resolves the
+    // hunks, and the landing is tried once more; only a pass that could not sends the card back
+    let mut passed = Vec::new();
+    let mut failed_pass = None;
+    if landed.as_ref().is_err_and(|e| e.downcast_ref::<LandConflict>().is_some()) {
+        match resolve_landing(store, id, worker).await {
+            Ok(line) => {
+                passed.push(line);
+                landed = land(store, id, worker).await;
+            }
+            Err(why) => failed_pass = Some(why),
+        }
+    }
+    let mut lines = passed;
+    lines.extend(say_landing(store, id, landed, failed_pass).await);
+    lines
+}
+
+/// The lines of a landing as [`land_or_say`] answers them, `failed_pass` the reason the
+/// conflict pass did not resolve a conflict when one ran.
+async fn say_landing(store: &Store, id: i64, landed: anyhow::Result<Vec<String>>, failed_pass: Option<String>) -> Vec<String> {
+    match landed {
         Ok(lines) => lines,
-        // the project moved on under the card: it goes back to its worker, whose rerun merges
-        // the project's branch into the card's first and resolves the conflicts the brief names,
+        // the conflict pass could not resolve it: the card goes back to its worker, whose rerun
+        // merges the project's branch in first and resolves the conflicts the brief names,
         // rather than waiting on a person (asm #73 and #78, 2026-11-12)
         Err(e) if e.downcast_ref::<LandConflict>().is_some() => {
+            let pass = failed_pass.map(|why| format!(" (the conflict pass: {why})")).unwrap_or_default();
             let text = match store.set_state(id, TaskState::NeedsRevision).await {
-                Ok(_) => format!("#{id} not landed: {e}; sent back to its worker to merge the project's branch in and resolve them"),
+                Ok(()) => {
+                    format!("#{id} not landed: {e}; sent back to its worker to merge the project's branch in and resolve them{pass}")
+                }
                 Err(set) => format!("#{id} not landed: {e}; it could not be sent back ({set:#}), land it by hand"),
             };
             tracing::warn!("{text}");
@@ -3920,7 +4151,8 @@ pub(crate) async fn land_or_say(store: &Store, id: i64, worker: &Worker) -> Vec<
                         }
                     }
                 }
-                None => format!("#{id} not landed: {}", first_line(&format!("{e:#}"))),
+                // not a conflict and not the worker's: git's own words, for the person
+                None => format!("#{id} not landed: {}", quote_git(&format!("{e:#}"))),
             };
             tracing::warn!("{text}");
             crate::pair::event(&workspace_of(store), &text);

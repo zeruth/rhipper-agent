@@ -1930,10 +1930,82 @@ async fn land_reason_a_real_conflict_names_its_file_and_goes_to_the_worker() {
     std::fs::write(dir.path().join("made.txt"), "by the project\n").unwrap();
     git_ok(dir.path(), &["add", "made.txt"]);
     git_ok(dir.path(), &["commit", "-q", "-m", "the project's own"]);
-    let runner = Worker::new("z-ai/glm-5.3-flash");
+    // the conflict pass gets no answer, so the conflict stands
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![]));
     let out = crate::agent::land_or_say(&store, 2, &runner).await;
     assert!(out.iter().any(|l| l.contains("conflicts in made.txt") && l.contains("sent back to its worker")), "{out:?}");
+    assert!(out.iter().any(|l| l.contains("(the conflict pass: ")), "{out:?}");
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+}
+
+#[tokio::test]
+async fn a_named_landing_conflict_goes_to_a_conflict_pass_whose_prompt_is_the_hunk_and_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_card_branch(dir.path()).await;
+    run("/edit 2 objective Greet the reader from the probe's own file", &store, &worker()).await.unwrap();
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    std::fs::write(dir.path().join("made.txt"), "by the project\n").unwrap();
+    git_ok(dir.path(), &["add", "made.txt"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "the project's own"]);
+    let resolve = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"made.txt","content":"by the project\nby the worker\n"}"#.into(),
+    };
+    let script = Scripted::new(vec![says("", vec![resolve]), says("kept both sides of made.txt", vec![])]);
+    let passing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(passing);
+    let out = crate::agent::land_or_say(&store, 2, &runner).await;
+    assert!(out.iter().any(|l| l == "conflict pass by glm-5.3-flash resolved made.txt"), "{out:?}");
+    assert!(out.iter().any(|l| l.starts_with("squashed card/2 into ")), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Accepted, "{out:?}");
+    assert_eq!(git_ok(dir.path(), &["show", "HEAD:made.txt"]).replace("\r\n", "\n").trim_end(), "by the project\nby the worker");
+    // the pass read the hunk, both sides' subjects and the title, not the card's brief
+    let seen = script.seen.lock();
+    assert_eq!(seen.len(), 2);
+    let prompt = &seen[0].messages.last().unwrap().content;
+    assert!(prompt.contains("<<<<<<< ") && prompt.contains("by the project") && prompt.contains(">>>>>>> "), "{prompt}");
+    assert!(
+        prompt.contains("The card: Probe") && prompt.contains("- the project's own") && prompt.contains("- the card's work"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("Greet the reader"), "{prompt}");
+}
+
+#[tokio::test]
+async fn a_merge_git_refused_naming_no_path_never_reaches_a_conflict_pass_or_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_card_branch(dir.path()).await;
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    // a lock no one releases: waited out once, then the person's
+    std::fs::write(dir.path().join(".git").join("index.lock"), "").unwrap();
+    let script = Scripted::new(vec![]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let out = crate::agent::land_or_say(&store, 2, &runner).await;
+    std::fs::remove_file(dir.path().join(".git").join("index.lock")).unwrap();
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].starts_with("#2 not landed: ") && out[0].contains("Unable to create") && out[0].contains("index.lock"), "{out:?}");
+    assert!(script.seen.lock().is_empty(), "a model was asked");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Implemented);
+    assert!(crate::pair::recent(dir.path(), 5).last().is_some_and(|l| l.contains("index.lock")));
+}
+
+#[tokio::test]
+async fn an_untracked_copy_of_the_incoming_file_is_cleared_and_the_merge_retried_without_a_conflict_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_card_branch(dir.path()).await;
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    // the card's own file, copied into the checkout by hand: in the way, and no one's work
+    std::fs::write(dir.path().join("made.txt"), "by the worker\n").unwrap();
+    let script = Scripted::new(vec![]);
+    let passing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(passing);
+    let out = crate::agent::land_or_say(&store, 2, &runner).await;
+    assert!(out.iter().any(|l| l.starts_with("cleared 1 untracked file(s) identical to card/2's: ")), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Accepted, "{out:?}");
+    assert_eq!(git_ok(dir.path(), &["show", "HEAD:made.txt"]).trim_end(), "by the worker");
+    assert!(git_ok(dir.path(), &["stash", "list"]).trim().is_empty());
+    assert!(script.seen.lock().is_empty());
 }
 
 #[tokio::test]
@@ -2033,24 +2105,32 @@ fn writes_made() -> ra_providers::Completion {
 #[tokio::test]
 async fn a_conflicting_catch_up_skips_the_review() {
     let dir = tempfile::tempdir().unwrap();
-    let answers = vec![writes_made(), says("wrote made.txt", vec![]), says("wrote made.txt again", vec![])];
+    // the run, then a conflict pass that leaves the markers, then the rerun
+    let answers = vec![writes_made(), says("wrote made.txt", vec![]), says("left them", vec![]), says("wrote made.txt again", vec![])];
     let (store, runner, script) = a_run_the_project_moves_under(dir.path(), "made.txt", "by the project\n", answers).await;
     let out = crate::agent::run(&store, 2, &runner).await.unwrap();
     assert!(
-        out.iter().any(|l| l.contains("#2 not reviewed: ") && l.contains("with conflicts in 1 file(s); sent back to its worker")),
+        out.iter().any(|l| l.contains("#2 not reviewed: ")
+            && l.contains("with conflicts in 1 file(s); sent back to its worker")
+            && l.contains("(the conflict pass: markers left in made.txt)")),
         "{out:?}"
     );
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
     // the markers stay in the tree for the worker, and no reviewer read a tree that cannot land
     let made = std::fs::read_to_string(dir.path().join("var").join("worktrees").join("2").join("made.txt")).unwrap();
     assert!(made.contains("<<<<<<<"), "{made}");
-    assert_eq!(script.seen.lock().len(), 2);
+    {
+        let seen = script.seen.lock();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[2].messages.last().unwrap().content.contains("The conflicted hunks"), "the third call was not the pass");
+    }
     // the next run opens on the conflicts; unresolved, they send it back again, still unreviewed
     let out = crate::agent::run(&store, 2, &runner).await.unwrap();
     let seen = script.seen.lock();
-    assert_eq!(seen.len(), 3, "{out:?}");
+    // the rerun and its catch-up's pass, which the script no longer answers
+    assert_eq!(seen.len(), 5, "{out:?}");
     assert!(seen.iter().all(|request| !request.tools.is_empty()), "a reviewer was asked");
-    let prompt = &seen[2].messages.last().unwrap().content;
+    let prompt = &seen[3].messages.last().unwrap().content;
     assert!(prompt.contains("FIRST: the project's branch was merged into this card's branch") && prompt.contains("- made.txt"), "{prompt}");
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
 }
