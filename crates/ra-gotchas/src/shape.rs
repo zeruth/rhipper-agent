@@ -79,6 +79,7 @@ const BASH: &[&str] = &[
     "git ls-tree*",
     "git blame*",
     "git branch --contains*",
+    "git rm --cached*",
     "sort*",
     "uniq*",
     "cut *",
@@ -112,6 +113,7 @@ const POWERSHELL: &[&str] = &[
     "git ls-tree*",
     "git blame*",
     "git branch --contains*",
+    "git rm --cached*",
     "rc wait *",
 ];
 
@@ -153,6 +155,9 @@ const GIT_WRITES: &[&str] = &[
     "rm",
     "mv",
 ];
+
+/// The git subcommands a worktree is read with from outside it.
+const GIT_READS: &[&str] = &["status", "log", "diff", "show"];
 
 const GIT_FORM: &str = "the git state is the person's: only the read-only git commands run here (status, diff, log, show)";
 const GIT_C_FORM: &str = "git runs in the workspace already: drop the `-C <dir>`";
@@ -252,6 +257,9 @@ fn judge_part(part: &Part, shell: Shell, workspace: &Path, own: &dyn Fn(&str) ->
     if own(&line) {
         return Shape::Allowed;
     }
+    if is_worktree_read(&line) {
+        return Shape::Allowed;
+    }
     let fold = shell == Shell::PowerShell;
     if shell.allowed().iter().any(|rule| matches(rule, &line, fold)) { Shape::Allowed } else { Shape::Unknown }
 }
@@ -263,7 +271,11 @@ fn refusal(name: &str, rest: &[&str]) -> Option<&'static str> {
     }
     if name == "git" {
         if rest.first() == Some(&"-C") {
-            return Some(GIT_C_FORM);
+            return (!worktree_read(rest)).then_some(GIT_C_FORM);
+        }
+        // `rm --cached` only takes a path out of the index; the file stays
+        if rest.starts_with(&["rm", "--cached"]) {
+            return None;
         }
         if rest.first().is_some_and(|sub| GIT_WRITES.contains(sub))
             || rest.starts_with(&["branch", "-d"])
@@ -274,6 +286,26 @@ fn refusal(name: &str, rest: &[&str]) -> Option<&'static str> {
     }
     let python = ["python", "python3", "py"].iter().any(|p| p.eq_ignore_ascii_case(name));
     (python && (rest.is_empty() || rest.first() == Some(&"-"))).then_some(STDIN_FORM)
+}
+
+/// Whether the arguments of a git command (after `git`) read a card's worktree from outside it:
+/// `-C var/worktrees/<id>` and a read-only subcommand. The path is relative to the project and
+/// stays under `var/worktrees/`.
+fn worktree_read(rest: &[&str]) -> bool {
+    let [dash_c, path, sub, ..] = rest else { return false };
+    let path = path.trim_matches(['"', '\'']).replace('\\', "/");
+    let path = path.strip_prefix("./").unwrap_or(&path);
+    *dash_c == "-C"
+        && path.strip_prefix("var/worktrees/").is_some_and(|id| !id.is_empty() && !id.split('/').any(|s| s == ".."))
+        && GIT_READS.contains(sub)
+}
+
+/// Whether `command` is a `git -C var/worktrees/<id>` read, as [`worktree_read`] judges it: the
+/// shell-outside-allowlist gotcha stands aside for it.
+#[must_use]
+pub fn is_worktree_read(command: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words.split_first().is_some_and(|(&first, rest)| program(first) == "git" && worktree_read(rest))
 }
 
 /// Whether a permission rule takes `line`: `cargo *` the word alone or with arguments, `ls*`
@@ -476,7 +508,10 @@ pub fn block() -> String {
     for (names, form) in REFUSED {
         lines.push(format!("  - {}: {form}", names.join(", ")));
     }
-    lines.push(format!("  - git {} and git -C: {GIT_FORM}", GIT_WRITES.join("|")));
+    lines.push(format!(
+        "  - git {} (but `git rm --cached` runs) and git -C (but `git -C var/worktrees/<id> status|log|diff|show` runs): {GIT_FORM}",
+        GIT_WRITES.join("|")
+    ));
     lines.push(format!("  - a `>` redirect to a file: {REDIRECT_FORM}"));
     lines.push(format!("  - `python -` or a bare `python`: {STDIN_FORM}"));
     lines.join("\n")

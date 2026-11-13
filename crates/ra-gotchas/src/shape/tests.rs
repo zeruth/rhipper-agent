@@ -55,6 +55,18 @@ fn an_and_chain_passes_when_its_parts_do() {
 }
 
 #[test]
+fn a_worktree_read_and_an_index_only_rm_pass_and_the_rest_of_git_keeps_its_verdict() {
+    assert_eq!(bash("git merge-base main HEAD"), Shape::Allowed);
+    assert_eq!(bash("git -C var/worktrees/214 status"), Shape::Allowed);
+    assert_eq!(powershell("git -C var\\worktrees\\214 log -3"), Shape::Allowed);
+    assert_eq!(bash("git rm --cached foo"), Shape::Allowed);
+    assert!(denied_with(&bash("git -C var/worktrees/214 push"), "git -C", "-C <dir>"));
+    assert!(denied_with(&bash("git -C var/worktrees/../.. status"), "git -C", "-C <dir>"));
+    assert!(denied_with(&bash("git rm foo"), "git rm", "person"));
+    assert!(denied_with(&bash("git push --force"), "git push", "person"));
+}
+
+#[test]
 fn an_env_prefix_is_the_command_it_heads() {
     assert_eq!(bash("RUST_BACKTRACE=1 cargo test -p ra-gotchas"), Shape::Allowed);
     assert_eq!(bash("A=1 B=two cargo build && tail -n 5 log.txt"), Shape::Allowed);

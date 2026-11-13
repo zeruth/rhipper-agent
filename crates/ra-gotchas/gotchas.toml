@@ -53,7 +53,7 @@ remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\
 [[gotcha]]
 id = "git-writes"
 where = "command"
-pattern = '(^|&&|\|\||;)\s*git\s+(stash|checkout|switch|restore|reset|clean|add|commit|rebase|merge|push|pull|cherry-pick|revert|branch\s+-[dD])\b'
+pattern = '(^|&&|\|\||;)\s*git\s+(stash|checkout|switch|restore|reset|clean|add|commit|rebase|merge|push|pull|cherry-pick|revert|branch\s+-[dD])\b([^-]|$)'
 message = "the git state is the person's: only the read-only git commands run here (status, diff, log, show); leave the working tree as you changed it and report, the person reviews and commits"
 remedy = { kind = "hint" }
 

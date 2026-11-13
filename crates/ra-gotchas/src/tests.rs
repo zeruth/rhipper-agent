@@ -55,6 +55,16 @@ fn a_command_outside_the_allowlist_is_denied_with_the_reason() {
         assert!(matches!(catalogue.command(command, Conditions::default()), Verdict::Deny { id, .. } if id == "git-writes"), "{command}");
     }
     assert_eq!(catalogue.command("git diff --stat", Conditions::default()), Verdict::Pass);
+    assert_eq!(catalogue.command("git merge-base main HEAD", Conditions::default()), Verdict::Pass);
+    // a project's catalogue keeps its own pattern, the one that ran into `merge-base`
+    let old = Catalogue::parse(
+        "[[gotcha]]\nid = \"git-writes\"\nwhere = \"command\"\npattern = '(^|&&|\\|\\||;)\\s*git\\s+(add|merge|push)\\b'\nmessage = \"m\"\nremedy = { kind = \"hint\" }\n",
+    )
+    .unwrap();
+    assert_eq!(old.command("git merge-base main HEAD", Conditions::default()), Verdict::Pass);
+    for command in ["git merge main", "git add -A", "git merge-base a b && git push"] {
+        assert!(matches!(old.command(command, Conditions::default()), Verdict::Deny { .. }), "{command}");
+    }
     assert_eq!(catalogue.command("git branch --show-current", Conditions::default()), Verdict::Pass);
 }
 

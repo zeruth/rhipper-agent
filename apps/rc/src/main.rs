@@ -324,6 +324,14 @@ enum Command {
         /// `pre` refuses or rewrites a command about to run; `post` adds the hint a result calls for.
         event: String,
     },
+    /// What the shell gate says of a command, as the pre hook would: prints `allow`, `deny` with the reason, or `ask` when neither the hook nor the shape table allows it.
+    Gate {
+        /// The command line to judge.
+        command: String,
+        /// The shell it would run in: `bash` or `powershell`.
+        #[arg(long, default_value = "bash")]
+        shell: String,
+    },
     /// The gotchas that fired, by id, and the refused commands no gotcha names yet.
     Gotchas,
     /// The link to a paired session: the latest events of var/pair.log (a run's start and end, a walk's end, a note), which a pairing session watches.
@@ -766,6 +774,7 @@ async fn run_main() -> anyhow::Result<()> {
         Command::Console { roadmap, replace } => console(roadmap, replace).await,
         // a hook answers fast and stays silent on anything it cannot judge; no trace file either
         Command::Hook { event } => hook(&event),
+        Command::Gate { command, shell } => gate(&command, &shell),
         Command::Gotchas => gotchas(),
         Command::Open { dir } => {
             let dir = dir.unwrap_or_else(|| PathBuf::from("."));
@@ -1072,6 +1081,39 @@ fn hook(event: &str) -> anyhow::Result<()> {
     };
     if let Some(answer) = answer {
         println!("{answer}");
+    }
+    Ok(())
+}
+
+/// Prints the verdict of the pre hook on `command` without running it: `allow`, `deny: <reason>`,
+/// or `ask` for a command neither the hook nor the shape table allows.
+fn gate(command: &str, shell: &str) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let tool = if shell.eq_ignore_ascii_case("powershell") { "PowerShell" } else { "Bash" };
+    let (catalogue, _) = ra_gotchas::Catalogue::refresh(&cwd.join("var/gotchas.toml"))?;
+    let worker = ra_console::router::Router::load(&ra_console::hub::project_root_of(&cwd)).map(|r| r.worker).ok();
+    let call = serde_json::json!({"tool_name": tool, "session_id": "rc-gate", "cwd": cwd, "tool_input": {"command": command}});
+    let answer = hook_pre(&catalogue, &call, &cwd, command, worker.as_ref());
+    let decision = answer.as_ref().and_then(|a| a.pointer("/hookSpecificOutput/permissionDecision")).and_then(serde_json::Value::as_str);
+    match decision {
+        Some("deny") => {
+            let reason =
+                answer.as_ref().and_then(|a| a.pointer("/hookSpecificOutput/permissionDecisionReason")).and_then(serde_json::Value::as_str);
+            println!("deny: {}", reason.unwrap_or_default());
+        }
+        Some(other) => println!("{other}"),
+        // the shape table is the allowlist the harness is given: a command it allows runs
+        // without a prompt whether or not the hook spoke
+        None => {
+            let shell = ra_gotchas::shape::Shell::of_tool(tool).unwrap_or(ra_gotchas::shape::Shell::Bash);
+            let own = |part: &str| worker.as_ref().is_some_and(|w| w.allows(part));
+            let judged = ra_gotchas::self_held(command).unwrap_or(command);
+            match ra_gotchas::shape::judge(judged, shell, &cwd, &own) {
+                ra_gotchas::shape::Shape::Allowed => println!("allow"),
+                ra_gotchas::shape::Shape::Denied(reason) => println!("deny: {reason}"),
+                ra_gotchas::shape::Shape::Unknown => println!("ask"),
+            }
+        }
     }
     Ok(())
 }

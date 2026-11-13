@@ -180,6 +180,9 @@ pub fn self_held(command: &str) -> Option<&str> {
 /// command sets [`Conditions::allowed`] and it stands aside.
 pub const ALLOWLIST_HINT: &str = "shell-outside-allowlist";
 
+/// The gotcha that denies a git command that writes the git state.
+const GIT_WRITES: &str = "git-writes";
+
 /// Whether `command` is a full suite: a `cargo test` that names no package, nor a manifest.
 #[must_use]
 pub fn is_suite(command: &str) -> bool {
@@ -445,7 +448,19 @@ impl Catalogue {
                 continue;
             }
             match &gotcha.remedy {
-                Remedy::Hint if conditions.allowed && gotcha.id == ALLOWLIST_HINT => continue,
+                Remedy::Hint if gotcha.id == ALLOWLIST_HINT && (conditions.allowed || shape::is_worktree_read(&current)) => continue,
+                // a catalogue from before `git merge-base` was read as a read ends its git
+                // writes at a `\b`, which `merge-base` passes: a match running into a hyphen
+                // is another subcommand
+                Remedy::Hint
+                    if gotcha.id == GIT_WRITES
+                        && gotcha
+                            .pattern
+                            .find_iter(&current)
+                            .all(|m| m.as_str().ends_with(|c: char| c.is_ascii_alphabetic()) && current[m.end()..].starts_with('-')) =>
+                {
+                    continue;
+                }
                 Remedy::Hint => return Verdict::Deny { id: gotcha.id.clone(), reason: gotcha.message.clone() },
                 Remedy::Allow => break,
                 Remedy::Rewrite { insert, after, append, unless, when } => {
