@@ -1363,6 +1363,67 @@ impl ra_providers::ModelProvider for ByTurn {
     }
 }
 
+/// A committed probe project with card #2 `Probe` on the roadmap and a branch `card/2` that adds
+/// `made.txt`, the project back on its own branch.
+async fn project_with_a_card_branch(dir: &std::path::Path) -> Store {
+    cargo_project(dir, true);
+    git_ok(dir, &["init", "-q"]);
+    git_ok(dir, &["add", "-A"]);
+    git_ok(dir, &["commit", "-q", "-m", "probe"]);
+    git_ok(dir, &["checkout", "-q", "-b", "card/2"]);
+    std::fs::write(dir.join("made.txt"), "by the worker\n").unwrap();
+    git_ok(dir, &["add", "made.txt"]);
+    git_ok(dir, &["commit", "-q", "-m", "the card's work"]);
+    git_ok(dir, &["checkout", "-q", "-"]);
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    store
+}
+
+#[tokio::test]
+async fn a_landing_whose_merged_check_fails_sends_the_card_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_card_branch(dir.path()).await;
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    let failing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((101, "test probe ... FAILED\nthe probe broke\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_script(failing);
+    let out = crate::agent::land_or_say(&store, 2, &runner).await;
+    let line = "#2 not landed: the merged tree fails cargo test --workspace -q; sent back to its worker";
+    assert_eq!(out, [line]);
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
+    let notes = node.notes.unwrap_or_default();
+    assert!(notes.starts_with("check failed: cargo test --workspace -q\ntest probe ... FAILED\n"), "{notes}");
+    // the rerun reads the failure off the head of the notes
+    let blocks = crate::agent::judgment_of(&notes);
+    assert!(blocks.first().is_some_and(|b| b.contains("the probe broke")), "{blocks:?}");
+    assert!(crate::pair::recent(dir.path(), 5).last().is_some_and(|l| l.ends_with("sent back to its worker")));
+    // the merge was undone
+    assert!(!dir.path().join("made.txt").exists());
+}
+
+#[tokio::test]
+async fn a_third_failed_landing_check_waits_for_the_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_card_branch(dir.path()).await;
+    // the run's own check passes and the merged tree's fails, each time
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let alternating: ra_tools::Script = std::sync::Arc::new(move |_: &str| {
+        let call = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(if call % 2 == 0 { (0, "ok\n".to_owned()) } else { (101, format!("test probe ... FAILED\nmerged run {call}\n")) })
+    });
+    let script = Scripted::new(accepted_runs(&["did A", "did A again", "did A once more"]));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(alternating);
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    assert!(out.iter().any(|l| l.starts_with("rerun #2 Probe · its check failed 2 time(s)") && l.ends_with("(2 of 2)")), "{out:?}");
+    assert!(out.iter().any(|l| l.starts_with("waits #2 Probe · its check failed 3 time(s) · waits for the person")), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 6, "{out:?}");
+    let sent = crate::pair::recent(dir.path(), 100).iter().filter(|l| l.ends_with("sent back to its worker")).count();
+    assert_eq!(sent, 3);
+}
+
 /// Leaves the plan's five-hour window at `utilization` in the project's `var/limits.json`, seen
 /// just now, so it is the latest reading on the machine.
 fn plan_at(root: &std::path::Path, utilization: f64) {

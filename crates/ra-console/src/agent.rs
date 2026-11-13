@@ -2113,10 +2113,12 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         if let (Some(mark), Some(ledger), Ok(node)) = (mark, worker.ledger(), store.read(id).await) {
             lines.extend(crate::retro::landed(&root, &node, ledger, mark).await);
         }
-        let node = store.read(id).await?;
-        // a card the reviewer accepted lands now: committed, proved and cleared
+        let mut node = store.read(id).await?;
+        // a card the reviewer accepted lands now: committed, proved and cleared; one the landing
+        // sent back is counted below as any card sent back
         if node.state == TaskState::Implemented {
             lines.extend(land_or_say(store, id, worker).await);
+            node = store.read(id).await?;
         }
         if node.state == TaskState::NeedsRevision {
             // the first rejection and the first two check failures are rerun on the card's
@@ -2621,8 +2623,8 @@ const TEMP_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(3600)
 /// worktree's changes are committed on `card/<id>` (the title as the message), the branch is
 /// merged into the project's HEAD (a conflict aborts the merge and names the files; the
 /// person lands that one by hand), the project's check runs on the merged tree on a build
-/// slot (a failure undoes the merge commit with `git reset --merge` and the card stays
-/// implemented), the card is set accepted, and the cleanup follows: the worktree and the
+/// slot (a failure undoes the merge commit with `git reset --merge` and answers a [`LandCheck`],
+/// which a walk sends back to the worker), the card is set accepted, and the cleanup follows: the worktree and the
 /// branch, the card's own target directory, its research brief, and under the system temp
 /// directory the entries of the names `[worker] temp` lists that are older than an hour. A
 /// card without a worktree or a branch (a run in the project's own tree) is accepted as it
@@ -2735,12 +2737,11 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
                 let runs = run_checks(&toolbox, &commands).await;
                 if let Some(failed) = runs.iter().find(|r| !r.passed) {
                     let _ = git(&root, &["reset", "--merge", "ORIG_HEAD"]).await;
-                    anyhow::bail!(
-                        "the merged tree fails the check `{}` ({}); the merge was undone and #{id} stays implemented:\n{}",
-                        failed.command,
-                        failed.exit,
-                        failed.text
-                    );
+                    return Err(anyhow::Error::new(LandCheck {
+                        command: failed.command.clone(),
+                        exit: failed.exit.clone(),
+                        text: failed.text.clone(),
+                    }));
                 }
                 lines.push(format!("check passed on the merged tree: {}", commands.join(" · ")));
             }
@@ -2774,9 +2775,26 @@ impl std::fmt::Display for LandConflict {
 
 impl std::error::Error for LandConflict {}
 
+/// A landing whose merged tree failed the project's check; the merge was undone. The output is
+/// the failing check's, clipped as [`run_checks`] clips it.
+#[derive(Debug)]
+pub struct LandCheck {
+    command: String,
+    exit: String,
+    text: String,
+}
+
+impl std::fmt::Display for LandCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the merged tree fails the check `{}` ({}); the merge was undone:\n{}", self.command, self.exit, self.text)
+    }
+}
+
+impl std::error::Error for LandCheck {}
+
 /// [`land`] for a walk: the lines it answers, or the one line of why it did not, on the feed
 /// too; never an error, since a card the person must land by hand is not the walk's end.
-async fn land_or_say(store: &Store, id: i64, worker: &Worker) -> Vec<String> {
+pub(crate) async fn land_or_say(store: &Store, id: i64, worker: &Worker) -> Vec<String> {
     match land(store, id, worker).await {
         Ok(lines) => lines,
         // the project moved on under the card: it goes back to its worker, whose rerun merges
@@ -2792,7 +2810,25 @@ async fn land_or_say(store: &Store, id: i64, worker: &Worker) -> Vec<String> {
             vec![text]
         }
         Err(e) => {
-            let text = format!("#{id} not landed: {}", first_line(&format!("{e:#}")));
+            let text = match e.downcast_ref::<LandCheck>() {
+                // a failed check on the merged tree is a failed check of the card: it goes back
+                // to its worker with the output at the head of the notes, where the rerun reads
+                // it, and the walk counts it against the check's retries (#182 sat implemented
+                // until a person blocked it, 2026-11-12)
+                Some(failed) => {
+                    let notes = store.read(id).await.ok().and_then(|n| n.notes).unwrap_or_default();
+                    let lead = format!("check failed: {}\n{}\n\n{notes}", failed.command, failed.text);
+                    let sent = match store.set_notes(id, lead.trim_end()).await {
+                        Ok(()) => store.set_state_by(id, TaskState::NeedsRevision, Source::Run).await,
+                        Err(err) => Err(err),
+                    };
+                    match sent {
+                        Ok(()) => format!("#{id} not landed: the merged tree fails {}; sent back to its worker", failed.command),
+                        Err(err) => format!("#{id} not landed: the merged tree fails {}; it could not be sent back ({err:#})", failed.command),
+                    }
+                }
+                None => format!("#{id} not landed: {}", first_line(&format!("{e:#}"))),
+            };
             tracing::warn!("{text}");
             crate::pair::event(&workspace_of(store), &text);
             vec![text]
