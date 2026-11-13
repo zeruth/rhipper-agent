@@ -625,6 +625,13 @@ async fn run_main() -> anyhow::Result<()> {
             println!("{}", Status::header());
             for row in &rows {
                 println!("{}", row.line());
+                // what waits on the person and why the walk stopped, read without the log
+                if let Some(stopped) = &row.stopped {
+                    println!("  walk stopped: {stopped}");
+                }
+                for waiting in &row.waiting {
+                    println!("{}", waiting.line());
+                }
                 // with --all, the cards each project has in hand go under its row, costed
                 if all {
                     for line in status::card_lines_of(Path::new(&row.path)).await {

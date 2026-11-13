@@ -1546,6 +1546,8 @@ struct Workspace {
     /// priority order) and when it was read; read again once a second.
     allocation: (Option<String>, u32, Option<usize>),
     allocation_at: Option<Instant>,
+    /// The cards that wait on the person, read with the allocation.
+    waiting: Vec<ra_console::hub::Waiting>,
     store: Store,
     worker: Worker,
     sink: Sink,
@@ -1762,6 +1764,7 @@ impl Workspace {
             job: None,
             allocation: (None, 1, None),
             allocation_at: None,
+            waiting: Vec::new(),
             job_tx,
             job_done,
             ledger: Ledger::default(),
@@ -4172,8 +4175,10 @@ impl Workspace {
                 ra_console::allocation::runners(&self.root),
                 ra_console::allocation::priority_place(&self.root),
             );
+            self.waiting = ra_console::hub::waiting(&self.root, &nodes);
             self.allocation_at = Some(Instant::now());
         }
+        let waiting = self.waiting.clone();
         let (implementer, runners, place) = self.allocation.clone();
         // the header's model badge is the project's implementer, as the toggle sets it, not the
         // window's default model
@@ -4263,6 +4268,10 @@ impl Workspace {
                         cards::badge(ui, &model, cards::model_color(&model));
                         let ready = format!("{} ready", order.len());
                         cards::badge(ui, &ready, if order.is_empty() { theme::dim() } else { theme::online() });
+                        if !waiting.is_empty() {
+                            let hover: Vec<String> = waiting.iter().map(|w| w.line().trim_start().to_owned()).collect();
+                            cards::badge(ui, &format!("{} waits", waiting.len()), theme::warn()).on_hover_text(hover.join("\n"));
+                        }
                         match (running, &job) {
                             (Some(id), _) => {
                                 cards::badge(ui, &format!("running #{id}"), theme::warn_text());
