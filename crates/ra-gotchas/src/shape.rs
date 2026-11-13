@@ -247,6 +247,9 @@ fn judge_part(part: &Part, shell: Shell, workspace: &Path, own: &dyn Fn(&str) ->
     }
     // a program by its path is the program: `& "C:\…\cargo.exe" test` is `cargo test`
     let name = program(first);
+    if name == "git" && rest.first() == Some(&"mv") {
+        return judge_move(&rest[1..], shell, workspace, assigned);
+    }
     if let Some(form) = refusal(name, rest) {
         return Shape::Denied(form.to_owned());
     }
@@ -262,6 +265,19 @@ fn judge_part(part: &Part, shell: Shell, workspace: &Path, own: &dyn Fn(&str) ->
     }
     let fold = shell == Shell::PowerShell;
     if shell.allowed().iter().any(|rule| matches(rule, &line, fold)) { Shape::Allowed } else { Shape::Unknown }
+}
+
+/// `git mv` with `args` (after `mv`): allowed when it names a source and a destination and every
+/// path stays inside the workspace; a path outside it is refused.
+fn judge_move(args: &[&str], shell: Shell, workspace: &Path, assigned: &[String]) -> Shape {
+    let paths: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+    if args.iter().any(|w| outside(w, workspace)) {
+        return Shape::Denied(GIT_FORM.to_owned());
+    }
+    if paths.len() < 2 || args.iter().any(|w| !known(w, shell, assigned)) {
+        return Shape::Unknown;
+    }
+    Shape::Allowed
 }
 
 /// The form to use instead of a refused program, when `name` with `rest` is one.
@@ -509,7 +525,7 @@ pub fn block() -> String {
         lines.push(format!("  - {}: {form}", names.join(", ")));
     }
     lines.push(format!(
-        "  - git {} (but `git rm --cached` runs) and git -C (but `git -C var/worktrees/<id> status|log|diff|show` runs): {GIT_FORM}",
+        "  - git {} (but `git rm --cached` and `git mv` inside the workspace run) and git -C (but `git -C var/worktrees/<id> status|log|diff|show` runs): {GIT_FORM}",
         GIT_WRITES.join("|")
     ));
     lines.push(format!("  - a `>` redirect to a file: {REDIRECT_FORM}"));
