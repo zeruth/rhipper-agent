@@ -1451,9 +1451,14 @@ async fn run_all_in_a_tight_window_takes_the_smallest_ready_card_first_and_the_s
 async fn run_all_stops_at_a_card_that_needs_revision_when_told_to() {
     let dir = tempfile::tempdir().unwrap();
     let store = three_cards(dir.path(), false).await;
-    // the check always fails: the walk reruns #2 twice by itself, and the third failure waits
+    // the check always fails, each time another way (the same failure twice holds the card): the
+    // walk reruns #2 twice by itself, and the third failure waits
     let script = Scripted::new(vec![says("did A", vec![]), says("did A again", vec![]), says("did A once more", vec![])]);
-    let failing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((1, "the probe broke\n".to_owned())));
+    let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failing: ra_tools::Script = std::sync::Arc::new(move |_: &str| {
+        let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok((1, format!("the probe broke on run {run}\n")))
+    });
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(failing);
     let out = crate::agent::run_all(&store, &runner, true).await.unwrap();
     assert_eq!(out.last().unwrap(), "ran 3 card(s) · stopped: #2 needs revision");
