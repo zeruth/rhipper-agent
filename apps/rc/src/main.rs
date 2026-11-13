@@ -1008,11 +1008,24 @@ fn hook_pre(
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "allow",
                     "permissionDecisionReason": reason,
-                    "updatedInput": {"command": command}
+                    "updatedInput": rewritten_input(call, command)
                 }
             }))
         }
     }
+}
+
+/// The tool timeout of a rewritten build, in milliseconds: a build outlasts the tool's 120 s.
+const BUILD_TIMEOUT_MS: u64 = 600_000;
+
+/// The call's whole `tool_input` with the command replaced, and the timeout raised to the
+/// build's when the call set none or a lower one; the rewrite keeps the description and the rest.
+fn rewritten_input(call: &serde_json::Value, command: String) -> serde_json::Value {
+    let mut input = call.get("tool_input").cloned().filter(serde_json::Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+    let asked = input.get("timeout").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    input["command"] = serde_json::Value::String(command);
+    input["timeout"] = serde_json::json!(asked.max(BUILD_TIMEOUT_MS));
+    input
 }
 
 /// Answers one Claude Code tool hook from the gotchas. `pre` prints a deny with the reason, an

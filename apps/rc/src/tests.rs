@@ -260,6 +260,19 @@ fn a_status_card_line_carries_the_cost_and_the_tokens_a_turn_and_is_blank_before
 }
 
 #[test]
+fn rewrite_keeps_the_whole_tool_input_and_the_higher_timeout() {
+    let call = serde_json::json!({"tool_input": {"command": "cargo build", "description": "build", "timeout": 300_000}});
+    let input = rewritten_input(&call, "rc hold -- cargo build".to_string());
+    assert_eq!(input["command"], "rc hold -- cargo build");
+    assert_eq!(input["description"], "build");
+    assert_eq!(input["timeout"], 600_000);
+    let higher = serde_json::json!({"tool_input": {"command": "x", "timeout": 900_000}});
+    assert_eq!(rewritten_input(&higher, "y".to_string())["timeout"], 900_000);
+    let none = serde_json::json!({"tool_input": {"command": "x"}});
+    assert_eq!(rewritten_input(&none, "y".to_string())["timeout"], 600_000);
+}
+
+#[test]
 fn rc_wait_on_a_live_pid_outlasts_ten_silent_seconds_and_returns_when_it_ends() {
     #[cfg(windows)]
     let mut child =
