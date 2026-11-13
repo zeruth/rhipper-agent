@@ -2882,24 +2882,25 @@ async fn a_check_that_outlives_its_budget_is_killed() {
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     // a real process, so the limit has something to kill: the sleep outlives the budget by far,
     // and the budget is wide enough for python to start and print on a machine busy with
-    // other builds (a 1s budget missed the line under load, #179)
-    run(r#"/edit 2 acceptance `python -c "print('started', flush=True); import time; time.sleep(60)"` passes"#, &store, &worker())
+    // other builds (a 1s budget missed the line under load, #179, and 5s did under the full
+    // suite on the builders' CPU share, #190)
+    run(r#"/edit 2 acceptance `python -c "print('started', flush=True); import time; time.sleep(120)"` passes"#, &store, &worker())
         .await
         .unwrap();
-    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 5\n").unwrap();
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 15\n").unwrap();
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])]));
     let started = std::time::Instant::now();
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_secs(40), "the walk did not wait for the sleep: {out:?}");
-    assert!(out.iter().any(|l| l.contains("check failed: python -c") && l.contains(" · timed out after 5s")), "{out:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(90), "the walk did not wait for the sleep: {out:?}");
+    assert!(out.iter().any(|l| l.contains("check failed: python -c") && l.contains(" · timed out after 15s")), "{out:?}");
     let node = store.read(2).await.unwrap();
     assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
     // python ends its line the platform's way; the output before the limit and the line stay
     let notes = node.notes.unwrap_or_default().replace("\r\n", "\n");
     assert!(notes.starts_with("check failed: python -c"), "{notes}");
-    assert!(notes.contains("started\ntimed out after 5s\n\ndone"), "{notes}");
+    assert!(notes.contains("started\ntimed out after 15s\n\ndone"), "{notes}");
     let task = ra_context::TaskContext::open(dir.path(), 2);
-    assert!(task.handoffs.last().is_some_and(|h| h.report.contains("timed out after 5s")), "{:?}", task.handoffs.last());
+    assert!(task.handoffs.last().is_some_and(|h| h.report.contains("timed out after 15s")), "{:?}", task.handoffs.last());
 }
 
 #[tokio::test]
