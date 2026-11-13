@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod allocation;
+pub mod allow_exe;
 pub mod channel;
 pub mod clock;
 pub mod commands;

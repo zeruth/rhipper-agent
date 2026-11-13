@@ -146,7 +146,7 @@ impl Rule {
 
 /// Whether `path` matches `glob`: `**` is any run of characters, `*` any run without a `/`, `?`
 /// one character; a backslash in either reads as `/`, and a trailing `/**` takes the directory.
-fn glob_matches(glob: &str, path: &str) -> bool {
+pub(crate) fn glob_matches(glob: &str, path: &str) -> bool {
     fn walk(glob: &[u8], path: &[u8]) -> bool {
         match glob {
             [] => path.is_empty(),
@@ -397,13 +397,7 @@ impl WorkerConfig {
 
     /// Whether the command's program is a test binary the project listed in `binaries`.
     fn runs_listed_binary(&self, command: &str) -> bool {
-        let program = command.split_whitespace().next().unwrap_or("").trim_matches(['"', '\'']).replace('\\', "/");
-        let program = program.strip_prefix("./").unwrap_or(&program);
-        // a path that leaves the project is no listed binary, whatever its glob says
-        if program.is_empty() || program.starts_with('/') || program.contains(':') || program.split('/').any(|part| part == "..") {
-            return false;
-        }
-        self.binaries.iter().any(|glob| glob_matches(glob, program))
+        crate::allow_exe::runs_listed_binary(&self.binaries, command)
     }
 }
 
