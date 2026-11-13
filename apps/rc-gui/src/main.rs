@@ -1352,7 +1352,7 @@ impl App {
             // the content past the window, if any, comes off the next frame's shares; the
             // slack only grows, so the shares settle in a frame and never swing back
             let overflow = scrolled.content_size.y - scrolled.inner_rect.height();
-            if overflow > 0.5 && any_working {
+            if overflow > 0.5 && small.iter().any(|s| !*s) {
                 self.dash_slack = (self.dash_slack + overflow.ceil()).min(300.0);
                 ctx.request_repaint();
             }
