@@ -15,6 +15,7 @@ use crate::commands::plan::{self as command, DAY, Day, Measure, verdict};
 use crate::commands::tests::{Scripted, says};
 
 use super::evidence::Line;
+use super::home::Owner;
 use super::propose::{self, Refusal};
 
 /// Five lines of evidence, numbered 1 to 5 in the brief.
@@ -34,6 +35,14 @@ fn card(title: &str, evidence: &str, saves: &str, acceptance: &str) -> String {
     text
 }
 
+/// A project directory holding the `src/lib.rs` every outline card names, so the cards stand.
+fn project_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+    dir
+}
+
 /// `count` well-formed cards, each citing its own line.
 fn well_formed(count: usize) -> String {
     (1..=count).map(|n| card(&format!("Card {n}"), &format!("#{n}"), "turns", "`cargo test -p x` passes")).collect()
@@ -41,11 +50,11 @@ fn well_formed(count: usize) -> String {
 
 #[tokio::test]
 async fn an_uncited_card_is_dropped_with_its_reason_and_the_rest_stand() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = project_dir();
     let text = format!("{}{}", well_formed(4), card("Guess", "", "turns", "`cargo test -p x` passes"));
     let script = Scripted::new(vec![says(&text, vec![])]);
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
-    let plan = propose::propose(dir.path(), &worker, &evidence(), &[]).await.unwrap();
+    let plan = propose::propose(dir.path(), None, &worker, &evidence(), &[]).await.unwrap();
     assert_eq!(plan.cards.iter().map(|c| c.item.title.as_str()).collect::<Vec<_>>(), ["Card 1", "Card 2", "Card 3", "Card 4"]);
     assert_eq!(plan.dropped.iter().map(ToString::to_string).collect::<Vec<_>>(), ["Guess: cites no evidence line"]);
     // the planner read the numbered brief under the instruction
@@ -56,10 +65,10 @@ async fn an_uncited_card_is_dropped_with_its_reason_and_the_rest_stand() {
 
 #[tokio::test]
 async fn a_well_formed_outline_of_five_is_kept_with_what_each_card_cites_and_saves() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = project_dir();
     let text = format!("```\n{}```\n", well_formed(5));
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(&text, vec![])]));
-    let plan = propose::propose(dir.path(), &worker, &evidence(), &[]).await.unwrap();
+    let plan = propose::propose(dir.path(), None, &worker, &evidence(), &[]).await.unwrap();
     assert_eq!(plan.cards.len(), 5, "{:?}", plan.dropped);
     assert!(plan.dropped.is_empty(), "{:?}", plan.dropped);
     let third = &plan.cards[2];
@@ -71,9 +80,9 @@ async fn a_well_formed_outline_of_five_is_kept_with_what_each_card_cites_and_sav
 
 #[tokio::test]
 async fn a_three_card_outline_is_refused_not_planned() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = project_dir();
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(&well_formed(3), vec![])]));
-    let error = propose::propose(dir.path(), &worker, &evidence(), &[]).await.unwrap_err();
+    let error = propose::propose(dir.path(), None, &worker, &evidence(), &[]).await.unwrap_err();
     let refusal = error.downcast_ref::<Refusal>().unwrap_or_else(|| panic!("{error:#}"));
     assert_eq!(refusal.kept, 3);
     assert_eq!(format!("{error:#}"), "the planner's 3 card(s) are no plan: 4 to 8 must stand");
@@ -103,10 +112,31 @@ fn the_verdict_names_every_reason_a_card_is_no_card() {
     assert_eq!((cards.len(), dropped.len()), (9, 0));
 }
 
+#[test]
+fn a_card_naming_a_file_not_in_the_tree_and_not_marked_new_is_dropped() {
+    let text =
+        format!("{}{}", well_formed(2), card("Invents", "#1", "turns", "`cargo test -p x` passes").replace("src/lib.rs", "src/show.rs"));
+    let marked = card("Creates", "#1", "turns", "`cargo test -p x` passes").replace("src/lib.rs", "src/lib.rs +src/card.rs");
+    // an agent card is looked for in the agent's tree, where the project's file is not
+    let agents = card("The agent's", "#1", "turns", "`cargo test -p x` passes")
+        .replace("src/lib.rs", "crates/ra-console/src/agent.rs\n  owner: agent");
+    let strays = card("Strays", "#1", "turns", "`cargo test -p x` passes").replace("  files:", "  owner: agent\n  files:");
+    let (cards, _) = propose::judge(&format!("{text}{marked}{agents}{strays}"), 5);
+    let (kept, dropped) = propose::in_tree(cards, |owner, file| match owner {
+        Owner::Project => file == "src/lib.rs",
+        Owner::Agent => file == "crates/ra-console/src/agent.rs",
+    });
+    assert_eq!(kept.iter().map(|c| c.item.title.as_str()).collect::<Vec<_>>(), ["Card 1", "Card 2", "Creates", "The agent's"]);
+    assert_eq!(
+        dropped.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ["Invents: names src/show.rs, not in the tree and not marked new", "Strays: names src/lib.rs, not in the tree and not marked new"]
+    );
+}
+
 /// A project with one open milestone and one look-back of the person's: the plan's only
 /// evidence line of its own, numbered 1 ahead of whatever the test hub holds.
 async fn planning_project() -> (tempfile::TempDir, Store) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = project_dir();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     store.insert(Some(1), NodeKind::Milestone, "Phase N", None, None, 3).await.unwrap();
     crate::retro::record_pair(dir.path(), "the check ran twice").unwrap();
@@ -177,6 +207,12 @@ async fn a_run_adds_the_cards_under_the_look_back_milestone_with_their_evidence_
 async fn a_projects_agent_cards_go_to_the_agents_roadmap_once_and_its_own_stay_home() {
     let (dir, store) = planning_project().await;
     let agent_dir = tempfile::tempdir().unwrap();
+    // the agent cards name files of the agent's tree, which the project's has not
+    for file in ["crates/ra-gotchas/src/shape.rs", "crates/ra-console/src/agent.rs"] {
+        let path = agent_dir.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
     let agent = Store::open(&agent_dir.path().join("rhipper.md"), "Rhipper Agent").await.unwrap();
     let known = agent.insert(Some(1), NodeKind::Task, "Allow git merge-base in the read-only list", None, None, 2).await.unwrap();
     let mut text = cites_the_first();

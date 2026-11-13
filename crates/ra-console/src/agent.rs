@@ -1539,6 +1539,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
         let worktree = root.join(WORKTREES_DIR).join(id.to_string());
         if worktree.join(".git").exists() { worktree } else { root.clone() }
     });
+    let node = with_branch_files(store, &root, &acting, node).await;
     let brief = review_brief(&root, &acting, &node).await;
     let before = node.state;
     store.set_state_by(id, TaskState::Review, Source::Run).await?;
@@ -3410,6 +3411,63 @@ async fn branch_files(project: &Path, root: &Path) -> Vec<String> {
     files.sort();
     files.dedup();
     files
+}
+
+/// A card's file list widened by the files its branch changed: the list keeps its order, a path
+/// marked new that the branch wrote loses its mark, and every changed file no entry covers (a
+/// listed directory covers what lies under it) joins at the end. Asm #80 left out the files
+/// its work needed, and the reviewer judged the card by the ones it named.
+fn file_list(files: &[String], changed: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = files
+        .iter()
+        .map(|entry| {
+            let path = tree::path_of(entry);
+            if tree::is_new(entry) && changed.iter().any(|file| file == path) { path.to_owned() } else { entry.clone() }
+        })
+        .collect();
+    for file in changed {
+        let covered = out.iter().any(|entry| {
+            let path = tree::path_of(entry);
+            path == file || (path.ends_with('/') && file.starts_with(path))
+        });
+        if !covered {
+            out.push(file.clone());
+        }
+    }
+    out
+}
+
+/// The card with its file list widened by [`branch_files`] before the review, written back to
+/// the roadmap so the reviewer, the next run and the person read the files the work touched. A
+/// card that inherits its files from a section widens a copy of its own. The card as it was when
+/// nothing changed or the roadmap cannot be written.
+async fn with_branch_files(store: &Store, project: &Path, root: &Path, mut node: Node) -> Node {
+    // in the project's own tree a dirty file may be the person's
+    if same_tree(project, root) {
+        return node;
+    }
+    // the project's own state and paths a list cannot carry are no card file
+    let changed: Vec<String> = branch_files(project, root)
+        .await
+        .into_iter()
+        .filter(|file| !file.starts_with("var/") && file != "rhipper.md" && !file.contains(char::is_whitespace))
+        .collect();
+    if changed.is_empty() {
+        return node;
+    }
+    let own = if node.files.is_empty() {
+        store.all().await.map(|nodes| tree::files_of(&nodes, &node).0.to_vec()).unwrap_or_default()
+    } else {
+        node.files.clone()
+    };
+    let files = file_list(&own, &changed);
+    if files != own {
+        match store.set_files(node.id, &files).await {
+            Ok(()) => node.files = files,
+            Err(e) => tracing::warn!("cannot widen the files of #{} from its branch: {e:#}", node.id),
+        }
+    }
+    node
 }
 
 /// What a commit of a card's work is for: the landing of an accepted card, a checkpoint

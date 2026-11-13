@@ -258,6 +258,33 @@ fn a_clean_roadmap_lints_to_nothing_and_a_done_card_is_left_alone() {
 }
 
 #[test]
+fn rc_check_reports_a_missing_file_not_marked_new() {
+    let mut section = node(1, None);
+    section.kind = NodeKind::Section;
+    section.files = vec!["crates/a/src/gone.rs".to_owned()];
+    let nodes = vec![
+        section,
+        Node {
+            files: vec!["src/lib.rs".to_owned(), "src/show.rs".to_owned(), "+src/card.rs".to_owned()],
+            ..whole(2, TaskState::Ready, &[])
+        },
+        // a started or finished card is not asked: its branch may hold the file
+        Node { files: vec!["src/show.rs".to_owned()], ..whole(3, TaskState::InProgress, &[]) },
+        Node { files: vec!["src/show.rs".to_owned()], ..whole(4, TaskState::Accepted, &[]) },
+    ];
+    let lines = missing_files(&nodes, |path| path == "src/lib.rs");
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert!(lines[0].starts_with("#1:") && lines[0].contains("crates/a/src/gone.rs"), "{}", lines[0]);
+    assert!(
+        lines[1].starts_with("#2:") && lines[1].contains("src/show.rs") && lines[1].contains("marked new (+src/show.rs)"),
+        "{}",
+        lines[1]
+    );
+    assert_eq!((path_of("+src/card.rs"), is_new("+src/card.rs")), ("src/card.rs", true));
+    assert_eq!((path_of("src/lib.rs"), is_new("src/lib.rs")), ("src/lib.rs", false));
+}
+
+#[test]
 fn placeholder_text_is_a_bracketed_hint_or_a_bare_tbd() {
     assert!(is_placeholder("<the acceptance>"));
     assert!(is_placeholder("TBD"));

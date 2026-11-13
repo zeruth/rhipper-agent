@@ -234,6 +234,38 @@ pub fn lint(nodes: &[Node]) -> Vec<String> {
     out
 }
 
+/// The mark of a path in `files:` that the card creates, `+crates/a/src/new.rs`: the one path
+/// that may be missing from the tree. Agent #188 named `show.rs` and `card.rs`, which never
+/// existed, and the worker spent its turns looking for them.
+pub const NEW_MARK: char = '+';
+
+/// The path an entry of `files:` names, without its [`NEW_MARK`].
+#[must_use]
+pub fn path_of(entry: &str) -> &str {
+    entry.strip_prefix(NEW_MARK).unwrap_or(entry)
+}
+
+/// Whether an entry of `files:` is marked as a path the card creates.
+#[must_use]
+pub fn is_new(entry: &str) -> bool {
+    entry.starts_with(NEW_MARK)
+}
+
+/// The faults `rc check` reports beside [`lint`] once it can look at the tree: a path a node
+/// not yet started names that is neither in the tree, as `exists` reads it from the project's
+/// root, nor marked new. A started card is left alone: its branch may hold the file the
+/// project's tree does not.
+#[must_use]
+pub fn missing_files(nodes: &[Node], exists: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for node in nodes.iter().filter(|n| matches!(n.state, TaskState::Defined | TaskState::Ready | TaskState::Blocked)) {
+        for entry in node.files.iter().filter(|entry| !is_new(entry) && !exists(entry)) {
+            out.push(format!("#{}: names {entry}, which is not in the tree and not marked new ({NEW_MARK}{entry})", node.id));
+        }
+    }
+    out
+}
+
 /// The words of an acceptance that ask for what only a person, a CI run or an emulator gives.
 const HUMAN_CLAUSES: [&str; 9] =
     ["manually", "by hand", "a person", "the person", "reviewer confirms", "on ci", "ci run", "emulator", "on a device"];

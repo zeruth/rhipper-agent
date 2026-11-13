@@ -109,6 +109,17 @@ fn the_end_line_marks_a_computed_cost_as_an_estimate_and_names_the_cached_share(
 }
 
 #[test]
+fn the_file_list_widens_from_the_branch_and_drops_the_new_mark_of_what_it_wrote() {
+    let owned = |files: &[&str]| files.iter().map(|f| (*f).to_owned()).collect::<Vec<String>>();
+    let card = owned(&["src/lib.rs", "+src/card.rs", "+src/later.rs", "crates/a/"]);
+    let changed = owned(&["src/card.rs", "src/lib.rs", "crates/a/src/x.rs", "src/extra.rs"]);
+    // the card's order holds, the written new file is a plain path, the directory covers its
+    // file and the one file the card left out joins at the end
+    assert_eq!(file_list(&card, &changed), owned(&["src/lib.rs", "src/card.rs", "+src/later.rs", "crates/a/", "src/extra.rs"]));
+    assert_eq!(file_list(&card, &[]), card);
+}
+
+#[test]
 fn the_turn_sizes_lead_with_the_average_and_name_the_largest_when_shown() {
     let usage = Usage { prompt_tokens: 30_000, completion_tokens: 600, cached_tokens: 0, cost_usd: None, cost_computed: false };
     let mut session = Session {

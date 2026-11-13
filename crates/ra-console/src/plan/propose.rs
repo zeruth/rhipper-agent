@@ -1,6 +1,7 @@
 //! The planner's call and its verdict on the cards: the brief goes to the planning route, the
 //! outline that comes back is read card by card, and a card that cites no evidence line, names
-//! no saving or names no check is dropped with its reason. Fewer than [`MIN_CARDS`] or more than
+//! no saving, names no check or names a file the tree lacks and the card does not mark new is
+//! dropped with its reason. Fewer than [`MIN_CARDS`] or more than
 //! [`MAX_CARDS`] cards left is a [`Refusal`], not a plan: the planner either found too little in
 //! the evidence or did not pick.
 
@@ -10,6 +11,7 @@ use std::path::Path;
 use ra_providers::{CompletionRequest, Message, Usage};
 use ra_roadmap::model::NodeKind;
 use ra_roadmap::outline::{self, Item};
+use ra_roadmap::tree;
 
 use super::evidence::Line;
 use super::home::Owner;
@@ -77,12 +79,20 @@ impl std::error::Error for Refusal {}
 /// Sends the numbered evidence to the planning route and judges the cards it answers with. The
 /// planner's model is the `planner` rule of `rhipper.toml` that names no kind, else the worker's
 /// own; the call is booked under it as the planner's. `agent_open` are the agent's open cards,
-/// which the planner is told not to propose again.
+/// which the planner is told not to propose again. A card's files are looked for in its owner's
+/// tree: the project's under `root`, the agent's under `agent_root`, and not at all when the
+/// agent is not loaded, since nothing here holds its tree.
 ///
 /// # Errors
 /// No evidence to plan from, an unreadable `rhipper.toml`, no provider for the model, a failed
 /// call, or a [`Refusal`] when fewer than [`MIN_CARDS`] or more than [`MAX_CARDS`] cards stand.
-pub async fn propose(root: &Path, worker: &Worker, lines: &[Line], agent_open: &[String]) -> anyhow::Result<Proposal> {
+pub async fn propose(
+    root: &Path,
+    agent_root: Option<&Path>,
+    worker: &Worker,
+    lines: &[Line],
+    agent_open: &[String],
+) -> anyhow::Result<Proposal> {
     anyhow::ensure!(!lines.is_empty(), "no evidence to plan from");
     let planner = crate::router::Router::load(root)?;
     let model = planner
@@ -110,7 +120,12 @@ pub async fn propose(root: &Path, worker: &Worker, lines: &[Line], agent_open: &
         .await
         .map_err(agent::map_error)?;
     worker.record_as(&model, Some("planner"), None, &answer.usage, answer.turns).await;
-    let (cards, dropped) = judge(&answer.text, lines.len());
+    let (cards, mut dropped) = judge(&answer.text, lines.len());
+    let (cards, missing) = in_tree(cards, |owner, file| match owner {
+        Owner::Project => root.join(file).exists(),
+        Owner::Agent => agent_root.is_none_or(|agent| agent.join(file).exists()),
+    });
+    dropped.extend(missing);
     if !(MIN_CARDS..=MAX_CARDS).contains(&cards.len()) {
         return Err(Refusal { kept: cards.len(), dropped }.into());
     }
@@ -145,6 +160,26 @@ pub fn judge(text: &str, evidence: usize) -> (Vec<Card>, Vec<Dropped>) {
         }
     }
     (cards, dropped)
+}
+
+/// The cards whose files are all in their owner's tree, as `exists` reads it, or marked new with
+/// [`tree::NEW_MARK`], and the others dropped with the paths they invented: a card that names a
+/// file nobody wrote sends its worker looking for it (agent #188).
+#[must_use]
+pub fn in_tree(cards: Vec<Card>, exists: impl Fn(Owner, &str) -> bool) -> (Vec<Card>, Vec<Dropped>) {
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for card in cards {
+        let missing: Vec<&str> =
+            card.item.files.iter().filter(|file| !tree::is_new(file) && !exists(card.owner, file)).map(String::as_str).collect();
+        if missing.is_empty() {
+            kept.push(card);
+        } else {
+            let reason = format!("names {}, not in the tree and not marked new", missing.join(" "));
+            dropped.push(Dropped { title: card.item.title, reason });
+        }
+    }
+    (kept, dropped)
 }
 
 /// One block as a card, or the reasons it is none, all of them in one line.

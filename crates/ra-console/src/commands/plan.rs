@@ -115,7 +115,7 @@ pub async fn plan_to(
         None => Vec::new(),
     };
     let lines = gather(store, &root, worker).await?;
-    let proposal = propose::propose(&root, worker, &lines, &home::open_titles(&agent_nodes, OPEN_TITLES)).await?;
+    let proposal = propose::propose(&root, agent_root, worker, &lines, &home::open_titles(&agent_nodes, OPEN_TITLES)).await?;
     let mut out = vec![head_line(&proposal, lines.len())];
     out.extend(proposal.dropped.iter().map(|dropped| format!("  dropped {dropped}")));
     let place = named.as_ref().map_or_else(|| format!("the {} milestone", home::MILESTONE), |(id, title)| format!("#{id} {title}"));

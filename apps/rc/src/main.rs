@@ -1440,12 +1440,15 @@ async fn route(id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints every fault the lint finds and exits 1 when there is one, so a script or a hook can
-/// gate on a clean roadmap.
+/// Prints every fault the lint finds, and every named path missing from the project's tree,
+/// and exits 1 when there is one, so a script or a hook can gate on a clean roadmap.
 async fn check() -> anyhow::Result<()> {
     let store = open_store().await?;
     let nodes = store.all().await?;
+    let path = store_path();
+    let root = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut faults = tree::lint(&nodes);
+    faults.extend(tree::missing_files(&nodes, |file| root.join(file).exists()));
     // a check that cannot run fails every run of its card for a reason no worker can fix
     faults.extend(ra_console::agent::unrunnable_checks(&ra_console::agent::workspace_of(&store), &nodes).await);
     // a command the tool rejects is a fault of the card's text, found before a walk holds it
