@@ -242,7 +242,121 @@ struct ContextView {
 struct VerdictView {
     /// The card the verdict was read for.
     id: Option<i64>,
+    /// The whole verdict, git's line-ending warnings dropped.
     text: Option<String>,
+    /// One line a run of the card, oldest first, as [`run_lines`] writes them.
+    runs: Vec<String>,
+    /// The foot of the runs: the cost that did not land, of the card's whole cost.
+    foot: Option<String>,
+}
+
+/// How many lines of a verdict show before the rest folds.
+const VERDICT_SHOWN: usize = 8;
+
+/// The lines of a verdict worth reading: git's line-ending warnings (`warning: in the working
+/// copy of …, LF will be replaced by CRLF …`) are dropped, the rest keep their order.
+fn verdict_lines(verdict: &str) -> Vec<&str> {
+    verdict
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !(line.starts_with("warning:") && (line.contains("LF will be replaced") || line.contains("CRLF will be replaced")))
+        })
+        .collect()
+}
+
+/// How far from its handoff a ledger row may lie and still count to that run: a reviewer's
+/// call lands a minute or two after the handoff it judges, a run's own call just before.
+const RUN_SLACK: u64 = 3600;
+
+/// The RUNS card of a card: one line a handoff, oldest first, with its number, model, turns,
+/// age, cost, outcome and cause, and a foot line with the cost that did not land. The ledger's
+/// rows (`calls`, any order) go to the handoff nearest them in time; turns count the worker's
+/// own rows, the cost every row, the reviewer's too. A run lands when its outcome stayed
+/// `implemented`; a row no handoff is near is a run that left none, and did not land either.
+fn run_lines(handoffs: &[ra_context::Handoff], calls: &[ra_usage::Call], now: u64) -> (Vec<String>, Option<String>) {
+    let mut turns = vec![0u64; handoffs.len()];
+    let mut costs: Vec<Option<f64>> = vec![None; handoffs.len()];
+    let mut stray = 0.0;
+    let mut total: Option<f64> = None;
+    for call in calls {
+        if let Some(cost) = call.cost_usd {
+            *total.get_or_insert(0.0) += cost;
+        }
+        let near = ledger_secs(&call.at).and_then(|at| {
+            handoffs
+                .iter()
+                .enumerate()
+                .map(|(n, h)| (n, h.when.abs_diff(at)))
+                .filter(|&(_, gap)| gap <= RUN_SLACK)
+                .min_by_key(|&(_, gap)| gap)
+        });
+        match near {
+            Some((n, _)) => {
+                if call.role.is_none() {
+                    turns[n] += call.turns;
+                }
+                if let Some(cost) = call.cost_usd {
+                    *costs[n].get_or_insert(0.0) += cost;
+                }
+            }
+            None => stray += call.cost_usd.unwrap_or(0.0),
+        }
+    }
+    let lines = handoffs
+        .iter()
+        .enumerate()
+        .map(|(n, h)| {
+            let cost = costs[n].map_or_else(|| "$—".to_owned(), |c| format!("${c:.2}"));
+            let age = ra_roadmap::history::age(now.saturating_sub(h.when));
+            format!("#{} · {} · {} turns · {age} ago · {cost} · {} · {}", n + 1, h.model, turns[n], h.outcome, run_cause(h))
+        })
+        .collect();
+    let lost = stray + handoffs.iter().zip(&costs).filter(|(h, _)| h.outcome != "implemented").filter_map(|(_, c)| *c).sum::<f64>();
+    let foot = total.map(|total| format!("${lost:.2} of ${total:.2} did not land"));
+    (lines, foot)
+}
+
+/// Why a run ended as it did, read off its handoff: what sent it back, or where it stands.
+fn run_cause(handoff: &ra_context::Handoff) -> String {
+    let standing = handoff.standing();
+    let mut sent = Vec::new();
+    if standing.failing > 0 {
+        sent.push(format!("check: {} failing", standing.failing));
+    }
+    if standing.points > 0 {
+        sent.push(format!("review: {} point(s)", standing.points));
+    }
+    if standing.warnings > 0 {
+        sent.push(format!("lint: {} warning(s)", standing.warnings));
+    }
+    if !sent.is_empty() {
+        return sent.join(", ");
+    }
+    match handoff.verdict.as_deref() {
+        Some(verdict) if verdict.starts_with("accepted") => "accepted".to_owned(),
+        _ if handoff.outcome.starts_with("failed") => "failed".to_owned(),
+        Some(_) => "judged".to_owned(),
+        None => "not reviewed".to_owned(),
+    }
+}
+
+/// Seconds since the epoch of a ledger stamp, `YYYY-MM-DD HH:MM:SS` in UTC; `None` for another
+/// form. The civil date to days, the usual arithmetic, the inverse of [`utc_day`]'s.
+fn ledger_secs(at: &str) -> Option<u64> {
+    let (date, time) = at.trim().split_once(' ')?;
+    let mut date = date.split('-').map(str::parse::<i64>);
+    let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
+    let mut time = time.split(':').map(str::parse::<i64>);
+    let (hour, minute, second) = (time.next()?.ok()?, time.next()?.ok()?, time.next()?.ok()?);
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year.rem_euclid(400);
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second).ok()
 }
 
 /// What the diff tab shows: `git diff HEAD` of the files the selected card's last handoff
@@ -1943,11 +2057,12 @@ impl Workspace {
     fn refresh_verdict(&mut self) {
         let id = self.selected;
         let root = self.store.path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let text = id
-            .and_then(|id| ra_context::TaskContext::open(&root, id).handoffs.pop())
-            .and_then(|h| h.verdict)
-            .and_then(|v| v.lines().next().map(|line| line.trim().to_owned()));
-        self.verdict = VerdictView { id, text };
+        let handoffs = id.map(|id| ra_context::TaskContext::open(&root, id).handoffs).unwrap_or_default();
+        // the selection read the card's ledger rows already
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let (runs, foot) = run_lines(&handoffs, &self.ledger.calls, now);
+        let text = handoffs.last().and_then(|h| h.verdict.as_deref()).map(|v| verdict_lines(v).join("\n")).filter(|v| !v.trim().is_empty());
+        self.verdict = VerdictView { id, text, runs, foot };
     }
 
     /// Builds the diff tab for the selected card: `git diff HEAD` over the files its last
@@ -3650,10 +3765,33 @@ impl Workspace {
                 cards::card(ui, color, false, |ui| {
                     ui.set_width(ui.available_width());
                     cards::section(ui, "VERDICT", color);
-                    ui.label(RichText::new(verdict).color(color));
+                    let lines = verdict_lines(verdict);
+                    for line in lines.iter().take(VERDICT_SHOWN) {
+                        ui.label(RichText::new(*line).color(color));
+                    }
+                    if lines.len() > VERDICT_SHOWN {
+                        ui.collapsing(format!("{} more lines", lines.len() - VERDICT_SHOWN), |ui| {
+                            for line in &lines[VERDICT_SHOWN..] {
+                                ui.label(RichText::new(*line).color(color));
+                            }
+                        });
+                    }
                     ui.label(
                         RichText::new("the reviewer's verdict on the last run · `review <id>` judges it again").color(theme::dim()).small(),
                     );
+                });
+                ui.add_space(6.0);
+            }
+            if !self.verdict.runs.is_empty() {
+                cards::card(ui, theme::dim(), false, |ui| {
+                    ui.set_width(ui.available_width());
+                    cards::section(ui, "RUNS", theme::dim());
+                    for run in &self.verdict.runs {
+                        ui.label(RichText::new(run).color(theme::dim()).small());
+                    }
+                    if let Some(foot) = &self.verdict.foot {
+                        ui.label(RichText::new(foot).color(theme::trace()).small());
+                    }
                 });
                 ui.add_space(6.0);
             }

@@ -3,6 +3,70 @@
 
 use super::*;
 
+#[test]
+fn verdict_lines_drop_the_line_ending_warnings_and_keep_the_order() {
+    let verdict = "needs revision · 2 points\nwarning: in the working copy of 'a.rs', LF will be replaced by CRLF the next time Git touches it\n- first\n- second";
+    assert_eq!(verdict_lines(verdict), ["needs revision · 2 points", "- first", "- second"]);
+}
+
+#[test]
+fn a_ledger_stamp_reads_as_seconds_since_the_epoch() {
+    assert_eq!(ledger_secs("1970-01-02 00:00:10"), Some(86_410));
+    assert_eq!(ledger_secs("2000-03-01 00:00:00"), Some(951_868_800));
+    assert_eq!(ledger_secs("yesterday"), None);
+}
+
+fn handoff(when: u64, outcome: &str, verdict: Option<&str>) -> ra_context::Handoff {
+    ra_context::Handoff {
+        when,
+        model: "m".into(),
+        outcome: outcome.into(),
+        check: String::new(),
+        verdict: verdict.map(Into::into),
+        changed: Vec::new(),
+        report: String::new(),
+        warnings: Vec::new(),
+        read: Vec::new(),
+        failures: Vec::new(),
+    }
+}
+
+fn call(at: &str, role: Option<&str>, turns: u64, cost: f64) -> ra_usage::Call {
+    ra_usage::Call {
+        at: at.into(),
+        model: "m".into(),
+        role: role.map(Into::into),
+        turns,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        cost_usd: Some(cost),
+        cost_computed: false,
+        read_in: 0,
+    }
+}
+
+#[test]
+fn the_runs_carry_their_turns_cost_and_cause_and_the_foot_what_did_not_land() {
+    let day = 951_868_800;
+    let handoffs = [
+        handoff(day + 600, "needs revision (substantive)", Some("needs revision (substantive) · 1 point(s) by r")),
+        handoff(day + 7200, "implemented", Some("accepted by r")),
+    ];
+    let calls = [
+        call("2000-03-01 01:59:00", None, 8, 0.5),
+        call("2000-03-01 00:11:00", Some("reviewer"), 1, 0.25),
+        call("2000-03-01 00:09:00", None, 12, 1.0),
+    ];
+    let (lines, foot) = run_lines(&handoffs, &calls, day + 7200);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].starts_with("#1 · m · 12 turns · "), "{}", lines[0]);
+    assert!(lines[0].ends_with("$1.25 · needs revision (substantive) · review: 1 point(s)"), "{}", lines[0]);
+    assert!(lines[1].starts_with("#2 · m · 8 turns · "), "{}", lines[1]);
+    assert!(lines[1].ends_with("$0.50 · implemented · accepted"), "{}", lines[1]);
+    assert_eq!(foot.as_deref(), Some("$1.25 of $1.75 did not land"));
+}
+
 fn totals(calls: u64, cost: f64) -> Totals {
     Totals { calls, cost_usd: Some(cost), ..Totals::default() }
 }
