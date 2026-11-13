@@ -23,7 +23,8 @@ A roadmap-driven, provider-independent AI development orchestrator in Rust. It b
 - A running console or window holds `rc.exe` / `rc-gui.exe`: build and test with `-p <crate>` or `--workspace --exclude rc --exclude rc-gui` when a workspace build fails to relink.
 - `var/` and `rhipper.md` are untracked state; never commit them, never run `git commit` at all: the person reviews and commits.
 - The machine has a scratch root (`rc scratch`, `D:\rhipper` here): cargo targets live under `<scratch>/target/<project>` (a worktree's under `wt-<id>` there), and runs get `TEMP` and `GRADLE_USER_HOME` under it. A test that asserts a target path must accept either place; read the target from `ra_providers::claude_code::project_target`, never assume `<root>/target`.
-- A full `cargo test -p ra-console` takes about two minutes while other cards build, and a timing test can fail under that load: when one fails, run that test alone by name (`cargo test -p ra-console -q <name>`) before changing code for it.
+- A full `cargo test -p ra-console` takes two to four minutes while other cards build, past the shell tool's two-minute foreground limit: start it with `run_in_background` and a 600000 ms timeout from the first call, not after it times out. A timing test can fail under that load: when one fails, run that test alone by name (`cargo test -p ra-console -q <name>`) before changing code for it.
+- Narrow a long output to its end (`| tail -n 60`, `| Select-Object -Last 60`), never its start: the warnings and the failures of the crates you touched come last, and a `-First` cut ended a clippy run before it reached them.
 
 ## Conventions
 
