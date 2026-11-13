@@ -2246,6 +2246,13 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             .await;
             return Ok(lines);
         }
+        // a card the context cap ended three times in a row is split, not continued a fourth
+        // time: the planner proposes the remaining work as cards, the card is blocked with it
+        if crate::plan::split::due(&root, &store.read(id).await?) {
+            lines.push(crate::plan::split::split(store, &root, id, worker).await?);
+            parked.insert(id);
+            continue;
+        }
         // the ledger's mark before the run: the rows after it are the run's
         let mark = match worker.ledger() {
             Some(ledger) => ledger.last_id().await.ok(),

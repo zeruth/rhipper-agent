@@ -6,6 +6,7 @@
 pub mod evidence;
 pub mod prompt;
 pub mod propose;
+pub mod split;
 
 #[cfg(test)]
 mod tests;

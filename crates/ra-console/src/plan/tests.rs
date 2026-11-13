@@ -235,3 +235,55 @@ async fn a_walk_after_a_cheaper_day_records_that_the_saving_held_once() {
     assert!(crate::retro::evidence(dir.path()).iter().any(|l| l.text.contains("[saving]")));
     assert!(!crate::retro::machine_lines(dir.path()).contains("[saving]"));
 }
+
+/// Records `n` runs of card `id` the context cap ended.
+fn capped_runs(root: &std::path::Path, id: i64, n: usize) {
+    let mut task = TaskContext::open(root, id);
+    for _ in 0..n {
+        task.record(Handoff {
+            when: crate::agent::unix_now(),
+            model: "claude-opus-5-5".to_owned(),
+            outcome: "continues".to_owned(),
+            check: "no check: the context cap of 160k tokens ended the run; the card continues in a fresh session".to_owned(),
+            verdict: None,
+            changed: vec!["src/lib.rs".to_owned()],
+            report: "the context cap of 160k tokens ended the run after 30 turn(s)\nthe store is done; the walk is left".to_owned(),
+            warnings: vec![],
+            read: vec![],
+        });
+    }
+    task.save(root).unwrap();
+}
+
+#[tokio::test]
+async fn split_after_cap_replaces_the_fourth_continuation_with_a_proposal_on_the_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    let id = store.insert_card(Some(1), NodeKind::Task, "Too big", &Card::new()).await.unwrap();
+    capped_runs(dir.path(), id, 3);
+    let provider = Scripted::new(vec![says("- Walk {c2}\n  acceptance: `cargo test -p x`\n", vec![])]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+    let out = crate::agent::run_all(&store, &worker, false).await.unwrap();
+    assert!(out[0].starts_with(&format!("split #{id} Too big: 3 runs ended on the context cap · split proposed:")), "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 0 card(s) · no card is ready");
+    assert_eq!(provider.seen.lock().len(), 1, "only the planner was called");
+    let node = store.read(id).await.unwrap();
+    assert_eq!(node.state, TaskState::Blocked);
+    assert!(node.notes.unwrap().contains("- Walk {c2}"));
+    assert!(crate::pair::recent(dir.path(), 5).iter().any(|l| l.starts_with(&format!("split #{id}"))));
+}
+
+#[tokio::test]
+async fn split_after_cap_leaves_an_absolute_card_and_a_card_under_three_caps_to_continue() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    let big = store.insert_card(Some(1), NodeKind::Task, "Absolute", &Card::new()).await.unwrap();
+    let small = store.insert_card(Some(1), NodeKind::Task, "Two caps", &Card::new()).await.unwrap();
+    store.set_absolute(big, true).await.unwrap();
+    capped_runs(dir.path(), big, 4);
+    capped_runs(dir.path(), small, 2);
+    assert!(!super::split::due(dir.path(), &store.read(big).await.unwrap()));
+    assert!(!super::split::due(dir.path(), &store.read(small).await.unwrap()));
+    capped_runs(dir.path(), small, 1);
+    assert!(super::split::due(dir.path(), &store.read(small).await.unwrap()));
+}
