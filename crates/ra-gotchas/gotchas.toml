@@ -159,6 +159,13 @@ message = "drop `$?` (and any other variable) from the command: the exit status 
 remedy = { kind = "hint" }
 
 [[gotcha]]
+id = "rg-missing"
+where = "result"
+pattern = '(?i)\brg\b.*(command not found|is not recognized|not found)'
+message = "`rg` is not on PATH here: search with the Grep tool, or `grep` in the shell"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 id = "mojibake"
 where = "result"
 pattern = 'â€[œ"˜™¦]|Ã©|Ã¼|Â·'
