@@ -544,6 +544,34 @@ pub fn guard(name: &str) -> Option<Guard> {
 /// aside twice.
 pub const INSTALL_LOCK: &str = "install";
 
+/// The file `rc install` leaves beside the binaries: the installed version and the time it went
+/// in, which a walk reads between cards to learn a newer `rc` is there.
+pub const INSTALLED_FILE: &str = "rc.version";
+
+/// What the install in `dir` says it is, `<version> <unix time>`; `None` before an install wrote it.
+#[must_use]
+pub fn installed(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(INSTALLED_FILE)).ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
+}
+
+/// The version a walk built as `own` moves to, given what the install said at the walk's start
+/// (`seen`) and says now: the install's when its version is newer than `own`, or when the
+/// install changed since the start and is not older (a rebuild on the same commit count). An
+/// older install is never moved to: the walk runs a newer build than the one on the path.
+#[must_use]
+pub fn moved_to(own: &str, seen: Option<&str>, now: Option<&str>) -> Option<String> {
+    let now = now?;
+    let version = now.split_whitespace().next()?;
+    let number = |v: &str| v.trim_end_matches('+').split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
+    let theirs = number(version)?;
+    let moved = match number(own) {
+        Some(ours) if theirs < ours => false,
+        Some(ours) if theirs > ours => true,
+        _ => seen != Some(now),
+    };
+    moved.then(|| version.to_owned())
+}
+
 /// The file under the hub that orders the projects by priority, one directory name a line,
 /// the first served first: the whole pool of writers and builders goes to the first project
 /// with work, the next takes what that one leaves, and so on down. The person's rule of
@@ -613,16 +641,74 @@ pub fn held_by(prefix: &str, count: usize, who: &str) -> usize {
 }
 
 /// The builds the machine runs at once, across every project's workers and checks: four
-/// builders beside the twelve writers. With a priority order set, the first project walking
-/// with work may use all four and a project below it the last two; without one, a project
-/// has two of its own and the two spare when it walks alone. The person's rules of
-/// 2026-11-12: "12 opus researchers, and 4 runners overall", "all 12 … and 4 builders [to]
-/// whichever project has priority first".
+/// builders beside the twelve writers, shared by every project. A project that wants a build
+/// and runs none goes before the projects that run one already, so each project asking has at
+/// least one. The person's rule of 2026-11-12: "the 4 are shared agent wide, with at least 1
+/// running per project if its requesting it (queue requested projects next always if they
+/// have a request and aren't in the pool already)".
 pub const BUILD_SLOTS: usize = 4;
 
-/// The build slots a project keeps for itself without a priority order, and the slots a
-/// project below the first in the order may use.
-pub const BUILD_SHARE: usize = 2;
+/// The most worker slots the window's `+` sets.
+pub const MAX_BUILD_SLOTS: usize = 8;
+
+/// The hub's file with the number of worker slots the person set, over [`BUILD_SLOTS`].
+const BUILD_SLOTS_FILE: &str = "build-slots.txt";
+
+/// How many worker (build) slots the machine has right now: the person's number from the
+/// window's `+`/`-`, else [`BUILD_SLOTS`]; read on every take, so a change applies to the next.
+#[must_use]
+pub fn build_slot_count() -> usize {
+    std::fs::read_to_string(dir().join(BUILD_SLOTS_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .map_or(BUILD_SLOTS, |n| n.clamp(1, MAX_BUILD_SLOTS))
+}
+
+/// Sets the number of worker slots, 1 to [`MAX_BUILD_SLOTS`]. A build in a slot past the new
+/// count runs on; no new build takes that slot.
+///
+/// # Errors
+/// When the hub's file cannot be written.
+pub fn set_build_slot_count(count: usize) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir()).with_context(|| format!("cannot make {}", dir().display()))?;
+    let path = dir().join(BUILD_SLOTS_FILE);
+    std::fs::write(&path, count.clamp(1, MAX_BUILD_SLOTS).to_string()).with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// How long a project's wish for a build slot stands without being renewed: a waiter renews it
+/// on every try, so one that stopped waiting stops counting after this.
+const BUILD_WANT_FRESH: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The file that says a project waits for a build slot.
+fn build_want_path(project: &str) -> PathBuf {
+    locks_dir().join(format!("build-want-{}", project.to_ascii_lowercase()))
+}
+
+/// The projects waiting for a build slot right now: their wish renewed within
+/// [`BUILD_WANT_FRESH`].
+fn build_wanting() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(locks_dir()) else { return Vec::new() };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let project = name.strip_prefix("build-want-")?.to_owned();
+            let fresh = e.metadata().ok()?.modified().ok()?.elapsed().is_ok_and(|age| age < BUILD_WANT_FRESH);
+            fresh.then_some(project)
+        })
+        .collect()
+}
+
+/// The project a build slot's note names: `runelite #42` is runelite's.
+fn holder_project(who: &str) -> &str {
+    who.split(" #").next().unwrap_or(who).trim()
+}
+
+/// How many builds run on the machine right now, every project's.
+#[must_use]
+pub fn builds_running() -> usize {
+    build_slots().iter().flatten().count()
+}
 
 /// The project a directory works in: itself, or the project above a card's worktree
 /// (`<root>/var/worktrees/<id>`), whose build slots the worktree's builds take.
@@ -643,35 +729,66 @@ pub fn build_lock_name(slot: usize) -> String {
     format!("build-{slot}")
 }
 
-/// Takes one of the machine's [`BUILD_SLOTS`] once: `Ok(None)` while every slot the project
-/// may take is held. With a priority order, the first project walking may take any of the
-/// four and a project behind a walking one only the last [`BUILD_SHARE`]; without an order,
-/// a project takes its own two (the first two for the project first in the hub's open list,
-/// the last two for the next) and any of the four when it walks alone.
+/// Takes one of the machine's [`BUILD_SLOTS`] once: `Ok(None)` while the project may take none.
+/// Any free slot is any project's, except that a project already running a build leaves the
+/// free slots to the waiting projects that run none: those go next. A project that gets
+/// nothing leaves its wish for the others to see, renewed on each try.
 ///
 /// # Errors
 /// When a lock file cannot be made or opened.
 pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
     let project_root = project_root_of(root);
     let project = project_name(&project_root);
-    let higher = crate::agent::higher_walking(&project_root);
-    let alone = crate::agent::other_walks(&project_root) == 0;
-    let slots: Vec<usize> = match rank_of(&project_root) {
-        _ if alone => (0..BUILD_SLOTS).collect(),
-        Some(_) if higher.is_empty() => (0..BUILD_SLOTS).collect(),
-        Some(_) => (BUILD_SLOTS - BUILD_SHARE..BUILD_SLOTS).collect(),
-        None => {
-            // no order: the first project of the hub's open list has the first two slots
-            let mine = recent().iter().position(|d| project_name(d).eq_ignore_ascii_case(&project)).unwrap_or(0);
-            if mine == 0 { (0..BUILD_SHARE).collect() } else { (BUILD_SLOTS - BUILD_SHARE..BUILD_SLOTS).collect() }
-        }
+    // the slot's note names the card too when the build is a worktree's, for the window's
+    // builders row: `runelite #42`
+    let card = std::fs::canonicalize(root)
+        .ok()
+        .filter(|dir| dir.parent().and_then(Path::file_name).is_some_and(|n| n == "worktrees"))
+        .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().into_owned()));
+    let who = match &card {
+        Some(card) => format!("{project} #{card}"),
+        None => project.clone(),
     };
-    for slot in slots {
-        if let Some(guard) = try_guard_as(&build_lock_name(slot), &project)? {
-            return Ok(Some(guard));
+    let held: Vec<String> = build_slots().into_iter().flatten().map(|(w, _)| holder_project(&w).to_ascii_lowercase()).collect();
+    let free = build_slot_count().saturating_sub(held.len());
+    let me = project.to_ascii_lowercase();
+    let want = build_want_path(&project);
+    // a project that runs a build already leaves the free slots to the ones that run none
+    let first_in_line = build_wanting().into_iter().filter(|p| *p != me && !held.contains(p)).count();
+    if free > 0 && (!held.contains(&me) || free > first_in_line) {
+        for slot in 0..build_slot_count() {
+            if let Some(guard) = try_guard_as(&build_lock_name(slot), &who)? {
+                let _ = std::fs::remove_file(&want);
+                return Ok(Some(guard));
+            }
         }
     }
+    let _ = std::fs::create_dir_all(locks_dir());
+    let _ = std::fs::write(&want, std::process::id().to_string());
     Ok(None)
+}
+
+/// The machine's build slots as the window shows them: for each, who holds it (`runelite #42`)
+/// and since when (unix seconds), or `None` when it is free. A slot is asked by taking its lock
+/// and letting it go at once; a builder that tries in that instant tries again on its next poll.
+#[must_use]
+pub fn build_slots() -> Vec<Option<(String, u64)>> {
+    (0..build_slot_count())
+        .map(|slot| {
+            let name = build_lock_name(slot);
+            if !matches!(try_guard(&name), Ok(None)) {
+                return None;
+            }
+            let note = locks_dir().join(format!("{name}.who"));
+            let who = std::fs::read_to_string(&note).map(|w| w.trim().to_owned()).unwrap_or_default();
+            let since = std::fs::metadata(&note)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            Some((if who.is_empty() { "a build".to_owned() } else { who }, since))
+        })
+        .collect()
 }
 
 /// The cargo target a check in `root` builds in: `CARGO_TARGET_DIR` when set (a relative one

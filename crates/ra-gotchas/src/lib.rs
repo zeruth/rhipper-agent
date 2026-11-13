@@ -8,7 +8,9 @@
 //! card outlines. The post-tool hook and the provider's stream reader ask [`Catalogue::scan`]
 //! what a result or an answer shows. The [`Journal`] keeps every hit, so `rc gotchas` can say
 //! which ones keep coming back and the next run can read [`Catalogue::notes`] about them. The
-//! refused commands no gotcha names grow the catalogue through [`Catalogue::promote`].
+//! refused commands no gotcha names grow the catalogue through [`Catalogue::promote`]. A
+//! command's shape, the simple commands it is made of, is judged by [`shape::judge`], from the
+//! table that also writes the worker's allowlist and the rules of its prompt.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -19,6 +21,7 @@ use serde::Deserialize;
 
 pub mod catalog;
 pub mod journal;
+pub mod shape;
 
 pub use journal::Journal;
 
@@ -155,7 +158,26 @@ pub struct Conditions<'a> {
     pub suite_check: bool,
     /// The packages the run has changed so far, by name ([`changed_crates`]).
     pub changed_crates: &'a [String],
+    /// The project's own allowlist runs the command: the allowlist hint ([`ALLOWLIST_HINT`])
+    /// stands aside, and the rewrites after it (the heavy work's slot) still apply.
+    pub allowed: bool,
 }
+
+/// The command inside an `rc hold [--shell <s>] -- <command>` a worker typed, when it is one.
+#[must_use]
+pub fn self_held(command: &str) -> Option<&str> {
+    let rest = command.trim_start().strip_prefix("rc hold")?;
+    let rest = rest.trim_start();
+    let rest = match rest.strip_prefix("--shell") {
+        Some(after) => after.trim_start().split_once(char::is_whitespace).map_or("", |(_, r)| r).trim_start(),
+        None => rest,
+    };
+    rest.strip_prefix("--").map(str::trim_start).filter(|inner| !inner.is_empty())
+}
+
+/// The gotcha that denies a shell outside the default allowlist; a project that allows the
+/// command sets [`Conditions::allowed`] and it stands aside.
+pub const ALLOWLIST_HINT: &str = "shell-outside-allowlist";
 
 /// Whether `command` is a full suite: a `cargo test` that names no package, nor a manifest.
 #[must_use]
@@ -288,15 +310,35 @@ impl Catalogue {
     /// the changed crates are read from the work tree only for a full suite while it is the
     /// project's check, as they cost a `git status`.
     #[must_use]
-    pub fn command_in(&self, workspace: &Path, command: &str, console_running: bool, suite_check: bool) -> Verdict {
+    pub fn command_in(&self, workspace: &Path, command: &str, console_running: bool, suite_check: bool, allowed: bool) -> Verdict {
         let changed = if suite_check && is_suite(command) { changed_crates(workspace) } else { Vec::new() };
-        self.command(command, Conditions { console_running, suite_check, changed_crates: &changed })
+        self.command(command, Conditions { console_running, suite_check, changed_crates: &changed, allowed })
     }
 
     /// What to do with a command about to run: the first hint or allow that matches decides;
     /// the rewrites before it compose, each on the command as the one before left it.
     #[must_use]
     pub fn command(&self, command: &str, conditions: Conditions) -> Verdict {
+        // a worker that typed `rc hold` itself (the slot messages name it) is judged on the
+        // command inside: `rc hold` runs whatever it is given, so it is no way past the
+        // allowlist. Heavy work the project allows gets its slot as it would have; anything
+        // else is told to run as written (#140's contract run and the agent's cargo tests were
+        // refused for typing it, 2026-11-12)
+        if let Some(inner) = self_held(command) {
+            return match self.command(inner, conditions) {
+                Verdict::Rewrite { id, command, reason } if command.trim_start().starts_with("rc hold") => {
+                    Verdict::Rewrite { id, command, reason }
+                }
+                Verdict::Deny { id, reason } => Verdict::Deny { id, reason },
+                _ => Verdict::Deny {
+                    id: String::from("self-held"),
+                    reason: format!(
+                        "`rc hold` is the hook's to add, not the worker's: run the command as written (`{}`); a build or other heavy work is put on a worker slot by itself",
+                        inner.trim()
+                    ),
+                },
+            };
+        }
         let mut current = command.to_owned();
         let mut rewritten: Option<(String, Vec<String>)> = None;
         for gotcha in self.entries.iter().filter(|g| g.place == Where::Command) {
@@ -304,6 +346,7 @@ impl Catalogue {
                 continue;
             }
             match &gotcha.remedy {
+                Remedy::Hint if conditions.allowed && gotcha.id == ALLOWLIST_HINT => continue,
                 Remedy::Hint => return Verdict::Deny { id: gotcha.id.clone(), reason: gotcha.message.clone() },
                 Remedy::Allow => break,
                 Remedy::Rewrite { insert, after, append, unless, when } => {

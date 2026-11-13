@@ -50,13 +50,14 @@ pub fn last_end(root: &Path) -> Option<String> {
     recent(root, 50).into_iter().rev().find_map(|line| line.strip_prefix("end ").map(str::trim).map(str::to_owned))
 }
 
-/// The run the feed has open: the latest `start` event with no `end` (or `run orphaned`) after
-/// it, without its word, and the pid its marker carries last; none while nothing runs. A start
-/// without a pid is from before the marker carried one, and its liveness cannot be judged.
+/// The run the feed has open: the latest `start` event with no `end` (or `re-queued`, or the
+/// older `run orphaned`) after it, without its word, and the pid its marker carries last; none
+/// while nothing runs. A start without a pid is from before the marker carried one, and its
+/// liveness cannot be judged.
 #[must_use]
 pub fn live_start(root: &Path) -> Option<(String, Option<u32>)> {
     let open = recent(root, 50).into_iter().rev().find_map(|line| {
-        if line.starts_with("end ") || line.starts_with("run orphaned") {
+        if line.starts_with("end ") || line.starts_with("re-queued ") || line.starts_with("run orphaned") {
             return Some(None);
         }
         line.strip_prefix("start ").map(|text| Some(text.trim().to_owned()))
@@ -140,31 +141,40 @@ pub fn follow(root: &Path, since: u64, out: &mut impl Write) -> std::io::Result<
     }
 }
 
-/// The window has come up on this project: `window up <build> pid <pid> tabs <n>`, then one
-/// `run orphaned #id` per run in the activity log that started, never ended, and whose process
-/// is gone — a run the window took down with it. The run's end is written to the activity log
-/// too, so it is reported once and its bubble closes; a run whose process lives is left alone,
-/// the window owns no run's lifetime.
-pub fn window_up(root: &Path, build: &str, tabs: usize) {
-    window_up_with(root, build, tabs, crate::hub::pid_alive);
+/// The window has come up on this project: `window up <build> pid <pid> tabs <n>`, then the
+/// runs the window took down with it go back on the queue through
+/// [`crate::agent::requeue_orphans`], one `re-queued …` line for all of them. A run whose
+/// process lives is left alone, the window owns no run's lifetime.
+pub async fn window_up(store: &ra_roadmap::store::Store, root: &Path, build: &str, tabs: usize) {
+    window_up_with(store, root, build, tabs, crate::hub::pid_alive).await;
 }
 
 /// [`window_up`] with the liveness check given, for the tests.
-pub fn window_up_with(root: &Path, build: &str, tabs: usize, alive: impl Fn(u32) -> bool) {
+pub async fn window_up_with(store: &ra_roadmap::store::Store, root: &Path, build: &str, tabs: usize, alive: impl Fn(u32) -> bool) {
     event(root, &format!("window up {build} pid {} tabs {tabs}", std::process::id()));
+    crate::agent::requeue_orphans_with(store, root, alive).await;
+}
+
+/// The cards of the runs in the activity log that started, never ended, and whose process is
+/// gone, each once in the order they started, however many killed walks started it. Every such
+/// run gets its end in the activity log, so its bubble closes and the next restart finds none
+/// of them: a restart lists an orphan once.
+#[must_use]
+pub fn orphaned(root: &Path, alive: impl Fn(u32) -> bool) -> Vec<i64> {
     let activity_path = root.join(crate::ui::ACTIVITY_FILE);
     let activity = std::fs::read_to_string(&activity_path).unwrap_or_default();
-    let orphaned = orphans(&activity, alive);
-    if orphaned.is_empty() {
-        return;
-    }
+    let gone = orphans(&activity, alive);
     let mut log = std::fs::OpenOptions::new().append(true).open(&activity_path).ok();
-    for (id, pid) in orphaned {
-        event(root, &format!("run orphaned #{id}"));
+    let mut ids: Vec<i64> = Vec::new();
+    for (id, pid) in gone {
         if let Some(log) = log.as_mut() {
             let _ = writeln!(log, "{}✗ orphaned #{id}: process {pid} is gone", crate::logs::RUN_END);
         }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
     }
+    ids
 }
 
 /// The window has gone from this project: `window down <reason>`, the reason `restart` under

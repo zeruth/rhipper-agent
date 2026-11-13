@@ -63,11 +63,76 @@ pub struct Prices {
     pub models: BTreeMap<String, Price>,
 }
 
-/// What one token costs a model, in dollars: read and written.
+/// What one token costs a model, in dollars: read and written, and the cache's own rates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Price {
     pub prompt: f64,
     pub completion: f64,
+    /// A prompt token served from the cache; `None` prices it as any prompt token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    /// A prompt token written to the cache; `None` prices it as any prompt token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+}
+
+/// The tokens of a call split by the rate each is priced at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tokens {
+    /// The prompt tokens neither read from nor written to the cache.
+    pub fresh: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub output: u64,
+}
+
+impl Price {
+    /// An Anthropic list price from its dollars per million tokens in and out; the cache reads
+    /// at a tenth of the input and writes, for the five minutes the harness asks, at a
+    /// quarter more.
+    const fn anthropic(input: f64, output: f64) -> Self {
+        let per_token = 1e-6;
+        Self {
+            prompt: input * per_token,
+            completion: output * per_token,
+            cache_read: Some(input * per_token * 0.1),
+            cache_write: Some(input * per_token * 1.25),
+        }
+    }
+
+    /// The cost of `tokens` at this price.
+    #[must_use]
+    pub fn of(&self, tokens: &Tokens) -> f64 {
+        // the token counts are far below 2^53, so the conversion is exact
+        #[allow(clippy::cast_precision_loss)]
+        let n = |n: u64| n as f64;
+        n(tokens.fresh) * self.prompt
+            + n(tokens.cache_read) * self.cache_read.unwrap_or(self.prompt)
+            + n(tokens.cache_write) * self.cache_write.unwrap_or(self.prompt)
+            + n(tokens.output) * self.completion
+    }
+}
+
+/// The Anthropic models' list prices, by the words of a model id, the first match standing: the
+/// Claude Code route reports a cost only with a result, and a run stopped before one is priced
+/// here; `OpenRouter` falls back to it for a Claude model its list leaves out.
+const ANTHROPIC: [(&str, Price); 8] = [
+    ("opus-4-0", Price::anthropic(15.0, 75.0)),
+    ("opus-4-1", Price::anthropic(15.0, 75.0)),
+    ("opus-4.1", Price::anthropic(15.0, 75.0)),
+    ("opus-4-2025", Price::anthropic(15.0, 75.0)),
+    ("3-opus", Price::anthropic(15.0, 75.0)),
+    ("opus", Price::anthropic(5.0, 25.0)),
+    ("sonnet", Price::anthropic(3.0, 15.0)),
+    ("haiku", Price::anthropic(1.0, 5.0)),
+];
+
+/// The Anthropic list price of `model`, from its id or its alias (`opus`, `claude-sonnet-4-6`,
+/// `anthropic/claude-haiku-4.5`); `None` for any other model.
+#[must_use]
+pub fn anthropic_price(model: &str) -> Option<Price> {
+    let model = model.to_ascii_lowercase();
+    ANTHROPIC.iter().find(|(words, _)| model.contains(words)).map(|(_, price)| *price)
 }
 
 impl Prices {
@@ -91,15 +156,25 @@ impl Prices {
         now.saturating_sub(self.read_at) < PRICES_FOR.as_secs()
     }
 
-    /// The list price of `usage` on `model`: every prompt token at the prompt price, cached or
-    /// not, and every completion token at the completion price; `None` for a model not listed.
+    /// The price of `model`: the list read from the route, else the Anthropic list for a Claude
+    /// model; `None` for a model neither names.
+    #[must_use]
+    pub fn price_of(&self, model: &str) -> Option<Price> {
+        self.models.get(model).copied().or_else(|| anthropic_price(model))
+    }
+
+    /// The list price of `usage` on `model`: the cached prompt tokens at the cache-read price,
+    /// the rest at the prompt price, every completion token at the completion price; `None`
+    /// for a model not listed.
     #[must_use]
     pub fn cost(&self, model: &str, usage: &Usage) -> Option<f64> {
-        let price = self.models.get(model)?;
-        // the token counts are far below 2^53, so the conversion is exact
-        #[allow(clippy::cast_precision_loss)]
-        let tokens = |n: u64| n as f64;
-        Some(tokens(usage.prompt_tokens) * price.prompt + tokens(usage.completion_tokens) * price.completion)
+        let tokens = Tokens {
+            fresh: usage.prompt_tokens.saturating_sub(usage.cached_tokens),
+            cache_read: usage.cached_tokens,
+            cache_write: 0,
+            output: usage.completion_tokens,
+        };
+        Some(self.price_of(model)?.of(&tokens))
     }
 
     /// The prices of the models the endpoint listed, at `now`; a model without a parsable price
@@ -110,7 +185,15 @@ impl Prices {
             .filter_map(|m| {
                 let pricing = m.pricing?;
                 let per_token = |text: Option<String>| text?.trim().parse::<f64>().ok();
-                Some((m.id, Price { prompt: per_token(pricing.prompt)?, completion: per_token(pricing.completion)? }))
+                Some((
+                    m.id,
+                    Price {
+                        prompt: per_token(pricing.prompt)?,
+                        completion: per_token(pricing.completion)?,
+                        cache_read: per_token(pricing.input_cache_read),
+                        cache_write: per_token(pricing.input_cache_write),
+                    },
+                ))
             })
             .collect();
         Self { read_at: now, models }
@@ -315,6 +398,11 @@ struct WirePricing {
     prompt: Option<String>,
     #[serde(default)]
     completion: Option<String>,
+    /// The cache's rates, for the models that list them.
+    #[serde(default)]
+    input_cache_read: Option<String>,
+    #[serde(default)]
+    input_cache_write: Option<String>,
 }
 
 /// The API root of the local server: `RHIPPER_LOCAL_URL` when it is set to something, else

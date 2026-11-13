@@ -66,7 +66,7 @@ pub(crate) fn card_line(node: &Node, cost: Option<&CardCost>) -> String {
 }
 
 /// A token count that reads at a glance: `950`, `12.3k`, `1.2M`.
-fn compact(count: u64) -> String {
+pub(crate) fn compact(count: u64) -> String {
     match count {
         0..=999 => count.to_string(),
         1_000..=999_999 => format!("{}.{}k", count / 1_000, count % 1_000 / 100),

@@ -6,13 +6,45 @@
 # the context it carries, so a run restarts fresh on a handoff once a turn passes this many
 # input tokens.
 context = 160000
-# Four cards at once, each in its own worktree sharing the project's one build, and no more:
-# six was too heavy for the machine's CPU and RAM (2026-11-12). Runelite is paused until the
-# agent's roadmap is green.
+# One Fable worker (the person, 2026-11-12, new week): the agent's roadmap is pruned and
+# regenerated around workflow execution, its efficiency and the model chosen per task, then
+# walked one card at a time. A Fable walk sits outside the Opus pool.
 parallel = 4
 borrow = false
+# the roadmap commands a regeneration card reshapes the roadmap with; in a worktree `rc` opens
+# the project's roadmap. Not `rc set` (accepted lands a card) nor the walk's commands
+allow = [
+    "Bash(rc show*)",
+    "Bash(rc check*)",
+    "Bash(rc next*)",
+    "Bash(rc history*)",
+    "Bash(rc usage*)",
+    "Bash(rc add *)",
+    "Bash(rc edit *)",
+    "Bash(rc remove *)",
+    "Bash(rc move *)",
+    "Bash(rc depend *)",
+    "Bash(rc priority *)",
+    "PowerShell(rc show*)",
+    "PowerShell(rc check*)",
+    "PowerShell(rc next*)",
+    "PowerShell(rc history*)",
+    "PowerShell(rc usage*)",
+    "PowerShell(rc add *)",
+    "PowerShell(rc edit *)",
+    "PowerShell(rc remove *)",
+    "PowerShell(rc move *)",
+    "PowerShell(rc depend *)",
+    "PowerShell(rc priority *)",
+    "Bash(rc set * defined)",
+    "Bash(rc set * blocked)",
+    "Bash(rc set * cancelled)",
+    "PowerShell(rc set * defined)",
+    "PowerShell(rc set * blocked)",
+    "PowerShell(rc set * cancelled)",
+]
 
-# The implementer of every card here is Opus; the reviewer and the cheap roles keep theirs.
+# The implementer of every card here is Fable; the reviewer and the cheap roles keep theirs.
 [[route]]
 model = "claude-opus-5-5"
 

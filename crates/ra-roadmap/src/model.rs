@@ -315,6 +315,23 @@ pub struct Node {
     /// intervention.
     #[serde(default)]
     pub saving: Option<String>,
+    /// An absolute card works until it is done: no turn or context cap restarts it, a review
+    /// that sends it back reruns it at once on its session, and no count of reruns parks or
+    /// blocks it; only a full stop (the plan's limit, the provider gone, the person) ends its
+    /// run. A card of complexity 5 is absolute whether or not it says so ([`Node::is_absolute`]).
+    /// The person's rule of 2026-11-12: the prune cards "should work until done, no limits
+    /// unless there is an actual full stop; monumental tasks get the absolute badge as well".
+    #[serde(default)]
+    pub absolute: bool,
+}
+
+impl Node {
+    /// Whether the card runs as an absolute card: marked so, or monumental (complexity 5), the
+    /// work a cap would cut into restarts that cost more than one whole run.
+    #[must_use]
+    pub fn is_absolute(&self) -> bool {
+        self.absolute || self.complexity >= 5
+    }
 }
 
 /// The range a priority and a gambit's weight share.

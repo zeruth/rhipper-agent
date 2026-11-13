@@ -71,7 +71,16 @@ pub struct Run {
     /// The process of the run, from its start marker, so a run whose process is gone can be
     /// closed as an orphan rather than stay live in the log; `None` for a run without one.
     pub pid: Option<u32>,
+    /// When the run last had a step or began.
+    pub touched: std::time::Instant,
 }
+
+/// The title of a run that untagged lines opened without a start marker.
+pub const UNTITLED_RUN: &str = "worker";
+
+/// How long an untitled run with no process stays live without a step: such a run has no end
+/// marker to wait for (a review from the command line before its lines carried the card).
+pub const UNTITLED_IDLE: std::time::Duration = std::time::Duration::from_mins(2);
 
 impl Run {
     /// Whether the run is still going.
@@ -153,11 +162,12 @@ impl Sink {
             // run here is dropped rather than put on a stranger's card or an untitled one
             let id = match card {
                 Some(card) => self.live_run_of(card),
-                None => Some(self.live_run().unwrap_or_else(|| self.open_run("worker"))),
+                None => Some(self.live_run().unwrap_or_else(|| self.open_run(UNTITLED_RUN))),
             };
             let Some(id) = id else { return };
             if let Some(run) = self.inner.runs.lock().0.get_mut(&id) {
                 run.steps.push(text.to_owned());
+                run.touched = std::time::Instant::now();
             }
             self.bump();
         }
@@ -177,6 +187,7 @@ impl Sink {
                 height: RUN_HEIGHT,
                 folded: None,
                 pid: None,
+                touched: std::time::Instant::now(),
             };
             runs.0.insert(id, run);
             id
@@ -205,6 +216,21 @@ impl Sink {
         for (id, pid, title) in dead {
             let card = card_of(&title).map_or(String::new(), |card| format!(" #{card}"));
             self.close_run(id, &format!("✗ orphaned{card}: process {pid} is gone"));
+        }
+        // an untitled run with no process has no end to wait for: closed once it goes quiet,
+        // rather than held open as a "worker" card for good (runelite and asm, 2026-11-12)
+        let quiet: Vec<u64> = {
+            let runs = self.inner.runs.lock();
+            let lines = self.inner.lines.lock();
+            runs.0
+                .iter()
+                .filter(|(_, run)| run.live() && run.pid.is_none() && run.touched.elapsed() >= UNTITLED_IDLE)
+                .filter(|(id, _)| lines.iter().any(|l| l.kind == Kind::Run && l.run == Some(**id) && l.text == UNTITLED_RUN))
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in quiet {
+            self.close_run(id, "✓ quiet");
         }
     }
 

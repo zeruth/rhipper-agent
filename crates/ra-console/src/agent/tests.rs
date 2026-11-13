@@ -4,6 +4,17 @@
 use super::*;
 
 #[test]
+fn the_end_line_marks_a_computed_cost_as_an_estimate_and_names_the_cached_share() {
+    let computed =
+        Usage { prompt_tokens: 1_000_000, completion_tokens: 0, cached_tokens: 900_000, cost_usd: Some(4.12), cost_computed: true };
+    assert_eq!(end_cost(&computed), "$4.12 est. · 90% cached");
+    let reported = Usage { cost_computed: false, ..computed };
+    assert_eq!(end_cost(&reported), "$4.1200 · 90% cached");
+    let none = Usage { cost_usd: None, cost_computed: false, ..computed };
+    assert_eq!(end_cost(&none), "cost unreported · 90% cached");
+}
+
+#[test]
 fn the_turn_sizes_lead_with_the_average_and_name_the_largest_when_shown() {
     let usage = Usage { prompt_tokens: 30_000, completion_tokens: 600, cached_tokens: 0, cost_usd: None, cost_computed: false };
     let mut session = Session {
@@ -261,6 +272,109 @@ async fn the_doctor_reads_the_roadmap_and_opens_the_ledger_of_a_directory() {
     // the settings line names the sources a worker loads and what the project has for them
     let settings = settings_check(dir.path()).unwrap();
     assert!(settings.starts_with("a worker loads project,local: .claude/settings.json absent"));
+}
+
+#[test]
+fn a_fingerprint_changes_with_the_command_the_error_the_diff_and_the_base() {
+    let print = check_fingerprint("cargo test -q", "error: boom", "diff", "abc\n");
+    assert_eq!(print, check_fingerprint("cargo test -q", "error: boom", "diff", "abc"));
+    for other in [
+        check_fingerprint("cargo test", "error: boom", "diff", "abc"),
+        check_fingerprint("cargo test -q", "error: bang", "diff", "abc"),
+        check_fingerprint("cargo test -q", "error: boom", "diff2", "abc"),
+        check_fingerprint("cargo test -q", "error: boom", "diff", "abd"),
+    ] {
+        assert_ne!(print, other);
+    }
+    // the handoff reads it back off its check line, past the fields that follow it
+    let mut handoff = ra_context::Handoff {
+        when: 0,
+        model: "m".to_owned(),
+        outcome: "needs revision".to_owned(),
+        check: format!("check failed: cargo test -q{}{print} · on estimate · blocked: x", ra_context::FINGERPRINT_MARK),
+        verdict: None,
+        changed: vec![],
+        report: String::new(),
+        warnings: vec![],
+        read: vec![],
+    };
+    assert_eq!(handoff.fingerprint(), Some(print.as_str()));
+    handoff.check = "check passed: cargo test -q".to_owned();
+    assert_eq!(handoff.fingerprint(), None);
+}
+
+#[test]
+fn a_setup_failure_is_told_from_a_failure_of_the_code_for_the_fingerprint() {
+    assert!(is_setup_failure("error: unexpected argument '--frobnicate' found\n\nUsage: cargo test [OPTIONS]\n"));
+    assert!(is_setup_failure("'gradle' is not recognized as an internal or external command\n"));
+    assert!(is_setup_failure("SDK location not found. Define a valid SDK location with an ANDROID_HOME\n"));
+    // once a build ran, the failure is the code's whatever its words
+    assert!(!is_setup_failure("   Compiling x v0.1.0\nerror[E0425]: cannot find value `y`: no such file or directory\n"));
+    assert!(!is_setup_failure("test probe ... FAILED\nexit code 101\n"));
+    assert_eq!(first_error("warning: a\n\nerror: unexpected argument '-x' found\nUsage"), "error: unexpected argument '-x' found");
+    assert_eq!(first_error("\nthe probe broke\n"), "the probe broke");
+}
+
+/// A project with one card, #2, and a worker whose model says `report` and whose check answers
+/// `check` with its exit code.
+async fn blockable(dir: &Path, report: &str, check: (i32, &str)) -> (ra_roadmap::store::Store, Worker) {
+    use crate::commands::tests::{Scripted, says};
+    let store = ra_roadmap::store::Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    crate::commands::run("/add task Probe parent 1", &store, &Worker::new("z-ai/glm-5.3-flash")).await.unwrap();
+    let (code, output) = (check.0, check.1.to_owned());
+    let script: ra_tools::Script = std::sync::Arc::new(move |_: &str| Ok((code, output.clone())));
+    let answers = (0..4).map(|_| says(report, vec![])).collect();
+    (store, Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(answers)).with_script(script))
+}
+
+/// Whether the feed of `dir` carries a line naming #2 blocked for `reason`.
+fn fed_blocked(dir: &Path, reason: &str) -> bool {
+    crate::pair::recent(dir, 50).iter().any(|line| line.contains("#2 blocked: ") && line.contains(reason))
+}
+
+#[tokio::test]
+async fn a_repeated_fingerprint_blocks_the_card_on_its_first_sight() {
+    use ra_roadmap::model::TaskState;
+    let dir = tempfile::tempdir().unwrap();
+    let (store, worker) = blockable(dir.path(), "tried again", (1, "the probe broke\nexit code 1\n")).await;
+    // the first failure is a revision; the same one on the same tree holds the card
+    crate::commands::run("/run 2", &store, &worker).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, TaskState::NeedsRevision);
+    let (out, _) = crate::commands::run("/run 2", &store, &worker).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, TaskState::Blocked, "{out:?}");
+    let reason = "the check failed as the last run's did";
+    assert!(out.iter().any(|l| l.contains(&format!("#2 blocked: {reason}")) && l.contains("the probe broke")), "{out:?}");
+    assert!(fed_blocked(dir.path(), reason), "{:?}", crate::pair::recent(dir.path(), 50));
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    assert_eq!(task.handoffs.last().unwrap().outcome, "blocked");
+    assert_eq!(task.handoffs[0].fingerprint(), task.handoffs[1].fingerprint());
+}
+
+#[tokio::test]
+async fn a_setup_failure_blocks_the_card_on_its_first_sight_with_its_fingerprint_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let rejected = "error: unexpected argument '--frobnicate' found\n\nUsage: cargo test [OPTIONS]\nexit code 1\n";
+    let (store, worker) = blockable(dir.path(), "done", (1, rejected)).await;
+    let (out, _) = crate::commands::run("/run 2", &store, &worker).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Blocked, "{out:?}");
+    let reason = "the check failed before any build";
+    assert!(
+        out.iter().any(|l| l.contains(&format!("#2 blocked: {reason}")) && l.contains("unexpected argument '--frobnicate'")),
+        "{out:?}"
+    );
+    assert!(fed_blocked(dir.path(), "unexpected argument '--frobnicate'"), "{:?}", crate::pair::recent(dir.path(), 50));
+}
+
+#[tokio::test]
+async fn a_blocked_report_that_changed_nothing_holds_the_card_on_its_first_sight_without_a_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = "I could not start.\n\n## Blocked\nno MIPS LLVM on this machine\n";
+    let (store, worker) = blockable(dir.path(), report, (0, "ok\nexit code 0\n")).await;
+    let (out, _) = crate::commands::run("/run 2", &store, &worker).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Blocked, "{out:?}");
+    assert!(out.iter().any(|l| l.contains("#2 blocked: the worker reported it blocked: no MIPS LLVM on this machine")), "{out:?}");
+    assert!(fed_blocked(dir.path(), "no MIPS LLVM on this machine"), "{:?}", crate::pair::recent(dir.path(), 50));
+    assert_eq!(ra_context::TaskContext::open(dir.path(), 2).handoffs.last().unwrap().fingerprint(), None);
 }
 
 /// A PostToolUse event for a Read of `file` in `root`, with the range the worker gave.

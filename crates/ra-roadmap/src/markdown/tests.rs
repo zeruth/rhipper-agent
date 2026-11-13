@@ -24,6 +24,7 @@ fn node(id: i64, parent: Option<i64>, kind: NodeKind, title: &str) -> Node {
         notes: None,
         assessed: None,
         priority: None,
+        absolute: false,
         evidence: None,
         saving: None,
     }

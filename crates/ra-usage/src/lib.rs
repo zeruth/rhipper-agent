@@ -48,11 +48,17 @@ pub struct Totals {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cached_tokens: u64,
-    /// The summed cost of the entries that reported one; `None` when none did.
+    /// The summed cost of the entries that have one, reported or computed; `None` when none did.
     pub cost_usd: Option<f64>,
+    /// The share of [`Totals::cost_usd`] computed from list prices rather than reported: the
+    /// part a reader marks as an estimate.
+    pub estimated_usd: f64,
     pub turns: u64,
     /// The summed read-in, as [`Entry::read_in`] has it: what the cards rank by in Phase S.
     pub read_in: u64,
+    /// The worker's own calls among `calls`, those with no role: the runs of a card, a rerun
+    /// counted each time, the cheap roles' calls not.
+    pub runs: u64,
 }
 
 /// One row of the ledger, as the ledger tab lists the calls of a card.
@@ -100,8 +106,12 @@ impl Totals {
         self.cached_tokens += entry.cached_tokens;
         self.turns += entry.turns;
         self.read_in += entry.read_in;
+        self.runs += u64::from(entry.role.is_none());
         if let Some(cost) = entry.cost_usd {
             self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
+            if entry.cost_computed {
+                self.estimated_usd += cost;
+            }
         }
     }
 
@@ -113,8 +123,21 @@ impl Totals {
         self.cached_tokens += other.cached_tokens;
         self.turns += other.turns;
         self.read_in += other.read_in;
+        self.runs += other.runs;
+        self.estimated_usd += other.estimated_usd;
         if let Some(cost) = other.cost_usd {
             self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
+        }
+    }
+
+    /// The cost for a table column: the dollars, reported and computed together, with the
+    /// computed share marked, as `$4.1200 ($1.10 est.)`; `—` when no entry had a cost.
+    #[must_use]
+    pub fn cost_text(&self) -> String {
+        match self.cost_usd {
+            None => "—".to_owned(),
+            Some(cost) if self.estimated_usd > 0.0 => format!("${cost:.4} (${:.2} est.)", self.estimated_usd),
+            Some(cost) => format!("${cost:.4}"),
         }
     }
 }
@@ -344,6 +367,23 @@ impl UsageStore {
         Ok(rows.iter().map(|row| (row.get::<Option<i64>, _>("node"), totals_of(row))).collect())
     }
 
+    /// Every card the ledger has seen, the costliest first, each summed over every run on it,
+    /// landed or not: what `rc usage --cards` ranks. A card whose rows reported no cost ranks
+    /// last, by its turns; the rows that served no node are left out.
+    ///
+    /// # Errors
+    /// When the query fails.
+    pub async fn by_card(&self) -> anyhow::Result<Vec<query::CardCost>> {
+        let rows = sqlx::query(concat!(
+            "select node, ",
+            sums!(),
+            " from usage where node is not null group by node order by cost desc nulls last, turns desc, node"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|row| query::CardCost { node: row.get("node"), totals: totals_of(row) }).collect())
+    }
+
     /// The calls that served one node, the latest first; `None` lists the calls that served
     /// no node.
     ///
@@ -392,8 +432,10 @@ macro_rules! sums {
          coalesce(sum(completion_tokens), 0) as completion, \
          coalesce(sum(cached_tokens), 0) as cached, \
          sum(cost_usd) as cost, \
+         coalesce(sum(case when cost_computed then cost_usd end), 0.0) as estimated, \
          coalesce(sum(turns), 0) as turns, \
-         coalesce(sum(read_in), 0) as read_in"
+         coalesce(sum(read_in), 0) as read_in, \
+         coalesce(sum(case when role is null then 1 else 0 end), 0) as runs"
     };
 }
 use sums;
@@ -406,8 +448,10 @@ fn totals_of(row: &sqlx::sqlite::SqliteRow) -> Totals {
         completion_tokens: count("completion"),
         cached_tokens: count("cached"),
         cost_usd: row.get::<Option<f64>, _>("cost"),
+        estimated_usd: row.get::<Option<f64>, _>("estimated").unwrap_or(0.0),
         turns: count("turns"),
         read_in: count("read_in"),
+        runs: count("runs"),
     }
 }
 

@@ -172,6 +172,58 @@ fn plan_without_an_id_is_the_evidence_plan_and_with_one_the_split_and_dry_takes_
 }
 
 #[test]
+fn usage_cards_rank_by_cost_under_the_header_and_total_the_landed_ones() {
+    let mut nodes = roadmap();
+    nodes[2].state = TaskState::Accepted;
+    let card = |node: i64, runs: u64, turns: u64, cost: Option<f64>| CardCost {
+        node,
+        totals: Totals {
+            calls: runs,
+            prompt_tokens: 10_000 * turns,
+            completion_tokens: 2_300 * turns,
+            turns,
+            read_in: 4_000,
+            runs,
+            cost_usd: cost,
+            ..Totals::default()
+        },
+    };
+    // as the ledger ranks them: the landed card, the card it unblocks (its state the effective
+    // one), a card the roadmap lost, one with no cost known
+    let cards = [card(3, 2, 10, Some(1.25)), card(4, 1, 3, Some(0.40)), card(99, 1, 1, Some(0.05)), card(2, 1, 2, None)];
+    let lines = usage_card_lines(&cards, &nodes, 3);
+    assert_eq!(
+        lines,
+        [
+            "card  runs  turns  tok/turn  read-in  cost  state",
+            "#3       2     10     12.3k     4.0k  $1.25  accepted",
+            "#4       1      3     12.3k     4.0k  $0.40  ready",
+            "#99      1      1     12.3k     4.0k  $0.05  ?",
+            "landed: 1 cards, $1.25, median $1.25 a card",
+        ]
+    );
+    // the cost unknown shows as `?`; the landed line counts the whole ledger, not the rows shown
+    nodes[1].state = TaskState::Accepted;
+    let lines = usage_card_lines(&cards, &nodes, 1);
+    assert_eq!(lines[1], "#3       2     10     12.3k     4.0k  $1.25  accepted");
+    assert_eq!(lines[2], "landed: 2 cards, $1.25, median $1.25 a card");
+    let lines = usage_card_lines(&cards[..1], &nodes, 1);
+    assert_eq!(lines.len(), 3);
+    let lines = usage_card_lines(&[card(2, 1, 2, None)], &nodes, 5);
+    assert_eq!(lines[1], "#2       1      2     12.3k     4.0k     ?  accepted");
+    assert_eq!(lines[2], "landed: 1 cards, $0.00, median ? a card");
+    // the option parses bare and with a count
+    let Options { command: Command::Usage { cards } } = Options::try_parse_from(["rc", "usage", "--cards"]).expect("parses") else {
+        panic!("not usage")
+    };
+    assert_eq!(cards, Some(20));
+    let Options { command: Command::Usage { cards } } = Options::try_parse_from(["rc", "usage", "--cards", "5"]).expect("parses") else {
+        panic!("not usage")
+    };
+    assert_eq!(cards, Some(5));
+}
+
+#[test]
 fn a_status_card_line_carries_the_cost_and_the_tokens_a_turn_and_is_blank_before_a_run() {
     let nodes = roadmap();
     let ran = CardCost {
@@ -182,8 +234,10 @@ fn a_status_card_line_carries_the_cost_and_the_tokens_a_turn_and_is_blank_before
             completion_tokens: 23_000,
             cached_tokens: 0,
             cost_usd: Some(0.4249),
+            estimated_usd: 0.0,
             turns: 10,
             read_in: 0,
+            runs: 2,
         },
     };
     let lines = status::card_lines(&nodes, &[ran]);

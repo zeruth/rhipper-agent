@@ -174,6 +174,34 @@ async fn usage_prints_the_ledger_by_card_summed_up_the_tree() {
 }
 
 #[tokio::test]
+async fn usage_by_card_sums_every_run_of_a_card() {
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    let entry = |node: i64, turns: u64, cost: Option<f64>| ra_usage::Entry {
+        model: "m".to_owned(),
+        role: None,
+        node: Some(node),
+        prompt_tokens: 1_000,
+        completion_tokens: 100,
+        cached_tokens: 0,
+        cost_usd: cost,
+        cost_computed: false,
+        turns,
+        read_in: 300,
+    };
+    // two runs on card 3, one on card 4 whose model reports no cost
+    for e in [entry(3, 6, Some(0.30)), entry(3, 4, Some(0.20)), entry(4, 5, None)] {
+        ledger.record(&e).await.unwrap();
+    }
+    // a worker without a ledger reads nothing; with one, the costliest card first
+    assert!(worker().by_card().await.is_none());
+    let cards = worker().with_ledger(ledger).by_card().await.unwrap();
+    assert_eq!(
+        cards.iter().map(|c| (c.node, c.totals.runs, c.totals.turns, c.totals.cost_usd, c.tokens_per_turn())).collect::<Vec<_>>(),
+        [(3, 2, 10, Some(0.5), 220), (4, 1, 5, None, 220)]
+    );
+}
+
+#[tokio::test]
 async fn adds_a_task_under_its_parent() {
     let store = store().await;
     let (out, _) = run("/add task Write the decoder parent 1", &store, &worker()).await.unwrap();
@@ -1137,6 +1165,38 @@ async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_depend
     }
 }
 
+/// A relaunch that starts nothing and names a pid, for the walks that move to a newer install.
+fn relaunched(_dir: &std::path::Path, _root: &std::path::Path) -> anyhow::Result<u32> {
+    Ok(4242)
+}
+
+#[tokio::test]
+async fn a_walk_moves_to_a_newer_installed_rc_after_its_card_and_goes_on_when_the_install_did_not_move() {
+    let install = tempfile::tempdir().unwrap();
+    let walk = |dir: &std::path::Path, script| {
+        Worker::new("z-ai/glm-5.3-flash").with_provider(script).with_install(Some(dir.to_path_buf())).with_relaunch(relaunched)
+    };
+    // the install is newer than this build: the walk ends after its first card, never inside it
+    std::fs::write(install.path().join(crate::hub::INSTALLED_FILE), "99.0.0 1\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = three_cards(dir.path(), true).await;
+    let out = crate::agent::run_all(&store, &walk(install.path(), Scripted::new(accepted_runs(&["did A"]))), false).await.unwrap();
+    assert_eq!(implemented(&out).len(), 1, "{out:?}");
+    assert_eq!(out.last().unwrap(), "moved to 99.0.0 · ran 1 card(s) · pid 4242");
+    let feed = std::fs::read_to_string(dir.path().join("var/pair.log")).unwrap();
+    assert!(feed.contains("walk moved to 99.0.0"), "{feed}");
+    // the lock went with the walk: the successor takes it
+    assert!(!crate::agent::walk_running(dir.path()));
+    // the install is this build: the walk runs every card
+    std::fs::write(install.path().join(crate::hub::INSTALLED_FILE), format!("{} 1\n", crate::VERSION)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = three_cards(dir.path(), true).await;
+    let script = Scripted::new(accepted_runs(&["did A", "did B", "did C"]));
+    let out = crate::agent::run_all(&store, &walk(install.path(), script), false).await.unwrap();
+    assert_eq!(implemented(&out).len(), 3, "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 3 card(s) · no card is ready");
+}
+
 #[tokio::test]
 async fn a_matching_gambit_pulls_a_later_card_ahead_in_the_walk_and_a_priority_ahead_of_that() {
     let dir = tempfile::tempdir().unwrap();
@@ -1391,9 +1451,14 @@ async fn run_all_in_a_tight_window_takes_the_smallest_ready_card_first_and_the_s
 async fn run_all_stops_at_a_card_that_needs_revision_when_told_to() {
     let dir = tempfile::tempdir().unwrap();
     let store = three_cards(dir.path(), false).await;
-    // the check always fails: the walk reruns #2 twice by itself, and the third failure waits
+    // the check always fails, each time another way (the same failure twice holds the card): the
+    // walk reruns #2 twice by itself, and the third failure waits
     let script = Scripted::new(vec![says("did A", vec![]), says("did A again", vec![]), says("did A once more", vec![])]);
-    let failing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((1, "the probe broke\n".to_owned())));
+    let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failing: ra_tools::Script = std::sync::Arc::new(move |_: &str| {
+        let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok((1, format!("the probe broke on run {run}\n")))
+    });
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(failing);
     let out = crate::agent::run_all(&store, &runner, true).await.unwrap();
     assert_eq!(out.last().unwrap(), "ran 3 card(s) · stopped: #2 needs revision");
@@ -1402,6 +1467,71 @@ async fn run_all_stops_at_a_card_that_needs_revision_when_told_to() {
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
     assert_eq!(store.read(3).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
     assert_eq!(script.seen.lock().len(), 3);
+}
+
+/// Three cards in progress in a project whose activity log holds the starts given, none ended.
+async fn orphaned_project(dir: &std::path::Path, activity: &str) -> Store {
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    for title in ["A", "B", "C"] {
+        run(&format!("/add task {title} parent 1"), &store, &worker()).await.unwrap();
+    }
+    for id in 2..=4 {
+        store.set_state(id, ra_roadmap::model::TaskState::InProgress).await.unwrap();
+    }
+    std::fs::create_dir_all(dir.join("var")).unwrap();
+    std::fs::write(dir.join(crate::ui::ACTIVITY_FILE), activity).unwrap();
+    store
+}
+
+/// The feed lines beginning `re-queued`, without their stamps.
+fn requeued_lines(dir: &std::path::Path) -> Vec<String> {
+    crate::pair::recent(dir, 50).into_iter().filter(|l| l.starts_with("re-queued")).collect()
+}
+
+#[tokio::test]
+async fn a_restart_requeues_the_orphaned_cards_once() {
+    use crate::logs::RUN_START;
+    use ra_roadmap::model::TaskState;
+    let dir = tempfile::tempdir().unwrap();
+    // #2 was started by two killed walks in a row: it is listed once
+    let activity =
+        format!("{RUN_START}#2 A · m · pid 11\n{RUN_START}#3 B · m · pid 12\n{RUN_START}#2 A · m · pid 13\n{RUN_START}#4 C · m · pid 14\n");
+    let store = orphaned_project(dir.path(), &activity).await;
+    store.set_session(2, Some(("s-2", "claude-code")), 1).await.unwrap();
+    let line = crate::agent::requeue_orphans_with(&store, dir.path(), |_| false).await;
+    assert_eq!(line.as_deref(), Some("re-queued 3 orphaned run(s): #2 #3 #4"));
+    for id in 2..=4 {
+        assert_eq!(store.read(id).await.unwrap().state, TaskState::Defined, "#{id}");
+    }
+    // the session stays, so the next run resumes it; the history says the run gave it back
+    assert_eq!(store.read(2).await.unwrap().session.as_deref(), Some("s-2"));
+    assert_eq!(store.history(Some(2)).unwrap().last().unwrap().by, ra_roadmap::history::Source::Run);
+    // once: the next restart finds nothing and says nothing, and the feed shows no live run
+    assert_eq!(crate::agent::requeue_orphans_with(&store, dir.path(), |_| false).await, None);
+    assert_eq!(requeued_lines(dir.path()), ["re-queued 3 orphaned run(s): #2 #3 #4"]);
+    assert_eq!(crate::pair::live_start(dir.path()), None);
+}
+
+#[tokio::test]
+async fn an_orphan_that_ended_is_left_alone() {
+    use crate::logs::{RUN_END, RUN_START};
+    use ra_roadmap::model::TaskState;
+    let dir = tempfile::tempdir().unwrap();
+    // #2 ended, #3 is gone but its card moved on, #4 is still running: nothing goes back, so
+    // no `re-queued` line lands and #4's start stays open on the feed
+    let activity = format!("{RUN_START}#2 A · m · pid 11\n{RUN_END}✓ $0.01\n{RUN_START}#3 B · m · pid 12\n{RUN_START}#4 C · m · pid 14\n");
+    let store = orphaned_project(dir.path(), &activity).await;
+    store.set_state(3, TaskState::Review).await.unwrap();
+    crate::pair::event(dir.path(), "start #4 C · m · pid 14");
+    assert_eq!(crate::agent::requeue_orphans_with(&store, dir.path(), |pid| pid == 14).await, None);
+    assert_eq!(store.read(2).await.unwrap().state, TaskState::InProgress);
+    assert_eq!(store.read(3).await.unwrap().state, TaskState::Review);
+    assert_eq!(store.read(4).await.unwrap().state, TaskState::InProgress);
+    assert!(requeued_lines(dir.path()).is_empty());
+    assert_eq!(crate::pair::live_start(dir.path()), Some(("#4 C · m · pid 14".to_owned(), Some(14))));
+    // #3's orphan was closed in the activity log: the next restart does not see it again, and a
+    // card left alone is named only beside the ones that went back
+    assert_eq!(crate::pair::orphaned(dir.path(), |pid| pid == 14), Vec::<i64>::new());
 }
 
 #[tokio::test]
@@ -2077,6 +2207,64 @@ async fn without_a_local_server_the_roles_make_no_call_and_the_rule_based_path_s
     assert!(out.iter().any(|l| l.contains("↯ Select-String")), "{out:?}");
     assert!(!crate::retro::recent(dir.path(), 1)[0].machine);
     assert!(crate::hub::own_digest(dir.path()).unwrap().last.unwrap().starts_with("✓ #2 Probe implemented"));
+}
+
+#[tokio::test]
+async fn a_role_without_a_local_server_makes_no_call() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let card = Scripted::new(vec![says(ROLE_REPORT, vec![]), says("accepted", vec![])]);
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    // no `[role]` table and no server: every role resolves to off, and the start line says so
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger);
+    assert_eq!(runner.roles(dir.path()).await.summary(), "roles: summary off · digest off · classify off");
+    run("/run 2", &store, &runner).await.unwrap();
+    // the card's model answered as the worker and the reviewer; no role fell to a Claude model,
+    // so the ledger has no claude row and no row tagged with a cheap role
+    assert_eq!(card.seen.lock().len(), 2);
+    assert_eq!(runner.tally().calls, 2);
+    let rows = runner.by_model().await.unwrap();
+    assert!(rows.iter().all(|(model, _)| !model.starts_with("claude-")), "{rows:?}");
+    let calls = runner.calls_of(Some(2)).await.unwrap();
+    let tags: Vec<(&str, Option<&str>)> = calls.iter().map(|c| (c.model.as_str(), c.role.as_deref())).collect();
+    assert!(tags.iter().all(|(_, role)| !matches!(role, Some("summary" | "digest" | "classify"))), "{tags:?}");
+}
+
+#[tokio::test]
+async fn a_role_named_in_the_table_goes_to_that_model() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    // the table names the summary's model and turns the other two off; nothing pings a server
+    std::fs::write(
+        dir.path().join(crate::router::ROUTES_FILE),
+        "[role]\nsummary = \"z-ai/glm-5.3-flash\"\ndigest = \"\"\nclassify = \"\"\n",
+    )
+    .unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // the named model is the card's own, so its provider takes the report, the summary, then
+    // the verdict
+    let card =
+        Scripted::new(vec![says(ROLE_REPORT, vec![]), says("wrote hello.txt; verified by cargo test", vec![]), says("accepted", vec![])]);
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger);
+    assert_eq!(runner.roles(dir.path()).await.summary(), "roles: summary z-ai/glm-5.3-flash · digest off · classify off");
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    {
+        let seen = card.seen.lock();
+        assert_eq!(seen.len(), 3, "{out:?}");
+        assert!(seen[1].tools.is_empty() && seen[1].workspace.is_none());
+        assert!(seen[1].messages[1].content.starts_with("wrote the greeting"), "{}", seen[1].messages[1].content);
+    }
+    assert_eq!(ra_context::TaskContext::open(dir.path(), 2).handoffs.last().unwrap().report, "wrote hello.txt; verified by cargo test");
+    // the role's row carries the role in its model column, as the reviewer's does
+    let calls = runner.calls_of(Some(2)).await.unwrap();
+    let mut tags: Vec<(&str, Option<&str>)> = calls.iter().map(|c| (c.model.as_str(), c.role.as_deref())).collect();
+    tags.sort_unstable();
+    assert_eq!(tags, [("z-ai/glm-5.3-flash", None), ("z-ai/glm-5.3-flash", Some("reviewer")), ("z-ai/glm-5.3-flash", Some("summary"))]);
+    assert!(runner.by_model().await.unwrap().iter().all(|(model, _)| !model.starts_with("claude-")));
 }
 
 #[tokio::test]

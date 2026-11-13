@@ -215,6 +215,9 @@ fn detail_lines(node: &Node, level: usize) -> Vec<String> {
     if let Some(priority) = node.priority {
         lines.push(format!("{indent}priority: {priority}"));
     }
+    if node.absolute {
+        lines.push(format!("{indent}absolute: true"));
+    }
     lines
 }
 
@@ -301,6 +304,7 @@ pub fn parse_file(text: &str) -> anyhow::Result<Roadmap> {
             "effort" => node.effort = value.parse().with_context(|| format!("line {number}"))?,
             "estimate" => node.estimate = Some(value.parse().with_context(|| format!("line {number}"))?),
             "priority" => node.priority = Some(weight_of(&value, "priority").with_context(|| format!("line {number}"))?),
+            "absolute" => node.absolute = matches!(value.trim(), "true" | "yes"),
             "waits-on" => {
                 node.depends_on = value
                     .split_whitespace()
@@ -399,6 +403,7 @@ fn node_of_line(rest: &str) -> anyhow::Result<Node> {
         notes: None,
         assessed: None,
         priority: None,
+        absolute: false,
         evidence: None,
         saving: None,
     })

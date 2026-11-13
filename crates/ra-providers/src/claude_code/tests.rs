@@ -118,6 +118,21 @@ fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
 }
 
 #[test]
+fn a_workers_system_prompt_carries_the_allowed_shapes_and_a_chats_does_not() {
+    let provider = ClaudeCode::new().with_allowed(["Bash(ninja *)".to_owned()]);
+    let system = provider.system_of(&request(Some(PathBuf::from("."))));
+    assert!(system.starts_with("You answer in one word.\n\nAllowed shell shapes"), "{system}");
+    assert!(system.contains(&ra_gotchas::shape::block()), "{system}");
+    assert!(system.contains("the project's own commands run too: ninja"), "{system}");
+    // the allowlist is the same table's
+    assert_eq!(provider.new_allowed()[..ra_gotchas::shape::rules().len()], ra_gotchas::shape::rules()[..]);
+    let mut reader = request(Some(PathBuf::from(".")));
+    reader.read_only = true;
+    assert_eq!(provider.system_of(&reader), "You answer in one word.");
+    assert_eq!(provider.system_of(&request(None)), "You answer in one word.");
+}
+
+#[test]
 fn a_known_session_is_resumed() {
     let mut worker = request(Some(PathBuf::from(".")));
     worker.resume = Some("3f2a9c1e".to_owned());
@@ -245,8 +260,25 @@ fn the_stream_tallies_the_read_in_through_the_first_edit_and_the_files_read_whol
         }
     }
     assert_eq!((tally.read_in(), tally.whole_reads()), (1203 + 2005, 2));
-    let answer = tally.completion();
+    let answer = tally.completion("claude-opus-5-5");
     assert_eq!((answer.read_in, answer.whole_reads, answer.turns), (3208, 2, 3));
+}
+
+#[test]
+fn a_capped_completion_with_most_of_its_input_cached_is_priced_at_the_cache_rate() {
+    // one turn of a million in, 90% read from the cache, on sonnet: $3/M fresh, $0.30/M cached
+    let mut tally = TurnTally::default();
+    tally.note(r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":100000,"cache_read_input_tokens":900000,"output_tokens":0},"content":[]}}"#);
+    let answer = tally.completion("sonnet");
+    let cost = answer.usage.cost_usd.expect("priced");
+    assert!((cost - (0.3 + 0.27)).abs() < 1e-9, "{cost}, not the $3.00 of every token at the input rate");
+    assert!(answer.usage.cost_computed);
+    assert_eq!(answer.usage.cached_tokens * 10, answer.usage.prompt_tokens * 9);
+    // a model the table does not know keeps no cost rather than a wrong one
+    let mut tally = TurnTally::default();
+    tally.note(r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":1},"content":[]}}"#);
+    let answer = tally.completion("z-ai/glm-5.3-flash");
+    assert_eq!((answer.usage.cost_usd, answer.usage.cost_computed), (None, false));
 }
 
 #[test]
@@ -281,13 +313,17 @@ fn a_turn_past_the_context_cap_stops_the_run_once_its_tool_results_are_in() {
     }
     let reading_in = 1 + 2 * READING_IN_TURNS;
     assert_eq!((stopped, read), (Some(130_005), reading_in + 3), "the run stops at the tool result of the crossing turn");
-    let answer = tally.completion();
+    let answer = tally.completion("claude-opus-5-5");
     let turns = READING_IN_TURNS as u64;
     assert_eq!(answer.turns, turns + 1);
     assert_eq!(answer.usage.prompt_tokens, turns * 90_003 + 130_005);
     assert_eq!(answer.usage.completion_tokens, turns * 40 + 90);
     assert_eq!(answer.usage.cached_tokens, turns * 90_000 + 120_000);
-    assert_eq!(answer.usage.cost_usd, None);
+    // the capped run has a cost of its own, computed: 41 fresh tokens at $5/M, 1.2M cache
+    // reads at $0.50/M, 10k cache writes at $6.25/M, 570 out at $25/M
+    let cost = answer.usage.cost_usd.expect("a capped run is priced from its turns");
+    assert!((cost - 0.676_955).abs() < 1e-9, "{cost}");
+    assert!(answer.usage.cost_computed);
     assert_eq!(answer.text, "editing");
     assert_eq!(answer.turn_usage.len(), READING_IN_TURNS + 1);
     // without a cap nothing stops, and under it neither; and a crossing within the reading-in
@@ -304,6 +340,20 @@ fn a_turn_past_the_context_cap_stops_the_run_once_its_tool_results_are_in() {
             assert_eq!(early.note(line, &tally), None, "line {i} is within the reading-in turns");
         }
     }
+    // a resumed session gets two turns, not twelve: one already past the cap hands off after
+    // its verdict instead of paying a fresh read-in's grace at twice the cap
+    let mut tally = TurnTally::default();
+    let mut resumed = ContextWatch::new(Some(80_000)).resumed(true);
+    let mut stopped_at = None;
+    for (i, line) in stream.iter().enumerate() {
+        tally.note(line);
+        if resumed.note(line, &tally).is_some() {
+            stopped_at = Some(i);
+            break;
+        }
+    }
+    let stopped_at = stopped_at.expect("a resumed run past the cap stops");
+    assert!(stopped_at < reading_in, "it stopped at line {stopped_at}, within what a fresh run's grace would have allowed");
 }
 
 #[test]

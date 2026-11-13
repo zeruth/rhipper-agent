@@ -136,6 +136,11 @@ pub struct Worker {
     /// verdict or the lint's warnings, leading the task instead of the card being taken up
     /// afresh.
     fix: Option<String>,
+    /// The install directory a walk watches between cards, moving to a newer `rc` found there;
+    /// `None`, the default and the tests', watches none.
+    install: Option<PathBuf>,
+    /// What starts the walk again on the installed `rc`; the tests hand in one that starts nothing.
+    relaunch: fn(&Path, &Path) -> anyhow::Result<u32>,
 }
 
 impl Worker {
@@ -161,7 +166,23 @@ impl Worker {
             workspace: None,
             branch: None,
             fix: None,
+            install: None,
+            relaunch,
         }
+    }
+
+    /// The same worker, its walks moving to a newer `rc` installed in `dir` between cards.
+    #[must_use]
+    pub fn with_install(mut self, dir: Option<PathBuf>) -> Self {
+        self.install = dir;
+        self
+    }
+
+    /// The same worker, its walks started again on a newer install by `relaunch`.
+    #[must_use]
+    pub fn with_relaunch(mut self, relaunch: fn(&Path, &Path) -> anyhow::Result<u32>) -> Self {
+        self.relaunch = relaunch;
+        self
     }
 
     /// The same worker, acting in the worktree at `path` on `branch` instead of the project
@@ -372,6 +393,19 @@ impl Worker {
         }
     }
 
+    /// The ledger's cards, the costliest first, each summed over every run on it; `None`
+    /// without a ledger, or when it cannot be read.
+    pub async fn by_card(&self) -> Option<Vec<ra_usage::CardCost>> {
+        let ledger = self.ledger.as_ref()?;
+        match ledger.by_card().await {
+            Ok(cards) => Some(cards),
+            Err(e) => {
+                tracing::warn!("cannot read the usage ledger: {e:#}");
+                None
+            }
+        }
+    }
+
     /// The ledger's calls of one node, the latest first (`None` for the calls that served none);
     /// `None` as a whole without a ledger, or when it cannot be read.
     pub async fn calls_of(&self, node: Option<i64>) -> Option<Vec<ra_usage::Call>> {
@@ -529,7 +563,7 @@ pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
             answer.usage.prompt_tokens,
             answer.usage.completion_tokens,
             answer.usage.cached_tokens,
-            cost_text(answer.usage.cost_usd)
+            cost_text(&answer.usage)
         ),
     ])
 }
@@ -879,27 +913,53 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     // the cheap roles of this run, resolved once: the local server is pinged here, not per role
     let roles = worker.roles(&root).await;
     let mut outcome = run_task(store, node, worker, &roles).await;
-    // a lint-only failure never reaches the reviewer, so its fix pass starts here: the warnings
-    // are the task, the pass lints again, and a clean one goes on to the reviewer
-    if let Ok((lines, _, _)) = &mut outcome
-        && store.read(id).await.is_ok_and(|n| n.state == TaskState::NeedsRevision)
-    {
-        lint_fix(store, id, worker, &roles, lines).await;
-    }
-    // the reviewer judges a run that passed its checks before the card is offered: implemented
-    // means review-ready, and a card is review-ready only with a verdict attached
-    if let Ok((lines, _, _)) = &mut outcome
-        && store.read(id).await.is_ok_and(|n| n.state == TaskState::Implemented)
-    {
-        lines.extend(review_after_run(store, id, worker).await);
+    // an absolute card is one run until it is done: a failed check or a rejection sends it
+    // straight back to work on its session, the verdict as the prompt, inside this run, not
+    // back to the walk's queue for a restart (the person: needs revision "passed around with
+    // an absolute card restarting, they shouldn't do that"). A pass that changed no file in
+    // three in a row is a card going round stuck; it ends the run and the walk blocks it
+    let mut idle = 0;
+    let mut passes = 0;
+    loop {
+        // a lint-only failure never reaches the reviewer, so its fix pass starts here: the
+        // warnings are the task, the pass lints again, and a clean one goes on to the reviewer
+        if let Ok((lines, _, _)) = &mut outcome
+            && store.read(id).await.is_ok_and(|n| n.state == TaskState::NeedsRevision)
+        {
+            lint_fix(store, id, worker, &roles, lines).await;
+        }
+        // the reviewer judges a run that passed its checks before the card is offered:
+        // implemented means review-ready, and a card is review-ready only with a verdict attached
+        if let Ok((lines, _, _)) = &mut outcome
+            && store.read(id).await.is_ok_and(|n| n.state == TaskState::Implemented)
+        {
+            lines.extend(review_after_run(store, id, worker).await);
+        }
+        let Ok(node) = store.read(id).await else { break };
+        if outcome.is_err() || !node.is_absolute() || node.state != TaskState::NeedsRevision {
+            break;
+        }
+        let moved = ra_context::TaskContext::open(&root, id).handoffs.last().is_some_and(|h| !h.changed.is_empty());
+        idle = if moved { 0 } else { idle + 1 };
+        if idle >= RERUNS_A_WALK {
+            break;
+        }
+        passes += 1;
+        tracing::info!(target: crate::trace::PROGRESS, "  absolute: pass {} goes on, the verdict as its prompt", passes + 1);
+        let previous = outcome.as_ref().map(|(lines, _, _)| lines.clone()).unwrap_or_default();
+        outcome = run_task(store, node, worker, &roles).await.map(|(lines, usage, gotchas)| {
+            let mut all = previous;
+            all.extend(lines);
+            (all, usage, gotchas)
+        });
     }
     match &outcome {
-        Ok((lines, cost, 0)) => {
-            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, cost_text(*cost));
+        Ok((lines, usage, 0)) => {
+            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {}", crate::logs::RUN_END, end_cost(usage));
             crate::pair::event(&root, &format!("end {}", lines.first().map_or("", String::as_str)));
         }
-        Ok((lines, cost, gotchas)) => {
-            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {} · {gotchas} gotchas", crate::logs::RUN_END, cost_text(*cost));
+        Ok((lines, usage, gotchas)) => {
+            tracing::info!(target: crate::trace::PROGRESS, "{}✓ {} · {gotchas} gotchas", crate::logs::RUN_END, end_cost(usage));
             crate::pair::event(&root, &format!("end {} · {gotchas} gotcha(s)", lines.first().map_or("", String::as_str)));
         }
         Err(e) => {
@@ -1046,7 +1106,11 @@ async fn lint_fix(store: &Store, id: i64, worker: &Worker, roles: &Roles, lines:
 /// A bad id or a project, an unreadable `rhipper.toml`, no provider for the model, or a failed
 /// call; the card goes back to the state it had.
 pub async fn review(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
-    review_to(store, id, worker, TaskState::Accepted).await
+    // under the card's span, so its lines carry the card: untagged, the window took a review
+    // from the command line for a run of its own and kept a "worker" card open for it (runelite
+    // and asm, 2026-11-12); a tagged line of a card with no live run is dropped there
+    let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id);
+    review_to(store, id, worker, TaskState::Accepted).instrument(span).await
 }
 
 /// The reviewer on a card a run just left implemented, before it is offered for acceptance:
@@ -1217,7 +1281,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
         short(&model),
         answer.usage.prompt_tokens,
         answer.usage.completion_tokens,
-        cost_text(answer.usage.cost_usd)
+        cost_text(&answer.usage)
     )];
     if let Verdict::NeedsRevision(points) = &verdict {
         lines.extend(points.iter().map(|point| format!("  - {point}")));
@@ -1341,7 +1405,7 @@ impl Plan {
             short(&self.model),
             self.usage.prompt_tokens,
             self.usage.completion_tokens,
-            cost_text(self.usage.cost_usd)
+            cost_text(&self.usage)
         )];
         lines.extend(self.outline.preview().into_iter().map(|line| format!("  {line}")));
         lines
@@ -1515,6 +1579,29 @@ fn clock(when: u64) -> String {
     format!("{:02}:{:02}Z", day / 3600, day / 60 % 60)
 }
 
+/// Takes the hub's lock on landing in `root`'s checkout, waiting while another process lands
+/// there; the wait is said once. `None` when the lock cannot be opened: the landing goes
+/// unguarded, as before the lock.
+async fn guard_landing(root: &Path) -> Option<crate::hub::Guard> {
+    let name = format!("land-{}", crate::hub::project_name(&crate::hub::project_root_of(root)).to_ascii_lowercase());
+    let mut said = false;
+    loop {
+        match crate::hub::try_guard(&name) {
+            Ok(Some(guard)) => return Some(guard),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("the landing runs without its lock: {e:#}");
+                return None;
+            }
+        }
+        if !said {
+            said = true;
+            tracing::info!(target: crate::trace::PROGRESS, "  wait: another landing is merging into the project");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// Takes the hub's lock on the cargo target of `root` for the check, waiting on a check of
 /// another project that builds in the same target; the wait is said once, on the progress
 /// channel and the paired feed. `None` when the lock cannot be opened: the check goes unguarded.
@@ -1567,7 +1654,11 @@ async fn hold_build(root: &Path) -> Option<crate::hub::Guard> {
         }
         if !said {
             said = true;
-            let text = format!("wait: the check waits for a build slot, {} builds of the project are running", crate::hub::BUILD_SLOTS);
+            let text = format!(
+                "wait: the check waits for a worker slot, {} of the machine's {} are running",
+                crate::hub::builds_running(),
+                crate::hub::build_slot_count()
+            );
             tracing::info!(target: crate::trace::PROGRESS, "  {text}");
             crate::pair::event(root, &text);
         }
@@ -1637,17 +1728,21 @@ pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
             Ok(Some(guard)) => break Some(guard),
             Ok(None) => {}
             Err(e) => {
-                eprintln!("rc hold: the command runs without a build slot: {e:#}");
+                eprintln!("rc hold: the command runs without a worker slot: {e:#}");
                 break None;
             }
         }
         if started.elapsed() >= HOLD_WAIT {
-            eprintln!("rc hold: no build slot came free in {} minutes; the command runs without one", HOLD_WAIT.as_secs() / 60);
+            eprintln!("rc hold: no worker slot came free in {} minutes; the command runs without one", HOLD_WAIT.as_secs() / 60);
             break None;
         }
         if !said {
             said = true;
-            eprintln!("rc hold: waiting for a build slot, {} builds of the project are running", crate::hub::BUILD_SLOTS);
+            eprintln!(
+                "rc hold: waiting for a worker slot, {} of the machine's {} are running",
+                crate::hub::builds_running(),
+                crate::hub::build_slot_count()
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     };
@@ -1667,13 +1762,35 @@ pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
             p
         }
     };
-    match process.current_dir(dir).status() {
-        Ok(status) => status.code().unwrap_or(1),
+    let mut child = match process.current_dir(dir).spawn() {
+        Ok(child) => child,
         Err(e) => {
             eprintln!("rc hold: cannot start {shell}: {e}");
-            127
+            return 127;
         }
-    }
+    };
+    // the build runs on its share of the builders' CPU, following the number of builds
+    share_cpu_among_builds();
+    #[cfg(windows)]
+    let _share = {
+        use std::os::windows::io::AsRawHandle;
+        ra_tools::cpu::attach(child.as_raw_handle())
+    };
+    child.wait().map_or(1, |status| status.code().unwrap_or(1))
+}
+
+/// The share of the processor every build on the machine runs at together: one build may use
+/// it all, `n` builds a `1/n` part each. The person's rule of 2026-11-12: "1 builder 90%, 3 at
+/// 30% each".
+pub const BUILD_CPU: u32 = 9000;
+
+/// Sets this process's builds to run on their share of [`BUILD_CPU`]: the whole budget split
+/// evenly among the builds holding a slot right now, read again as they come and go.
+pub fn share_cpu_among_builds() {
+    ra_tools::cpu::set_rate(Box::new(|| {
+        let running = u32::try_from(crate::hub::builds_running()).unwrap_or(1).max(1);
+        BUILD_CPU / running
+    }));
 }
 
 /// The share of the plan's five-hour window one run of a card is taken to use: the margin a run
@@ -1830,6 +1947,48 @@ pub async fn run_next(store: &Store, worker: &Worker) -> anyhow::Result<Vec<Stri
     }
 }
 
+/// The cards a restart orphaned, back on the queue: every run in the activity log that started,
+/// never ended and whose process is gone ([`crate::pair::orphaned`]) has its card set from
+/// `in_progress` back to `defined` under [`Source::Run`], its session kept, so the next run
+/// resumes it as a rerun would; a card already past `in_progress` is left as it is. One feed
+/// line names them all, `re-queued 3 orphaned run(s): #179 #181 #184`, and is the line
+/// returned; none when no card went back. Before this the history showed the person
+/// resetting four or five cards by hand after each walk restart (2026-11-12).
+pub async fn requeue_orphans(store: &Store, root: &Path) -> Option<String> {
+    requeue_orphans_with(store, root, crate::hub::pid_alive).await
+}
+
+/// [`requeue_orphans`] with the liveness check given, for the tests.
+pub async fn requeue_orphans_with(store: &Store, root: &Path, alive: impl Fn(u32) -> bool) -> Option<String> {
+    let orphaned = crate::pair::orphaned(root, alive);
+    if orphaned.is_empty() {
+        return None;
+    }
+    let mut requeued = Vec::new();
+    let mut left = Vec::new();
+    for id in orphaned {
+        match store.read(id).await {
+            Ok(node) if node.state == TaskState::InProgress => match store.set_state_by(id, TaskState::Defined, Source::Run).await {
+                Ok(()) => requeued.push(format!("#{id}")),
+                Err(e) => left.push(format!("#{id} (not written: {e:#})")),
+            },
+            Ok(node) => left.push(format!("#{id} ({})", node.state)),
+            Err(_) => left.push(format!("#{id} (no such card)")),
+        }
+    }
+    // no line when nothing went back: `live_start` closes an open start on a `re-queued` line,
+    // and a window coming up beside a live run of another process must not read it idle
+    if requeued.is_empty() {
+        return None;
+    }
+    let mut text = format!("re-queued {} orphaned run(s): {}", requeued.len(), requeued.join(" "));
+    if !left.is_empty() {
+        let _ = write!(text, " · left as they are: {}", left.join(" "));
+    }
+    crate::pair::event(root, &text);
+    Some(text)
+}
+
 /// Runs the ready cards one after another, reading readiness again after each, until none is
 /// ready or a run fails. A card a run left needing revision is rerun by the walk on its session,
 /// after a failed check twice and after a rejection once ([`CHECK_RETRIES`], [`REVIEW_RETRIES`]);
@@ -1843,6 +2002,7 @@ pub async fn run_next(store: &Store, worker: &Worker) -> anyhow::Result<Vec<Stri
 /// # Errors
 /// When the roadmap cannot be read between runs.
 pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
+    share_cpu_among_builds();
     let mut lines = Vec::new();
     let mut ran = 0;
     // the card the last run continued and how many runs in a row it has had: a card the
@@ -1854,14 +2014,27 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     // the card the walk takes up again by itself, and per card the check failures and the
     // rejections this walk has seen: a person re-queued those by hand before (#103, #47, #134)
     let mut retry: Option<i64> = None;
+    // the cards past their reruns in this walk
+    let mut parked: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut sent: std::collections::HashMap<i64, (usize, usize)> = std::collections::HashMap::new();
-    // one walk per project: the lock is held for the whole of it
-    let Some(_lock) = take_walk_lock(&workspace_of(store)) else {
+    // one walk per project: the lock is held for the whole of it, and a walk moving to a newer
+    // install hands it to its successor as it exits
+    let lock = match take_walk_lock(&workspace_of(store)) {
+        Some(lock) => Some(lock),
+        None => handed_walk_lock(&workspace_of(store)).await,
+    };
+    let Some(_lock) = lock else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
     };
+    // what the install said at the start: a change since is a newer rc to move to
+    let seen = worker.install.as_deref().and_then(crate::hub::installed);
+    // set when the move failed: the walk finishes on its own rc rather than try at every card
+    let mut stays = false;
     // the other projects see the walk from its start
     let root = workspace_of(store);
     write_digest(store, &root, Some(format!("walk · pid {} · started {}", std::process::id(), clock(unix_now()))), None, None).await;
+    // the cards a killed walk left in progress go back on the queue before this one reads it
+    lines.extend(requeue_orphans(store, &root).await);
     // the planned cards done a day ago are read back first: the day since them against the
     // day before, so the plan's claims are judged before the walk spends the next day
     lines.extend(crate::commands::plan::read_back(store, &root, worker).await);
@@ -1879,7 +2052,11 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         // a rerun the walk queued goes first, while the card still waits on it: a person who
         // took the card meanwhile has the say
         let retried = retry.take().filter(|id| roadmap.nodes.iter().any(|n| n.id == *id && n.state == TaskState::NeedsRevision));
-        let Some(id) = retried.or_else(|| batch_ready(&roadmap.nodes, &roadmap.gambits, tight).map(|n| n.id)) else {
+        // a card past its reruns in this walk waits for the next walk: the queue counts a card
+        // sent back as ready, and without this the one-at-a-time walk took the same card again
+        let Some(id) = retried
+            .or_else(|| ready_cards(&roadmap.nodes, &roadmap.gambits, tight).into_iter().find(|n| !parked.contains(&n.id)).map(|n| n.id))
+        else {
             // a `plan-next` gambit lets the planner fill the next empty milestone; its cards
             // are the next picks
             if !planned && crate::commands::run::plans_next(&roadmap.gambits) {
@@ -1908,7 +2085,9 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             _ => 1,
         };
         again = Some((id, runs));
-        if runs > RESTARTS {
+        // an absolute card is continued as often as it takes: only a full stop ends it
+        let absolute = store.read(id).await.is_ok_and(|n| n.is_absolute());
+        if runs > RESTARTS && !absolute {
             done(
                 &mut lines,
                 format!("ran {ran} card(s) · stopped: #{id} continued {RESTARTS} times in a row; raise [worker] turns or split the card"),
@@ -1951,11 +2130,17 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
                 *checks += 1;
                 (*checks, CHECK_RETRIES, format!("its check failed {} time(s)", *checks))
             };
-            let rerun = (count <= allowed).then_some((count, allowed));
+            // an absolute card goes back to work however often it is sent back, while its runs
+            // change files: one that changed nothing is stuck, and the counts hold it again
+            let moved = ra_context::TaskContext::open(&root, id).handoffs.last().is_some_and(|h| !h.changed.is_empty());
+            let rerun = (count <= allowed || (node.is_absolute() && moved)).then_some((count, allowed.max(count)));
             lines.push(crate::pair::sent_back(&root, id, &node.title, &why, rerun));
             if rerun.is_some() {
                 retry = Some(id);
-            } else if stop_on_revision {
+            } else {
+                parked.insert(id);
+            }
+            if rerun.is_none() && stop_on_revision {
                 done(&mut lines, format!("ran {ran} card(s) · stopped: #{id} needs revision")).await;
                 return Ok(lines);
             }
@@ -1966,6 +2151,27 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             let _ = std::fs::remove_file(&stop);
             done(&mut lines, format!("ran {ran} card(s) · stopped after #{id}, as asked")).await;
             return Ok(lines);
+        }
+        // a newer rc installed: it takes the walk up from the next card, so `rc install` is
+        // enough and no run in flight is cut; a card being rerun keeps the walk that counts its
+        // retries
+        if !stays
+            && retry.is_none()
+            && let Some(dir) = &worker.install
+            && let Some(version) = crate::hub::moved_to(crate::VERSION, seen.as_deref(), crate::hub::installed(dir).as_deref())
+        {
+            match (worker.relaunch)(dir, &root) {
+                Ok(pid) => {
+                    done(&mut lines, format!("moved to {version} · ran {ran} card(s) · pid {pid}")).await;
+                    return Ok(lines);
+                }
+                Err(error) => {
+                    // the walk stays on its own rc; the line says why, and it does not try again
+                    lines.push(format!("the walk stays on {}: {error:#}", crate::VERSION));
+                    crate::pair::event(&root, &format!("walk stays on {}: {error:#}", crate::VERSION));
+                    stays = true;
+                }
+            }
         }
     }
 }
@@ -2092,6 +2298,49 @@ pub fn spawn_walk(root: &Path, debug: bool, parallel: Option<u32>) -> anyhow::Re
 /// The file a detached walk writes its stderr to: what it printed and why it died.
 const WALK_LOG: &str = "var/walk.log";
 
+/// The variable a walk moving to a newer install leaves its successor: its own pid, whose walk
+/// lock the successor waits for.
+const WALK_FROM_VAR: &str = "RHIPPER_WALK_FROM";
+
+/// How long a successor waits for the walk it takes over to let the lock go.
+const HANDOVER: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The walk lock of the walk this process takes over, when it was started by one moving to a
+/// newer install: taken as that walk exits, so the project has one walk lock throughout.
+async fn handed_walk_lock(root: &Path) -> Option<WalkLock> {
+    let from = std::env::var(WALK_FROM_VAR).ok()?.parse::<u32>().ok()?;
+    let start = std::time::Instant::now();
+    while start.elapsed() < HANDOVER {
+        if let Some(lock) = take_walk_lock(root) {
+            return Some(lock);
+        }
+        if !crate::hub::pid_alive(from) {
+            // gone and the lock still held: another walk has it
+            return take_walk_lock(root);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    None
+}
+
+/// Starts this walk again on the `rc` installed in `dir`, in `root`, with this process's
+/// arguments, detached as [`spawn_walk`] starts one; the new walk takes the lock as this one
+/// exits. Returns the process id.
+///
+/// # Errors
+/// When the installed `rc` cannot start.
+pub fn relaunch(dir: &Path, root: &Path) -> anyhow::Result<u32> {
+    let rc = dir.join(format!("rc{}", std::env::consts::EXE_SUFFIX));
+    let mut command = std::process::Command::new(&rc);
+    command.args(std::env::args_os().skip(1)).current_dir(root).env(WALK_FROM_VAR, std::process::id().to_string());
+    crate::hub::detach(&mut command);
+    if let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(root.join(WALK_LOG)) {
+        command.stderr(log);
+    }
+    let child = command.spawn().map_err(|e| anyhow::anyhow!("cannot start {}: {e}", rc.display()))?;
+    Ok(child.id())
+}
+
 /// Asks the walk to stop after the task it is in: leaves the file it reads between runs. A
 /// walk that is not running finds the file at its next start and stops after one card, so the
 /// line says what to do about that.
@@ -2105,8 +2354,8 @@ pub fn stop_walk(root: &Path) -> String {
 }
 
 /// The order a walk would take the cards in, as `rc run --all` picks them one after another,
-/// each pick counted as implemented for the next: the projected order of the work, for the
-/// window's walk view. With `tight` the picks are the smallest ready card first, as a walk picks
+/// each pick counted as landed (accepted) for the next: the projected order of the work, for
+/// the window's walk view. With `tight` the picks are the smallest ready card first, as a walk picks
 /// when the plan's window is tight ([`plan_tight`]). Nothing is written.
 #[must_use]
 pub fn walk_order(nodes: &[Node], gambits: &[Gambit], tight: bool) -> Vec<i64> {
@@ -2115,17 +2364,18 @@ pub fn walk_order(nodes: &[Node], gambits: &[Gambit], tight: bool) -> Vec<i64> {
     while let Some(id) = batch_ready(&nodes, gambits, tight).map(|n| n.id) {
         order.push(id);
         if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
-            node.state = TaskState::Implemented;
+            node.state = TaskState::Accepted;
         }
     }
     order
 }
 
-/// The first card a batch runs: a defined task whose waits-on are each accepted or implemented,
-/// scored as `rc next` scores ([`tree::rank`]): priority, then the gambits, then tree order.
-/// Implemented counts beside accepted here, unlike in [`tree::next_ready`]: the cards the batch
-/// implements are not accepted until the person reviews, and their dependents are what the batch
-/// is meant to run ahead of that review. A card whose waits-on failed, left the roadmap or are
+/// The first card a batch runs: a defined task whose waits-on are each accepted, scored as
+/// `rc next` scores ([`tree::rank`]): priority, then the gambits, then tree order. Implemented
+/// does not count: the walk reviews and lands its own cards, so a card still implemented is
+/// either before its review or one whose landing failed, and in neither case is its code on the
+/// project's branch for a dependent to build on (runelite #140 started on #80's implemented,
+/// and #80 was sent back seconds later, 2026-11-12). A card whose waits-on failed, left the roadmap or are
 /// still open is not picked, so every pick moves a card out of defined and the loop ends; a
 /// card still in progress is picked too, since a walk holds the project and such a card is one
 /// a run left to continue, as the project's turn cap does. With `tight` the pick is the ready
@@ -2138,9 +2388,12 @@ fn batch_ready<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Opt
 /// Every card a batch may run, in the order [`batch_ready`] would pick them: by score, or by
 /// complexity with `tight`, the smallest first.
 fn ready_cards<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Vec<&'a Node> {
-    let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && matches!(d.state, TaskState::Accepted | TaskState::Implemented));
+    let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && d.state == TaskState::Accepted);
+    // a card sent back for revision is ready again at once: its verdict is in its notes and the
+    // rerun resumes its session; only what it waits on holds it (the person, 2026-11-12: "all
+    // needs revision cards should go right back into queue unless depends on changes")
     let candidates = nodes.iter().filter(|n| {
-        matches!(n.state, TaskState::Defined | TaskState::InProgress)
+        matches!(n.state, TaskState::Defined | TaskState::InProgress | TaskState::NeedsRevision)
             && matches!(n.kind, NodeKind::Task | NodeKind::Subtask)
             && n.depends_on.iter().all(met)
     });
@@ -2388,6 +2641,10 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
         node.state
     );
     let root = workspace_of(store);
+    // one landing at a time in the project's checkout across processes: `rc land` from a shell
+    // and a walk's own landings merge into the same tree, and the walk's lock is its own
+    // process's alone (a hand merge was clobbered by a walk's landing, asm, 2026-11-12)
+    let _landing = guard_landing(&root).await;
     let branch = worktree_branch(id);
     let path = root.join(WORKTREES_DIR).join(id.to_string());
     let mut lines = Vec::new();
@@ -2403,6 +2660,19 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
         }
     }
     let has_branch = git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).await.is_ok();
+    // the roadmap is the walk's, written in the project's tree with every state change and
+    // never committed there; a card branch that carries a copy of it (a catch-up merge brings
+    // one) cannot merge over those edits, and git refuses the whole landing (asm #139). The
+    // branch takes the project's committed roadmap back before the merge
+    if has_branch && path.join(".git").exists() {
+        let roadmap = crate::setup::ROADMAP_FILE;
+        let main = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_else(|_| String::from("HEAD"));
+        if git(&root, &["diff", "--quiet", &main, &branch, "--", roadmap]).await.is_err() {
+            git(&path, &["checkout", &main, "--", roadmap]).await?;
+            git(&path, &["commit", "-q", "-m", &format!("Leave the roadmap to the project before landing (#{id})"), "--", roadmap]).await?;
+            lines.push("the branch's copy of the roadmap gave way to the project's".to_owned());
+        }
+    }
     if !has_branch && !path.join(".git").exists() {
         // a run in the project's own tree: its work is in the tree, uncommitted; the files
         // its handoff names are committed by name, the other cards' dirty files left alone
@@ -2437,12 +2707,25 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
             if let Err(e) = git(&root, &["merge", "--no-ff", "-m", &message, &branch]).await {
                 let conflicts = git(&root, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
                 let _ = git(&root, &["merge", "--abort"]).await;
-                anyhow::bail!(
-                    "the merge of {branch} conflicts in {}; the merge was aborted, land #{id} by hand ({e:#})",
-                    if conflicts.is_empty() { "files git did not name".to_owned() } else { conflicts.replace('\n', ", ") }
-                );
+                tracing::debug!("the merge of {branch} failed: {e:#}");
+                return Err(anyhow::Error::new(LandConflict {
+                    branch,
+                    files: if conflicts.is_empty() { "files git did not name".to_owned() } else { conflicts.replace('\n', ", ") },
+                }));
             }
             lines.push(format!("merged {branch} into {}", git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()));
+            // a Rust tree is formatted as it lands, into the merge commit: a build on push
+            // that checks the format stays green without a worker ever running rustfmt
+            if root.join("Cargo.toml").is_file() {
+                let formatted = tokio::process::Command::new("cargo").args(["fmt", "--all"]).current_dir(&root).output().await;
+                if formatted.is_ok_and(|o| o.status.success())
+                    && git(&root, &["status", "--porcelain", "--untracked-files=no"]).await.is_ok_and(|s| !s.trim().is_empty())
+                {
+                    git(&root, &["add", "-u"]).await?;
+                    git(&root, &["commit", "-q", "--amend", "--no-edit"]).await?;
+                    lines.push("formatted the merged tree".to_owned());
+                }
+            }
             // the project's check on the merged tree: two cards right on their own are not
             // always right together (#176 and #181 compiled apart and not merged)
             let Checks { commands, timeout, .. } = checks_of(&root, &node);
@@ -2472,11 +2755,42 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
     Ok(lines)
 }
 
+/// The runs in a row a parallel walk gives a card that each end sent back for revision before
+/// it parks the card until the next walk.
+const RERUNS_A_WALK: u32 = 3;
+
+/// A landing whose merge into the project's branch conflicted; the merge was aborted.
+#[derive(Debug)]
+pub struct LandConflict {
+    branch: String,
+    files: String,
+}
+
+impl std::fmt::Display for LandConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the merge of {} conflicts in {}; the merge was aborted", self.branch, self.files)
+    }
+}
+
+impl std::error::Error for LandConflict {}
+
 /// [`land`] for a walk: the lines it answers, or the one line of why it did not, on the feed
 /// too; never an error, since a card the person must land by hand is not the walk's end.
 async fn land_or_say(store: &Store, id: i64, worker: &Worker) -> Vec<String> {
     match land(store, id, worker).await {
         Ok(lines) => lines,
+        // the project moved on under the card: it goes back to its worker, whose rerun merges
+        // the project's branch into the card's first and resolves the conflicts the brief names,
+        // rather than waiting on a person (asm #73 and #78, 2026-11-12)
+        Err(e) if e.downcast_ref::<LandConflict>().is_some() => {
+            let text = match store.set_state(id, TaskState::NeedsRevision).await {
+                Ok(_) => format!("#{id} not landed: {e}; sent back to its worker to merge the project's branch in and resolve them"),
+                Err(set) => format!("#{id} not landed: {e}; it could not be sent back ({set:#}), land it by hand"),
+            };
+            tracing::warn!("{text}");
+            crate::pair::event(&workspace_of(store), &text);
+            vec![text]
+        }
         Err(e) => {
             let text = format!("#{id} not landed: {}", first_line(&format!("{e:#}")));
             tracing::warn!("{text}");
@@ -2695,19 +3009,39 @@ pub async fn run_in_worktree(store: &Store, id: i64, worker: &Worker) -> anyhow:
 /// When the roadmap cannot be read between waves, or a worktree cannot be made.
 pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
     anyhow::ensure!(width > 0, "the width of a parallel batch is at least one");
+    share_cpu_among_builds();
     let root = workspace_of(store);
     let Some(_lock) = take_walk_lock(&root) else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
     };
     let mut lines = Vec::new();
+    // the cards a killed walk left in progress go back on the queue before this one reads it
+    lines.extend(requeue_orphans(store, &root).await);
+    // the cards the reviewer accepted that a walk stopped before they landed: landed first, so
+    // a restart never strands accepted work (runelite #21 and #35, 2026-11-12)
+    for node in store.all().await? {
+        if node.state == TaskState::Implemented && matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
+            // under the card's span, so its check reads on the card's own console card rather
+            // than an untagged one the window shows as "worker" (asm #39, 2026-11-12)
+            let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id = node.id);
+            lines.extend(land_or_say(store, node.id, worker).instrument(span).await);
+        }
+    }
     let mut ran = 0;
     // the runs in flight, as a pool of `width`: when one ends the next ready card starts in
     // its slot at once, rather than the pool waiting for the slowest of a wave (the person
     // saw one card going on a two-job project for the length of a long card). Every slot
     // is polled on this one task, so two runs never interleave a read-modify-write of the
     // roadmap, which a spawned task per run could not promise
+    // the project's git, one landing or checkpoint at a time across the runs in flight; and
+    // the project's root, which the runs' futures borrow
+    let git_lock_owned = tokio::sync::Mutex::new(());
+    let root_owned = root.clone();
     let mut flight: Vec<(i64, std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + '_>>, Seat)> = Vec::new();
     let mut stopped: Option<String> = None;
+    // the cards sent back in a row in this walk, and the ones parked past [`RERUNS_A_WALK`]
+    let mut reruns: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+    let mut parked: std::collections::HashSet<i64> = std::collections::HashSet::new();
     loop {
         // `stop` from the console or the window: nothing new starts, and the walk ends when
         // the runs it is in have ended
@@ -2724,11 +3058,14 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
         if stopped.is_none() {
             let roadmap = store.load().await?;
             let router = crate::router::Router::load(&root).unwrap_or_default();
+            // the runners as the table says now: the dashboard's `+`/`-` changes them while the
+            // walk runs, and a lower number lets the runs in flight end without starting more
+            let width = router.worker.parallel.and_then(|n| usize::try_from(n.max(1)).ok()).unwrap_or(width);
             let in_flight: std::collections::HashSet<i64> = flight.iter().map(|(id, _, _)| *id).collect();
             let others = other_walks(&root);
             let ready: Vec<Node> = ready_cards(&roadmap.nodes, &roadmap.gambits, plan_tight(&root))
                 .into_iter()
-                .filter(|n| !in_flight.contains(&n.id))
+                .filter(|n| !in_flight.contains(&n.id) && !parked.contains(&n.id))
                 .cloned()
                 .collect();
             // the builders first, and a card with a brief before one without: the
@@ -2762,12 +3099,26 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // on the progress target: the filter lets that target through and no other,
                 // and a span the filter drops is no span at all
                 let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id);
+                let (git_lock, root_ref) = (&git_lock_owned, &root_owned);
                 flight.push((
                     id,
                     Box::pin(
                         async move {
                             let _slot = slot;
-                            run(store, id, &runner).await
+                            let mut out = run(store, id, &runner).await?;
+                            // what follows the run happens inside its own future, so the
+                            // other runs are read while it merges and compiles: a landing
+                            // awaited in the walk's loop stalled every worker behind it (the
+                            // runelite walk, half an hour, 2026-11-12). The landings and the
+                            // checkpoints take the project's git lock one at a time
+                            let node = store.read(id).await?;
+                            let _git = git_lock.lock().await;
+                            if node.state == TaskState::Implemented {
+                                out.extend(land_or_say(store, id, &runner).await);
+                            } else {
+                                out.extend(checkpoint_worktree(&root_ref, &node).await);
+                            }
+                            Ok(out)
                         }
                         .instrument(span),
                     ),
@@ -2796,7 +3147,12 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 continue;
             }
-            lines.push(format!("ran {ran} card(s) · {}", stopped.unwrap_or_else(|| "no card is ready".to_owned())));
+            let text = format!("ran {ran} card(s) · {}", stopped.unwrap_or_else(|| "no card is ready".to_owned()));
+            // on the feed as well: a detached walk's own lines go nowhere, and walks stopped by
+            // the plan's week read as dying with no word (asm and runelite, 2026-11-12)
+            crate::pair::event(&root, &format!("walk {text}"));
+            write_digest(store, &root, None, None, None).await;
+            lines.push(text);
             return Ok(lines);
         }
         // a run ends, or half a minute passes: a card re-queued or made ready while the pool
@@ -2815,27 +3171,71 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 lines.push(text);
             }
             (Seat::Build(_), Ok(run_lines)) => {
+                // the checkpoint or the landing already happened inside the run's future
                 lines.extend(run_lines);
                 ran += 1;
-                let node = store.read(id).await?;
-                let state = node.state;
-                // the run's work goes on the card's branch now, whatever the verdict
-                if state != TaskState::Implemented {
-                    lines.extend(checkpoint_worktree(&root, &node).await);
-                }
-                if stop_on_revision && stopped.is_none() && state == TaskState::NeedsRevision {
+                let sent_back = store.read(id).await?.state == TaskState::NeedsRevision;
+                if stop_on_revision && stopped.is_none() && sent_back {
                     stopped = Some(format!("stopped: #{id} needs revision"));
                 }
-                // a card the reviewer accepted lands now: merged, proved and cleared, so
-                // the tree keeps up with the walk (the person: "merging / committing as
-                // tasks are complete for all projects"); a landing that fails leaves the
-                // card implemented, for the person, and says why
-                if state == TaskState::Implemented {
-                    lines.extend(land_or_say(store, id, worker).await);
+                // a card sent back run after run is parked until the next walk: a rerun that
+                // ends in revision at once otherwise starts again at once, and asm ran #131 270
+                // times and #132 234 times in an afternoon, a turn each (2026-11-12)
+                // an absolute card is counted only on runs that changed nothing: work in
+                // progress is never cut, a card going round without touching a file is stuck
+                let task = ra_context::TaskContext::open(&root, id);
+                let idle = task.handoffs.last().is_none_or(|h| h.changed.is_empty());
+                let absolute = store.read(id).await.is_ok_and(|n| n.is_absolute());
+                if sent_back && (!absolute || idle) {
+                    let count = reruns.entry(id).or_insert(0);
+                    *count += 1;
+                    if *count >= RERUNS_A_WALK {
+                        parked.insert(id);
+                        // blocked, not only parked: a card sent back three times in a row is
+                        // one its worker cannot move (a missing toolchain or fixture, asm #53
+                        // and #80 ran nine times saying so); the next walk would run it three
+                        // more times. Its last answer says why, and a person sets it defined
+                        let why = ra_context::TaskContext::open(&root, id)
+                            .handoffs
+                            .last()
+                            .map(|h| first_line(&h.report).chars().take(200).collect::<String>())
+                            .unwrap_or_default();
+                        let held = store.set_state_by(id, TaskState::Blocked, Source::Run).await.is_ok();
+                        let text = if held {
+                            format!(
+                                "#{id} blocked: sent back {RERUNS_A_WALK} times in a row in this walk; a person sets it defined again. Its last answer: {why}"
+                            )
+                        } else {
+                            format!(
+                                "#{id} parked: sent back {RERUNS_A_WALK} times in a row in this walk; it waits for the next walk or a person"
+                            )
+                        };
+                        tracing::warn!("{text}");
+                        crate::pair::event(&root, &text);
+                        lines.push(text);
+                    }
+                } else {
+                    reruns.remove(&id);
                 }
             }
             (Seat::Build(_), Err(error)) => {
-                stopped.get_or_insert(format!("stopped: the run of #{id} failed: {error:#}"));
+                // a full stop (the plan's limit, the provider gone) stops the walk; a card's own
+                // failure (the content filter on one card, runelite #56) is that card's: it waits
+                // for a person and the other runners go on (the walk stopped starting cards on
+                // it and runelite ran one card of four, 2026-11-12)
+                let text = format!("{error:#}");
+                let full_stop = ["unreachable", "limit", "week", "logged in", "authentication"]
+                    .iter()
+                    .any(|word| text.to_ascii_lowercase().contains(word));
+                if full_stop {
+                    stopped.get_or_insert(format!("stopped: the run of #{id} failed: {text}"));
+                } else {
+                    parked.insert(id);
+                    let line = format!("#{id} failed and waits for a person; the walk goes on: {}", first_line(&text));
+                    tracing::warn!("{line}");
+                    crate::pair::event(&root, &line);
+                    lines.push(line);
+                }
             }
         }
     }
@@ -2922,7 +3322,7 @@ pub async fn investigate(store: &Store, id: i64, worker: &Worker) -> anyhow::Res
         answer.turns,
         answer.usage.prompt_tokens,
         answer.usage.completion_tokens,
-        cost_text(answer.usage.cost_usd)
+        cost_text(&answer.usage)
     );
     crate::pair::event(&root, &line);
     Ok(vec![line])
@@ -2957,8 +3357,8 @@ pub enum PoolKind {
 /// once another project walks. A Fable project runs one card at a time, its own slot, in no
 /// pool: as many Fable projects as walk. The slots are the hub's locks, held by the run and
 /// released with it, dead or done. Six runs write code; what made six too heavy was six
-/// builds at once, which the project's two build slots ([`crate::hub::BUILD_SLOTS`]) now
-/// keep to two. The person's rule of 2026-11-12: "i want the 6x, just don't do stupid shit
+/// builds at once, which the machine's four shared build slots ([`crate::hub::BUILD_SLOTS`])
+/// now keep to four across every project. The person's rule of 2026-11-12: "i want the 6x, just don't do stupid shit
 /// like having them all building with gradle".
 pub struct Pool;
 
@@ -3008,7 +3408,10 @@ impl Pool {
                             crate::hub::held_by("pool-opus", size, &name) + ready
                         })
                         .sum();
-                    size.saturating_sub(demand)
+                    // never past the project's own runners: the order decides who is served
+                    // first, the runners how many it runs (the agent at four runners took nine
+                    // slots the order left it, 2026-11-12)
+                    size.saturating_sub(demand).min(width.max(1))
                 } else if borrow {
                     // the share, and an equal part of what the pool holds beyond every walking
                     // project's share: one project alone has the four, two have two each
@@ -3065,9 +3468,10 @@ fn project_kind(root: &Path) -> PoolKind {
     Pool::kind_of(model)
 }
 
-/// The work of [`run`], with the cost of the session and the count of the gotchas it hit beside
-/// the log lines.
-async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> anyhow::Result<(Vec<String>, Option<f64>, usize)> {
+/// The work of [`run`], with the usage of the session, its cost reported or computed, and the
+/// count of the gotchas it hit beside the log lines.
+#[allow(clippy::too_many_lines)]
+async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> anyhow::Result<(Vec<String>, Usage, usize)> {
     let id = node.id;
     let provider = worker.provider()?;
     store.set_state_by(id, TaskState::InProgress, Source::Run).await?;
@@ -3096,7 +3500,22 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the topic changes). The session is dropped only when it is stale: then the brief and the
     // handoffs carry it, and the run says so first
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
-    let (resume, fresh) = match resume_of(&node, unix_now()) {
+    // a rerun after a rejection or a failed check resumes only a lean session: the verdict and
+    // the handoff carry what it needs, and a session already heavy paid its whole weight every
+    // turn of every rerun (runelite #23 resumed at 132k tokens a turn, $7.39 for eleven turns;
+    // #28 at 144k, $3.91 for four), where a fresh one cost a few tens of cents
+    let resumed = match resume_of(&node, unix_now()) {
+        // an absolute card keeps its session whatever its weight: its work is one run
+        Ok(Some(_)) if rerun.is_some() && !node.is_absolute() && last_largest_turn(&task).is_some_and(|t| t > RERUN_RESUME_LIMIT) => {
+            Err(format!(
+                "the last session ran to {}k tokens a turn, past the {}k a rerun resumes",
+                last_largest_turn(&task).unwrap_or(0) / 1000,
+                RERUN_RESUME_LIMIT / 1000
+            ))
+        }
+        other => other,
+    };
+    let (resume, fresh) = match resumed {
         Ok(Some(session)) => {
             let noted =
                 rerun.as_ref().map(|_| "  rerun on the session: the verdict and the failing check ride as the new prompt".to_owned());
@@ -3311,11 +3730,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             short(&worker.model),
             session.calls,
             tokens_line(&session),
-            cost_text(session.usage.cost_usd)
+            cost_text(&session.usage)
         )];
         lines.extend(fresh);
         lines.extend(noted);
-        return Ok((lines, session.usage.cost_usd, gotcha_hits.len()));
+        return Ok((lines, session.usage, gotcha_hits.len()));
     }
     // the local checks before the card counts as done: no model call, the acceptance names
     // them (else the project, else the workspace tests), and they run in order up to the first
@@ -3400,6 +3819,29 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             (false, format!("  check failed: {}{count}{after}{where_}", failed.command))
         }
     };
+    // the failure's fingerprint rides on the check line, which the handoff keeps: the next run
+    // of the card tells a failure that repeats on the same tree (asm #131 and #132 ran 23 times
+    // on a check cargo rejected on its own arguments)
+    let failed = checks.iter().find(|run| !run.passed);
+    let print = match failed {
+        Some(failed) => {
+            let diff = git_text(&acting, &["diff", "HEAD"]).await;
+            let base = git_text(&acting, &["rev-parse", "HEAD"]).await;
+            Some(check_fingerprint(&failed.command, &failed.first_error, &diff, &base))
+        }
+        None => None,
+    };
+    if let Some(print) = &print {
+        check_line = format!("{check_line}{}{print}", ra_context::FINGERPRINT_MARK);
+    }
+    let last_print = task
+        .handoffs
+        .iter()
+        .rev()
+        .find(|h| !h.outcome.starts_with("note from"))
+        .and_then(ra_context::Handoff::fingerprint)
+        .map(str::to_owned);
+    let held = held_reason(&session.text, &changed, failed, print.as_deref(), last_print.as_deref());
     // the lint of what the run changed, once the check passed: the orchestrator finds the
     // warnings so the worker spends no turns on them. A lint that cannot run is a line, not a
     // verdict; a warning in a changed file is.
@@ -3425,7 +3867,20 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             lint_warnings = lint.warnings;
         }
     }
-    if passed {
+    // a card no rerun can move is held for a person on the first sight, with the line that
+    // says why on its check line, the feed and the run's lines; the walk does not send it again
+    if let Some(reason) = &held {
+        passed = false;
+        if let Some(review) = carried_review(node.notes.as_deref()) {
+            report = format!("{review}\n\n{report}");
+        }
+        store.set_notes(id, &report).await?;
+        store.set_state_by(id, TaskState::Blocked, Source::Run).await?;
+        check_line = format!("{check_line} · blocked: {reason}");
+        let text = format!("#{id} blocked: {reason}; a person sets it defined again");
+        tracing::warn!("{text}");
+        crate::pair::event(&root, &text);
+    } else if passed {
         store.set_notes(id, &report).await?;
         store.set_state_by(id, TaskState::Implemented, Source::Run).await?;
     } else {
@@ -3461,7 +3916,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let summary = worker.ask_role(roles, Role::Summary, Some(id), SUMMARY_INSTRUCTION, &session.text).await;
     let answer = summary.as_deref().unwrap_or(&session.text);
     let handed = if lint_warnings.is_empty() { format!("{lead}{answer}") } else { answer.to_owned() };
-    let mut last = handoff(if passed { "implemented" } else { "needs revision" }, check_line.trim(), &handed, changed);
+    let outcome = if held.is_some() {
+        "blocked"
+    } else if passed {
+        "implemented"
+    } else {
+        "needs revision"
+    };
+    let mut last = handoff(outcome, check_line.trim(), &handed, changed);
     last.warnings = lint_warnings;
     // a run sent back by its check hands on what it read, as a capped one does
     if !passed {
@@ -3479,15 +3941,18 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             if passed { "✓" } else { "✗" },
             id,
             node.title,
-            if passed { "implemented" } else { "needs revision" },
+            outcome,
             short(&worker.model),
             session.calls,
             tokens_line(&session),
-            cost_text(session.usage.cost_usd),
+            cost_text(&session.usage),
             if asked_twice { " · report asked twice" } else { "" }
         ),
         check_line,
     ];
+    if let Some(reason) = &held {
+        lines.push(format!("  #{id} blocked: {reason}; a person sets it defined again"));
+    }
     lines.extend(fresh);
     lines.extend(noted);
     lines.extend(lint_lines);
@@ -3535,7 +4000,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         ids.dedup();
         lines.push(format!("  ⚠ {} gotcha(s): {} · rc gotchas lists them", gotcha_hits.len(), ids.join(", ")));
     }
-    Ok((lines, session.usage.cost_usd, gotcha_hits.len()))
+    Ok((lines, session.usage, gotcha_hits.len()))
 }
 
 /// What a run of a node has in hand before it calls the model: the workspace, the task context,
@@ -3641,13 +4106,16 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // cap only when one was asked for. No limit stands by default: the person asked for none
     let budget = worker.budget.or_else(|| worker.budgets.then(|| budget_for(node.complexity)));
     let router = crate::router::Router::load(&root).ok();
+    // an absolute card works until it is done: no cap restarts it or ends it, the whole run in
+    // one session costing less than the restarts a cap would cut it into
+    let absolute = node.is_absolute();
     let caps = Caps {
-        hard: worker.turns,
-        restart: router.as_ref().and_then(|router| router.worker.turns()),
+        hard: worker.turns.filter(|_| !absolute),
+        restart: router.as_ref().and_then(|router| router.worker.turns()).filter(|_| !absolute),
         // no context cap on a run whose last session hit it while still reading in: the fresh
         // session reads the same files and hits it again, and the card never gets past them
         // (runelite #15: AffineTransform and Arc2D from the JDK, 161k at turn 7)
-        context: router.as_ref().and_then(|router| router.worker.context()).filter(|_| !capped_reading_in(&task)),
+        context: router.as_ref().and_then(|router| router.worker.context()).filter(|_| !capped_reading_in(&task) && !absolute),
     };
     let effort = worker.effort.unwrap_or(node.effort);
     Ok(Prepared { workspace, root, task, project, budget, caps, effort })
@@ -3750,9 +4218,11 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; run a task");
     let worker = &worker.for_card(&workspace_of(store), &node)?;
-    let provider = worker.provider()?;
+    // a dry run calls no model, so it needs no key: without one (CI has none) the route alone
+    // says whether the run is a harness, and the harness's command line is left out
+    let provider = worker.provider().ok();
     let Prepared { workspace, root, task, project, budget, caps, effort } = prepare(store, &node, worker, false).await?;
-    let harness = provider.has_own_tools();
+    let harness = provider.as_ref().map_or(worker.route() == Route::ClaudeCode, |p| p.has_own_tools());
     let checks = checks_of(&root, &node);
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
     let resume = resume_of(&node, unix_now());
@@ -3805,7 +4275,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             }
         }
     }
-    let command = provider.command_line(&request);
+    let command = provider.as_ref().and_then(|p| p.command_line(&request));
     if let Some(command) = &command {
         // the effort and the allowed tools, named before the argument list buries them
         let effort = argument(command, "--effort").unwrap_or("the harness default");
@@ -4158,6 +4628,104 @@ struct CheckRun {
     /// short tail of a passed one.
     text: String,
     failed_tests: usize,
+    /// The first line of a failed command's output that reads as its error, else its first
+    /// line; empty for a passed one. The fingerprint and the reason of a block name it.
+    first_error: String,
+    /// Whether the command failed before any compile or test output: an argument the tool
+    /// rejects, a program not found, an SDK location missing. A rerun cannot move such a card.
+    setup: bool,
+}
+
+/// What a failed command's output says when it never reached a build or a test: the tool
+/// rejected its arguments, the program or the SDK is not there.
+const SETUP_FAILURES: [&str; 16] = [
+    "unexpected argument",
+    "unrecognized option",
+    "unrecognized argument",
+    "unknown option",
+    "invalid value",
+    "no such command",
+    "no such subcommand",
+    "did not match any packages",
+    "command not found",
+    "is not recognized as",
+    "no such file or directory",
+    "cannot find the path",
+    "sdk location not found",
+    "could not find `cargo.toml`",
+    "no targets specified",
+    "not installed",
+];
+
+/// The lines of an output that show a build or a test ran: past them a failure is the code's.
+const BUILD_OUTPUT: [&str; 10] =
+    ["compiling ", "checking ", "running ", "test ", "test result:", "finished ", "> task", "build ", "error[e", "warning:"];
+
+/// The line a failed command's output leads with as its error: the first that names an error,
+/// a failed test or a panic, else the first that is not blank.
+fn first_error(output: &str) -> String {
+    let lines = || output.lines().map(str::trim).filter(|line| !line.is_empty());
+    let is_error = |line: &&str| {
+        let lower = line.to_lowercase();
+        lower.starts_with("error") || lower.contains("error:") || line.ends_with(" FAILED") || lower.contains("panicked")
+    };
+    lines().find(is_error).or_else(|| lines().next()).unwrap_or_default().chars().take(200).collect()
+}
+
+/// Whether a failed command's output is a setup failure: it says so, and no line of it shows
+/// a build or a test running.
+fn is_setup_failure(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    let built = lower.lines().map(str::trim_start).any(|line| BUILD_OUTPUT.iter().any(|mark| line.starts_with(mark)));
+    !built && SETUP_FAILURES.iter().any(|mark| lower.contains(mark))
+}
+
+/// The fingerprint of a failed check: the command, its first error line, the hash of the
+/// tree's diff and the commit it is on. A run that ends on the fingerprint its last run ended
+/// on failed the same way on the same tree, and a third run would too. FNV-1a, so a fingerprint
+/// kept in a context file reads the same to the next build of the agent.
+fn check_fingerprint(command: &str, first_error: &str, diff: &str, base: &str) -> String {
+    let hash = |text: &str| {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3))
+    };
+    let diff = format!("{:016x}", hash(diff));
+    format!("{:016x}", hash(&format!("{command}\n{first_error}\n{diff}\n{}", base.trim())))
+}
+
+/// The output of a read-only git command in `root`, or nothing where git has nothing to say.
+async fn git_text(root: &Path, args: &[&str]) -> String {
+    match tokio::process::Command::new("git").args(args).current_dir(root).output().await {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => String::new(),
+    }
+}
+
+/// The reason a worker's report gives under its `## Blocked` heading: the rest of the heading's
+/// line, else the first line under it. `None` when the report has no such heading.
+fn blocked_reason(report: &str) -> Option<String> {
+    let mut lines = report.lines().map(str::trim);
+    let heading = lines
+        .find(|line| line.strip_prefix("## Blocked").is_some_and(|rest| rest.is_empty() || !rest.starts_with(char::is_alphanumeric)))?;
+    let own = heading.trim_start_matches("## Blocked").trim_start_matches([':', ' ', '-', '—', '·']).trim();
+    let reason = if own.is_empty() { lines.find(|line| !line.is_empty()).unwrap_or("the worker reported the card blocked") } else { own };
+    Some(reason.chars().take(200).collect())
+}
+
+/// Why a run holds its card for a person at once instead of sending it back: a report under
+/// `## Blocked` from a run that changed nothing, a check that failed before any build, or one
+/// that failed as the last run's did. `None` leaves the verdict to the check.
+fn held_reason(report: &str, changed: &[String], failed: Option<&CheckRun>, print: Option<&str>, last: Option<&str>) -> Option<String> {
+    if changed.is_empty()
+        && let Some(reason) = blocked_reason(report)
+    {
+        return Some(format!("the worker reported it blocked: {reason}"));
+    }
+    let failed = failed?;
+    if failed.setup {
+        return Some(format!("the check failed before any build: {}: {}", failed.command, failed.first_error));
+    }
+    (print.is_some() && print == last)
+        .then(|| format!("the check failed as the last run's did: {}: {}", failed.command, failed.first_error))
 }
 
 /// How many lines of a passed command's output the notes keep.
@@ -4179,6 +4747,8 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                 exit: output.lines().last().unwrap_or_default().to_owned(),
                 text: last_lines(&output, PASSED_TAIL_LINES),
                 failed_tests: 0,
+                first_error: String::new(),
+                setup: false,
             },
             Ok((false, output)) => {
                 let failure = check_failure(&output);
@@ -4188,9 +4758,22 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                     exit: output.lines().last().unwrap_or_default().to_owned(),
                     text: failure.text,
                     failed_tests: failure.failed,
+                    first_error: first_error(&output),
+                    setup: is_setup_failure(&output),
                 }
             }
-            Err(e) => CheckRun { command: command.clone(), passed: false, exit: format!("{e:#}"), text: format!("{e:#}"), failed_tests: 0 },
+            Err(e) => {
+                let text = format!("{e:#}");
+                CheckRun {
+                    command: command.clone(),
+                    passed: false,
+                    exit: text.clone(),
+                    first_error: first_error(&text),
+                    setup: is_setup_failure(&text),
+                    text,
+                    failed_tests: 0,
+                }
+            }
         };
         tracing::info!(
             target: crate::trace::PROGRESS,
@@ -4714,6 +5297,8 @@ fn add_usage(sum: &mut Usage, one: &Usage) {
     sum.cached_tokens += one.cached_tokens;
     if let Some(cost) = one.cost_usd {
         sum.cost_usd = Some(sum.cost_usd.unwrap_or(0.0) + cost);
+        // a sum with an estimate in it is an estimate
+        sum.cost_computed |= one.cost_computed;
     }
 }
 
@@ -5190,6 +5775,21 @@ fn hash_fields<'a>(fields: impl IntoIterator<Item = &'a str>) -> String {
 /// How long a session is resumed: past a day its context is older than the work around it.
 const SESSION_LIFE: u64 = 24 * 60 * 60;
 
+/// The largest turn a session may have run to and still be resumed by a rerun.
+const RERUN_RESUME_LIMIT: u64 = 80_000;
+
+/// The largest turn of the card's last run, in tokens, read off its handoff's check line
+/// (`… largest 134k …`); `None` when the line does not say.
+fn last_largest_turn(task: &ra_context::TaskContext) -> Option<u64> {
+    let check = &task.handoffs.last()?.check;
+    let rest = check.split("largest ").nth(1)?;
+    let word: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == 'k').collect();
+    match word.strip_suffix('k') {
+        Some(thousands) => thousands.parse::<f64>().ok().map(|k| (k * 1000.0) as u64),
+        None => word.parse().ok(),
+    }
+}
+
 /// The session a run of `node` resumes at `now`: `Ok(None)` when the node has none, `Err` with
 /// the reason when it has one the run must not resume, since a session older than a day or made
 /// for other text of the card would lead the harness by what it no longer is.
@@ -5425,8 +6025,24 @@ pub(crate) fn map_error(error: ProviderError) -> anyhow::Error {
     }
 }
 
-/// A cost for a log line: the dollars, or a word when the provider reported none.
-fn cost_text(cost: Option<f64>) -> String {
+/// A cost for a log line: the dollars the provider reported, the list price computed from the
+/// tokens marked as an estimate (`$4.12 est.`), or a word when there is neither.
+fn cost_text(usage: &Usage) -> String {
+    match usage.cost_usd {
+        Some(c) if usage.cost_computed => format!("${c:.2} est."),
+        cost => dollars(cost),
+    }
+}
+
+/// The cost of a run's end line with the cached share of its input beside it, `$4.12 est. ·
+/// 90% cached`: the share is what the cache rate priced, and what a fresh session gives up.
+fn end_cost(usage: &Usage) -> String {
+    let cached = usage.cached_tokens * 100 / usage.prompt_tokens.max(1);
+    format!("{} · {cached}% cached", cost_text(usage))
+}
+
+/// A bare cost for a log line: the dollars, or a word when there are none.
+fn dollars(cost: Option<f64>) -> String {
     cost.map_or_else(|| "cost unreported".to_owned(), |c| format!("${c:.4}"))
 }
 

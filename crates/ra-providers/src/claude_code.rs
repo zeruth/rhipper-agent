@@ -7,6 +7,7 @@
 //! request are not forwarded: the harness owns its tool set, and the answer carries no tool
 //! calls. `temperature` and `max_tokens` have no flag on the command line and are not sent.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -14,6 +15,7 @@ use ra_gotchas::{Catalogue, Conditions, Hit, Journal, Verdict, Where};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+use crate::openrouter::Tokens;
 use crate::{Completion, CompletionFuture, CompletionRequest, Message, ModelProvider, ProviderError, TurnUsage, Usage};
 
 /// Where the plan's limits are kept, beside the roadmap.
@@ -79,53 +81,9 @@ impl ClaudeCode {
             binary: PathBuf::from("claude"),
             max_turns: None,
             // the build, the read-only git commands, and the read-only shell in both shells: a
-            // denied `ls` costs a turn and teaches nothing. A pipe is judged by its parts, so
-            // `cargo test 2>&1 | tail -20` passes and keeps the output short
-            allowed_shell: [
-                "Bash(cargo *)",
-                "Bash(rustfmt *)",
-                "Bash(git status*)",
-                "Bash(git diff*)",
-                "Bash(git log*)",
-                "Bash(git show*)",
-                "Bash(ls*)",
-                "Bash(cat *)",
-                "Bash(head *)",
-                "Bash(tail *)",
-                "Bash(wc *)",
-                "Bash(grep *)",
-                "Bash(rg *)",
-                "Bash(find *)",
-                "Bash(pwd*)",
-                "Bash(tree*)",
-                "Bash(mkdir *)",
-                // a word to the log, and the one more git question that only reads
-                "Bash(echo *)",
-                "Bash(git check-ignore*)",
-                // the text filters a pipe ends in, so a long output can be narrowed
-                "Bash(sort*)",
-                "Bash(uniq*)",
-                "Bash(cut *)",
-                "Bash(paste *)",
-                "Bash(tr *)",
-                "PowerShell(cargo *)",
-                "PowerShell(rustfmt *)",
-                "PowerShell(git status*)",
-                "PowerShell(git diff*)",
-                "PowerShell(git log*)",
-                "PowerShell(git show*)",
-                "PowerShell(Get-ChildItem*)",
-                "PowerShell(Get-Content *)",
-                "PowerShell(Select-String *)",
-                "PowerShell(Select-Object *)",
-                "PowerShell(Test-Path *)",
-                "PowerShell(Get-Location*)",
-                "PowerShell(New-Item *)",
-                "PowerShell(Write-Output *)",
-                "PowerShell(git check-ignore*)",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
+            // denied `ls` costs a turn and teaches nothing. The table is the hook's too, which
+            // judges a chain or a pipe by its parts and answers for the shapes this list cannot
+            allowed_shell: ra_gotchas::shape::rules(),
             effort: "medium".to_owned(),
             hooks: None,
             catalogue: None,
@@ -207,6 +165,22 @@ impl ClaudeCode {
         &self.allowed_shell
     }
 
+    /// The system prompt of one request: the request's own, and for a worker with a shell the
+    /// allowed shapes block, so the rules are read before a refusal has to teach them.
+    fn system_of(&self, request: &CompletionRequest) -> String {
+        let mut system = system_prompt(&request.messages);
+        if request.workspace.is_some() && !request.read_only {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&ra_gotchas::shape::block());
+            if !self.own_prefixes.is_empty() {
+                let _ = writeln!(system, "\n- the project's own commands run too: {}", self.own_prefixes.join(", "));
+            }
+        }
+        system
+    }
+
     /// The command-line arguments of one request. The prompt goes on stdin, so its length is no
     /// concern of the argument list.
     fn args(&self, request: &CompletionRequest) -> Vec<String> {
@@ -226,7 +200,7 @@ impl ClaudeCode {
             // the harness picks up where the last run of the task left off, its context intact
             args.extend(["--resume".to_owned(), session.trim().to_owned()]);
         }
-        let system = system_prompt(&request.messages);
+        let system = self.system_of(request);
         if !system.is_empty() {
             // a worker's system prompt goes by file: on the command line it ran past Windows'
             // limit (os error 206) once the project context, the other projects' digests and
@@ -291,6 +265,12 @@ impl ClaudeCode {
         {
             command.env("CARGO_TARGET_DIR", target);
         }
+        // the worker's shell finds `rc` (its roadmap commands, `rc hold`) beside the binary that
+        // runs it: the PATH a walk inherits can predate the install directory's place on it, and
+        // every `rc show` of the agent's regeneration card was `command not found` (2026-11-12)
+        if let Some(path) = path_with_own_dir() {
+            command.env("PATH", path);
+        }
         let mut child = command.spawn().map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!("{} is not installed or not on the path", self.binary.display()))
@@ -321,7 +301,8 @@ impl ClaudeCode {
         // the project's context cap, and the size of the turn that crossed it once one did;
         // a Fable run has none whatever the project sets: its window is the point of it
         let fable = request.model.to_ascii_lowercase().contains("fable");
-        let mut watch = ContextWatch::new(request.max_context.filter(|_| !fable));
+        let resumed = request.resume.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let mut watch = ContextWatch::new(request.max_context.filter(|_| !fable)).resumed(resumed);
         let mut crossed: Option<u64> = None;
         // which tool each call id belongs to, so only a shell's output is read for gotchas
         let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -359,7 +340,8 @@ impl ClaudeCode {
                         Some(workspace) if self.suite_check && line.contains("cargo test") => ra_gotchas::changed_crates(workspace),
                         _ => Vec::new(),
                     };
-                    let conditions = Conditions { console_running, suite_check: self.suite_check, changed_crates: &changed };
+                    let conditions =
+                        Conditions { console_running, suite_check: self.suite_check, changed_crates: &changed, allowed: false };
                     for hit in gotchas_of_event(catalogue, &line, conditions, &mut tools) {
                         // the project's own commands are past the allowlist by design: the
                         // hook lets them run, and the count leaves them alone too
@@ -405,7 +387,13 @@ impl ClaudeCode {
         };
         // a result names the reason itself, exit code or not
         if let Some(result) = result {
+            let listed = turns.cost(&request.model);
             with_stream(parse_result(&result), |completion| {
+                // a result without a cost, as a run out of turns can end, is priced from its turns
+                if completion.usage.cost_usd.is_none() && listed.is_some() {
+                    completion.usage.cost_usd = listed;
+                    completion.usage.cost_computed = true;
+                }
                 completion.gotchas = gotchas;
                 completion.read_in = turns.read_in();
                 completion.whole_reads = turns.whole_reads();
@@ -413,7 +401,7 @@ impl ClaudeCode {
                 completion.reads = reads;
             })
         } else if let Some((size, cap)) = crossed.zip(request.max_context) {
-            let mut completion = turns.completion();
+            let mut completion = turns.completion(&request.model);
             completion.gotchas = gotchas;
             completion.reads = reads;
             Err(ProviderError::ContextOut { completion: Box::new(completion), cap, size })
@@ -466,6 +454,8 @@ struct TurnTally {
     turns: Vec<(Option<String>, TurnUsage)>,
     /// The cached share of each turn's input, for the usage of a run that ends without a result.
     cached: Vec<u64>,
+    /// The share of each turn's input written to the cache, which is priced at its own rate.
+    written: Vec<u64>,
     /// The text blocks of the last turn, the worker's words when the run ends without a result.
     said: Vec<String>,
     /// The index of the turn that made the first edit or write, once one has.
@@ -506,11 +496,15 @@ impl TurnTally {
                 if let Some(cached) = self.cached.last_mut() {
                     *cached = count("cache_read_input_tokens");
                 }
+                if let Some(written) = self.written.last_mut() {
+                    *written = count("cache_creation_input_tokens");
+                }
                 self.said.extend(text);
             }
             _ => {
                 self.turns.push((id, turn));
                 self.cached.push(count("cache_read_input_tokens"));
+                self.written.push(count("cache_creation_input_tokens"));
                 self.said = text.collect();
             }
         }
@@ -555,16 +549,33 @@ impl TurnTally {
         self.turns.last().map(|(_, turn)| turn.input_tokens)
     }
 
+    /// The list price of the turns the stream showed on `model`, each side of the input at its
+    /// own rate; `None` for a model the price table does not know or a stream without turns.
+    fn cost(&self, model: &str) -> Option<f64> {
+        let price = crate::openrouter::anthropic_price(model).filter(|_| !self.turns.is_empty())?;
+        let tokens =
+            self.turns.iter().zip(&self.cached).zip(&self.written).fold(Tokens::default(), |mut sum, (((_, turn), &cached), &written)| {
+                sum.fresh += turn.input_tokens.saturating_sub(cached + written);
+                sum.cache_read += cached;
+                sum.cache_write += written;
+                sum.output += turn.output_tokens;
+                sum
+            });
+        Some(price.of(&tokens))
+    }
+
     /// The completion of a run stopped before its result: the usage summed over the turns the
-    /// stream showed, at no reported cost, and the last turn's words.
-    fn completion(self) -> Completion {
+    /// stream showed, at the list price of `model` the ledger marks as computed, and the last
+    /// turn's words.
+    fn completion(self, model: &str) -> Completion {
         let turns = u64::try_from(self.turns.len()).unwrap_or(u64::MAX);
+        let cost_usd = self.cost(model);
         let usage = Usage {
             prompt_tokens: self.turns.iter().map(|(_, turn)| turn.input_tokens).sum(),
             completion_tokens: self.turns.iter().map(|(_, turn)| turn.output_tokens).sum(),
             cached_tokens: self.cached.iter().sum(),
-            cost_usd: None,
-            cost_computed: false,
+            cost_usd,
+            cost_computed: cost_usd.is_some(),
         };
         let (read_in, whole_reads) = (self.read_in(), self.whole_reads());
         Completion {
@@ -592,19 +603,35 @@ impl TurnTally {
 /// resumed rerun at turn 1).
 pub const READING_IN_TURNS: usize = 12;
 
+/// The turns of a resumed run the cap leaves alone: enough to read its verdict and answer it,
+/// not the twelve of a fresh read-in. A resumed session already past the cap paid twelve turns
+/// at twice the cap before (runelite #21: thirteen turns at 300k tokens each, $3.75, 2026-11-12);
+/// now it hands off after two and a fresh session opens on the handoff.
+pub const RESUMED_TURNS: usize = 2;
+
 /// Watches a stream for the turn whose input passes the context cap, past the reading-in
 /// turns. The run stops after that turn, once its tool results are in, so an edit in flight
 /// lands and the handoff can name it; a result that comes first means the run finished on its
 /// own and stands.
 struct ContextWatch {
     cap: Option<u64>,
+    /// The turns before the cap applies: [`READING_IN_TURNS`] fresh, [`RESUMED_TURNS`] resumed.
+    grace: usize,
     /// The input of the turn that crossed the cap, once one has.
     crossed: Option<u64>,
 }
 
 impl ContextWatch {
     fn new(cap: Option<u64>) -> Self {
-        Self { cap, crossed: None }
+        Self { cap, grace: READING_IN_TURNS, crossed: None }
+    }
+
+    /// The watch of a resumed run: the cap applies after [`RESUMED_TURNS`].
+    fn resumed(mut self, resumed: bool) -> Self {
+        if resumed {
+            self.grace = RESUMED_TURNS;
+        }
+        self
     }
 
     /// Reads one event after the tally has: the size of the crossing turn once the run may
@@ -612,7 +639,7 @@ impl ContextWatch {
     fn note(&mut self, line: &str, turns: &TurnTally) -> Option<u64> {
         let cap = self.cap?;
         if line.contains(r#""type":"assistant""#) {
-            if turns.turns.len() > READING_IN_TURNS
+            if turns.turns.len() > self.grace
                 && let Some(input) = turns.last_input().filter(|input| *input > cap)
             {
                 self.crossed = Some(input);
@@ -860,6 +887,20 @@ fn write_system_prompt(workspace: &Path, text: &str) -> std::io::Result<PathBuf>
     // absolute: the harness runs in the workspace, and a relative path (a worktree's,
     // `var/worktrees/47`) read against it doubled into `var/worktrees/47/var/worktrees/47/…`
     std::path::absolute(&path).or(Ok(path))
+}
+
+/// The PATH this process has with the directory of its own binary first, the installed `rc`
+/// beside it; `None` when either cannot be read. A PATH that has the directory already is left
+/// as it is.
+fn path_with_own_dir() -> Option<std::ffi::OsString> {
+    let own = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    if dirs.iter().any(|d| d == &own) {
+        return Some(path);
+    }
+    dirs.insert(0, own);
+    std::env::join_paths(dirs).ok()
 }
 
 /// The target directory for a run in one of the project's worktrees

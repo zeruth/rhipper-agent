@@ -249,6 +249,65 @@ pub(crate) const GAUGE_SPAN: usize = 120;
 /// under a line in `color`, the oldest end fading into the bubble's fill; a thin rule marks the
 /// top of the range.
 #[allow(clippy::cast_possible_truncation)]
+/// One of the machine's heavy-work slots as a slim bubble `width` wide: `WORKER n` and, while a
+/// build, a script or a search holds it, who (`runelite #42`), for how long and its share of the
+/// processor (`share` percent), lit in the lane of the slot; dim and `idle` when it is free. The
+/// person named them workers on 2026-11-12; in the code they are the build slots.
+pub(crate) fn builder(ui: &mut Ui, index: usize, held: Option<(&str, u64)>, share: u32, width: f32) {
+    let color = if held.is_some() { theme::lane(7 + index % 3) } else { theme::dim() };
+    bubble(ui, color, held.is_some(), |ui| {
+        let inner = (width - 18.0).max(60.0);
+        ui.set_width(inner);
+        ui.set_max_width(inner);
+        ui.horizontal(|ui| {
+            ui.set_width(inner);
+            ui.label(RichText::new(format!("WORKER {}", index + 1)).small().strong().color(theme::dim()));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| match held {
+                Some((who, secs)) => {
+                    badge(ui, &format!("{who} · {}:{:02} · {share}% cpu", secs / 60, secs % 60), color);
+                }
+                None => {
+                    ui.label(RichText::new("idle").small().color(theme::dim()));
+                }
+            });
+        });
+    });
+}
+
+/// The machine's worker-slot count as a bubble of the worker row, the same height as a slot:
+/// `BUILDERS`, `−`, the count and `+`; answers -1 or +1 on a click of an end, 0 otherwise.
+pub(crate) fn builders(ui: &mut Ui, count: usize, width: f32) -> i32 {
+    let color = theme::accent();
+    let mut step = 0;
+    bubble(ui, color, false, |ui| {
+        let inner = (width - 18.0).max(60.0);
+        ui.set_width(inner);
+        ui.set_max_width(inner);
+        ui.horizontal(|ui| {
+            ui.set_width(inner);
+            ui.label(RichText::new("WORKERS").small().strong().color(theme::dim()));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let end = |ui: &mut Ui, text: &str| {
+                    ui.add(egui::Label::new(RichText::new(text).color(color).strong()).sense(egui::Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("the machine's worker slots, shared by every project")
+                        .clicked()
+                };
+                // right to left: the `+` is drawn first
+                if end(ui, "+") {
+                    step = 1;
+                }
+                ui.label(RichText::new(count.to_string()).small().strong().color(theme::text()));
+                if end(ui, "−") {
+                    step = -1;
+                }
+            });
+        });
+    });
+    step
+}
+
 pub(crate) fn gauge(ui: &mut Ui, name: &str, value: &str, samples: &[f32], color: Color32, width: f32) {
     use egui::epaint::{Mesh, Vertex, WHITE_UV};
     let fill = theme::mix(theme::bg(), color, 0.07);
@@ -264,9 +323,9 @@ pub(crate) fn gauge(ui: &mut Ui, name: &str, value: &str, samples: &[f32], color
                 badge(ui, value, color);
             });
         });
-        ui.add_space(2.0);
-        // a short plot: the gauges are a glance, the room under them is the projects'
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(inner, 24.0), egui::Sense::hover());
+        // a short plot: the gauges are a glance, the room under them is the projects' (six
+        // in one row, slim enough that two by six run cards fit under them)
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(inner, 14.0), egui::Sense::hover());
         let painter = ui.painter();
         let plot = rect.shrink2(egui::vec2(0.0, 2.0));
         painter.hline(plot.x_range(), plot.top(), Stroke::new(1.0, alpha(color, 60)));
@@ -323,6 +382,103 @@ pub(crate) fn chip(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
         .response
         .interact(egui::Sense::click());
     response.on_hover_text(if on { "shown · click to hide" } else { "hidden · click to show" }).clicked()
+}
+
+/// The Blood Moon scroll bar at the right of a scroll area's view: shown for as long as the
+/// content overflows, never fading; a red thumb on a dark track, dragged to scroll and clicked on
+/// the track to jump there. The area's own bar is hidden. The person's ask of 2026-11-12: "a
+/// permanent visible, blood moon themed slider on the far right when the content is
+/// scrollable". `x` is the bar's left edge, `width` its width.
+pub(crate) fn blood_scroll_bar<R>(ui: &mut Ui, output: &egui::scroll_area::ScrollAreaOutput<R>, x: f32, width: f32) -> Option<f32> {
+    let view = output.inner_rect;
+    let content = output.content_size.y;
+    let room = content - view.height();
+    if room <= 0.5 {
+        return None;
+    }
+    let track = egui::Rect::from_min_max(egui::pos2(x, view.top()), egui::pos2(x + width, view.bottom()));
+    let thumb_height = (view.height() / content * track.height()).clamp(28.0, track.height());
+    let travel = (track.height() - thumb_height).max(1.0);
+    let current = output.state.clamped_offset().y;
+    let mut offset = current.clamp(0.0, room);
+    let response = ui.interact(track, output.id.with("blood-bar"), egui::Sense::click_and_drag());
+    if response.dragged() {
+        offset = (offset + response.drag_delta().y * room / travel).clamp(0.0, room);
+    } else if response.clicked()
+        && let Some(at) = response.interact_pointer_pos()
+    {
+        // the thumb's middle goes where the track was clicked
+        offset = (((at.y - track.top() - thumb_height / 2.0) / travel) * room).clamp(0.0, room);
+    }
+    // the caller hands the new offset to the area on the next frame: egui's state has no setter
+    let moved = ((offset - current).abs() > 0.1).then(|| {
+        ui.ctx().request_repaint();
+        offset
+    });
+    let thumb_top = track.top() + offset / room * travel;
+    let thumb = egui::Rect::from_min_size(egui::pos2(track.left(), thumb_top), egui::vec2(width, thumb_height));
+    let lit = response.hovered() || response.dragged();
+    let painter = ui.painter();
+    let radius = CornerRadius::same(u8::try_from((width / 2.0).round() as i32).unwrap_or(4));
+    painter.rect_filled(track, radius, theme::mix(theme::bg(), theme::deep(), 0.7));
+    painter.rect_stroke(track, radius, Stroke::new(1.0, alpha(theme::accent(), 50)), egui::StrokeKind::Inside);
+    // a soft glow under the thumb, then the thumb itself, brighter while held or hovered
+    painter.rect_filled(thumb.expand(2.0), radius, alpha(theme::accent(), if lit { 70 } else { 35 }));
+    painter.rect_filled(thumb, radius, if lit { theme::accent() } else { theme::mix(theme::deep(), theme::accent(), 0.75) });
+    moved
+}
+
+/// A `−` `name value` `+` stepper in one slim pill: answers -1 or +1 on a click of its ends,
+/// 0 otherwise. `hint` is the hover text of the whole.
+pub(crate) fn stepper(ui: &mut Ui, name: &str, value: &str, color: Color32, hint: &str) -> i32 {
+    let mut step = 0;
+    Frame::new()
+        .fill(alpha(color, 18))
+        .stroke(Stroke::new(1.0, alpha(color, 120)))
+        .corner_radius(CornerRadius::same(9))
+        .inner_margin(Margin::symmetric(4, 1))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let end = |ui: &mut Ui, text: &str| {
+                ui.add(egui::Label::new(RichText::new(text).color(color).strong()).sense(egui::Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+            };
+            if end(ui, "−") {
+                step = -1;
+            }
+            ui.label(RichText::new(format!("{name} {value}")).small().strong().color(theme::text())).on_hover_text(hint);
+            if end(ui, "+") {
+                step = 1;
+            }
+        });
+    step
+}
+
+/// A choice of two in one pill: the lit side is `first` while `on_first`; answers `Some(true)`
+/// for a click on the first, `Some(false)` on the second.
+pub(crate) fn toggle(ui: &mut Ui, first: &str, second: &str, on_first: bool, color: Color32) -> Option<bool> {
+    let mut picked = None;
+    ui.spacing_mut().item_spacing.x = 2.0;
+    for (text, is_first) in [(first, true), (second, false)] {
+        let on = on_first == is_first;
+        let response = Frame::new()
+            .fill(alpha(color, if on { 44 } else { 6 }))
+            .stroke(Stroke::new(1.0, alpha(color, if on { 180 } else { 50 })))
+            .corner_radius(CornerRadius::same(9))
+            .inner_margin(Margin::symmetric(7, 1))
+            .show(ui, |ui| {
+                ui.label(RichText::new(text).small().strong().color(if on { color } else { alpha(theme::dim(), 170) }));
+            })
+            .response
+            .interact(egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.clicked() && !on {
+            picked = Some(is_first);
+        }
+    }
+    ui.spacing_mut().item_spacing.x = 6.0;
+    picked
 }
 
 /// A tab of the card area: lit while `on`, dim and clickable while not; reports a click.
@@ -410,6 +566,10 @@ pub(crate) fn tooltip(ui: &mut Ui, node: &Node, lane: Color32, last: Option<&Cha
         priority(ui, node.complexity);
         if node.is_final() {
             badge(ui, "final", theme::warn());
+        }
+        // works until it is done: no cap, no rerun limit (marked, or complexity 5)
+        if node.is_absolute() {
+            badge(ui, "absolute", theme::lane(2));
         }
     });
     // a change recorded for another state than the card's came before a hand edit of the

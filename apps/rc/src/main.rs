@@ -112,6 +112,13 @@ enum Command {
         #[arg(long)]
         clear: bool,
     },
+    /// Marks a card absolute: it works until it is done, with no turn or context cap and no limit on the reruns a review sends it back for; only a full stop (the plan's limit, the provider gone, the person) ends its run. A card of complexity 5 is absolute already. `--clear` takes the mark off.
+    Absolute {
+        id: i64,
+        /// Takes the mark off.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Links a node to the nodes it waits for.
     Depend {
         /// The node that waits.
@@ -181,7 +188,12 @@ enum Command {
         model: String,
     },
     /// The usage ledger: the calls, the tokens and the cost of every model, all time.
-    Usage,
+    Usage {
+        /// By card instead: the costliest `n` cards (20 when bare), each summed over every run on it,
+        /// landed or not, with its state from the roadmap, and a last line totalling the landed ones.
+        #[arg(long, value_name = "n", num_args = 0..=1, default_missing_value = "20")]
+        cards: Option<usize>,
+    },
     /// This project's state in one line: the live run (orphaned when its process is gone), the ready count, today's calls and the last end.
     Status {
         /// One line per project the hub remembers (the window's tabs, the digests), this one first.
@@ -337,7 +349,7 @@ enum Command {
         #[arg(long, value_name = "N")]
         retire: Option<usize>,
     },
-    /// Runs a build command on one of the project's two build slots, waiting its turn while two other builds of the project run; the hook puts a worker's gradle and cargo commands under it.
+    /// Runs a build command on one of the machine's four build slots, shared by every project, waiting its turn while they are all taken; the hook puts a worker's gradle and cargo commands under it.
     Hold {
         /// The shell the command runs through: bash, sh or powershell; PowerShell on Windows and sh elsewhere when left out.
         #[arg(long)]
@@ -511,6 +523,21 @@ async fn run_main() -> anyhow::Result<()> {
             };
             console_line(&format!("/priority {id} {value}")).await
         }
+        Command::Absolute { id, clear } => {
+            plain_tracing()?;
+            let store = open_store().await?;
+            store.set_absolute(id, !clear).await?;
+            let node = store.read(id).await?;
+            println!(
+                "#{id} {}",
+                match (node.absolute, node.is_absolute()) {
+                    (true, _) => "is absolute: it works until it is done",
+                    (false, true) => "is not marked absolute, but runs as one: its complexity is 5",
+                    (false, false) => "is not absolute",
+                }
+            );
+            Ok(())
+        }
         Command::Depend { id, waits_for } => {
             plain_tracing()?;
             depend(id, &waits_for).await
@@ -575,9 +602,12 @@ async fn run_main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Usage => {
+        Command::Usage { cards } => {
             plain_tracing()?;
-            usage().await
+            match cards {
+                Some(limit) => usage_cards(limit).await,
+                None => usage().await,
+            }
         }
         // a read of files only, no trace: it runs from any directory, a project or not
         Command::Status { all } => {
@@ -621,7 +651,11 @@ async fn run_main() -> anyhow::Result<()> {
                 Some(id) => ra_console::agent::run(&store, id, &worker).await?,
                 None if all => match parallel {
                     Some(width) => ra_console::agent::run_parallel(&store, &worker, width, stop_on_revision).await?,
-                    None => ra_console::agent::run_all(&store, &worker, stop_on_revision).await?,
+                    // the walk moves to a newer rc that `rc install` put on the path, between cards
+                    None => {
+                        let worker = worker.with_install(Some(ra_console::install::default_dir()));
+                        ra_console::agent::run_all(&store, &worker, stop_on_revision).await?
+                    }
                 },
                 None => ra_console::agent::run_next(&store, &worker).await?,
             };
@@ -701,6 +735,17 @@ async fn run_main() -> anyhow::Result<()> {
                 // the window has the project: it starts the walk, so the tab shows it from its
                 // first line and the walk is nobody's child but the system's
                 println!("{}", ra_console::agent::request_walk(&dir, parallel));
+                // a minimized window draws no frames and never reads the request (both walks
+                // sat unstarted, 2026-11-12): not taken in a few seconds, it is taken back
+                // here and the walk starts on its own; the window attaches to it when it draws
+                let asked = std::time::Instant::now();
+                while asked.elapsed() < std::time::Duration::from_secs(5) && dir.join("var/walk.start").exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                if let Some(parallel) = ra_console::agent::walk_requested(&dir) {
+                    let pid = ra_console::agent::spawn_walk(&dir, true, parallel)?;
+                    println!("the window did not take it (minimized?): walk started in {} (pid {pid})", dir.display());
+                }
             } else {
                 let pid = ra_console::agent::spawn_walk(&dir, true, parallel)?;
                 println!("walk started in {} (pid {pid}); `rc pair` and var/activity.log follow it", dir.display());
@@ -818,8 +863,117 @@ async fn plan_context() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Answers one Claude Code tool hook from the gotchas. `pre` prints a deny with the reason, or
-/// an allow with the rewritten command; `post` prints the hints the result calls for. Anything
+/// The answer to one `pre` hook for a shell command: the catalogue's verdict, the build budget,
+/// and the command's shape, which denies the whole when one part is refused and allows it
+/// outright when every part is allowed. `None` leaves the command to the static allowlist.
+fn hook_pre(
+    catalogue: &ra_gotchas::Catalogue,
+    call: &serde_json::Value,
+    cwd: &Path,
+    command: &str,
+    worker: Option<&ra_console::router::WorkerConfig>,
+) -> Option<serde_json::Value> {
+    // a command the project's `[worker] allow` names is the project's own: the shell
+    // allowlist gotcha stands aside for it, the other gotchas do not
+    // a worker's own `rc hold -- <command>` is the command inside, as the catalogue judges it
+    let judged = ra_gotchas::self_held(command).unwrap_or(command);
+    let own = worker.is_some_and(|w| w.allows(judged));
+    // a running console or window holds its binary only while it runs from target/; an
+    // installed one leaves the build free, so the lock itself is asked, not the pid file
+    let console_running = {
+        let locked = |name: &str| {
+            let path = cwd.join("target").join("debug").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            path.exists() && std::fs::OpenOptions::new().append(true).open(&path).is_err()
+        };
+        locked("rc") || locked("rc-gui")
+    };
+    // the full suite is the orchestrator's when it is the project's check: a worker's own run
+    // of it goes to the crates the run has changed
+    let suite_check = worker.is_none_or(ra_console::router::WorkerConfig::checks_the_suite);
+    let mut verdict = match catalogue.command_in(cwd, command, console_running, suite_check, own) {
+        ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. } if own && id == "shell-outside-allowlist" => {
+            ra_gotchas::Verdict::Pass
+        }
+        other => other,
+    };
+    // a build, under `rc hold` by the rewrite or by the worker's own hand, is the session's to
+    // spend from a small budget: the code comes first, the check compiles after the report
+    // a build is gradle, cargo or the contract runner: the other heavy work the slots hold (a
+    // script, a search, a WSL toolchain) is the worker's to run, budget or not
+    let is_build = |text: &str| {
+        let inner = text.trim_start().strip_prefix("rc hold").map(|rest| {
+            let rest = rest.trim_start();
+            rest.split_once("-- ").map_or(rest, |(_, command)| command)
+        });
+        inner.is_some_and(|command| {
+            let first = command.trim_start().trim_start_matches("& ").trim_start_matches(".\\").trim_start_matches("./");
+            first.starts_with("gw.ps1")
+                || first.starts_with("gradlew")
+                || first.starts_with("cargo ")
+                || command.contains("run-awt-contracts.py")
+        })
+    };
+    let built = match &verdict {
+        ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => is_build(rewritten),
+        ra_gotchas::Verdict::Pass => is_build(command),
+        ra_gotchas::Verdict::Deny { .. } => false,
+    };
+    let session = call.get("session_id").and_then(serde_json::Value::as_str).unwrap_or("-");
+    if let (true, Err(reason)) = (built, ra_console::agent::build_allowance(cwd, session)) {
+        verdict = ra_gotchas::Verdict::Deny { id: String::from("build-budget"), reason };
+    }
+    // the hook is the judge of a command's shape: every part allowed is an allow the static
+    // allowlist, which cannot parse a chain or a prefix, would have refused; a part refused
+    // denies the whole, a rewrite's allow included; a shape it cannot read is left to the
+    // allowlist
+    let shape = call.get("tool_name").and_then(serde_json::Value::as_str).and_then(ra_gotchas::shape::Shell::of_tool).map_or(
+        ra_gotchas::shape::Shape::Unknown,
+        |shell| {
+            let own_part = |part: &str| worker.is_some_and(|w| w.allows(part));
+            ra_gotchas::shape::judge(judged, shell, cwd, &own_part)
+        },
+    );
+    let final_verdict = match (verdict, shape) {
+        (ra_gotchas::Verdict::Deny { id, reason }, _) => ra_gotchas::Verdict::Deny { id, reason },
+        (_, ra_gotchas::shape::Shape::Denied(reason)) => ra_gotchas::Verdict::Deny { id: String::from("shell-shape"), reason },
+        (ra_gotchas::Verdict::Pass, ra_gotchas::shape::Shape::Allowed) => {
+            return Some(serde_json::json!({
+                "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "every part of the command is allowed"}
+            }));
+        }
+        (verdict, _) => verdict,
+    };
+    match final_verdict {
+        ra_gotchas::Verdict::Pass => None,
+        ra_gotchas::Verdict::Deny { reason, .. } => Some(serde_json::json!({
+            "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
+        })),
+        ra_gotchas::Verdict::Rewrite { command, reason, .. } => {
+            // a command put under `rc hold` runs through the shell of the tool that called it:
+            // the Bash tool's bash, the PowerShell tool's powershell
+            let shell = match call.get("tool_name").and_then(serde_json::Value::as_str) {
+                Some("Bash") => "bash",
+                _ => "powershell",
+            };
+            let command = match command.strip_prefix("rc hold -- ") {
+                Some(rest) => format!("rc hold --shell {shell} -- {rest}"),
+                None => command,
+            };
+            Some(serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": reason,
+                    "updatedInput": {"command": command}
+                }
+            }))
+        }
+    }
+}
+
+/// Answers one Claude Code tool hook from the gotchas. `pre` prints a deny with the reason, an
+/// allow with the rewritten command, or an allow for a command whose every part the shape table
+/// allows; `post` prints the hints the result calls for. Anything
 /// the hook cannot judge, a missing catalogue included, gets no answer at all: the run goes on.
 fn hook(event: &str) -> anyhow::Result<()> {
     use std::io::Read;
@@ -850,72 +1004,12 @@ fn hook(event: &str) -> anyhow::Result<()> {
     // the seed's new entries reach a project's catalogue here too: a worker started from an
     // installed rc, not the console, has only the hook to bring them
     let Ok((catalogue, _)) = ra_gotchas::Catalogue::refresh(&cwd.join("var/gotchas.toml")) else { return Ok(()) };
-    // a running console or window holds its binary only while it runs from target/; an
-    // installed one leaves the build free, so the lock itself is asked, not the pid file
-    let locked = |name: &str| {
-        let path = cwd.join("target").join("debug").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        path.exists() && std::fs::OpenOptions::new().append(true).open(&path).is_err()
-    };
-    let console_running = locked("rc") || locked("rc-gui");
     let answer = match event {
         "pre" => {
             let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str).unwrap_or("");
             // the project's table, read above a worktree, which has no copy of it
             let worker = ra_console::router::Router::load(&ra_console::hub::project_root_of(&cwd)).map(|r| r.worker).ok();
-            // a command the project's `[worker] allow` names is the project's own: the shell
-            // allowlist gotcha stands aside for it, the other gotchas do not
-            let own = worker.as_ref().is_some_and(|w| w.allows(command));
-            // the full suite is the orchestrator's when it is the project's check: a worker's
-            // own run of it goes to the crates the run has changed
-            let suite_check = worker.as_ref().is_none_or(ra_console::router::WorkerConfig::checks_the_suite);
-            let verdict = match catalogue.command_in(&cwd, command, console_running, suite_check) {
-                ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. }
-                    if own && id == "shell-outside-allowlist" =>
-                {
-                    ra_gotchas::Verdict::Pass
-                }
-                other => other,
-            };
-            // a build, under `rc hold` by the rewrite or by the worker's own hand, is the
-            // session's to spend from a small budget: the code comes first, the check
-            // compiles after the report
-            let is_build = |text: &str| text.trim_start().starts_with("rc hold");
-            let built = match &verdict {
-                ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => is_build(rewritten),
-                ra_gotchas::Verdict::Pass => is_build(command),
-                ra_gotchas::Verdict::Deny { .. } => false,
-            };
-            let session = call.get("session_id").and_then(serde_json::Value::as_str).unwrap_or("-");
-            let verdict = match (built, ra_console::agent::build_allowance(&cwd, session)) {
-                (true, Err(reason)) => ra_gotchas::Verdict::Deny { id: String::from("build-budget"), reason },
-                _ => verdict,
-            };
-            match verdict {
-                ra_gotchas::Verdict::Pass => None,
-                ra_gotchas::Verdict::Deny { reason, .. } => Some(serde_json::json!({
-                    "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
-                })),
-                ra_gotchas::Verdict::Rewrite { command, reason, .. } => {
-                    // a command put under `rc hold` runs through the shell of the tool that
-                    // called it: the Bash tool's bash, the PowerShell tool's powershell
-                    let shell = match call.get("tool_name").and_then(serde_json::Value::as_str) {
-                        Some("Bash") => "bash",
-                        _ => "powershell",
-                    };
-                    let command = match command.strip_prefix("rc hold -- ") {
-                        Some(rest) => format!("rc hold --shell {shell} -- {rest}"),
-                        None => command,
-                    };
-                    Some(serde_json::json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "allow",
-                            "permissionDecisionReason": reason,
-                            "updatedInput": {"command": command}
-                        }
-                    }))
-                }
-            }
+            hook_pre(&catalogue, &call, &cwd, command, worker.as_ref())
         }
         "post" => {
             // what a shell said is read one way, what an edit tool said another
@@ -1037,8 +1131,71 @@ async fn usage() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Prints the ledger by card, the costliest `limit` first, and what the landed cards cost in
+/// all: the measure a card of Phase V is judged by.
+async fn usage_cards(limit: usize) -> anyhow::Result<()> {
+    let ledger = open_ledger().await?;
+    let cards = ledger.by_card().await?;
+    if cards.is_empty() {
+        println!("the ledger is empty: no completion has run yet");
+        return Ok(());
+    }
+    let nodes = open_store().await?.load().await?.nodes;
+    for line in usage_card_lines(&cards, &nodes, limit) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The lines of `rc usage --cards`: the header, a row per card for the costliest `limit` of
+/// `cards` (the state `?` for a card the roadmap lost, the cost `?` when no call reported one),
+/// and a last line totalling the accepted cards of the whole ledger, with the median cost of
+/// those whose cost is known.
+fn usage_card_lines(cards: &[ra_usage::CardCost], nodes: &[ra_roadmap::model::Node], limit: usize) -> Vec<String> {
+    let states = tree::effective_states(nodes);
+    let state = |node: i64| states.get(&node).map_or_else(|| "?".to_owned(), ToString::to_string);
+    let dollars = |cost: Option<f64>| cost.map_or_else(|| "?".to_owned(), |c| format!("${c:.2}"));
+    // the widths are the header's, so the header reads as written and the rows line up under it
+    let row = |card: &str, runs: &str, turns: &str, per_turn: &str, read_in: &str, cost: &str, state: &str| {
+        format!("{card:<4}  {runs:>4}  {turns:>5}  {per_turn:>8}  {read_in:>7}  {cost:>4}  {state}")
+    };
+    let mut lines = vec![row("card", "runs", "turns", "tok/turn", "read-in", "cost", "state")];
+    for card in cards.iter().take(limit) {
+        let t = &card.totals;
+        lines.push(row(
+            &format!("#{}", card.node),
+            &t.runs.to_string(),
+            &t.turns.to_string(),
+            &status::compact(card.tokens_per_turn()),
+            &status::compact(t.read_in),
+            &dollars(t.cost_usd),
+            &state(card.node),
+        ));
+    }
+    let landed: Vec<_> = cards.iter().filter(|c| states.get(&c.node) == Some(&TaskState::Accepted)).collect();
+    let mut known: Vec<f64> = landed.iter().filter_map(|c| c.totals.cost_usd).collect();
+    known.sort_by(f64::total_cmp);
+    // folded from zero: `sum` of nothing is -0.0 and would print as `$-0.00`
+    let total = known.iter().fold(0.0, |total, cost| total + cost);
+    let median = match known.len() {
+        0 => "?".to_owned(),
+        n if n % 2 == 1 => format!("${:.2}", known[n / 2]),
+        n => format!("${:.2}", f64::midpoint(known[n / 2 - 1], known[n / 2])),
+    };
+    lines.push(format!("landed: {} cards, ${total:.2}, median {median} a card", landed.len()));
+    lines
+}
+
 /// The default roadmap file; the commands open it in the working directory.
 fn store_path() -> PathBuf {
+    // in a card's worktree the roadmap is the project's, not the branch's copy: a worker that
+    // prunes or adds cards edits the roadmap the walk reads, where a landing would otherwise
+    // give the branch's copy back and drop its edits (2026-11-12, roadmap regeneration cards)
+    let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project = ra_console::hub::project_root_of(&here);
+    if project != std::fs::canonicalize(&here).unwrap_or(here) {
+        return project.join("rhipper.md");
+    }
     PathBuf::from("rhipper.md")
 }
 

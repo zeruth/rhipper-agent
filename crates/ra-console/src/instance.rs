@@ -80,10 +80,12 @@ pub fn stop_running(root: &Path) -> Option<String> {
     Some(if killed { format!("instance {pid} did not quit in time and was killed") } else { format!("instance {pid} was already gone") })
 }
 
-/// Kills a process by id, the platform's way.
+/// Kills a process by id, the platform's way: the process alone, never its tree. The window's
+/// tree holds the walks it started and their workers; `/T` took them all down with a window
+/// slow to quit on `rc restart` (both projects' walks, 2026-11-12).
 fn kill(pid: u32) -> bool {
     let status = if cfg!(windows) {
-        std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/F", "/T"]).output()
+        std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).output()
     } else {
         std::process::Command::new("kill").args(["-9", &pid.to_string()]).output()
     };
