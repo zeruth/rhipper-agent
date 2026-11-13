@@ -1004,6 +1004,53 @@ async fn a_second_run_that_changed_nothing_parks_the_card() {
     assert!(shown[0].contains("[blocked]"), "{shown:?}");
 }
 
+#[tokio::test]
+async fn a_blocked_card_is_in_the_status_with_its_reason() {
+    use ra_roadmap::model::TaskState;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    for title in ["Parked", "Sent back", "Not landed", "Landed", "Fine"] {
+        run(&format!("/add task {title} parent 1"), &store, &worker()).await.unwrap();
+    }
+    store.set_state(2, TaskState::Blocked).await.unwrap();
+    store.set_notes(2, "refused: `rc hold -- cargo test -q`: rc is not recognized\n\nthe rest of the notes").await.unwrap();
+    store.set_state(3, TaskState::NeedsRevision).await.unwrap();
+    store.set_state(4, TaskState::Implemented).await.unwrap();
+    store.set_state(5, TaskState::Implemented).await.unwrap();
+    let _ = crate::pair::sent_back(dir.path(), 3, "Sent back", "the reviewer sent it back 5 time(s)", None);
+    crate::pair::event(dir.path(), "#4 not landed: the merged tree fails cargo test -q; sent back to its worker");
+    crate::pair::event(dir.path(), "#5 not landed: a conflict in src/lib.rs");
+    crate::pair::event(dir.path(), "start #5 Landed · m · pid 1");
+    let status = crate::hub::status_with(dir.path(), |_| true, &[], "2026-11-12");
+    let ids: Vec<i64> = status.waiting.iter().map(|w| w.id).collect();
+    // the card rerun after its failed landing waits on its run, not on the person
+    assert_eq!(ids, vec![2, 3, 4], "{:?}", status.waiting);
+    assert_eq!(status.waiting[0].reason, "refused: `rc hold -- cargo test -q`: rc is not recognized");
+    assert_eq!(status.waiting[1].reason, "the reviewer sent it back 5 time(s)");
+    assert!(status.waiting[2].reason.starts_with("not landed: the merged tree fails"), "{:?}", status.waiting[2]);
+    let line = status.line();
+    assert!(line.ends_with(" · waits 3 (#2 refused, #3 reviewer ×5, #4 landing)"), "{line}");
+    let printed = status.waiting[1].line();
+    assert!(printed.starts_with("  waits #3 Sent back · the reviewer sent it back 5 time(s)"), "{printed}");
+    assert!(printed.ends_with("rc set 3 defined"), "{printed}");
+}
+
+#[test]
+fn the_last_stop_line_of_the_walk_is_in_the_status() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(crate::hub::status_with(dir.path(), |_| true, &[], "2026-11-12").stopped.is_none());
+    crate::pair::event(dir.path(), "walk ran 1 card(s) · no card is ready");
+    assert!(crate::hub::status_with(dir.path(), |_| true, &[], "2026-11-12").stopped.is_none());
+    crate::pair::event(dir.path(), "walk ran 2 card(s) · stopped: the run of #182 failed: out of usage credits");
+    crate::pair::event(dir.path(), "end ✓ #183 Other implemented");
+    let status = crate::hub::status_with(dir.path(), |_| true, &[], "2026-11-12");
+    assert_eq!(status.stopped.as_deref(), Some("the run of #182 failed: out of usage credits"));
+    assert_eq!(crate::pair::last_stop(dir.path()), status.stopped);
+    // a later walk that ran out of cards is not stopped
+    crate::pair::event(dir.path(), "walk ran 0 card(s) · no card is ready");
+    assert!(crate::pair::last_stop(dir.path()).is_none());
+}
+
 #[test]
 fn a_report_is_a_placeholder_when_it_names_no_file_and_says_nothing_beyond_the_check() {
     assert!(crate::agent::is_empty_handoff(""));
