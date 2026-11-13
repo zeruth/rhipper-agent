@@ -31,6 +31,8 @@ message = "the contract runner is a build: it takes one of the machine's four bu
 remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 
 [[gotcha]]
+# the first word of a command; the parts after a pipe or a `;`, `&&` or `||` are judged by the
+# hook's shape table (`ra_gotchas::shape`), which names the form to use instead of each refusal
 id = "shell-outside-allowlist"
 where = "command"
 pattern = '^\s*(cd|Set-Location|Start-Process|powershell(\.exe)?|pwsh|cmd(\.exe)?|sh|bash|python|pip|npm|node|sed|awk|perl)\b|^\s*git\s+-C\b'

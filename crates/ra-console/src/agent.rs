@@ -3408,7 +3408,10 @@ impl Pool {
                             crate::hub::held_by("pool-opus", size, &name) + ready
                         })
                         .sum();
-                    size.saturating_sub(demand)
+                    // never past the project's own runners: the order decides who is served
+                    // first, the runners how many it runs (the agent at four runners took nine
+                    // slots the order left it, 2026-11-12)
+                    size.saturating_sub(demand).min(width.max(1))
                 } else if borrow {
                     // the share, and an equal part of what the pool holds beyond every walking
                     // project's share: one project alone has the four, two have two each
