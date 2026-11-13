@@ -22,7 +22,21 @@ pub fn event(root: &Path, text: &str) {
     }
 }
 
+/// What a walk did with card `id`, which a run left needing revision because of `why`: reran it
+/// by itself, `n` of the `of` reruns it gives (`rerun`), or left it for the person. The event
+/// goes on the feed, so the paired session knows a re-queue is its to make; the line is the walk's.
+#[must_use]
+pub fn sent_back(root: &Path, id: i64, title: &str, why: &str, rerun: Option<(usize, usize)>) -> String {
+    let text = match rerun {
+        Some((n, of)) => format!("rerun #{id} {title} · {why} · the walk takes it up again on its session ({n} of {of})"),
+        None => format!("waits #{id} {title} · {why} · waits for the person: `rc set {id} defined` re-queues it"),
+    };
+    event(root, &text);
+    text
+}
+
 /// The latest `limit` events, oldest first; none without a feed.
+#[must_use]
 pub fn recent(root: &Path, limit: usize) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(root.join(PAIR_FILE)) else { return Vec::new() };
     let lines: Vec<String> = text.lines().map(|l| l.split_once('\t').map_or(l, |(_, t)| t).to_owned()).collect();
@@ -166,20 +180,16 @@ pub fn window_down(root: &Path, reason: &str) {
 fn orphans(activity: &str, alive: impl Fn(u32) -> bool) -> Vec<(i64, u32)> {
     let mut open: Vec<(i64, Option<u32>)> = Vec::new();
     for line in activity.lines() {
+        // a walk of several cards tags each line with its card; the markers sit after the tag
+        let (tag, line) = crate::logs::untag_card(line);
         if let Some(title) = line.strip_prefix(crate::logs::RUN_START) {
             let pid = title.rsplit_once(" · pid ").and_then(|(_, pid)| pid.trim().parse().ok());
             if let Some(id) = crate::logs::card_of(title) {
                 open.push((id, pid));
             }
         } else if let Some(outcome) = line.strip_prefix(crate::logs::RUN_END) {
-            let named = crate::logs::orphaned_card(outcome);
-            match named.and_then(|id| open.iter().rposition(|(open_id, _)| *open_id == id)) {
-                Some(at) => {
-                    open.remove(at);
-                }
-                None => {
-                    open.pop();
-                }
+            if let Some(at) = crate::logs::end_closes(&open, outcome, tag, |(id, pid)| (Some(*id), *pid)) {
+                open.remove(at);
             }
         }
     }

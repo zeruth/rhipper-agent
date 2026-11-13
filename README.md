@@ -260,7 +260,19 @@ of them. The dashboard shows every project's queue and live run on one page.
 | `rc` (app) | The CLI, every command above |
 | `rc-gui` (app) | The window: the strip, the dashboard, the report, the roadmap column, the card view, the console |
 
-## Build and install
+## Install
+
+A release on GitHub carries `rhipper-agent-<version>-setup.exe`, a per-user installer that
+puts `rc` and `rc-gui` in `%LOCALAPPDATA%\Programs\rhipper` on the PATH (where `rc install`
+puts them) with a Start Menu entry, and a zip of the same binaries with the README and the
+pairing skill. The release notes are the changes since the last release. The version is
+`0.2.<n>`, `n` the commit count of the tree the build is of.
+
+Every push builds and tests on Windows (`.github/workflows/build.yml`); a `v*` tag, or the
+release workflow run by hand, makes the release (`.github/workflows/release.yml`,
+`installer/rhipper.iss`).
+
+## Build
 
 ```powershell
 cargo build -p rc -p rc-gui

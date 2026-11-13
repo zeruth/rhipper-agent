@@ -119,11 +119,20 @@ enum Command {
         /// The nodes it waits for.
         waits_for: Vec<i64>,
     },
-    /// Sets the state of a node; cancelled removes the card, since a cancelled card does not stay on the roadmap.
+    /// Sets the state of a node; cancelled removes the card, since a cancelled card does not stay on the roadmap. `accepted` lands the card first when it has a branch (see `land`).
     Set {
         id: i64,
         /// The state: one of the twelve lifecycle names.
         state: TaskState,
+    },
+    /// Lands a card the reviewer accepted: commits its worktree on `card/<id>`, merges the branch into HEAD, runs the project's check on the merged tree, marks the card accepted, and clears its worktree, branch, target directory and the project's old temp entries.
+    Land { id: i64 },
+    /// Orders the projects by priority across the machine, first served first: the whole pool of writers and builders goes to the first project with work, the next takes what it leaves. With no names, prints the order; `--clear` removes it.
+    Order {
+        /// The projects' directory names, first first.
+        names: Vec<String>,
+        #[arg(long)]
+        clear: bool,
     },
     /// The state changes so far, oldest first: when, the card, from what to what, and by whom
     /// (console, window, cli, mcp or run); of one card with an id.
@@ -328,6 +337,15 @@ enum Command {
         #[arg(long, value_name = "N")]
         retire: Option<usize>,
     },
+    /// Runs a build command on one of the project's two build slots, waiting its turn while two other builds of the project run; the hook puts a worker's gradle and cargo commands under it.
+    Hold {
+        /// The shell the command runs through: bash, sh or powershell; PowerShell on Windows and sh elsewhere when left out.
+        #[arg(long)]
+        shell: Option<String>,
+        /// The command, after `--`, as it was written.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// Makes this directory a project: drafts rhipper.md with a strong model from what the directory shows, imports a roadmap-shaped file, or starts empty.
     Init {
         /// A roadmap-shaped file (ROADMAP.md, TODO.md, a plan) the model converts, keeping every item.
@@ -500,6 +518,27 @@ async fn run_main() -> anyhow::Result<()> {
         Command::Set { id, state } => {
             plain_tracing()?;
             set(id, state).await
+        }
+        Command::Land { id } => {
+            plain_tracing()?;
+            land(id).await
+        }
+        Command::Order { names, clear } => {
+            if clear {
+                ra_console::hub::set_priority(&[])?;
+                println!("the priority order is cleared; the pool is shared by shares again");
+            } else if !names.is_empty() {
+                ra_console::hub::set_priority(&names)?;
+                println!("priority: {}", names.join(" → "));
+            } else {
+                let order = ra_console::hub::priority();
+                if order.is_empty() {
+                    println!("no priority order; the pool is shared by shares (`rc order <first> <second> …` sets one)");
+                } else {
+                    println!("priority: {}", order.join(" → "));
+                }
+            }
+            Ok(())
         }
         Command::History { id } => {
             plain_tracing()?;
@@ -708,6 +747,11 @@ async fn run_main() -> anyhow::Result<()> {
             println!("noted; the next runs read it with the workers' own look-backs");
             Ok(())
         }
+        Command::Hold { shell, command } => {
+            let shell = shell.unwrap_or_else(|| String::from(if cfg!(windows) { "powershell" } else { "sh" }));
+            let dir = std::env::current_dir()?;
+            std::process::exit(ra_console::agent::hold(&dir, &shell, &command.join(" ")));
+        }
         Command::Init { import, empty, model } => {
             plain_tracing()?;
             let mode = match (import, empty) {
@@ -786,8 +830,16 @@ fn hook(event: &str) -> anyhow::Result<()> {
     let cwd =
         call.get("cwd").and_then(serde_json::Value::as_str).map_or_else(|| std::env::current_dir().unwrap_or_default(), PathBuf::from);
     // a file the worker read is not the machine talking: no gotcha reads it, but a whole long
-    // file read at once gets the outline instead, catalogue or not
+    // file the card outlines is refused with its items, and any other gets the outline after
     if call.get("tool_name").and_then(serde_json::Value::as_str) == Some("Read") {
+        if event == "pre"
+            && let Some(reason) = ra_console::agent::read_refusal(&cwd, &call)
+        {
+            println!(
+                "{}",
+                serde_json::json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}})
+            );
+        }
         if event == "post"
             && let Some(hint) = ra_console::agent::read_hint(&cwd, &call)
         {
@@ -804,14 +856,19 @@ fn hook(event: &str) -> anyhow::Result<()> {
         let path = cwd.join("target").join("debug").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         path.exists() && std::fs::OpenOptions::new().append(true).open(&path).is_err()
     };
-    let conditions = ra_gotchas::Conditions { console_running: locked("rc") || locked("rc-gui") };
+    let console_running = locked("rc") || locked("rc-gui");
     let answer = match event {
         "pre" => {
             let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str).unwrap_or("");
+            // the project's table, read above a worktree, which has no copy of it
+            let worker = ra_console::router::Router::load(&ra_console::hub::project_root_of(&cwd)).map(|r| r.worker).ok();
             // a command the project's `[worker] allow` names is the project's own: the shell
             // allowlist gotcha stands aside for it, the other gotchas do not
-            let own = ra_console::router::Router::load(&cwd).is_ok_and(|r| r.worker.allows(command));
-            let verdict = match catalogue.command(command, conditions) {
+            let own = worker.as_ref().is_some_and(|w| w.allows(command));
+            // the full suite is the orchestrator's when it is the project's check: a worker's
+            // own run of it goes to the crates the run has changed
+            let suite_check = worker.as_ref().is_none_or(ra_console::router::WorkerConfig::checks_the_suite);
+            let verdict = match catalogue.command_in(&cwd, command, console_running, suite_check) {
                 ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. }
                     if own && id == "shell-outside-allowlist" =>
                 {
@@ -819,19 +876,45 @@ fn hook(event: &str) -> anyhow::Result<()> {
                 }
                 other => other,
             };
+            // a build, under `rc hold` by the rewrite or by the worker's own hand, is the
+            // session's to spend from a small budget: the code comes first, the check
+            // compiles after the report
+            let is_build = |text: &str| text.trim_start().starts_with("rc hold");
+            let built = match &verdict {
+                ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => is_build(rewritten),
+                ra_gotchas::Verdict::Pass => is_build(command),
+                ra_gotchas::Verdict::Deny { .. } => false,
+            };
+            let session = call.get("session_id").and_then(serde_json::Value::as_str).unwrap_or("-");
+            let verdict = match (built, ra_console::agent::build_allowance(&cwd, session)) {
+                (true, Err(reason)) => ra_gotchas::Verdict::Deny { id: String::from("build-budget"), reason },
+                _ => verdict,
+            };
             match verdict {
                 ra_gotchas::Verdict::Pass => None,
                 ra_gotchas::Verdict::Deny { reason, .. } => Some(serde_json::json!({
                     "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
                 })),
-                ra_gotchas::Verdict::Rewrite { command, reason, .. } => Some(serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow",
-                        "permissionDecisionReason": reason,
-                        "updatedInput": {"command": command}
-                    }
-                })),
+                ra_gotchas::Verdict::Rewrite { command, reason, .. } => {
+                    // a command put under `rc hold` runs through the shell of the tool that
+                    // called it: the Bash tool's bash, the PowerShell tool's powershell
+                    let shell = match call.get("tool_name").and_then(serde_json::Value::as_str) {
+                        Some("Bash") => "bash",
+                        _ => "powershell",
+                    };
+                    let command = match command.strip_prefix("rc hold -- ") {
+                        Some(rest) => format!("rc hold --shell {shell} -- {rest}"),
+                        None => command,
+                    };
+                    Some(serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                            "permissionDecisionReason": reason,
+                            "updatedInput": {"command": command}
+                        }
+                    }))
+                }
             }
         }
         "post" => {
@@ -1282,12 +1365,38 @@ async fn show_history(id: Option<i64>) -> anyhow::Result<()> {
 
 async fn set(id: i64, state: TaskState) -> anyhow::Result<()> {
     let store = open_store().await?;
+    // an acceptance is a landing when the card has a branch to land: the merge is made and
+    // proved, not assumed (the person: "checks for making sure if a card was accepted, its
+    // merge was successful")
+    if state == TaskState::Accepted {
+        let root = ra_console::agent::workspace_of(&store);
+        let branch = ra_console::agent::worktree_branch(id);
+        let has_branch = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+            .current_dir(&root)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if has_branch {
+            return land(id).await;
+        }
+    }
     store.set_state(id, state).await?;
     if state == TaskState::Cancelled {
         println!("#{id} removed: a cancelled card does not stay on the roadmap");
     } else {
         println!("#{id} is now {state}");
     }
+    Ok(())
+}
+
+/// Lands one card and prints each step; the project's check runs through the worker's toolbox.
+async fn land(id: i64) -> anyhow::Result<()> {
+    let store = open_store().await?;
+    let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
+    for line in ra_console::agent::land(&store, id, &worker).await? {
+        println!("{line}");
+    }
+    println!("#{id} is now accepted");
     Ok(())
 }
 

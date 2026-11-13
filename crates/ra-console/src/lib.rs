@@ -23,5 +23,6 @@ pub mod theme;
 pub mod trace;
 pub mod ui;
 
-/// The build version, `0.1.<n>`: a counter in `var/build-number`, up by one per build.
+/// The version, `0.2.<n>`: `n` the commits of the tree the build is of, `+` after it when
+/// the sources had changes past that commit.
 pub const VERSION: &str = env!("RA_VERSION");

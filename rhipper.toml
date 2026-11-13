@@ -6,8 +6,11 @@
 # the context it carries, so a run restarts fresh on a handoff once a turn passes this many
 # input tokens.
 context = 160000
-# Two cards at once, each in its own worktree, sharing the project's one build.
-parallel = 2
+# Four cards at once, each in its own worktree sharing the project's one build, and no more:
+# six was too heavy for the machine's CPU and RAM (2026-11-12). Runelite is paused until the
+# agent's roadmap is green.
+parallel = 4
+borrow = false
 
 # The implementer of every card here is Opus; the reviewer and the cheap roles keep theirs.
 [[route]]

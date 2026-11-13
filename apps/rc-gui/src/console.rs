@@ -65,12 +65,15 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
     let runs: Vec<(usize, u64, String)> = sink.with_lines(|lines| {
         lines.iter().enumerate().filter(|(_, l)| l.kind == Kind::Run).filter_map(|(i, l)| l.run.map(|id| (i, id, l.text.clone()))).collect()
     });
-    // every live run, oldest first (a walk of two cards at once has two), else the latest run
+    // the live runs, oldest first, the newest six at most (the whole Opus pool; a run whose
+    // process was killed under it stays open in the log until the orphan scan closes it),
+    // else the latest run
     let live = sink.live_runs();
-    let picked: Vec<&(usize, u64, String)> = if live.is_empty() {
+    let newest: Vec<u64> = live.iter().rev().take(6).rev().copied().collect();
+    let picked: Vec<&(usize, u64, String)> = if newest.is_empty() {
         runs.last().into_iter().collect()
     } else {
-        live.iter().filter_map(|id| runs.iter().rev().find(|(_, run, _)| run == id)).collect()
+        newest.iter().filter_map(|id| runs.iter().rev().find(|(_, run, _)| run == id)).collect()
     };
     if picked.is_empty() {
         return false;
@@ -78,24 +81,36 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
     // a fixed room: in a scroll area the clip is the page, and a live card would take it all;
     // the queue beside the card is the most it gets, the default rows the least
     let room = room.max(96.0 + 24.0 * DASHBOARD_ROWS);
-    // two live runs sit side by side, each in half the column less the space between them;
-    // the column's width comes from the caller, since what egui called available here ran
-    // past the column and the second card bled off the page
+    // the live cards in a grid of two columns: two side by side, four two by two, six two by
+    // three, each half the column's width and a row's part of its height, less the space
+    // between; a project running flat out still fills its share. The column's width comes
+    // from the caller, since what egui called available here ran past the column
     let gap = 10.0;
+    let cols = picked.len().min(2);
+    let rows = picked.len().div_ceil(cols.max(1));
     #[allow(clippy::cast_precision_loss)]
-    let count = picked.len() as f32;
-    let width = ((column - gap * (count - 1.0)) / count).floor();
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for (index, id, title) in picked {
-            let Some(run) = sink.run(*id) else { continue };
-            ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.set_width(width);
-                ui.set_max_width(width);
-                run_card(ui, sink, *id, title, &run, *index, Some(room));
-            });
+    let width = ((column - gap * (cols as f32 - 1.0)) / cols as f32).floor();
+    // a card is never shorter than its title, the fold line and two steps: the frame (19),
+    // the title row with the space under it (30) and three rows of 26; a grid that would
+    // squeeze the cards below that grows past its share and the page scrolls
+    #[allow(clippy::cast_precision_loss)]
+    let height = ((room - gap * (rows as f32 - 1.0)) / rows as f32).floor().max(19.0 + 30.0 + 3.0 * 26.0);
+    for row in picked.chunks(cols.max(1)) {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (index, id, title) in row {
+                let Some(run) = sink.run(*id) else { continue };
+                ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(width);
+                    ui.set_max_width(width);
+                    run_card(ui, sink, *id, title, &run, *index, Some(height));
+                });
+            }
+        });
+        if rows > 1 {
+            ui.add_space(gap - ui.spacing().item_spacing.y);
         }
-    });
+    }
     true
 }
 
@@ -175,7 +190,8 @@ fn clipped(ui: &mut Ui, raw: &str, limit: usize, font: &FontId, color: Color32) 
     // card past its column (two cards side by side halve it); truncated, it ends in an
     // ellipsis at the edge and the whole line is on hover
     let count = raw.chars().count();
-    let (shown, cut) = if count <= limit { (raw.to_owned(), false) } else { (format!("{}…", raw.chars().take(limit).collect::<String>()), true) };
+    let (shown, cut) =
+        if count <= limit { (raw.to_owned(), false) } else { (format!("{}…", raw.chars().take(limit).collect::<String>()), true) };
     let label = egui::Label::new(RichText::new(shown).font(font.clone()).color(color)).truncate();
     let response = ui.add(label);
     // the whole line on hover when it may not all be on the row
@@ -288,7 +304,11 @@ fn run_title(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, lane: Co
     // not wrap, and an uncut title pushed the card past its column (two cards side by side)
     let room = ((ui.available_width() - 260.0) / 6.5).max(16.0) as usize;
     let fit = |text: &str| -> (String, bool) {
-        if text.chars().count() <= room { (text.to_owned(), false) } else { (format!("{}…", text.chars().take(room.saturating_sub(1)).collect::<String>()), true) }
+        if text.chars().count() <= room {
+            (text.to_owned(), false)
+        } else {
+            (format!("{}…", text.chars().take(room.saturating_sub(1)).collect::<String>()), true)
+        }
     };
     let row = ui.horizontal(|ui| {
         ui.label(RichText::new(if folded { "▸" } else { "▾" }).color(theme::dim()).small());
@@ -387,9 +407,12 @@ fn run_steps(ui: &mut Ui, run: &Run, room: f32, bounded: bool) {
         let ppp = ui.pixels_per_point();
         ui.spacing_mut().item_spacing.y += (extra * ppp).floor() / ppp;
     }
-    // the entries that fell off the top fold into one line, which takes a row of its own
-    let skip = if hidden > 0 { hidden + 1 } else { 0 };
-    if hidden > 0 {
+    // the entries that fell off the top fold into one line, which takes a row of its own;
+    // a card with one row shows its latest step, not the fold alone (six cards in a short
+    // grid read "earlier steps" and nothing else)
+    let fold = hidden > 0 && body >= 2;
+    let skip = if fold { hidden + 1 } else { hidden };
+    if fold {
         let earlier: usize = folded.iter().take(skip).map(|(_, n)| n).sum();
         ui.label(RichText::new(format!("⋯ {earlier} earlier steps")).font(font.clone()).color(theme::dim()).italics()).on_hover_ui(|ui| {
             for (step, count) in folded.iter().take(skip) {

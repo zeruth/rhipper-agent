@@ -53,6 +53,20 @@ fn the_check_timeout_is_the_tables_seconds_and_the_agents_default_without_it() {
 }
 
 #[test]
+fn the_check_is_the_suite_without_one_or_as_a_cargo_test_over_no_package() {
+    assert!(WorkerConfig::default().checks_the_suite(), "no check is the workspace tests");
+    for (check, suite) in [
+        ("cargo test -q", true),
+        ("cargo test --workspace --exclude rc", true),
+        ("cargo test -p ra-asm -q", false),
+        (".\\\\gw.ps1 :core:test", false),
+    ] {
+        let router = Router::parse(&format!("[worker]\ncheck = \"{check}\"\n")).unwrap();
+        assert_eq!(router.worker.checks_the_suite(), suite, "{check}");
+    }
+}
+
+#[test]
 fn two_rules_pick_a_local_model_for_c1_and_the_default_for_c3() {
     let router = Router::parse(RULES).unwrap();
     assert_eq!(router.rules.len(), 2);

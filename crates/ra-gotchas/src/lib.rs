@@ -4,7 +4,8 @@
 //! costs a model call.
 //!
 //! Three places use it. The pre-tool hook asks [`Catalogue::command`] what to do with a command
-//! before it runs. The post-tool hook and the provider's stream reader ask [`Catalogue::scan`]
+//! before it runs, and [`Catalogue::read`] what to do with a whole-file Read of a long file the
+//! card outlines. The post-tool hook and the provider's stream reader ask [`Catalogue::scan`]
 //! what a result or an answer shows. The [`Journal`] keeps every hit, so `rc gotchas` can say
 //! which ones keep coming back and the next run can read [`Catalogue::notes`] about them. The
 //! refused commands no gotcha names grow the catalogue through [`Catalogue::promote`].
@@ -36,9 +37,11 @@ pub const SEED_MARK: &str = "# from the seed of ra-gotchas ";
 pub(crate) const ENTRY_HEAD: &str = "[[gotcha]]";
 
 /// The seed's entries as text, each with its id: the blocks [`Catalogue::refresh`] appends, so
-/// a project's file gains the entry as written, comments and quoting included.
+/// a project's file gains the entry as written, comments and quoting included. The lines end in
+/// `\n` whatever the checkout made of the seed's.
 fn seed_blocks() -> Vec<(String, String)> {
-    SEED.split(ENTRY_HEAD)
+    SEED.replace("\r\n", "\n")
+        .split(ENTRY_HEAD)
         .skip(1)
         .map(|rest| {
             let body = rest.trim();
@@ -68,6 +71,26 @@ pub enum Where {
     Text,
     /// The worker's final report.
     Answer,
+    /// A Read of a whole file, offset and limit both missing, of a file over [`LONG_FILE`]
+    /// lines the card's outline knows; the pattern is matched against the file's path.
+    Read,
+}
+
+/// A file of more lines than this is read by region once the card's outline knows it.
+pub const LONG_FILE: usize = 400;
+
+/// A Read about to run, as the pre-tool hook sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadCall<'a> {
+    /// The file, as the outline names it.
+    pub file: &'a str,
+    /// The Read names an offset or a limit.
+    pub ranged: bool,
+    /// The file's line count.
+    pub lines: usize,
+    /// The outline's items of the file with their lines, `name 120-159` each; `None` when the
+    /// card's outline does not know the file.
+    pub items: Option<&'a [String]>,
 }
 
 /// What to do about a gotcha.
@@ -80,7 +103,8 @@ pub enum Remedy {
     /// unless it matches `unless`; `when` limits the rewrite to a condition of the machine.
     Rewrite {
         insert: String,
-        /// How many words of the command come before the insert; one unless said otherwise.
+        /// How many words of the command come before the insert; one unless said otherwise,
+        /// zero for a wrapper the whole command runs under.
         #[serde(default = "one")]
         after: usize,
         /// The insert goes on the end of the command, after everything: a pipe, a redirect.
@@ -93,6 +117,13 @@ pub enum Remedy {
     },
     /// The command runs as it is; the hit is only counted.
     Allow,
+    /// The command runs over the crates the run has changed: its workspace flags give way to a
+    /// `-p` for each, unless it matches `unless`; only while the project's check is the full
+    /// suite, which the orchestrator runs after the report, and the run has changed a crate.
+    Crates {
+        #[serde(default, with = "serde_regex_opt")]
+        unless: Option<Regex>,
+    },
 }
 
 /// One entry of the catalogue.
@@ -116,9 +147,51 @@ pub struct Catalogue {
 
 /// What the machine looks like right now, for the remedies that depend on it.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Conditions {
+pub struct Conditions<'a> {
     /// A console holds the binary.
     pub console_running: bool,
+    /// The project's check is the full suite ([`is_suite`]): the orchestrator runs it after the
+    /// report, so a worker that runs it too only waits.
+    pub suite_check: bool,
+    /// The packages the run has changed so far, by name ([`changed_crates`]).
+    pub changed_crates: &'a [String],
+}
+
+/// Whether `command` is a full suite: a `cargo test` that names no package, nor a manifest.
+#[must_use]
+pub fn is_suite(command: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words.starts_with(&["cargo", "test"])
+        && !words.iter().any(|w| w.starts_with("-p") || w.starts_with("--package") || w.starts_with("--manifest-path"))
+}
+
+/// The packages the uncommitted changes of `workspace` fall in: the nearest `Cargo.toml` with a
+/// `[package]` above each changed path, by its name, sorted. Empty outside a git work tree, and
+/// when git cannot run.
+#[must_use]
+pub fn changed_crates(workspace: &Path) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("git").args(["status", "--porcelain", "-uall"]).current_dir(workspace).output() else {
+        return Vec::new();
+    };
+    let mut crates: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.get(3..))
+        // a rename names the path it went to last
+        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"'))
+        .filter_map(|path| package_of(workspace, Path::new(path)))
+        .collect();
+    crates.sort();
+    crates.dedup();
+    crates
+}
+
+/// The name of the package whose manifest is nearest above `path`, within `workspace`.
+fn package_of(workspace: &Path, path: &Path) -> Option<String> {
+    path.ancestors().skip(1).find_map(|dir| {
+        let text = std::fs::read_to_string(workspace.join(dir).join("Cargo.toml")).ok()?;
+        let manifest: toml::Table = toml::from_str(&text).ok()?;
+        manifest.get("package")?.get("name")?.as_str().map(str::to_owned)
+    })
 }
 
 /// What the pre-tool hook does with a command.
@@ -211,6 +284,15 @@ impl Catalogue {
         self.entries.iter().find(|g| g.id == id)
     }
 
+    /// [`Catalogue::command`] for a worker's shell in `workspace`, as the pre-tool hook asks it:
+    /// the changed crates are read from the work tree only for a full suite while it is the
+    /// project's check, as they cost a `git status`.
+    #[must_use]
+    pub fn command_in(&self, workspace: &Path, command: &str, console_running: bool, suite_check: bool) -> Verdict {
+        let changed = if suite_check && is_suite(command) { changed_crates(workspace) } else { Vec::new() };
+        self.command(command, Conditions { console_running, suite_check, changed_crates: &changed })
+    }
+
     /// What to do with a command about to run: the first hint or allow that matches decides;
     /// the rewrites before it compose, each on the command as the one before left it.
     #[must_use]
@@ -234,11 +316,20 @@ impl Catalogue {
                         continue;
                     }
                     current = if *append { format!("{} {insert}", current.trim_end()) } else { insert_after(&current, *after, insert) };
-                    match &mut rewritten {
-                        None => rewritten = Some((gotcha.id.clone(), vec![gotcha.message.clone()])),
-                        Some((_, reasons)) => reasons.push(gotcha.message.clone()),
-                    }
                 }
+                Remedy::Crates { unless } => {
+                    if !conditions.suite_check
+                        || conditions.changed_crates.is_empty()
+                        || unless.as_ref().is_some_and(|u| u.is_match(&current))
+                    {
+                        continue;
+                    }
+                    current = over_crates(&current, conditions.changed_crates);
+                }
+            }
+            match &mut rewritten {
+                None => rewritten = Some((gotcha.id.clone(), vec![gotcha.message.clone()])),
+                Some((_, reasons)) => reasons.push(gotcha.message.clone()),
             }
         }
         match rewritten {
@@ -247,7 +338,43 @@ impl Catalogue {
         }
     }
 
+    /// What to do with a Read about to run: a whole-file Read of a file over [`LONG_FILE`] lines
+    /// the card's outline knows is denied by the first hint whose pattern matches its path, the
+    /// outline's items in the reason, so the next Read takes a region; a ranged Read, a short
+    /// file and a file the outline does not know pass.
+    #[must_use]
+    pub fn read(&self, call: ReadCall<'_>) -> Verdict {
+        let Some(items) = call.items.filter(|_| !call.ranged && call.lines > LONG_FILE) else { return Verdict::Pass };
+        for gotcha in self.entries.iter().filter(|g| g.place == Where::Read && g.pattern.is_match(call.file)) {
+            match gotcha.remedy {
+                Remedy::Hint => {
+                    let mut reason = format!("{}: {} is {} lines", gotcha.message, call.file, call.lines);
+                    if !items.is_empty() {
+                        let _ = write!(reason, "; its items: {}", items.join(", "));
+                    }
+                    return Verdict::Deny { id: gotcha.id.clone(), reason };
+                }
+                Remedy::Allow => break,
+                // a command's rewrites say nothing about a Read
+                Remedy::Rewrite { .. } | Remedy::Crates { .. } => {}
+            }
+        }
+        Verdict::Pass
+    }
+
+    /// The Read gotchas a refused Read's result names, each once: the harness answers the call
+    /// with the hook's reason, which opens with the gotcha's message.
+    #[must_use]
+    pub fn refused_read(&self, result: &str) -> Vec<Hit> {
+        self.entries
+            .iter()
+            .filter(|g| g.place == Where::Read && result.contains(&g.message))
+            .map(|g| Hit { id: g.id.clone(), message: g.message.clone(), excerpt: clip(result.lines().next().unwrap_or("").trim(), 160) })
+            .collect()
+    }
+
     /// The gotchas a result or an answer shows, each once, with the first line that matched.
+    #[must_use]
     pub fn scan(&self, place: Where, text: &str) -> Vec<Hit> {
         self.entries
             .iter()
@@ -277,18 +404,47 @@ impl Catalogue {
     }
 }
 
-/// The command with `insert` after its first `after` words, and the rest as it was.
+/// The command with `insert` after its first `after` words, and the rest as it was; `after`
+/// of zero puts the insert before the command, a wrapper it runs under.
 fn insert_after(command: &str, after: usize, insert: &str) -> String {
     let words: Vec<&str> = command.split_whitespace().collect();
-    let at = after.clamp(1, words.len());
+    let at = after.min(words.len());
     let mut out = words[..at].join(" ");
-    out.push(' ');
+    if at > 0 {
+        out.push(' ');
+    }
     out.push_str(insert);
     if at < words.len() {
         out.push(' ');
         out.push_str(&words[at..].join(" "));
     }
     out
+}
+
+/// The command with its first two words followed by a `-p` for each of `crates`, and its
+/// workspace flags (`--workspace`, `--all`, `--exclude x`) dropped up to the first pipe,
+/// redirect or `--`, past which the words belong to another program.
+fn over_crates(command: &str, crates: &[String]) -> String {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let mut out: Vec<String> = words.iter().take(2).map(|w| (*w).to_owned()).collect();
+    out.extend(crates.iter().map(|c| format!("-p {c}")));
+    let mut own = true;
+    let mut skip_next = false;
+    for word in words.iter().skip(2) {
+        own &= !(*word == "--" || word.starts_with('|') || word.contains('>') || word.starts_with('&') || word.starts_with(';'));
+        if own && std::mem::take(&mut skip_next) {
+            continue;
+        }
+        if own && (matches!(*word, "--workspace" | "--all") || word.starts_with("--exclude=")) {
+            continue;
+        }
+        if own && *word == "--exclude" {
+            skip_next = true;
+            continue;
+        }
+        out.push((*word).to_owned());
+    }
+    out.join(" ")
 }
 
 fn one() -> usize {

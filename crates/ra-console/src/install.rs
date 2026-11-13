@@ -38,6 +38,24 @@ pub fn install(dir: Option<&Path>) -> anyhow::Result<Vec<String>> {
     let suffix = std::env::consts::EXE_SUFFIX;
     let beside = std::env::current_exe()?.parent().context("the running binary has no directory")?.to_path_buf();
     let build = std::env::current_dir().ok().map(|d| d.join("target").join("debug")).filter(|d| d.join(format!("rc{suffix}")).is_file());
+    // an install from a checkout builds both binaries first: `cargo run -p rc -- install`
+    // builds rc alone, and the window went out three times on a stale binary before anyone
+    // noticed (the person: "install should install the window too")
+    if let Some(build) = &build
+        && let Some(root) = build.parent().and_then(Path::parent)
+    {
+        // the binary running this install cannot be rebuilt under itself (`target\debug\rc
+        // install` is the freshly built rc): the others are
+        let running = std::env::current_exe().ok().and_then(|exe| exe.file_stem().map(|s| s.to_string_lossy().into_owned()));
+        let from_build = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|p| p.to_path_buf())).is_some_and(|p| {
+            match (std::fs::canonicalize(&p), std::fs::canonicalize(build)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => p == *build,
+            }
+        });
+        let packages: Vec<&str> = BINARIES.iter().copied().filter(|stem| !(from_build && running.as_deref() == Some(stem))).collect();
+        build_packages(root, &packages)?;
+    }
     let source = build.unwrap_or(beside);
     let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
@@ -74,6 +92,26 @@ pub fn install(dir: Option<&Path>) -> anyhow::Result<Vec<String>> {
     }
     lines.push(on_path(&dir));
     Ok(lines)
+}
+
+/// Builds `packages` in the workspace at `root`, so an install from a checkout installs what
+/// the sources say and not what happened to be built last. Cargo's own output goes to the
+/// terminal; a failed build is the install's failure.
+///
+/// # Errors
+/// When cargo cannot start or the build fails.
+fn build_packages(root: &Path, packages: &[&str]) -> anyhow::Result<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+    let mut command = std::process::Command::new("cargo");
+    command.arg("build").current_dir(root);
+    for package in packages {
+        command.args(["-p", package]);
+    }
+    let status = command.status().with_context(|| format!("cannot start cargo to build {}", packages.join(", ")))?;
+    anyhow::ensure!(status.success(), "the build of {} failed; nothing was installed", packages.join(" and "));
+    Ok(())
 }
 
 /// Removes the set-aside binaries of earlier installs that nothing runs any more.
