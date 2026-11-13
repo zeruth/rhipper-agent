@@ -3,6 +3,49 @@
 
 use super::*;
 
+/// A toolbox whose commands answer from `script`, and the commands it saw.
+fn scripted_checks(answers: fn(&str, usize) -> (i32, String)) -> (anyhow::Result<ra_tools::Toolbox>, Arc<std::sync::Mutex<Vec<String>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let script: ra_tools::Script = Arc::new(move |command: &str| {
+        let mut log = log.lock().unwrap();
+        log.push(command.to_owned());
+        Ok(answers(command, log.len()))
+    });
+    (ra_tools::Toolbox::new(Path::new(".")).map(|toolbox| toolbox.with_script(script)), seen)
+}
+
+const FAILED_ALONE: &str = "running 2 tests\ntest timing::a_check_is_killed ... FAILED\n\nfailures:\n    timing::a_check_is_killed\n\ntest result: FAILED. 1 passed; 1 failed\nexit code 101";
+
+#[tokio::test]
+async fn flaky_rerun_passes_a_test_that_passes_alone_and_names_it() {
+    let (toolbox, seen) =
+        scripted_checks(
+            |_, call| if call == 1 { (101, FAILED_ALONE.to_owned()) } else { (0, "test result: ok. 1 passed\nexit code 0".to_owned()) },
+        );
+    let runs = run_checks(&toolbox, &["cargo test -p ra-console -q".to_owned()], &[]).await;
+    assert!(runs[0].passed);
+    assert!(runs[0].text.contains("timing::a_check_is_killed"));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1], "cargo test -p ra-console -q -- --exact timing::a_check_is_killed");
+}
+
+#[tokio::test]
+async fn flaky_rerun_fails_the_card_with_the_second_output_when_the_test_fails_again() {
+    let (toolbox, seen) = scripted_checks(|_, call| {
+        if call == 1 {
+            (101, FAILED_ALONE.to_owned())
+        } else {
+            (101, "test timing::a_check_is_killed ... FAILED\nsecond run\nexit code 101".to_owned())
+        }
+    });
+    let runs = run_checks(&toolbox, &["cargo test -p ra-console".to_owned()], &[]).await;
+    assert!(!runs[0].passed);
+    assert!(runs[0].text.contains("second run"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
 #[test]
 fn a_report_commit_section_gives_the_landing_its_message() {
     let report = "Done.\n\n## Commit\nCap a project's Opus slots at its runners\n\nThe priority order decides who goes first,\nthe runners how many.\n\n## Faster next time\n- nothing\n";

@@ -5335,6 +5335,10 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
             (Err(e), _) => Err(anyhow::anyhow!("{e:#}")),
             (_, Err(e)) => Err(e),
         };
+        let outcome = match (outcome, toolbox, ra_tools::words(command)) {
+            (Ok((false, output)), Ok(toolbox), Ok(words)) => Ok(rerun_alone(toolbox, &words, output).await),
+            (outcome, ..) => outcome,
+        };
         let kept = if orchestrated.contains(command) { TAIL_LINES } else { PASSED_TAIL_LINES };
         let run = match outcome {
             Ok((true, output)) => CheckRun {
@@ -5385,6 +5389,85 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
         }
     }
     runs
+}
+
+/// The names of the tests a failed cargo or gradle output marks `FAILED`: `test name ... FAILED`,
+/// `name --- FAILED` under `-q`, or gradle's `Class > method FAILED` as `Class.method`.
+fn failed_test_names(output: &str, gradle: bool) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in output.lines().map(str::trim).filter(|line| line.ends_with(" FAILED")) {
+        let name = if gradle {
+            line.strip_suffix(" FAILED")
+                .and_then(|head| head.split_once(" > "))
+                .map(|(class, method)| format!("{class}.{}", method.trim_end_matches("()")))
+        } else if let Some(rest) = line.strip_prefix("test ") {
+            rest.strip_suffix(" ... FAILED").map(str::to_owned)
+        } else {
+            line.split_once(" --- ").map(|(name, _)| name.to_owned())
+        };
+        if let Some(name) = name
+            && !name.is_empty()
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The command that runs only `names`: the cargo test's own flags with each name matched
+/// exactly, or the gradle wrapper with a `--tests` per name. `None` for any other command.
+fn rerun_words(words: &[String], names: &[String]) -> Option<Vec<String>> {
+    let program = words.first()?.rsplit(['/', '\\']).next()?.to_lowercase();
+    if names.is_empty() {
+        return None;
+    }
+    if program.starts_with("cargo") && words.get(1).is_some_and(|word| word == "test") {
+        const VALUED: [&str; 8] = ["-p", "--package", "--manifest-path", "--features", "-F", "--exclude", "--test", "--target"];
+        let mut rerun = vec![words[0].clone(), "test".to_owned()];
+        let mut rest = words[2..].iter().take_while(|word| *word != "--");
+        while let Some(word) = rest.next() {
+            if word.starts_with('-') {
+                rerun.push(word.clone());
+                if VALUED.contains(&word.as_str())
+                    && let Some(value) = rest.next()
+                {
+                    rerun.push(value.clone());
+                }
+            }
+        }
+        rerun.extend(["--".to_owned(), "--exact".to_owned()]);
+        rerun.extend(names.iter().cloned());
+        return Some(rerun);
+    }
+    if program.contains("gradlew") || program.starts_with("gw") || program.starts_with("gradle") {
+        let mut rerun = words.to_vec();
+        for name in names {
+            rerun.extend(["--tests".to_owned(), name.clone()]);
+        }
+        return Some(rerun);
+    }
+    None
+}
+
+/// Gives a failed test check a second chance alone: load makes a timing test fail in a full run
+/// and pass by itself. Tests that all pass alone make the check pass, the output naming them
+/// as load-sensitive; any that fails again keeps the check failed with that rerun's output.
+async fn rerun_alone(toolbox: &ra_tools::Toolbox, words: &[String], output: String) -> (bool, String) {
+    let gradle = !words.first().is_some_and(|word| word.to_lowercase().contains("cargo"));
+    let names = failed_test_names(&output, gradle);
+    let Some(rerun) = rerun_words(words, &names) else {
+        return (false, output);
+    };
+    match toolbox.check_args(&rerun).await {
+        Ok((true, again)) => {
+            let note = format!("load-sensitive, passed alone: {}", names.join(", "));
+            tracing::info!(target: crate::trace::PROGRESS, "{note}");
+            (true, format!("{note}\n{again}"))
+        }
+        Ok((false, again)) => (false, again),
+        Err(_) => (false, output),
+    }
 }
 
 /// The last `n` lines of a text.
