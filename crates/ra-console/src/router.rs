@@ -506,7 +506,7 @@ impl Ladder {
         let base = at.saturating_sub(down);
         let rung = (base + rejections.checked_div(self.up_after).unwrap_or(0)).min(ceiling);
         let model = id(&self.models[rung]);
-        let note = if rung > base {
+        let said = if rung > base {
             format!("escalated to {model} after {rejections} rejection{}", if rejections == 1 { "" } else { "s" })
         } else if rung < at {
             let rungs = if at - rung == 1 { "one rung".to_owned() } else { format!("{} rungs", at - rung) };
@@ -514,7 +514,7 @@ impl Ladder {
         } else {
             return None;
         };
-        Some(Step { model, note })
+        Some(Step { model, note: said })
     }
 }
 

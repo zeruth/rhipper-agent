@@ -59,7 +59,7 @@ enum Command {
         #[arg(long, num_args = 1..)]
         waits_on: Vec<i64>,
         /// The model that runs the card: a claude-* id on Claude Code, local/<name> on the local
-        /// server, vendor/model on OpenRouter; left out, the default route.
+        /// server, vendor/model on `OpenRouter`; left out, the default route.
         #[arg(long)]
         model: Option<String>,
     },
@@ -177,13 +177,13 @@ enum Command {
         dry: bool,
     },
     /// Checks what a run needs, one line each: `claude` on the path and logged in, the hooks, the settings a
-    /// worker loads, git, the local server, the OpenRouter key, the roadmap parsing, the ledger opening; exit
+    /// worker loads, git, the local server, the `OpenRouter` key, the roadmap parsing, the ledger opening; exit
     /// code 1 when a required one fails.
     Doctor,
     /// One round trip to a model: the answer and the usage.
     Ping {
         /// The model: a claude-* id runs on Claude Code, local/<name> on the local server at
-        /// RHIPPER_LOCAL_URL, vendor/model on OpenRouter.
+        /// `RHIPPER_LOCAL_URL`, vendor/model on `OpenRouter`.
         #[arg(long, default_value = ra_console::ui::DEFAULT_MODEL)]
         model: String,
     },
@@ -220,14 +220,14 @@ enum Command {
         /// that fits it, else the default.
         #[arg(long)]
         model: Option<String>,
-        /// The most dollars the run may spend; none unless given. With budgets on (RHIPPER_BUDGETS=on, or
+        /// The most dollars the run may spend; none unless given. With budgets on (`RHIPPER_BUDGETS=on`, or
         /// `budgets on` in the console) the node's complexity caps a run (c1 0.25 … c5 5.00) instead.
         #[arg(long)]
         budget: Option<f64>,
         /// The most turns the run may take; none unless given.
         #[arg(long)]
         turns: Option<u32>,
-        /// Out of debug mode: the worker is not asked what would have made the run faster. RHIPPER_DEBUG=off
+        /// Out of debug mode: the worker is not asked what would have made the run faster. `RHIPPER_DEBUG=off`
         /// does the same everywhere.
         #[arg(long)]
         no_debug: bool,
@@ -657,14 +657,15 @@ async fn run_main() -> anyhow::Result<()> {
                 Some(id) if dry => ra_console::agent::dry_run(&store, id, &worker).await?,
                 Some(id) if worktree => ra_console::agent::run_in_worktree(&store, id, &worker).await?,
                 Some(id) => ra_console::agent::run(&store, id, &worker).await?,
-                None if all => match parallel {
-                    Some(width) => ra_console::agent::run_parallel(&store, &worker, width, stop_on_revision).await?,
-                    // the walk moves to a newer rc that `rc install` put on the path, between cards
-                    None => {
+                None if all => {
+                    if let Some(width) = parallel {
+                        ra_console::agent::run_parallel(&store, &worker, width, stop_on_revision).await?
+                    } else {
+                        // the walk moves to a newer rc that `rc install` put on the path, between cards
                         let worker = worker.with_install(Some(ra_console::install::default_dir()));
                         ra_console::agent::run_all(&store, &worker, stop_on_revision).await?
                     }
-                },
+                }
                 None => ra_console::agent::run_next(&store, &worker).await?,
             };
             for line in lines {
@@ -1539,7 +1540,7 @@ async fn depend(id: i64, waits_for: &[i64]) -> anyhow::Result<()> {
     for other in waits_for {
         store.depend_on(id, *other).await?;
     }
-    println!("#{id} waits for {:?}", waits_for);
+    println!("#{id} waits for {waits_for:?}");
     Ok(())
 }
 
