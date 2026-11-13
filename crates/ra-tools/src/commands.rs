@@ -38,13 +38,28 @@ impl Toolbox {
     /// # Errors
     /// When the command is empty or cannot start.
     pub async fn check_acceptance(&self, command: &str) -> anyhow::Result<(bool, String)> {
-        let text = self.run(command, false).await?;
+        self.check_args(&words(command)?).await
+    }
+
+    /// Runs an acceptance command already split into its words, as
+    /// [`check_acceptance`](Self::check_acceptance) does: the words reach the program as its
+    /// arguments, never joined and split again, so a `.\gw.ps1` keeps its backslash (runelite
+    /// #88 lost it to a second split). A script sees the words joined by spaces.
+    ///
+    /// # Errors
+    /// When there are no words or the program cannot start.
+    pub async fn check_args(&self, words: &[String]) -> anyhow::Result<(bool, String)> {
+        let text = self.run_words(words, &words.join(" "), false).await?;
         let passed = text.lines().last() == Some("exit code 0");
         Ok((passed, text))
     }
 
     pub(crate) async fn run(&self, command: &str, allowlisted: bool) -> anyhow::Result<String> {
-        let words = split(command)?;
+        self.run_words(&split(command)?, command, allowlisted).await
+    }
+
+    /// Runs `words` as a program and its arguments; `command` is the line a script answers.
+    async fn run_words(&self, words: &[String], command: &str, allowlisted: bool) -> anyhow::Result<String> {
         let mut parts = words.iter().map(String::as_str);
         let program = parts.next().context("the command is empty")?;
         let mut args: Vec<&str> = parts.collect();
@@ -190,6 +205,15 @@ async fn kill_tree(child: &mut tokio::process::Child) {
             .await;
     }
     let _ = child.kill().await;
+}
+
+/// The words of a command line as a check runs them: the program, then its arguments, split
+/// once by [`split`]'s quoting so the caller passes them on whole.
+///
+/// # Errors
+/// When a quote is unbalanced or the line ends in a backslash.
+pub fn words(command: &str) -> anyhow::Result<Vec<String>> {
+    split(command)
 }
 
 /// The words of a command by shell quoting, not whitespace: a `"…"` or `'…'` group stays one

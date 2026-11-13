@@ -103,3 +103,29 @@ async fn an_init_writes_the_roadmap_the_mode_says_and_refuses_a_second() {
     assert!(third.path().join(DRAFT_FILE).exists());
     assert!(!exists(third.path()));
 }
+
+#[tokio::test]
+async fn init_writes_the_gitattributes_and_the_doctor_reports_a_project_without_them() {
+    let worker = Worker::new("claude-opus-5-5").with_provider(Arc::new(Answers(String::new())));
+    let fresh = tempfile::tempdir().unwrap();
+    let lines = init(fresh.path(), &worker, Mode::Empty).await.unwrap();
+    assert!(lines.iter().any(|l| l.starts_with(".gitattributes fixes the line endings")), "{lines:?}");
+    let written = std::fs::read_to_string(fresh.path().join(GITATTRIBUTES_FILE)).unwrap();
+    assert!(written.contains("* text=auto eol=lf"), "{written}");
+    assert!(line_endings_check(fresh.path()).is_ok());
+
+    // a project without them fails the check once and has them after; what it said is kept
+    let old = tempfile::tempdir().unwrap();
+    std::fs::write(old.path().join(GITATTRIBUTES_FILE), "*.png binary").unwrap();
+    let error = line_endings_check(old.path()).unwrap_err();
+    assert!(error.contains("no line-ending attributes"), "{error}");
+    let text = std::fs::read_to_string(old.path().join(GITATTRIBUTES_FILE)).unwrap();
+    assert!(text.starts_with("*.png binary\n#"), "{text}");
+    assert!(line_endings_check(old.path()).is_ok());
+
+    // attributes that already settle the ending are left as they are
+    let settled = tempfile::tempdir().unwrap();
+    std::fs::write(settled.path().join(GITATTRIBUTES_FILE), "* text=auto\n").unwrap();
+    assert!(!ensure_line_endings(settled.path()).unwrap());
+    assert_eq!(std::fs::read_to_string(settled.path().join(GITATTRIBUTES_FILE)).unwrap(), "* text=auto\n");
+}
