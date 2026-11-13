@@ -1290,33 +1290,47 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
 }
 
 /// What the reviewer reads: the card, the last handoff when there is one, and the diff of the
-/// card's files and the handoff's changed ones (what the run touched and the dirty files its
-/// report named, [`reported_files`]) against `HEAD`, clipped.
+/// card's own change ([`card_changed`]) and its files, clipped: in a worktree the branch from
+/// its merge base, every run of the card; in the project's tree the handoff's set against
+/// `HEAD`, with the tree's other dirty files listed apart and kept out of the diff.
 /// `project` holds the card's context (the handoffs live under the project's `var`); `root`
 /// is where the run acted and the diff is read: the project, or the card's worktree.
-async fn review_brief(project: &Path, root: &Path, node: &Node) -> String {
+pub(crate) async fn review_brief(project: &Path, root: &Path, node: &Node) -> String {
     let mut text = format!("# #{} {}\n", node.id, node.title);
     if let Some(objective) = &node.objective {
         let _ = writeln!(text, "\nObjective: {objective}");
     }
     let _ = writeln!(text, "\nAcceptance: {}", node.acceptance.as_deref().unwrap_or("none written; the workspace tests are the check"));
-    let mut files = node.files.clone();
+    let task = ra_context::TaskContext::open(project, node.id);
     let mut changed = Vec::new();
-    match ra_context::TaskContext::open(project, node.id).handoffs.last() {
+    match task.handoffs.last() {
         Some(last) => {
             let _ = writeln!(text, "\n## Handoff of the last run\n{} on {} · {}\n{}", last.outcome, last.model, last.check, last.report);
             changed.clone_from(&last.changed);
-            for file in &last.changed {
-                if !files.contains(file) {
-                    files.push(file.clone());
-                }
-            }
         }
         None => text.push_str("\n## Handoff of the last run\nnone: no run of this card left one\n"),
     }
+    // the card's change is the branch's in a worktree, whatever the last run alone touched: the
+    // reviewer judges the card, not its last session (#182, #183); in a shared tree the dirty
+    // files no handoff of the card names are someone else's
+    let stray = if same_tree(project, root) {
+        let named: Vec<&String> = task.handoffs.iter().flat_map(|h| &h.changed).collect();
+        dirty_paths(&git_status(root).await).into_iter().filter(|path| !changed.contains(path) && !named.contains(&path)).collect()
+    } else {
+        changed.extend(branch_files(project, root).await);
+        changed.sort();
+        changed.dedup();
+        Vec::new()
+    };
+    let mut files: Vec<String> = node.files.iter().filter(|f| !stray.contains(f)).cloned().collect();
+    for file in &changed {
+        if !files.contains(file) {
+            files.push(file.clone());
+        }
+    }
     // the list and the stat come before the diff: the reviewer of #159 looked for the change in
     // the one file it expected and judged the card unfinished for code that lived in another
-    text.push_str(&crate::review::files_section(&node.files, &changed));
+    text.push_str(&crate::review::files_section(&node.files, &changed, &stray));
     // the diff's base: HEAD in the project's own tree; in a card's worktree the merge base
     // with the project's branch, so the checkpoints the walk commits on the card's branch
     // after each run are in the reviewer's view and not behind it
@@ -2457,15 +2471,34 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
 /// tree; in a worktree the merge base of the worktree's branch and the project's, so the
 /// checkpoints on the card's branch count as the card's change.
 async fn diff_base(project: &Path, root: &Path) -> String {
-    let same = match (std::fs::canonicalize(project), std::fs::canonicalize(root)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => project == root,
-    };
-    if same {
+    if same_tree(project, root) {
         return String::from("HEAD");
     }
     let Ok(main) = git(project, &["rev-parse", "--abbrev-ref", "HEAD"]).await else { return String::from("HEAD") };
     git(root, &["merge-base", "HEAD", &main]).await.unwrap_or_else(|_| String::from("HEAD"))
+}
+
+/// Whether `root`, where a run acted, is the project's own tree rather than a card's worktree.
+fn same_tree(project: &Path, root: &Path) -> bool {
+    match (std::fs::canonicalize(project), std::fs::canonicalize(root)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => project == root,
+    }
+}
+
+/// The files of a card's branch in its worktree: what differs from the merge base with the
+/// project's branch, committed in a checkpoint or not, and the new files not yet tracked.
+async fn branch_files(project: &Path, root: &Path) -> Vec<String> {
+    let base = diff_base(project, root).await;
+    let mut files = Vec::new();
+    for args in [&["diff", "--name-only", base.as_str()][..], &["ls-files", "--others", "--exclude-standard"][..]] {
+        if let Ok(out) = git(root, args).await {
+            files.extend(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned));
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
 /// What a commit of a card's work is for: the landing of an accepted card, a checkpoint
@@ -3681,7 +3714,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 store.set_notes(id, &over.to_string()).await?;
             }
             store.set_state_by(id, TaskState::Failed, Source::Run).await?;
-            let changed = run_changed(&acting, &dirty_before, &git_status(&acting).await, run_started);
+            let changed = card_changed(&root, &acting, &dirty_before, &git_status(&acting).await, run_started, "", &task).await;
             task.record(handoff("failed", "no check: the run failed", &format!("{error:#}"), changed));
             save_context(store, &root, &task).await;
             return Err(error);
@@ -3706,7 +3739,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the next run, which the walk starts right away, opens on a small context again
     if let Some(cap) = session.capped {
         store.set_session(id, None, unix_now()).await?;
-        let changed = run_changed(&acting, &dirty_before, &git_status(&acting).await, run_started);
+        let changed = card_changed(&root, &acting, &dirty_before, &git_status(&acting).await, run_started, &session.text, &task).await;
         let report = capped_report(cap, &session, &changed, &node);
         store.set_notes(id, &report).await?;
         let why = format!("{cap} ended the run; the card continues in a fresh session");
@@ -3749,12 +3782,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root, &target).await } else { None };
     let checks = run_checks(&toolbox, &commands).await;
     let status_after = git_status(&acting).await;
-    let mut changed = run_changed(&acting, &dirty_before, &status_after, run_started);
-    // the worker's report names the files it worked in: on a tree other cards share, a file
-    // another run left dirty and this one edited through a path git status does not retell
-    // (a rename, an editor that keeps the old time) is the card's own and the reviewer would
-    // judge the card without it (#157). The named files that are dirty join the set
-    changed.extend(reported_files(&acting, &session.text, &status_after));
+    // the card's own set: on a tree other hands share, a dirty file joins it only when the run
+    // wrote to it and the report or an earlier handoff names it (#157 lost a named file, #185
+    // was judged on the person's edits); in a worktree it is the whole branch
+    let mut changed = card_changed(&root, &acting, &dirty_before, &status_after, run_started, &session.text, &task).await;
     // a fix pass edits the files the run before it dirtied, which `git status` shows no
     // differently: its change is the run's and its own together, so the lint reads the lines
     // it was sent to fix and the handoff still names them
@@ -4432,17 +4463,58 @@ fn run_changed(root: &Path, before: &str, after: &str, since: std::time::SystemT
     changed
 }
 
+/// The card's change, which the handoff's `changed` line names and the reviewer judges. In a
+/// card's worktree the branch's files from its merge base ([`branch_files`]): every run of the
+/// card and no one else's edit; a run that moved nothing names nothing, so the walk still
+/// counts it idle. In the project's own tree what the run can be held to: a file whose status
+/// line is new since the run began, or one already dirty that was written to inside the run
+/// and that the report or an earlier handoff of the card names. A file dirty before the run
+/// that only its time ties to it is not the card's: the person's edits in the shared checkout
+/// sent #185 back three times.
+async fn card_changed(
+    project: &Path,
+    acting: &Path,
+    before: &str,
+    after: &str,
+    since: std::time::SystemTime,
+    report: &str,
+    task: &ra_context::TaskContext,
+) -> Vec<String> {
+    if !same_tree(project, acting) {
+        return if run_changed(acting, before, after, since).is_empty() { Vec::new() } else { branch_files(project, acting).await };
+    }
+    let mut changed = ra_context::changed_between(before, after);
+    let reported = reported_files(acting, report, after);
+    let named = |path: &String| reported.contains(path) || task.handoffs.iter().any(|h| h.changed.contains(path));
+    for path in dirty_paths(after) {
+        if changed.contains(&path) || !named(&path) {
+            continue;
+        }
+        if std::fs::metadata(acting.join(&path)).and_then(|m| m.modified()).is_ok_and(|m| m >= since) {
+            changed.push(path);
+        }
+    }
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
+/// The paths `git status --porcelain` lists, a rename by its new name.
+fn dirty_paths(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"').to_owned())
+        .collect()
+}
+
 /// The files a worker's report names in backticks that are in the tree and that `status`
 /// (`git status --porcelain`) lists as dirty or new: what the run says it changed, held to
 /// what git can show of it. A clean file would add nothing to the reviewer's diff and would
 /// read to the lint as new, so it stays out; a span with spaces or a line of a command is not
 /// a path.
 fn reported_files(root: &Path, report: &str, status: &str) -> Vec<String> {
-    let dirty: Vec<String> = status
-        .lines()
-        .filter_map(|line| line.get(3..))
-        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"').to_owned())
-        .collect();
+    let dirty = dirty_paths(status);
     let mut files: Vec<String> = report
         .split('`')
         .skip(1)
