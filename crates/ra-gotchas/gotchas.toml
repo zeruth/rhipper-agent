@@ -146,7 +146,7 @@ remedy = { kind = "hint" }
 id = "powershell-not-allowed"
 where = "result"
 pattern = 'Command name is a dynamic expression|PowerShell.*not allowed|permission.*PowerShell'
-message = "the PowerShell tool refused the command; the same cargo or git command runs through Bash"
+message = "the PowerShell tool refused the command; the same cargo or git command runs through Bash. A call through a variable (`$exe = 'x'; & $exe`) is refused: write the literal path in the call, `& \"C:\\path\\tool.exe\" args`"
 remedy = { kind = "hint" }
 
 [[gotcha]]
