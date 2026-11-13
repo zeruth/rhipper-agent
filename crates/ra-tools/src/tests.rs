@@ -244,6 +244,26 @@ fn process_is_gone(pid: u32) -> bool {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn a_child_in_the_owning_job_dies_with_its_owner() {
+    use std::os::windows::io::AsHandle;
+    // a child that would wait a minute on its own
+    let mut child = std::process::Command::new("ping").args(["-n", "60", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+    let owner = crate::cpu::Owner::new().expect("a job that kills on close");
+    assert!(owner.adopt(child.as_handle()), "the child joins the job");
+    assert!(child.try_wait().unwrap().is_none(), "the child runs while its owner lives");
+    drop(owner);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the child outlived the job that owned it");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn the_changed_ranges_come_from_the_hunks_and_only_their_warnings_count() {
     let diff = "diff --git a/crates/probe/src/lib.rs b/crates/probe/src/lib.rs\n--- a/crates/probe/src/lib.rs\n+++ b/crates/probe/src/lib.rs\n@@ -1,0 +2,3 @@\n+a\n+b\n+c\n@@ -40,2 +43 @@\n-x\n-y\n+z\n@@ -60,1 +62,0 @@\n-gone\ndiff --git a/new.rs b/new.rs\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,2 @@\n+n\n+m\n";

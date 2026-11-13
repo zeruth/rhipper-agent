@@ -100,7 +100,13 @@ impl Toolbox {
             // the check is a build: it runs on its share of the builders' CPU, which follows
             // the number of builds running until it ends
             #[cfg(windows)]
-            let _share = child.raw_handle().and_then(crate::cpu::attach);
+            let _share = child.raw_handle().and_then(|handle| {
+                // and it ends with the walk that started it, however the walk ends
+                // SAFETY: the child is alive and owned here, so its handle is open for the call;
+                // a check outside the job still runs, so whether it went is not needed
+                let _ = crate::cpu::adopt(unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(handle) });
+                crate::cpu::attach(handle)
+            });
             // the output is read into buffers the run keeps when the limit ends it, so a check
             // that outlives its budget still leaves its last lines
             let stdout = drain(child.stdout.take());

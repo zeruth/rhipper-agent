@@ -2647,6 +2647,8 @@ pub async fn adopt(
 #[allow(clippy::too_many_lines)]
 pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
     share_cpu_among_builds();
+    // a walk that dies takes its workers with it
+    ra_tools::cpu::own_children();
     probe_the_machine(&workspace_of(store)).await;
     let mut lines = Vec::new();
     let mut ran = 0;
@@ -4867,6 +4869,8 @@ type InFlight<'a> = std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<Str
 pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
     anyhow::ensure!(width > 0, "the width of a parallel batch is at least one");
     share_cpu_among_builds();
+    // a walk that dies takes its workers with it
+    ra_tools::cpu::own_children();
     let root = workspace_of(store);
     let Some(_lock) = take_walk_lock(&root) else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")

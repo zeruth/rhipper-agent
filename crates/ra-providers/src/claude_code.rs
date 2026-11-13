@@ -42,6 +42,18 @@ pub const READER_TOOLS: &str = "Read,Glob,Grep,WebFetch,WebSearch";
 /// worker that inherits them has no shell at all. The gotcha hooks come in by `--settings`.
 pub const WORKER_SETTING_SOURCES: &str = "project,local";
 
+/// What puts a started worker in the job its starter's death closes: the toolbox's
+/// (`ra_tools::cpu::own_children`), which this crate cannot name, so it registers itself here.
+#[cfg(windows)]
+static ADOPTER: std::sync::OnceLock<fn(std::os::windows::io::BorrowedHandle<'_>) -> bool> = std::sync::OnceLock::new();
+
+/// Sets what every worker started from now on is handed to, by its process handle, so it dies
+/// with this process; the first call wins.
+#[cfg(windows)]
+pub fn set_adopter(adopt: fn(std::os::windows::io::BorrowedHandle<'_>) -> bool) {
+    let _ = ADOPTER.set(adopt);
+}
+
 /// The Claude Code provider.
 pub struct ClaudeCode {
     /// The command; `claude` on the path unless told otherwise.
@@ -419,12 +431,20 @@ impl ClaudeCode {
         }
         command.envs(self.run_env(request.workspace.as_deref()));
         command.envs(self.temp_env(&request));
+        // a run dropped mid-way, a walk stopped or timed out, takes its worker with it
+        command.kill_on_drop(true);
         let mut child = command.spawn().map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!("{} is not installed or not on the path", self.binary.display()))
             }
             _ => ProviderError::Unavailable(format!("cannot start {}: {e}", self.binary.display())),
         })?;
+        // a walk that dies outright drops nothing: the job its death closes ends the worker
+        #[cfg(windows)]
+        if let (Some(adopt), Some(handle)) = (ADOPTER.get(), child.raw_handle()) {
+            // SAFETY: the child is alive and owned here, so its handle is open for the call
+            adopt(unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(handle) });
+        }
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(prompt.as_bytes()).await.map_err(|e| ProviderError::Other(format!("cannot write the prompt: {e}")))?;
             drop(stdin);
