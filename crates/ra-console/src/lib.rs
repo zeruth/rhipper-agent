@@ -10,6 +10,7 @@ pub mod allow_move;
 pub mod channel;
 pub mod clock;
 pub mod commands;
+pub mod gotcha_shell_variable;
 pub mod hub;
 pub mod install;
 pub mod instance;

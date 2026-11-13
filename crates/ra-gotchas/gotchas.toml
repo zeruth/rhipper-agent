@@ -132,6 +132,15 @@ message = "the PowerShell tool refused the command; the same cargo or git comman
 remedy = { kind = "hint" }
 
 [[gotcha]]
+# the hook cannot judge a command whose `$?` (or another variable) only the shell resolves, and
+# refuses it whole; the exit status is already in the tool result
+id = "shell-variable"
+where = "result"
+pattern = "A variable in this command can't be checked before it runs"
+message = "drop `$?` (and any other variable) from the command: the exit status comes back in the tool result, so run the command on its own and read it there"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 id = "mojibake"
 where = "result"
 pattern = 'â€[œ"˜™¦]|Ã©|Ã¼|Â·'
