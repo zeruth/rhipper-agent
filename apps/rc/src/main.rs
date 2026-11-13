@@ -14,6 +14,8 @@ use ra_usage::UsageStore;
 #[cfg(test)]
 mod tests;
 
+#[allow(dead_code)]
+mod bench;
 mod doctor;
 mod status;
 mod wait;

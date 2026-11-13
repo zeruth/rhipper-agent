@@ -862,6 +862,24 @@ pub fn rank_of(root: &Path) -> Option<usize> {
     Some(order.iter().position(|n| n.eq_ignore_ascii_case(&name)).unwrap_or(order.len()))
 }
 
+/// The projects the hub knows, the priority order first and then the rest as the window
+/// had them: the set a walk over every project reads.
+#[must_use]
+pub fn known_projects() -> Vec<PathBuf> {
+    in_priority_order(recent(), &priority())
+}
+
+/// `projects` with those named in `order` first, in that order (a name matches the
+/// directory name, case aside); the others keep their place after them.
+#[must_use]
+pub fn in_priority_order(mut projects: Vec<PathBuf>, order: &[String]) -> Vec<PathBuf> {
+    projects.sort_by_key(|p| {
+        let name = project_name(p);
+        order.iter().position(|n| n.eq_ignore_ascii_case(&name)).unwrap_or(order.len())
+    });
+    projects
+}
+
 /// Takes the hub's lock `name` once, as [`try_guard`], and notes who holds it in a file
 /// beside the lock, so the other projects can count a project's slots ([`held_by`]).
 ///

@@ -299,6 +299,21 @@ fn rc_wait_on_a_live_pid_outlasts_ten_silent_seconds_and_returns_when_it_ends() 
 }
 
 #[test]
+fn bench_reads_the_hub() {
+    let known = vec![PathBuf::from("no-such/asm"), PathBuf::from("no-such/agent"), PathBuf::from("no-such/runelite")];
+    let order = vec!["Agent".to_owned(), "runelite".to_owned()];
+    let projects = ra_console::hub::in_priority_order(known, &order);
+    let names: Vec<String> = projects.iter().map(|p| ra_console::hub::project_name(p)).collect();
+    assert_eq!(names, ["agent", "runelite", "asm"]);
+
+    let rows = bench::rows(&projects[..2], |root| if root.ends_with("agent") { vec![true, true, false] } else { vec![true, false] });
+    assert_eq!(rows.len(), 3);
+    assert_eq!((rows[0].name.as_str(), rows[0].cases, rows[0].passed), ("agent", 3, 2));
+    assert_eq!((rows[1].name.as_str(), rows[1].cases, rows[1].passed), ("runelite", 2, 1));
+    assert_eq!((rows[2].name.as_str(), rows[2].cases, rows[2].passed), (bench::POOL, 5, 3));
+}
+
+#[test]
 fn rc_wait_on_an_empty_file_does_not_settle_on_silence() {
     let dir = std::env::temp_dir().join(format!("rc-wait-empty-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a dir");
