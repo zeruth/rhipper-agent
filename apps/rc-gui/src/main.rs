@@ -1286,16 +1286,31 @@ impl App {
                 // a project with nothing running stays off the dashboard while another works
                 // (the person: "hide the inactive projects in dashboard"); with nothing
                 // running anywhere, every project shows its header line
-                for i in 0..self.tabs.len() {
+                // in the machine's order, the projects not in it after; each card takes a drop
+                // of another's grip, above its middle to go before it, below to go after
+                let mut by_place: Vec<usize> = (0..self.tabs.len()).collect();
+                by_place.sort_by_key(|&i| ra_console::allocation::priority_place(&self.tabs[i].root).unwrap_or(usize::MAX));
+                let mut dropped: Option<(String, String, bool)> = None;
+                for i in by_place {
                     if any_working && small[i] {
                         continue;
                     }
                     let lane = theme::lane(1 + i % 9);
                     let budget = (pool * weights[i] / weight).floor();
-                    if self.tabs[i].dashboard_card(ui, lane, page, budget) {
+                    let target = self.tabs[i].root.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    let (zone, payload) =
+                        ui.dnd_drop_zone::<String, bool>(Frame::NONE, |ui| self.tabs[i].dashboard_card(ui, lane, page, budget));
+                    if zone.inner {
                         open = Some(i);
                     }
+                    if let Some(moved) = payload {
+                        let after = ui.ctx().pointer_latest_pos().is_some_and(|p| p.y > zone.response.rect.center().y);
+                        dropped = Some(((*moved).clone(), target, after));
+                    }
                     ui.add_space(10.0);
+                }
+                if let Some((moved, target, after)) = dropped {
+                    let _ = ra_console::allocation::place_next_to(&moved, &target, after);
                 }
             });
             // the bar sits in the strip the page leaves at the right for it
@@ -4225,7 +4240,6 @@ impl Workspace {
             .clone()
             .unwrap_or_else(|| self.root.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
         let dir = self.root.display().to_string();
-        let model = short(&self.worker.model).to_owned();
         let job = self.job.clone();
         // the project's allocation, read once a second: the header's controls change it
         if self.allocation_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
@@ -4241,9 +4255,6 @@ impl Workspace {
         let waiting = self.waiting.clone();
         let landed = self.landed;
         let (implementer, runners, place) = self.allocation.clone();
-        // the header's model badge is the project's implementer, as the toggle sets it, not the
-        // window's default model
-        let model = implementer.as_deref().map_or(model, |m| short(m).to_owned());
         let root = self.root.clone();
         let mut changed = false;
         // the rows read as in the column: the running card first, then the next ready ones
@@ -4289,33 +4300,36 @@ impl Workspace {
                 ui.horizontal(|ui| {
                     ui.set_width(inner);
                     ui.spacing_mut().item_spacing.x = 8.0;
+                    // the grip: drag the project above or below another to set the machine's
+                    // order, which the dashboard lists them in (the person, 2026-11-12)
+                    let grip_name = root.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    let place_text =
+                        place.map_or_else(|| "not in the machine's order".to_owned(), |p| format!("#{p} in the machine's order"));
+                    ui.dnd_drag_source(egui::Id::new(("dash-grip", &root)), grip_name, |ui| {
+                        ui.label(RichText::new("⋮").size(20.0).strong().color(theme::dim()));
+                    })
+                    .response
+                    .on_hover_cursor(egui::CursorIcon::Grab)
+                    .on_hover_text(format!("{place_text}: drag above or below another project to reorder"));
                     ui.label(RichText::new(&name).size(15.5).strong().color(theme::text()));
                     ui.label(RichText::new(&dir).small().color(theme::dim()));
-                    // the project's allocation, changed here: its implementer, its runners and
-                    // its place in the machine's order (the person, 2026-11-12: "change projects
-                    // allocation in the gui"); a walk picks each up before its next card
-                    let fable = implementer.as_deref() == Some(ra_console::allocation::FABLE);
-                    if let Some(pick_fable) = cards::toggle(ui, "fable", "opus", fable, theme::accent()) {
-                        let model = if pick_fable { ra_console::allocation::FABLE } else { ra_console::allocation::OPUS };
-                        changed |= ra_console::allocation::set_model(&root, model).is_ok();
+                    // the project's allocation, changed here: its implementer, one of three, and
+                    // its runners (the person, 2026-11-12: "change projects allocation in the
+                    // gui"); a walk picks each up before its next card
+                    ui.add_space(4.0);
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    for model in [ra_console::allocation::FABLE, ra_console::allocation::OPUS, ra_console::allocation::HAIKU] {
+                        let on = implementer.as_deref() == Some(model);
+                        if cards::choice(ui, model, cards::model_color(model), on) && !on {
+                            changed |= ra_console::allocation::set_model(&root, model).is_ok();
+                        }
                     }
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     ui.add_space(10.0);
                     let step = cards::stepper(ui, "runners", &runners.to_string(), lane, "cards this project's walk runs at once");
                     if step != 0 {
                         let to = runners.saturating_add_signed(step).max(1);
                         changed |= ra_console::allocation::set_runners(&root, to).is_ok();
-                    }
-                    let shown = place.map_or_else(|| "—".to_owned(), |p| format!("#{p}"));
-                    // `+` raises the project: a smaller place in the order
-                    let step = cards::stepper(
-                        ui,
-                        "priority",
-                        &shown,
-                        theme::warn_text(),
-                        "the project's place in the machine's order: + is served sooner",
-                    );
-                    if step != 0 {
-                        changed |= ra_console::allocation::move_priority(&root, step > 0).is_ok();
                     }
                     // what a landed card costs here, beside the allocation it is judged against;
                     // the waits badge is the row's already
@@ -4331,7 +4345,6 @@ impl Workspace {
                         if ui.add(button).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("the project's tab").clicked() {
                             open = true;
                         }
-                        cards::badge(ui, &model, cards::model_color(&model));
                         let ready = format!("{} ready", order.len());
                         cards::badge(ui, &ready, if order.is_empty() { theme::dim() } else { theme::online() });
                         if !waiting.is_empty() {

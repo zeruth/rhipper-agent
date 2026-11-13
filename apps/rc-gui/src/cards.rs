@@ -530,30 +530,21 @@ pub(crate) fn stepper(ui: &mut Ui, name: &str, value: &str, color: Color32, hint
     step
 }
 
-/// A choice of two in one pill: the lit side is `first` while `on_first`; answers `Some(true)`
-/// for a click on the first, `Some(false)` on the second.
-pub(crate) fn toggle(ui: &mut Ui, first: &str, second: &str, on_first: bool, color: Color32) -> Option<bool> {
-    let mut picked = None;
-    ui.spacing_mut().item_spacing.x = 2.0;
-    for (text, is_first) in [(first, true), (second, false)] {
-        let on = on_first == is_first;
-        let response = Frame::new()
-            .fill(alpha(color, if on { 44 } else { 6 }))
-            .stroke(Stroke::new(1.0, alpha(color, if on { 180 } else { 50 })))
-            .corner_radius(CornerRadius::same(9))
-            .inner_margin(Margin::symmetric(7, 1))
-            .show(ui, |ui| {
-                ui.label(RichText::new(text).small().strong().color(if on { color } else { alpha(theme::dim(), 170) }));
-            })
-            .response
-            .interact(egui::Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        if response.clicked() && !on {
-            picked = Some(is_first);
-        }
-    }
-    ui.spacing_mut().item_spacing.x = 6.0;
-    picked
+/// One option of a choice where only one may be lit: a pill in `color`, filled while `on`, dim
+/// and clickable while not; reports a click.
+pub(crate) fn choice(ui: &mut Ui, text: &str, color: Color32, on: bool) -> bool {
+    Frame::new()
+        .fill(alpha(color, if on { 44 } else { 6 }))
+        .stroke(Stroke::new(1.0, alpha(color, if on { 190 } else { 55 })))
+        .corner_radius(CornerRadius::same(9))
+        .inner_margin(Margin::symmetric(7, 1))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).small().strong().color(if on { color } else { alpha(color, 120) }));
+        })
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }
 
 /// A tab of the card area: lit while `on`, dim and clickable while not; reports a click.

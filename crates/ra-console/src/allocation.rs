@@ -8,9 +8,31 @@ use std::path::Path;
 
 use anyhow::Context;
 
-/// The two implementers the dashboard toggles between.
+/// The three implementers the dashboard chooses between.
 pub const FABLE: &str = "claude-fable-5-1";
 pub const OPUS: &str = "claude-opus-5-5";
+pub const HAIKU: &str = "claude-haiku-4-5-20251001";
+
+/// Moves the project named `moved` to just before `target` in the machine's order (`after`:
+/// just after it), as the dashboard's grip drops it; a project not in the order joins it.
+///
+/// # Errors
+/// When the hub's file cannot be written.
+pub fn place_next_to(moved: &str, target: &str, after: bool) -> anyhow::Result<()> {
+    if moved.eq_ignore_ascii_case(target) {
+        return Ok(());
+    }
+    let mut order = crate::hub::priority();
+    for name in [target, moved] {
+        if !order.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            order.push(name.to_owned());
+        }
+    }
+    order.retain(|n| !n.eq_ignore_ascii_case(moved));
+    let at = order.iter().position(|n| n.eq_ignore_ascii_case(target)).unwrap_or(order.len());
+    order.insert(if after { at + 1 } else { at }, moved.to_owned());
+    crate::hub::set_priority(&order)
+}
 
 /// The most runners the dashboard's `+` sets.
 pub const MAX_RUNNERS: u32 = 12;
