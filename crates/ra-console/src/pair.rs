@@ -45,6 +45,16 @@ pub fn parked(root: &Path, id: i64, reason: &str) -> String {
     text
 }
 
+/// What a run did with card `id` whose round no rerun can move: it is blocked on its first sight
+/// with `reason`. On the feed under the `parked` word, so the status reads its reason as it reads
+/// [`parked`]'s.
+#[must_use]
+pub fn held(root: &Path, id: i64, reason: &str) -> String {
+    let text = format!("parked #{id}: held on its first idle round: {reason}");
+    event(root, &text);
+    text
+}
+
 /// The latest `limit` events, oldest first; none without a feed.
 #[must_use]
 pub fn recent(root: &Path, limit: usize) -> Vec<String> {

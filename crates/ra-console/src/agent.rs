@@ -967,7 +967,6 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     // back to the walk's queue for a restart (the person: needs revision "passed around with
     // an absolute card restarting, they shouldn't do that"). A pass that changed no file in
     // three in a row is a card going round stuck; it ends the run and the walk blocks it
-    let mut idle = 0;
     let mut passes = 0;
     loop {
         // a lint-only failure never reaches the reviewer, so its fix pass starts here: the
@@ -996,9 +995,7 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
         if outcome.is_err() || !node.is_absolute() || node.state != TaskState::NeedsRevision {
             break;
         }
-        let moved = ra_context::TaskContext::open(&root, id).handoffs.last().is_some_and(|h| !h.changed.is_empty());
-        idle = if moved { 0 } else { idle + 1 };
-        if idle >= RERUNS_A_WALK {
+        if ra_context::TaskContext::open(&root, id).idle_rounds() >= RERUNS_A_WALK {
             break;
         }
         passes += 1;
@@ -1310,6 +1307,12 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     worker.record_as(&model, Some("reviewer"), Some(id), &answer.usage, answer.turns).await;
     let verdict = verdict_of(&answer.text);
     let mut trivial = None;
+    // the points' fingerprint rides the handoff's verdict, so a run that changed nothing and drew
+    // the same points again is held on that round, not run a third time
+    let print = match &verdict {
+        Verdict::NeedsRevision(points) => format!("{}{}", ra_context::POINTS_MARK, points_fingerprint(points)),
+        Verdict::Accepted => String::new(),
+    };
     let (state, head, said) = match &verdict {
         Verdict::Accepted => (accepted, format!("review by {model}: accepted"), "accepted".to_owned()),
         Verdict::NeedsRevision(points) => {
@@ -1328,7 +1331,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     // and the notes carry the verdict alone
     let mut task = ra_context::TaskContext::open(&root, id);
     if let Some(last) = task.handoffs.last_mut() {
-        last.verdict = Some(format!("{said} by {model}"));
+        last.verdict = Some(format!("{said} by {model}{print}"));
         if state == TaskState::NeedsRevision
             && let Some((tag, _)) = said.split_once(" · ")
         {
@@ -3329,8 +3332,9 @@ pub(crate) fn accepted_by_review(root: &Path, id: i64) -> bool {
 /// The flight's id for a look-back pass: no card is numbered 0.
 const LOOKBACK_SEAT: i64 = 0;
 
-/// The runs in a row a parallel walk gives a card that each end sent back for revision before
-/// it parks the card until the next walk.
+/// The runs in a row that each end sent back for revision without changing a file before the
+/// card is blocked for a person; counted off the card's context
+/// ([`ra_context::TaskContext::idle_rounds`]), so the count outlives the walk.
 const RERUNS_A_WALK: u32 = 3;
 
 /// A landing whose merge into the project's branch conflicted; the merge was aborted.
@@ -3652,8 +3656,8 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     let root_owned = root.clone();
     let mut flight: Vec<(i64, std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + '_>>, Seat)> = Vec::new();
     let mut stopped: Option<String> = None;
-    // the cards sent back in a row in this walk, and the ones parked past [`RERUNS_A_WALK`]
-    let mut reruns: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+    // the cards parked past [`RERUNS_A_WALK`] or failed in this walk; the count of the rounds is
+    // the card's context's, so a restarted window counts on
     let mut parked: std::collections::HashSet<i64> = std::collections::HashSet::new();
     loop {
         // `stop` from the console or the window: nothing new starts, and the walk ends when
@@ -3801,17 +3805,14 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // a card sent back run after run is parked until the next walk: a rerun that
                 // ends in revision at once otherwise starts again at once, and asm ran #131 270
                 // times and #132 234 times in an afternoon, a turn each (2026-11-12)
-                // an absolute card is counted only on runs that changed nothing: work in
-                // progress is never cut, a card going round without touching a file is stuck
-                let task = ra_context::TaskContext::open(&root, id);
-                let idle = task.handoffs.last().is_none_or(|h| h.changed.is_empty());
-                let absolute = store.read(id).await.is_ok_and(|n| n.is_absolute());
-                // a card the reviewer accepted is sent back by the landing, not by its work: it
-                // never counts toward the park
-                if sent_back && !accepted_by_review(&root, id) && (!absolute || idle) {
-                    let count = reruns.entry(id).or_insert(0);
-                    *count += 1;
-                    if *count >= RERUNS_A_WALK {
+                // only runs that changed nothing count: work in progress is never cut, a card
+                // going round without touching a file is stuck. The count is read off the card's
+                // handoffs, so a window restarted between its rounds does not start it again
+                // (1024 restarts within a minute of a card's last event). A card the reviewer
+                // accepted is sent back by the landing, not by its work: it never counts
+                if sent_back && !accepted_by_review(&root, id) {
+                    let count = ra_context::TaskContext::open(&root, id).idle_rounds();
+                    if count >= RERUNS_A_WALK {
                         parked.insert(id);
                         // blocked, not only parked: a card sent back three times in a row is
                         // one its worker cannot move (a missing toolchain or fixture, asm #53
@@ -3825,19 +3826,17 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                         let held = store.set_state_by(id, TaskState::Blocked, Source::Run).await.is_ok();
                         let text = if held {
                             format!(
-                                "#{id} blocked: sent back {RERUNS_A_WALK} times in a row in this walk; a person sets it defined again. Its last answer: {why}"
+                                "#{id} blocked: sent back {count} times in a row without changing a file; a person sets it defined again. Its last answer: {why}"
                             )
                         } else {
                             format!(
-                                "#{id} parked: sent back {RERUNS_A_WALK} times in a row in this walk; it waits for the next walk or a person"
+                                "#{id} parked: sent back {count} times in a row without changing a file; it waits for the next walk or a person"
                             )
                         };
                         tracing::warn!("{text}");
                         crate::pair::event(&root, &text);
                         lines.push(text);
                     }
-                } else {
-                    reruns.remove(&id);
                 }
             }
             (Seat::Build(_), Err(error)) => {
@@ -4113,7 +4112,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     }
     // what is dirty before the run, so the handoff names only what the run changed
     let dirty_before = git_status(&acting).await;
-    let run_started = std::time::SystemTime::now();
+    // set back by [`MTIME_SLACK`]: a file's time comes off a coarser clock than `now`, and a
+    // write in the run's first tick read as older than the run
+    let run_started = std::time::SystemTime::now() - MTIME_SLACK;
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
     // a run of a card resumes the session of the last one (the person: be generous with
@@ -5169,6 +5170,11 @@ pub fn workspace_of(store: &Store) -> PathBuf {
     store.path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
+/// How far before the run's start a file's modification time still counts as the run's: NTFS
+/// stamps a write off the system tick (about 16 ms), and a write right after the start read as
+/// before it, so the run's own file dropped out of its handoff.
+const MTIME_SLACK: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The files a run changed: the ones whose status line is new since the run began, and the
 /// dirty ones it wrote to in the same time, by their modification time. A file another card
 /// had already left dirty keeps its status line when this run edits it again, and the status
@@ -5565,6 +5571,32 @@ async fn git_text(root: &Path, args: &[&str]) -> String {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
         _ => String::new(),
     }
+}
+
+/// The fingerprint of a reviewer's points: each trimmed and lowercased, in sorted order, so the
+/// same points in another order or case read the same. FNV-1a, as [`check_fingerprint`].
+fn points_fingerprint(points: &[String]) -> String {
+    let mut points: Vec<String> = points.iter().map(|point| point.trim().to_lowercase()).collect();
+    points.sort();
+    let hash = points
+        .join("\n")
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3));
+    format!("{hash:016x}")
+}
+
+/// The phrases of a report that hands its card to a person: what is left only a person can give.
+const PERSON_PHRASES: [&str; 6] =
+    ["only a person", "only the person", "needs a person", "needs the person", "a person must", "a person has to"];
+
+/// The first line of a report that says only a person can move the card, clipped to 200
+/// characters; `None` when the report asks nothing of a person.
+fn person_line(report: &str) -> Option<String> {
+    let line = report.lines().map(str::trim).find(|line| {
+        let lower = line.to_lowercase();
+        PERSON_PHRASES.iter().any(|phrase| lower.contains(phrase))
+    })?;
+    Some(line.trim_start_matches(['-', '*', '#', '>', ' ']).chars().take(200).collect())
 }
 
 /// The reason a worker's report gives under its `## Blocked` heading: the rest of the heading's
@@ -6824,9 +6856,13 @@ async fn settle_idle(store: &Store, root: &Path, id: i64) -> Option<String> {
     let runs: Vec<usize> = task.handoffs.iter().enumerate().filter(|(_, h)| !h.outcome.starts_with("note from")).map(|(i, _)| i).collect();
     let (&at, before) = runs.split_last()?;
     let previous = before.last().map(|&i| &task.handoffs[i]);
-    let reason = idle_reason(&task.handoffs[at], previous, node.notes.as_deref().unwrap_or_default())?;
+    let notes = node.notes.as_deref().unwrap_or_default();
+    // a round no rerun can move is held on its first sight: 730 reruns of three turns or fewer
+    // changed nothing and were sent back again (the feeds, 2026-11-12)
+    let held = held_round(&task.handoffs[at], previous, notes);
+    let reason = held.clone().or_else(|| idle_reason(&task.handoffs[at], previous, notes))?;
     // the first idle run's reason names the card's trouble; the second only repeats it
-    let first = previous.and_then(idle_of).map(str::to_owned);
+    let first = if held.is_some() { Some(reason.clone()) } else { previous.and_then(idle_of).map(str::to_owned) };
     let last = &mut task.handoffs[at];
     if idle_of(last).is_none() {
         last.check = format!("{}{IDLE_MARK}{reason}", last.check.trim());
@@ -6845,9 +6881,33 @@ async fn settle_idle(store: &Store, root: &Path, id: i64) -> Option<String> {
         tracing::warn!("#{id} could not be parked: {e:#}");
         return None;
     }
-    let text = crate::pair::parked(root, id, &first);
+    let text = if held.is_some() { crate::pair::held(root, id, &first) } else { crate::pair::parked(root, id, &first) };
     tracing::warn!("{text}");
     Some(format!("  {text}; a person sets it defined again"))
+}
+
+/// Why the run of `last` holds its card on this round, before any second idle run: it changed
+/// no file, and its report stands under `## Blocked`, says only a person can move the card, or
+/// it drew the reviewer's points the run of `previous` drew. `None` leaves the round to
+/// [`idle_reason`].
+fn held_round(last: &ra_context::Handoff, previous: Option<&ra_context::Handoff>, notes: &str) -> Option<String> {
+    if !last.changed.is_empty() {
+        return None;
+    }
+    if let Some(reason) = blocked_reason(&last.report) {
+        return Some(format!("the worker reported it blocked: {reason}"));
+    }
+    if let Some(line) = person_line(&last.report) {
+        return Some(format!("only a person can move it: {line}"));
+    }
+    let points = last.points()?;
+    if previous.and_then(ra_context::Handoff::points) != Some(points) {
+        return None;
+    }
+    // the first point names what the reviewer keeps asking for
+    let first = ra_context::review_of(notes).and_then(|review| review.lines().nth(1).map(|p| p.trim_start_matches("- ").to_owned()));
+    let first: String = first.unwrap_or_default().chars().take(200).collect();
+    Some(format!("the reviewer's points again on an unchanged tree: {first}").trim_end_matches([':', ' ']).to_owned())
 }
 
 /// The turns a session spends reading in, a few past the harness's own reading-in allowance:

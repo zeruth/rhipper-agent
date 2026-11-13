@@ -1015,6 +1015,16 @@ impl TaskContext {
         self.handoffs.last().map_or(&[], |h| h.warnings.as_slice())
     }
 
+    /// The idle rounds the card is on: its last runs in a row that were sent back and changed no
+    /// file ([`Handoff::idle_round`]), past the notes other cards left. A run that changed a file
+    /// ends the count. Read off the file, so a new walk or a restarted window counts on.
+    #[must_use]
+    pub fn idle_rounds(&self) -> u32 {
+        let runs = self.handoffs.iter().rev().filter(|h| !h.outcome.starts_with("note from"));
+        let idle = runs.take_while(|h| h.idle_round()).count();
+        u32::try_from(idle).unwrap_or(u32::MAX)
+    }
+
     /// Adds the handoff of a run, keeping the newest [`HANDOFFS_KEPT`].
     pub fn record(&mut self, handoff: Handoff) {
         self.handoffs.push(handoff);
@@ -1092,6 +1102,10 @@ impl TaskContext {
 /// The line is kept in the file, so the next run of the card tells the same failure again.
 pub const FINGERPRINT_MARK: &str = " · fingerprint ";
 
+/// The mark of the reviewer's points' fingerprint on a rejecting verdict: ` · points <hex>`.
+/// The verdict is kept in the file, so the next run of the card tells the same points again.
+pub const POINTS_MARK: &str = " · points ";
+
 impl Handoff {
     /// The fingerprint of the failed check the run ended on, as its check line carries it;
     /// `None` for a run whose check passed or that predates the fingerprints.
@@ -1100,6 +1114,21 @@ impl Handoff {
         let (_, rest) = self.check.split_once(FINGERPRINT_MARK)?;
         let print = rest.split(" · ").next().unwrap_or_default().trim();
         (!print.is_empty()).then_some(print)
+    }
+
+    /// The fingerprint of the reviewer's points the run drew, as its verdict carries it; `None`
+    /// for a run the reviewer accepted, did not judge, or judged before the fingerprints.
+    #[must_use]
+    pub fn points(&self) -> Option<&str> {
+        let (_, rest) = self.verdict.as_deref()?.split_once(POINTS_MARK)?;
+        let print = rest.split(" · ").next().unwrap_or_default().trim();
+        (!print.is_empty()).then_some(print)
+    }
+
+    /// Whether the run was sent back, by its check or its reviewer, without changing a file.
+    #[must_use]
+    pub fn idle_round(&self) -> bool {
+        self.outcome.starts_with("needs revision") && self.changed.is_empty()
     }
 
     /// The handoff as a block of the file and of the prompt.

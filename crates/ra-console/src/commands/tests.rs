@@ -1004,6 +1004,97 @@ async fn a_second_run_that_changed_nothing_parks_the_card() {
     assert!(shown[0].contains("[blocked]"), "{shown:?}");
 }
 
+/// A handoff of a run of card #2 the reviewer sent back, which changed `changed`.
+fn sent_back_run(when: u64, changed: &[&str], point: &str) -> ra_context::Handoff {
+    ra_context::Handoff {
+        when,
+        model: "z-ai/glm-5.3-flash".to_owned(),
+        outcome: "needs revision (substantive)".to_owned(),
+        check: "cargo test -q: passed".to_owned(),
+        verdict: Some(format!("needs revision (substantive) · 1 point(s) by z-ai/glm-5.3-flash · {point}")),
+        changed: changed.iter().map(|&path| path.to_owned()).collect(),
+        report: "looked at `src/lib.rs`; nothing in it to change".to_owned(),
+        warnings: Vec::new(),
+        failures: Vec::new(),
+        read: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_run_that_changed_nothing_is_held_on_its_first_idle_round() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    git_ok(dir.path(), &["init", "-q"]);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let check: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let report = "looked at `src/lib.rs`; nothing in it to change";
+    let points = "needs_revision\n- src/lib.rs: the probe never asserts the flag";
+    let provider = Scripted::new(vec![says(report, vec![]), says(points, vec![]), says(report, vec![]), says(points, vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(check);
+
+    // the first rejection is a rerun's to answer
+    run("/run 2", &store, &runner).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+    // the same points on an unchanged tree: held on that round, not a third time
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert_eq!(provider.seen.lock().len(), 4, "{out:?}");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Blocked, "{out:?}");
+    let reason = "the reviewer's points again on an unchanged tree: src/lib.rs: the probe never asserts the flag";
+    assert!(node.notes.unwrap_or_default().starts_with(reason));
+    let feed = std::fs::read_to_string(dir.path().join(crate::pair::PAIR_FILE)).unwrap();
+    assert!(feed.contains(&format!("parked #2: held on its first idle round: {reason}")), "{feed}");
+}
+
+#[test]
+fn a_run_that_changed_a_file_is_not_counted_as_an_idle_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    task.record(sent_back_run(1, &[], "points a"));
+    task.record(sent_back_run(2, &["src/lib.rs"], "points b"));
+    task.record(sent_back_run(3, &[], "points c"));
+    assert_eq!(task.idle_rounds(), 1);
+    task.record(sent_back_run(4, &["src/lib.rs"], "points d"));
+    assert_eq!(task.idle_rounds(), 0);
+    // a note another card left is no run of this one, and the count reads back off the file
+    task.save(dir.path()).unwrap();
+    ra_context::TaskContext::leave_note(dir.path(), 2, 5, "m", 5, "a word").unwrap();
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    task.record(sent_back_run(6, &[], "points e"));
+    task.record(sent_back_run(7, &[], "points f"));
+    assert_eq!(task.idle_rounds(), 2);
+}
+
+#[tokio::test]
+async fn the_idle_round_count_survives_a_new_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    git_ok(dir.path(), &["init", "-q"]);
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "probe"]);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // two idle rounds an earlier walk ran, each on new points, before the window restarted
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    task.record(sent_back_run(1, &[], "points 1111111111111111"));
+    task.record(sent_back_run(2, &[], "points 2222222222222222"));
+    task.save(dir.path()).unwrap();
+    store.set_state(2, ra_roadmap::model::TaskState::NeedsRevision).await.unwrap();
+    let check: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let provider = Scripted::new(vec![
+        says("looked at `src/lib.rs` again; nothing in it to change", vec![]),
+        says("needs_revision\n- src/lib.rs: the empty case is still untested", vec![]),
+    ]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(check);
+
+    let out = crate::agent::run_parallel(&store, &runner, 1, false).await.unwrap();
+    // the third idle round is the new walk's first run, and it blocks the card
+    assert_eq!(provider.seen.lock().len(), 2, "{out:?}");
+    assert!(out.iter().any(|l| l.starts_with("#2 blocked: sent back 3 times in a row without changing a file")), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Blocked);
+}
+
 #[tokio::test]
 async fn a_blocked_card_is_in_the_status_with_its_reason() {
     use ra_roadmap::model::TaskState;
@@ -3000,7 +3091,10 @@ async fn a_run_whose_reviewer_rejects_it_ends_needs_revision_with_the_points_and
         Some("review by z-ai/glm-5.3-flash: needs revision (substantive)\n- src/lib.rs: no test covers the empty case\n\ndone")
     );
     assert_eq!(handoff.outcome, "needs revision (substantive)");
-    assert_eq!(handoff.verdict.as_deref(), Some("needs revision (substantive) · 1 point(s) by z-ai/glm-5.3-flash"));
+    let verdict = handoff.verdict.as_deref().unwrap_or_default();
+    assert!(verdict.starts_with("needs revision (substantive) · 1 point(s) by z-ai/glm-5.3-flash · points "), "{verdict}");
+    // the points' fingerprint rides the verdict, for the next run to tell the same points again
+    assert_eq!(handoff.points().map(str::len), Some(16), "{verdict}");
 }
 
 #[tokio::test]
