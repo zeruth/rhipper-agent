@@ -1237,6 +1237,12 @@ async fn review_to(store: &Store, id: i64, worker: &Worker, accepted: TaskState)
     Ok(lines)
 }
 
+/// The turns a review gets: enough to read the card's diff and the files it names.
+pub(crate) const REVIEW_TURNS: u32 = 4;
+
+/// The turns of the one retry of a review that ran out of [`REVIEW_TURNS`].
+pub(crate) const REVIEW_TURNS_LARGER: u32 = 12;
+
 /// One verdict of the reviewer on a card, as [`review`] describes it, without the fix pass:
 /// the lines, and the head of the notes (the verdict with its points) when the rejection was
 /// trivial. `accepted` is where an accepting verdict leaves the card ([`review_to`]).
@@ -1258,22 +1264,26 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     let before = node.state;
     store.set_state_by(id, TaskState::Review, Source::Run).await?;
     tracing::info!(target: crate::trace::PROGRESS, "#{id} {} · review by {} ({by})", node.title, short(&model));
-    let answer = provider
-        .complete(CompletionRequest {
-            model: model.clone(),
-            messages: vec![Message::system(REVIEW_INSTRUCTION), Message::user(&brief)],
-            temperature: Some(0.0),
-            max_tokens: Some(1500),
-            tools: Vec::new(),
-            workspace: None,
-            budget_usd: None,
-            resume: None,
-            max_turns: Some(1),
-            max_context: None,
-            effort: Some(Effort::default().to_string()),
-            read_only: false,
-        })
-        .await;
+    let ask = |turns: u32| CompletionRequest {
+        model: model.clone(),
+        messages: vec![Message::system(REVIEW_INSTRUCTION), Message::user(&brief)],
+        temperature: Some(0.0),
+        max_tokens: Some(1500),
+        tools: Vec::new(),
+        workspace: None,
+        budget_usd: None,
+        resume: None,
+        max_turns: Some(turns),
+        max_context: None,
+        effort: Some(Effort::default().to_string()),
+        read_only: false,
+    };
+    let mut answer = provider.complete(ask(REVIEW_TURNS)).await;
+    // a review out of turns (#224) is asked once more with room to read the files the diff names
+    if let Err(ProviderError::TurnsOut(spent)) = answer {
+        worker.record_as(&model, Some("reviewer"), Some(id), &spent.usage, spent.turns).await;
+        answer = provider.complete(ask(REVIEW_TURNS_LARGER)).await;
+    }
     let answer = match answer {
         Ok(answer) => answer,
         Err(error) => {

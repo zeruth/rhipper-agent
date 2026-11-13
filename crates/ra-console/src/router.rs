@@ -625,6 +625,21 @@ impl Ladder {
         }
         self.models.get(rung).map(|model| id(model))
     }
+
+    /// `model` itself when it is the ladder's first sonnet or above it (or off the ladder), else
+    /// that sonnet: the reviewer's floor, whatever rung the implementer started on. A haiku
+    /// review of #219 returned 19 points where Sonnet accepted.
+    #[must_use]
+    pub fn at_least_sonnet(&self, model: String) -> String {
+        let id = |model: &str| crate::agent::resolve(model);
+        let Some(floor) = self.models.iter().position(|m| id(m).starts_with("claude-sonnet-")) else {
+            return model;
+        };
+        match self.models.iter().position(|m| id(m) == model) {
+            Some(at) if at < floor => id(&self.models[floor]),
+            _ => model,
+        }
+    }
 }
 
 /// The rules of a project, in the order of the file, its worker table, its role table, its
@@ -729,7 +744,7 @@ impl Router {
         if let Some((place, rule)) = self.pick(node, REVIEWER, rejections) {
             return (resolve(&rule.model), format!("rule {place}"));
         }
-        match self.ladder.judge(implementer, node.complexity) {
+        match self.ladder.judge(implementer, node.complexity).map(|model| self.ladder.at_least_sonnet(model)) {
             Some(model) => (model, "default, one rung down".to_owned()),
             None => (resolve(implementer), "default, the implementer: off the ladder".to_owned()),
         }

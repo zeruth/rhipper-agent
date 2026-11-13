@@ -2543,6 +2543,56 @@ async fn without_a_key_the_reviewer_is_one_rung_below_the_implementer() {
     assert_eq!(ladder.judge("z-ai/glm-5.3-flash", 3), None);
 }
 
+#[tokio::test]
+async fn reviewer_floor_keeps_a_review_one_rung_down_on_sonnet() {
+    let (line, asked, _) = reviewed_on("claude-sonnet-4-5", "[[route]]\nmodel = \"sonnet\"\n").await;
+    assert_eq!(asked, "claude-sonnet-4-5", "the review does not step down to haiku");
+    assert!(line.contains(" (default, one rung down) · "), "{line}");
+    let ladder = crate::router::Ladder::default();
+    assert_eq!(ladder.at_least_sonnet("claude-haiku-4-5".to_owned()), "claude-sonnet-4-5");
+    assert_eq!(ladder.at_least_sonnet("claude-opus-5-5".to_owned()), "claude-opus-5-5");
+}
+
+/// Fails with the turns out for the first `outs` calls, then answers: the caps it was asked with.
+struct OutOfTurns {
+    outs: parking_lot::Mutex<usize>,
+    caps: parking_lot::Mutex<Vec<Option<u32>>>,
+}
+
+impl ra_providers::ModelProvider for OutOfTurns {
+    fn complete(&self, request: ra_providers::CompletionRequest) -> ra_providers::CompletionFuture<'_> {
+        self.caps.lock().push(request.max_turns);
+        let out = {
+            let mut outs = self.outs.lock();
+            let out = *outs > 0;
+            *outs = outs.saturating_sub(1);
+            out
+        };
+        Box::pin(async move {
+            if out { Err(ra_providers::ProviderError::TurnsOut(Box::new(says("", vec![])))) } else { Ok(says("Accepted.", vec![])) }
+        })
+    }
+}
+
+#[tokio::test]
+async fn reviewer_floor_retries_a_review_out_of_turns_once_with_the_larger_cap() {
+    let run_with = |outs: usize| async move {
+        let store = store().await;
+        run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+        let provider = std::sync::Arc::new(OutOfTurns { outs: parking_lot::Mutex::new(outs), caps: parking_lot::Mutex::new(Vec::new()) });
+        let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+        let result = run("/review 2", &store, &runner).await;
+        let caps = provider.caps.lock().clone();
+        (result.is_ok(), caps)
+    };
+    let (ok, caps) = run_with(1).await;
+    assert!(ok);
+    assert_eq!(caps, [Some(crate::agent::REVIEW_TURNS), Some(crate::agent::REVIEW_TURNS_LARGER)]);
+    let (ok, caps) = run_with(2).await;
+    assert!(!ok, "a second run out of turns is no verdict");
+    assert_eq!(caps.len(), 2);
+}
+
 /// Reviews a card that has one handoff of a run with `answer` as the reviewer's verdict: the
 /// run line, the notes and the outcome the handoff was left with.
 async fn reviewed_after_a_run(answer: &str) -> (Vec<String>, String, String) {
