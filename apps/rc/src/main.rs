@@ -141,6 +141,13 @@ enum Command {
         #[arg(long)]
         clear: bool,
     },
+    /// The machine's scratch root: where every project's heavy, throwaway output goes (cargo targets under target/<project>, the runs' and checks' temp directories, the Gradle cache). With no directory, prints it; `--clear` keeps everything in the projects again.
+    Scratch {
+        /// The directory, a fast spare drive for one (`D:\rhipper`).
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// The state changes so far, oldest first: when, the card, from what to what, and by whom
     /// (console, window, cli, mcp or run); of one card with an id.
     History {
@@ -557,6 +564,28 @@ async fn run_main() -> anyhow::Result<()> {
         Command::Land { id } => {
             plain_tracing()?;
             land(id).await
+        }
+        Command::Scratch { dir, clear } => {
+            let file = ra_console::hub::dir().join(ra_providers::claude_code::SCRATCH_FILE);
+            if clear {
+                let _ = std::fs::remove_file(&file);
+                println!("no scratch root: builds, temp and the Gradle cache stay in the projects and the user's home");
+            } else if let Some(dir) = dir {
+                let dir = std::path::absolute(&dir)?;
+                std::fs::create_dir_all(dir.join("target"))?;
+                std::fs::create_dir_all(ra_console::hub::dir())?;
+                std::fs::write(&file, dir.display().to_string())?;
+                println!(
+                    "scratch root {}: cargo targets under target/<project>, temp under tmp/<project>, the Gradle cache in gradle; a walk started from now on uses it",
+                    dir.display()
+                );
+            } else {
+                match ra_providers::claude_code::scratch() {
+                    Some(dir) => println!("scratch root {}", dir.display()),
+                    None => println!("no scratch root (`rc scratch <dir>` sets one)"),
+                }
+            }
+            Ok(())
         }
         Command::Order { names, clear } => {
             if clear {

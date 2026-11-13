@@ -4,6 +4,16 @@
 use super::*;
 
 #[test]
+fn a_report_commit_section_gives_the_landing_its_message() {
+    let report = "Done.\n\n## Commit\nCap a project's Opus slots at its runners\n\nThe priority order decides who goes first,\nthe runners how many.\n\n## Faster next time\n- nothing\n";
+    let (subject, body) = commit_section(report).unwrap();
+    assert_eq!(subject, "Cap a project's Opus slots at its runners");
+    assert_eq!(body, "The priority order decides who goes first,\nthe runners how many.");
+    assert_eq!(commit_section("**Commit:**\n`Fix the thing`\n").unwrap().0, "Fix the thing");
+    assert!(commit_section("Done. Nothing else.").is_none());
+}
+
+#[test]
 fn the_end_line_marks_a_computed_cost_as_an_estimate_and_names_the_cached_share() {
     let computed =
         Usage { prompt_tokens: 1_000_000, completion_tokens: 0, cached_tokens: 900_000, cost_usd: Some(4.12), cost_computed: true };

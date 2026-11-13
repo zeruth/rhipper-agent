@@ -271,6 +271,10 @@ impl ClaudeCode {
         if let Some(path) = path_with_own_dir() {
             command.env("PATH", path);
         }
+        // the scratch drive's temp directory and Gradle cache, when the machine has one
+        if let Some(dir) = &request.workspace {
+            command.envs(scratch_env(dir));
+        }
         let mut child = command.spawn().map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!("{} is not installed or not on the path", self.binary.display()))
@@ -912,17 +916,72 @@ fn path_with_own_dir() -> Option<std::ffi::OsString> {
 /// behind the project's target. `None` for a workspace that is not a worktree.
 #[must_use]
 pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
-    let id = workspace.parent()?;
-    if id.file_name()? != "worktrees" {
-        return None;
+    let worktree = || -> Option<(PathBuf, String)> {
+        let id = workspace.parent()?;
+        if id.file_name()? != "worktrees" {
+            return None;
+        }
+        let var = id.parent()?;
+        if var.file_name()? != "var" {
+            return None;
+        }
+        Some((var.parent()?.to_path_buf(), workspace.file_name()?.to_string_lossy().into_owned()))
+    };
+    match worktree() {
+        Some((root, card)) => std::path::absolute(project_target(&root).join(format!("wt-{card}"))).ok(),
+        // the project's own tree builds in its own target, on the scratch drive when there is one
+        None => scratch().map(|_| project_target(workspace)),
     }
-    let var = id.parent()?;
-    if var.file_name()? != "var" {
-        return None;
+}
+
+/// The machine's scratch root: where the heavy, throwaway output goes (build targets, temp
+/// directories, the Gradle cache). `RHIPPER_SCRATCH` when set, else the hub's `scratch.txt`
+/// that `rc scratch <dir>` writes. `None` keeps everything in the project as before.
+#[must_use]
+pub fn scratch() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("RHIPPER_SCRATCH").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(dir));
     }
-    let root = var.parent()?;
-    let card = workspace.file_name()?.to_string_lossy().into_owned();
-    std::path::absolute(root.join("target").join(format!("wt-{card}"))).ok()
+    let hub = match std::env::var_os("RHIPPER_HUB").filter(|h| !h.is_empty()) {
+        Some(hub) => PathBuf::from(hub),
+        None if cfg!(windows) => PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("rhipper").join("agent"),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".local").join("share").join("rhipper").join("agent"),
+    };
+    let text = std::fs::read_to_string(hub.join(SCRATCH_FILE)).ok()?;
+    let dir = text.trim();
+    (!dir.is_empty()).then(|| PathBuf::from(dir))
+}
+
+/// The hub's file that names the scratch root.
+pub const SCRATCH_FILE: &str = "scratch.txt";
+
+/// The cargo target of a project: `<scratch>/target/<project>` with a scratch root, else
+/// `<root>/target`.
+#[must_use]
+pub fn project_target(root: &Path) -> PathBuf {
+    match scratch() {
+        Some(scratch) => {
+            scratch.join("target").join(root.file_name().map_or_else(|| "project".into(), |n| n.to_string_lossy().into_owned()))
+        }
+        None => root.join("target"),
+    }
+}
+
+/// The environment a run or a check gets from the scratch root: its temp directory (the tests'
+/// leftovers land there, not on the system drive) and the Gradle cache. Empty without one.
+#[must_use]
+pub fn scratch_env(workspace: &Path) -> Vec<(String, PathBuf)> {
+    let Some(scratch) = scratch() else { return Vec::new() };
+    // the project of a worktree is three levels up (`<root>/var/worktrees/<id>`)
+    let root = workspace
+        .ancestors()
+        .nth(3)
+        .filter(|_| workspace.parent().and_then(Path::file_name).is_some_and(|n| n == "worktrees"))
+        .unwrap_or(workspace);
+    let name = root.file_name().map_or_else(|| "project".into(), |n| n.to_string_lossy().into_owned());
+    let temp = scratch.join("tmp").join(name);
+    let _ = std::fs::create_dir_all(&temp);
+    vec![("TEMP".into(), temp.clone()), ("TMP".into(), temp), ("GRADLE_USER_HOME".into(), scratch.join("gradle"))]
 }
 
 /// The program a permission rule names: `python` of `Bash(python *)`, `gw.ps1` of

@@ -1562,7 +1562,12 @@ async fn run_parallel_runs_two_cards_at_once_in_two_worktrees_that_both_end_impl
             out.iter().any(|l| l == &format!("committed 1 file(s) on card/{id}") || l.starts_with(&format!("  #{id}: caught up: "))),
             "{out:?}"
         );
-        assert!(out.iter().any(|l| l.starts_with(&format!("merged card/{id} into "))), "{out:?}");
+        // squashed into one commit, or nothing to add when the other card's landing already
+        // brought the same change (both write the same file here)
+        assert!(
+            out.iter().any(|l| l.starts_with(&format!("squashed card/{id} into ")) || l == &format!("card/{id} is in HEAD already")),
+            "{out:?}"
+        );
         let worktree = dir.path().join("var").join("worktrees").join(id.to_string());
         assert!(!worktree.join(".git").exists(), "{} was not cleared", worktree.display());
         assert!(git_ok(dir.path(), &["branch", "--list", &format!("card/{id}")]).trim().is_empty(), "card/{id} was not removed");

@@ -1088,11 +1088,12 @@ impl App {
             cards::badge_marked(ui, "◇", &format!("{projects} projects · {live} running"), theme::trace());
             // the counts over every open project
             ui.add_space(18.0);
-            let (mut prompt, mut completion, mut cost) = (0u64, 0u64, 0f64);
+            let (mut prompt, mut completion, mut cost, mut cached) = (0u64, 0u64, 0f64, 0u64);
             let (mut all_cost, mut all_calls, mut any_ledger) = (0f64, 0u64, false);
             for t in &self.tabs {
                 let session = t.ledger.session.clone().unwrap_or_else(|| t.worker.tally());
                 prompt += session.prompt_tokens;
+                cached += session.cached_tokens;
                 completion += session.completion_tokens;
                 cost += session.cost_usd.unwrap_or(0.0);
                 if let Some(all) = &t.ledger.all_time {
@@ -1104,10 +1105,16 @@ impl App {
             cards::badge_marked(
                 ui,
                 "⇅",
-                &format!("in {} · out {} · {}", compact(prompt), compact(completion), dollars(Some(cost))),
+                &format!(
+                    "in {} · {} cached · out {} · {}",
+                    compact(prompt),
+                    cached_share(cached, prompt),
+                    compact(completion),
+                    dollars(Some(cost))
+                ),
                 theme::warn_text(),
             )
-            .on_hover_text("today's tokens and cost, every project");
+            .on_hover_text("today's tokens and cost, every project; cached is the share of the input read from the cache");
             if any_ledger {
                 cards::badge_marked(ui, "◉", &format!("ledger {} · {all_calls} calls", dollars(Some(all_cost))), theme::online())
                     .on_hover_text("all time, every project's var/usage.db");
@@ -2638,14 +2645,15 @@ impl Workspace {
                 ui,
                 "⇅",
                 &format!(
-                    "in {} · out {} · {}",
+                    "in {} · {} cached · out {} · {}",
                     compact(session.prompt_tokens),
+                    cached_share(session.cached_tokens, session.prompt_tokens),
                     compact(session.completion_tokens),
                     dollars(session.cost_usd)
                 ),
                 theme::warn_text(),
             )
-            .on_hover_text("today's tokens and cost, from the ledger");
+            .on_hover_text("today's tokens and cost, from the ledger; cached is the share of the input read from the cache");
             match &self.ledger.all_time {
                 Some(all) => {
                     cards::badge_marked(ui, "◉", &format!("ledger {} · {} calls", dollars(all.cost_usd), all.calls), theme::online())
@@ -5179,6 +5187,13 @@ fn split_diff(output: &str, files: &[String]) -> Vec<(String, Vec<String>)> {
         }
     }
     files.iter().map(|f| (f.clone(), sections.remove(f).unwrap_or_default())).collect()
+}
+
+/// The share of the input read from the cache, `96%`; `0%` with no input yet.
+fn cached_share(cached: u64, input: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let share = if input == 0 { 0.0 } else { cached as f64 / input as f64 * 100.0 };
+    format!("{share:.0}%")
 }
 
 fn compact(count: u64) -> String {

@@ -89,10 +89,12 @@ impl Toolbox {
             // a check in a card's worktree builds in the project's target, as the worker did:
             // one build directory for the cards running at once, under the one lock
             if std::env::var_os("CARGO_TARGET_DIR").is_none()
-                && let Some(target) = shared_target(&self.root)
+                && let Some(target) = ra_providers::claude_code::shared_target(&self.root)
             {
                 command.env("CARGO_TARGET_DIR", target);
             }
+            // the scratch drive's temp directory and Gradle cache, when the machine has one
+            command.envs(ra_providers::claude_code::scratch_env(&self.root));
             command.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
             let mut child = command.spawn().with_context(|| format!("cannot start {program}"))?;
             // the check is a build: it runs on its share of the builders' CPU, which follows
@@ -261,22 +263,6 @@ pub(crate) fn split(command: &str) -> anyhow::Result<Vec<String>> {
         words.push(word);
     }
     Ok(words)
-}
-
-/// The target directory for a workspace that is one of the project's worktrees
-/// (`<root>/var/worktrees/<id>`): `<root>/target/wt-<id>`, the worktree's own under the
-/// project's target, the same the worker built in; `None` for any other workspace.
-fn shared_target(workspace: &Path) -> Option<PathBuf> {
-    let id = workspace.parent()?;
-    if id.file_name()? != "worktrees" {
-        return None;
-    }
-    let var = id.parent()?;
-    if var.file_name()? != "var" {
-        return None;
-    }
-    let card = workspace.file_name()?.to_string_lossy().into_owned();
-    std::path::absolute(var.parent()?.join("target").join(format!("wt-{card}"))).ok()
 }
 
 /// The interpreter a script program starts through, and the arguments before the script's

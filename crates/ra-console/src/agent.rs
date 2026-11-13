@@ -2714,17 +2714,37 @@ fn card_commit_message(node: &Node, handoff: Option<&ra_context::Handoff>, kind:
     format!("{subject}\n\n{}", body.join("\n\n"))
 }
 
-/// The message of the merge commit that lands a card on the project's branch.
-fn merge_commit_message(node: &Node, main: &str, handoff: Option<&ra_context::Handoff>) -> String {
-    let mut body = vec![format!("Merges the branch card/{} into {} on the reviewer's acceptance.", node.id, main)];
-    if let Some(objective) = node.objective.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
-        body.push(format!("Objective: {objective}"));
-    }
-    if let Some(verdict) = handoff.and_then(|h| h.verdict.as_deref()) {
-        body.push(format!("Review: {verdict}. The project's check ran on the merged tree before this commit."));
-    }
-    body.push(format!("Card: #{}", node.id));
-    format!("Land {} (#{})\n\n{}", node.title, node.id, body.join("\n\n"))
+/// What every worker is asked for, at the end of its report: the commit message of its change,
+/// written about the code, not the card. The landing squashes the card into one commit with it.
+pub const COMMIT_PROMPT: &str = "Close your report with a section headed `## Commit`: one subject line in the imperative, at most 72 characters, saying what the change does to the code (not the card, the roadmap or the run), then a blank line and at most four short lines on why and how. No card numbers, no phase names, no mention of reviews, checks or runs.";
+
+/// The `## Commit` section of a report: the subject and the body after it, when there is one
+/// with a subject.
+fn commit_section(report: &str) -> Option<(String, String)> {
+    let start = report.lines().position(|l| {
+        let l = l.trim().trim_start_matches('#').trim().trim_matches('*').trim_end_matches(':').trim();
+        l.eq_ignore_ascii_case("commit")
+    })?;
+    let mut lines = report.lines().skip(start + 1).take_while(|l| !l.trim_start().starts_with("## ")).map(str::trim_end);
+    let subject = lines.by_ref().map(str::trim).find(|l| !l.is_empty())?;
+    let subject = subject.trim_matches('`').trim_matches('*').trim().to_owned();
+    let body: Vec<&str> = lines.collect();
+    let body = body.join("\n").trim().trim_matches('`').trim().to_owned();
+    (!subject.is_empty()).then_some((subject, body))
+}
+
+/// The message of the one commit that lands a card: the worker's own `## Commit` section when
+/// its report has one, else the card's title and the first paragraph of what the run reported.
+/// Written about the change; no card number, no review or check boilerplate.
+fn landing_message(node: &Node, handoff: Option<&ra_context::Handoff>) -> String {
+    let notes = node.notes.as_deref().unwrap_or_default();
+    let report = handoff.map(|h| h.report.as_str()).unwrap_or_default();
+    let (subject, body) = commit_section(notes).or_else(|| commit_section(report)).unwrap_or_else(|| {
+        let first: String = report.trim().split("\n\n").next().unwrap_or_default().trim().to_owned();
+        (node.title.clone(), first)
+    });
+    let subject: String = subject.chars().take(100).collect();
+    if body.is_empty() { subject } else { format!("{subject}\n\n{body}") }
 }
 
 /// Merges the project's branch into the card's worktree before a run, when the project has
@@ -2999,7 +3019,7 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
             let mut args = vec!["add", "--"];
             args.extend(own.iter().copied());
             git(&root, &args).await?;
-            git(&root, &["commit", "-q", "-m", &card_commit_message(&node, handoff, CommitKind::Landing, own.len())]).await?;
+            git(&root, &["commit", "-q", "-m", &landing_message(&node, handoff)]).await?;
             lines.push(format!(
                 "committed {} file(s) of the handoff on {}",
                 own.len(),
@@ -3012,43 +3032,60 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
         if merged {
             lines.push(format!("{branch} is in HEAD already"));
         } else {
-            // a merge commit of its own, with the card's story, never a fast-forward: the
-            // project's history shows every landing as one
-            let main = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_else(|_| String::from("HEAD"));
-            let message = merge_commit_message(&node, &main, handoff);
-            if let Err(e) = git(&root, &["merge", "--no-ff", "-m", &message, &branch]).await {
+            // one commit on the project's branch, squashed: the card's checkpoints and catch-up
+            // merges stay on its branch, which goes once it lands, and the commit is written
+            // about the change, not the card (the person: the history "should be concise and
+            // changes focused, not roadmap focused", 2026-11-12)
+            if let Err(e) = git(&root, &["merge", "--squash", &branch]).await {
                 let conflicts = git(&root, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
-                let _ = git(&root, &["merge", "--abort"]).await;
+                let _ = git(&root, &["reset", "--merge"]).await;
                 tracing::debug!("the merge of {branch} failed: {e:#}");
                 return Err(anyhow::Error::new(LandConflict {
                     branch,
                     files: if conflicts.is_empty() { "files git did not name".to_owned() } else { conflicts.replace('\n', ", ") },
                 }));
             }
-            lines.push(format!("merged {branch} into {}", git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()));
-            // a Rust tree is formatted as it lands, into the merge commit: a build on push
-            // that checks the format stays green without a worker ever running rustfmt
-            if root.join("Cargo.toml").is_file() {
-                let formatted = tokio::process::Command::new("cargo").args(["fmt", "--all"]).current_dir(&root).output().await;
-                if formatted.is_ok_and(|o| o.status.success())
-                    && git(&root, &["status", "--porcelain", "--untracked-files=no"]).await.is_ok_and(|s| !s.trim().is_empty())
-                {
-                    git(&root, &["add", "-u"]).await?;
-                    git(&root, &["commit", "-q", "--amend", "--no-edit"]).await?;
-                    lines.push("formatted the merged tree".to_owned());
+            // the files the squash staged: the card's own, and the only ones this commit takes;
+            // whatever else the checkout holds uncommitted stays the person's
+            let staged = git(&root, &["diff", "--cached", "--name-only"]).await.unwrap_or_default();
+            let staged: Vec<String> = staged.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
+            if staged.is_empty() {
+                lines.push(format!("{branch} is in HEAD already"));
+            } else {
+                // a Rust tree is formatted as it lands, the card's files only, on a worker slot:
+                // a build on push that checks the format stays green without a worker running
+                // rustfmt, and the format is heavy work like any build
+                if root.join("Cargo.toml").is_file() {
+                    let _slot = hold_build(&root, &root).await;
+                    let formatted = tokio::process::Command::new("cargo").args(["fmt", "--all"]).current_dir(&root).output().await;
+                    if formatted.is_ok_and(|o| o.status.success()) {
+                        let rust: Vec<&str> =
+                            staged.iter().map(String::as_str).filter(|f| f.ends_with(".rs") && root.join(f).is_file()).collect();
+                        if !rust.is_empty() {
+                            let mut args = vec!["add", "--"];
+                            args.extend(rust.iter().copied());
+                            git(&root, &args).await?;
+                        }
+                    }
                 }
+                git(&root, &["commit", "-q", "-m", &landing_message(&node, handoff)]).await?;
+                lines.push(format!(
+                    "squashed {branch} into one commit on {}",
+                    git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()
+                ));
             }
             // the project's check on the merged tree: two cards right on their own are not
             // always right together (#176 and #181 compiled apart and not merged). A reviewed
             // card ran it on the caught-up tree already; this is the last guard, for a project
             // that moved on since the review
             let Checks { commands, timeout, .. } = checks_of(&root, &node);
-            if !commands.is_empty() {
+            if !commands.is_empty() && !staged.is_empty() {
                 let toolbox = worker.toolbox(&root).map(|t| t.with_timeout(timeout));
                 let _slot = hold_build(&root, &root).await;
                 let runs = run_checks(&toolbox, &commands, &[]).await;
                 if let Some(failed) = runs.iter().find(|r| !r.passed) {
-                    let _ = git(&root, &["reset", "--merge", "ORIG_HEAD"]).await;
+                    // the squash commit goes; what the checkout held uncommitted stays
+                    let _ = git(&root, &["reset", "--merge", "HEAD~1"]).await;
                     return Err(anyhow::Error::new(LandCheck {
                         command: failed.command.clone(),
                         exit: failed.exit.clone(),
@@ -3163,7 +3200,9 @@ async fn clean_after(root: &Path, id: i64, has_branch: bool) -> Vec<String> {
         }
     }
     if has_branch {
-        match git(root, &["branch", "-d", &worktree_branch(id)]).await {
+        // -D: a landing squashes the branch, so git never counts it merged; the card's work is on
+        // the project's branch by the time the cleanup runs
+        match git(root, &["branch", "-D", &worktree_branch(id)]).await {
             Ok(_) => lines.push("branch removed".to_owned()),
             Err(e) => lines.push(format!("branch kept: {}", first_line(&format!("{e:#}")))),
         }
@@ -4541,6 +4580,8 @@ fn harness_messages(
     if debug {
         messages.push(Message::system(crate::retro::PROMPT));
     }
+    // the change's commit message, which the landing squashes the card under
+    messages.push(Message::system(COMMIT_PROMPT));
     // a project whose builds are the orchestrator's alone says so up front, so the worker does
     // not spend a turn finding the build refused
     if crate::router::Router::load(root).is_ok_and(|r| r.worker.builds() == 0) {
@@ -4596,6 +4637,8 @@ fn bare_context(task: &ra_context::TaskContext, rerun: Option<&str>, project: &s
         text.push_str("\n\n");
         text.push_str(crate::retro::PROMPT);
     }
+    text.push_str("\n\n");
+    text.push_str(COMMIT_PROMPT);
     text
 }
 
