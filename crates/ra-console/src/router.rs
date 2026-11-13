@@ -428,17 +428,75 @@ impl RoleConfig {
     }
 }
 
-/// The `[plan]` table: how far into the week a run on a `claude-*` model may go before it is
-/// steered, to the local route when one is up and refused otherwise, unless `--force`.
+/// The `[plan]` table: how the week is spent by a run on a `claude-*` model, unless `--force`.
+/// The ladder's marks move the small cards off the Claude route first and hold the big ones
+/// last; without a ladder the default one stands, its last rung on `threshold`.
 ///
 /// ```toml
 /// [plan]
-/// threshold = 0.95    # the share of the week; 0.9 when left out
+/// threshold = 0.95    # the share of the week of the default ladder's hold; 0.9 when left out
+/// ladder = [
+///     { at = 0.5, span = "1-2", to = "local" },
+///     { at = 0.75, span = "1-3", to = "claude-haiku-4-5" },
+///     { at = 0.9, span = "1-5", to = "hold", except_priority = 1 },
+/// ]
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct PlanConfig {
     #[serde(default)]
     pub threshold: Option<f64>,
+    #[serde(default)]
+    pub ladder: Option<Vec<Mark>>,
+}
+
+/// Where a [`Mark`] sends a card to the local server's model, refused when none is up.
+pub const TO_LOCAL: &str = "local";
+
+/// Where a [`Mark`] holds a card: on the local server's model when one is up, else the run waits
+/// for the week to reset.
+pub const TO_HOLD: &str = "hold";
+
+/// One rung of `[plan] ladder`: once the week is at `at`, a card whose complexity `span` holds
+/// goes `to` the local server, a hold, or the model it names; a card of `except_priority` or
+/// higher passes the rung.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Mark {
+    pub at: f64,
+    #[serde(deserialize_with = "span_of")]
+    pub span: Span,
+    pub to: String,
+    #[serde(default)]
+    pub except_priority: Option<u8>,
+}
+
+impl Mark {
+    /// Whether the rung is for `node`: its span holds the card and the card's priority does not
+    /// pass it.
+    #[must_use]
+    pub fn holds(&self, node: &Node) -> bool {
+        let passes = self.except_priority.is_some_and(|least| node.priority.is_some_and(|p| p >= least));
+        self.span.holds(node.complexity) && !passes
+    }
+}
+
+/// A span as a mark writes it, `"1-2"` or `"3"`, or as a rule does, `[1, 2]` or `3`.
+fn span_of<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Span, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Written {
+        Span(Span),
+        Text(String),
+    }
+    let text = match Written::deserialize(deserializer)? {
+        Written::Span(span) => return Ok(span),
+        Written::Text(text) => text,
+    };
+    let number =
+        |part: &str| -> Result<u8, D::Error> { part.trim().trim_start_matches(['c', 'C']).parse::<u8>().map_err(serde::de::Error::custom) };
+    match text.split_once('-') {
+        Some((low, high)) => Ok(Span::Between(number(low)?, number(high)?)),
+        None => Ok(Span::One(number(&text)?)),
+    }
 }
 
 impl PlanConfig {
@@ -446,6 +504,33 @@ impl PlanConfig {
     #[must_use]
     pub fn threshold(&self) -> f64 {
         self.threshold.filter(|t| (0.0..=1.0).contains(t)).unwrap_or(ra_providers::limits::DEFAULT_THRESHOLD)
+    }
+
+    /// The ladder's marks: the table's, else c1–2 to the local server at half the week, c1–3 to
+    /// Haiku at three quarters and every card but a priority one held at the threshold.
+    #[must_use]
+    pub fn marks(&self) -> Vec<Mark> {
+        if let Some(ladder) = &self.ladder {
+            return ladder.clone();
+        }
+        let mark = |at: f64, span: Span, to: &str, except_priority: Option<u8>| Mark { at, span, to: to.to_owned(), except_priority };
+        vec![
+            mark(ra_providers::limits::LOCAL_MARK, Span::Between(1, 2), TO_LOCAL, None),
+            mark(ra_providers::limits::CHEAP_MARK, Span::Between(1, 3), "claude-haiku-4-5", None),
+            mark(self.threshold(), Span::Between(1, 5), TO_HOLD, Some(1)),
+        ]
+    }
+
+    /// The rung `node` stands on with the week at `week`, 0 to 1, and its place counted from one:
+    /// the highest mark the week has passed that is for the card, the earlier on a tie.
+    #[must_use]
+    pub fn rung(&self, node: &Node, week: f64) -> Option<(usize, Mark)> {
+        self.marks()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, mark)| week >= mark.at && mark.holds(node))
+            .reduce(|best, next| if next.1.at > best.1.at { next } else { best })
+            .map(|(index, mark)| (index + 1, mark))
     }
 }
 

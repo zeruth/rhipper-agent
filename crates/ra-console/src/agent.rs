@@ -276,41 +276,61 @@ impl Worker {
         self
     }
 
-    /// The worker a run in `root` goes to once the plan's week is read: this one, unless it is
-    /// on a `claude-*` model and the week is at or past the project's threshold; then, without
-    /// `--force`, the same worker on the local server's model when one is up, and an error
-    /// naming the room left and the reset when none is.
+    /// The worker a run of `node` in `root` goes to once the plan's week is read: this one,
+    /// unless it is on a `claude-*` model and the week has passed a mark of the project's
+    /// `[plan] ladder` that is for the card; then, without `--force`, the same worker on the
+    /// rung's model, or on the local server's when the rung says `local` or `hold`. A `local`
+    /// rung with no local route up is an error naming the room left and the reset; a `hold`
+    /// one waits for the week to reset, as [`wait_for_plan`] waits on the five-hour window.
     ///
     /// # Errors
-    /// When the week is past the threshold, the run is not forced and no local route is up.
-    pub async fn steered_by_plan(&self, root: &Path) -> anyhow::Result<Self> {
+    /// When the week is past a `local` mark, the run is not forced and no local route is up.
+    pub async fn steered_by_plan(&self, root: &Path, node: &Node) -> anyhow::Result<Self> {
         if self.force || self.route() != Route::ClaudeCode {
             return Ok(self.clone());
         }
-        let threshold = plan_threshold(root);
+        let plan = crate::router::Router::load(root).map(|router| router.plan).unwrap_or_default();
         let readings = plan_readings(root);
-        let Some((name, window)) = plan_week(&readings, threshold, unix_now()) else {
+        // every reading of a week that has not reset; the ladder decides whether it is past a mark
+        let Some((name, window)) = plan_week(&readings, 0.0, unix_now()) else {
             return Ok(self.clone());
         };
-        let room = ra_providers::limits::room(&window);
-        let at = format!(
-            "the plan's week is at {:.0}% as {name} last saw it, past the {:.0}% threshold: {room}",
-            window.utilization * 100.0,
-            threshold * 100.0
-        );
+        let Some((place, mark)) = plan.rung(node, window.utilization) else {
+            return Ok(self.clone());
+        };
+        let week = format!("week at {:.0}%", window.utilization * 100.0);
+        let card = format!("c{}", node.complexity);
+        let steer = |model: String| {
+            tracing::info!(target: crate::trace::PROGRESS, "  steer: {week}, {card} → {} by ladder {place}", short(&model));
+            let mut worker = self.clone();
+            worker.model = model;
+            // the steer line says why the model moved; the ladder's rung is not this one
+            worker.step = None;
+            worker
+        };
+        let to = mark.to.trim();
+        if !to.eq_ignore_ascii_case(crate::router::TO_LOCAL) && !to.eq_ignore_ascii_case(crate::router::TO_HOLD) {
+            let model = resolve(to);
+            return Ok(if model == self.model { self.clone() } else { steer(model) });
+        }
         // the tests never ping the local server
         let local = if cfg!(test) { None } else { ra_providers::local::default_model().await };
-        match local {
-            Some(model) => {
-                tracing::info!(target: crate::trace::PROGRESS, "  steer: {at}; this run goes to {model}");
-                let mut worker = self.clone();
-                worker.model = model;
-                // the steer line says why the model moved; the ladder's rung is not this one
-                worker.step = None;
-                Ok(worker)
-            }
-            None => anyhow::bail!("{at}; no local route is up, run with --force to spend the week"),
+        if let Some(model) = local {
+            return Ok(steer(model));
         }
+        let at = format!(
+            "the plan's {week} as {name} last saw it, past the {:.0}% mark of ladder {place} for {card}: {}",
+            mark.at * 100.0,
+            ra_providers::limits::room(&window)
+        );
+        if to.eq_ignore_ascii_case(crate::router::TO_LOCAL) {
+            anyhow::bail!("{at}; no local route is up, run with --force to spend the week");
+        }
+        let held = format!("hold: {at}; this run waits for the reset, or run with --force");
+        // the tests never wait out a week
+        anyhow::ensure!(!cfg!(test), "{held}");
+        wait_for_week(root, mark.at, &held).await;
+        Ok(self.clone())
     }
 
     /// The worker a run of `node` in `root` goes to: this one unless it is routed; then the one
@@ -891,7 +911,7 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     let root = workspace_of(store);
     // then the plan's week: a claude-* pick past the threshold falls to the local route or is
     // refused here, before the start marker
-    let worker = &worker.for_card(&root, &node)?.steered_by_plan(&root).await?;
+    let worker = &worker.for_card(&root, &node)?.steered_by_plan(&root, &node).await?;
     let mut pick = worker.step.as_ref().map_or_else(String::new, |step| format!(" · {step}"));
     if tight {
         write!(pick, " · {TIGHT_PICK}").unwrap();
@@ -1946,6 +1966,17 @@ async fn wait_for_plan(root: &Path) {
             tracing::info!(target: crate::trace::PROGRESS, "  {text}");
             crate::pair::event(root, &text);
         }
+        tokio::time::sleep(PLAN_POLL).await;
+    }
+}
+
+/// Holds the run while the plan's week, across every project on the machine, is at or past
+/// `mark`: says `line` once, on the progress channel and the paired feed, and reads the limits
+/// again every minute until the week resets.
+async fn wait_for_week(root: &Path, mark: f64, line: &str) {
+    tracing::info!(target: crate::trace::PROGRESS, "  {line}");
+    crate::pair::event(root, line);
+    while plan_week(&plan_readings(root), mark, unix_now()).is_some() {
         tokio::time::sleep(PLAN_POLL).await;
     }
 }

@@ -8,9 +8,17 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// The share of the week past which a run on the plan is steered: refused, or sent to the local
-/// route when one is up. `[plan] threshold` of `rhipper.toml` moves it.
+/// The share of the week past which a run on the plan is held, on the local route when one is
+/// up: the last rung of the default ladder. `[plan] threshold` of `rhipper.toml` moves it.
 pub const DEFAULT_THRESHOLD: f64 = 0.9;
+
+/// The share of the week past which the default ladder sends the smallest cards to the local
+/// route.
+pub const LOCAL_MARK: f64 = 0.5;
+
+/// The share of the week past which the default ladder sends the small cards to the cheapest
+/// Claude model.
+pub const CHEAP_MARK: f64 = 0.75;
 
 /// The name of the week's window in the harness's events.
 pub const WEEK: &str = "seven_day";
