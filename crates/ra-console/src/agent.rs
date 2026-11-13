@@ -1617,6 +1617,8 @@ async fn write_digest(store: &Store, root: &Path, live: Option<String>, changed:
         ready,
         changed: changed.or_else(|| before.map(|d| d.changed)).unwrap_or_default(),
         leftovers,
+        landed_today: crate::hub::landed_today(root).await,
+        waiting: u32::try_from(crate::hub::waiting(root, &nodes).len()).unwrap_or(u32::MAX),
     });
 }
 

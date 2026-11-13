@@ -83,6 +83,17 @@ pub fn priority_place(root: &Path) -> Option<usize> {
     crate::hub::priority().iter().position(|n| n.eq_ignore_ascii_case(&name)).map(|at| at + 1)
 }
 
+/// The cards the project landed today and their cost, as its digest last said it, beside the
+/// allocation so the person spends the week where a landed card is cheapest; a digest written on
+/// another day says nothing of today.
+#[must_use]
+pub fn landed(root: &Path) -> (u32, Option<f64>) {
+    let today = crate::hub::day_of(crate::hub::unix_now());
+    crate::hub::own_digest(&crate::hub::project_root_of(root))
+        .filter(|digest| crate::hub::day_of(digest.when) == today)
+        .map_or((0, None), |digest| digest.landed_today)
+}
+
 /// Reads the project's table, changes it with `change` and writes it back.
 fn edit(root: &Path, change: impl FnOnce(&str) -> String) -> anyhow::Result<()> {
     let path = root.join(crate::router::ROUTES_FILE);
