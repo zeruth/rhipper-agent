@@ -4181,11 +4181,16 @@ impl Workspace {
         let root = self.root.clone();
         let mut changed = false;
         // the rows read as in the column: the running card first, then the next ready ones
+        // a numbered row is a card ready now: one whose waits-on are all accepted. The walk's
+        // projected order also holds the cards that only become ready later; those sit in the
+        // tree under what they wait on instead of as rows of their own
+        let accepted = |id: &i64| nodes.iter().any(|n| n.id == *id && n.state == TaskState::Accepted);
+        let ready_now = |id: &i64| nodes.iter().find(|n| n.id == *id).is_some_and(|n| n.depends_on.iter().all(accepted));
         let mut rows: Vec<i64> = running.into_iter().collect();
-        rows.extend(order.iter().copied().filter(|id| Some(*id) != running).take(6));
+        rows.extend(order.iter().copied().filter(|id| Some(*id) != running && ready_now(id)).take(6));
         // the ready cards past the six: the queue adds them one by one while the card's share
         // of the window has room for another row (a very tall window)
-        let extra: Vec<i64> = order.iter().copied().filter(|id| Some(*id) != running && !rows.contains(id)).collect();
+        let extra: Vec<i64> = order.iter().copied().filter(|id| Some(*id) != running && !rows.contains(id) && ready_now(id)).collect();
         let walk = Walk {
             searching: false,
             matched: HashSet::new(),
@@ -4308,7 +4313,7 @@ impl Workspace {
                         // card that waits on several sits under the first shown (the person: "a
                         // nice subtree view in queue for tasks waiting on other tasks")
                         let waiting = waiting_on(&nodes);
-                        let mut placed: HashSet<i64> = order.iter().copied().chain(running).collect();
+                        let mut placed: HashSet<i64> = rows.iter().copied().chain(extra.iter().copied()).collect();
                         let mut rank = 0;
                         while rank < shown.len() {
                             let id = shown[rank];
