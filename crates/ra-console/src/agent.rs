@@ -2368,6 +2368,11 @@ pub fn spawn_walk(root: &Path, debug: bool, parallel: Option<u32>) -> anyhow::Re
 /// The file a detached walk writes its stderr to: what it printed and why it died.
 const WALK_LOG: &str = "var/walk.log";
 
+/// How often a parallel walk looks again while its runs go: the roadmap, its runners and the
+/// pool. Three seconds, so the dashboard's `+` on runners or workers acts within a moment (it
+/// took up to half a minute, the person: "increasing runners on a project is not responsive").
+const WALK_TICK: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The variable a walk moving to a newer install leaves its successor: its own pid, whose walk
 /// lock the successor waits for.
 const WALK_FROM_VAR: &str = "RHIPPER_WALK_FROM";
@@ -3233,7 +3238,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
         if flight.is_empty() {
             if starved && stopped.is_none() {
                 // every slot of the kind is another project's: wait for one
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tokio::time::sleep(WALK_TICK).await;
                 continue;
             }
             let text = format!("ran {ran} card(s) · {}", stopped.unwrap_or_else(|| "no card is ready".to_owned()));
@@ -3244,9 +3249,9 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             lines.push(text);
             return Ok(lines);
         }
-        // a run ends, or half a minute passes: a card re-queued or made ready while the pool
-        // has a free slot is taken then, not when the next run happens to end
-        let Ok((at, outcome)) = tokio::time::timeout(std::time::Duration::from_secs(30), poll_one(&mut flight)).await else {
+        // a run ends, or a tick passes: a card re-queued or made ready, a runner or a worker slot
+        // added on the dashboard, is taken then, not when the next run happens to end
+        let Ok((at, outcome)) = tokio::time::timeout(WALK_TICK, poll_one(&mut flight)).await else {
             continue;
         };
         let (id, _, seat) = flight.remove(at);
