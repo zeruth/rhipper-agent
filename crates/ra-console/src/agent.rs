@@ -4097,8 +4097,12 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     if idle.is_some() && node.session.is_some() {
         store.set_session(id, None, unix_now()).await?;
     }
+    // an idle run is the reason a session is not resumed, ahead of the rerun's own fresh start
+    // (#210): it names what went wrong, which "a rerun starts a fresh session" does not
     let resumed = match rerun_resume(&node, rerun.is_some(), unix_now()) {
-        Ok(Some(_)) if idle.is_some() => Err(format!("the last run changed nothing ({})", idle.as_deref().unwrap_or_default())),
+        Ok(Some(_)) | Err(_) if idle.is_some() && node.session.is_some() => {
+            Err(format!("the last run changed nothing ({})", idle.as_deref().unwrap_or_default()))
+        }
         other => other,
     };
     let (resume, fresh) = match resumed {

@@ -1811,7 +1811,12 @@ async fn a_third_failed_landing_check_waits_for_the_person() {
     // the run's own check passes and the merged tree's fails, each time
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = calls.clone();
-    let alternating: ra_tools::Script = std::sync::Arc::new(move |_: &str| {
+    let alternating: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        // the failed test fails alone too: a real failure, not a load-sensitive one
+        if command.contains("--exact") {
+            let call = counted.load(std::sync::atomic::Ordering::SeqCst);
+            return Ok((101, format!("test probe ... FAILED\nalone after merged run {call}\n")));
+        }
         let call = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(if call % 2 == 0 { (0, "ok\n".to_owned()) } else { (101, format!("test probe ... FAILED\nmerged run {call}\n")) })
     });
@@ -4057,7 +4062,9 @@ async fn a_rerun_of_a_card_not_absolute_starts_fresh_though_it_has_a_session() {
 async fn a_rerun_of_an_absolute_card_resumes_the_session_it_came_back_from() {
     // the person: be generous with --resume unless the topic changes. An absolute card's work
     // is one run: sent back by the reviewer, it answers the points on the session it read the
-    // code in, cache and all; the verdict is its new prompt, the handoffs are not re-sent
+    // code in, cache and all; the verdict is its new prompt, the handoffs are not re-sent. The
+    // rerun is the second pass of the one run, not a run of its own: an absolute card is not
+    // handed back to the queue between passes
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Greet parent 1", &store, &worker()).await.unwrap();
@@ -4065,15 +4072,15 @@ async fn a_rerun_of_an_absolute_card_resumes_the_session_it_came_back_from() {
     let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\nexit code 0\n".to_owned())));
     let mut first = says("wrote the greeting into hello.rs", vec![]);
     first.session_id = Some("sess-1".into());
-    let mut again = says("renamed it", vec![]);
+    let mut again = says("renamed greet to salute in hello.rs", vec![]);
     again.session_id = Some("sess-1".into());
     let provider = Scripted::new(vec![first, says("needs revision\n- rename greet to salute", vec![]), again, says("accepted", vec![])]);
     let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(provider.clone()))).with_script(script);
-    run("/run 2", &store, &runner).await.unwrap();
-    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(out.iter().any(|l| l.contains("rerun on the session: the verdict")), "{}", out.join("\n"));
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Implemented);
     let seen = provider.seen.lock();
+    assert_eq!(seen.len(), 4);
     assert_eq!(seen[2].resume.as_deref(), Some("sess-1"), "the rerun resumes the session it came back from");
     let prompt = &seen[2].messages.last().unwrap().content;
     assert!(prompt.contains("## Review\n") && prompt.contains(")\n- rename greet to salute\n"), "{prompt}");
@@ -4118,6 +4125,10 @@ async fn a_revision_prompt_lists_the_reviewers_points() {
     let tests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = tests.clone();
     let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        // the failed test fails alone too, so the rerun's check stays failed
+        if command.contains("--exact") {
+            return Ok((101, "test greet ... FAILED\nexit code 101\n".to_owned()));
+        }
         if command.starts_with("cargo test") && counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
             return Ok((101, "test greet ... FAILED\nexit code 101\n".to_owned()));
         }
