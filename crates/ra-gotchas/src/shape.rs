@@ -70,6 +70,15 @@ const BASH: &[&str] = &[
     "mkdir *",
     "echo *",
     "git check-ignore*",
+    // the read-only git a card's history needs: where its changes start (refused to #223) and
+    // what a branch holds
+    "git merge-base*",
+    "git rev-list*",
+    "git rev-parse*",
+    "git ls-files*",
+    "git ls-tree*",
+    "git blame*",
+    "git branch --contains*",
     "sort*",
     "uniq*",
     "cut *",
@@ -96,6 +105,13 @@ const POWERSHELL: &[&str] = &[
     "New-Item *",
     "Write-Output *",
     "git check-ignore*",
+    "git merge-base*",
+    "git rev-list*",
+    "git rev-parse*",
+    "git ls-files*",
+    "git ls-tree*",
+    "git blame*",
+    "git branch --contains*",
     "rc wait *",
 ];
 

@@ -24,6 +24,8 @@ A roadmap-driven, provider-independent AI development orchestrator in Rust. It b
 - `var/` and `rhipper.md` are untracked state; never commit them, never run `git commit` at all: the person reviews and commits.
 - The machine has a scratch root (`rc scratch`, `D:\rhipper` here): cargo targets live under `<scratch>/target/<project>` (a worktree's under `wt-<id>` there), and runs get `TEMP` and `GRADLE_USER_HOME` under it. A test that asserts a target path must accept either place; read the target from `ra_providers::claude_code::project_target`, never assume `<root>/target`.
 - A full `cargo test -p ra-console` takes two to four minutes while other cards build, past the shell tool's two-minute foreground limit: start it with `run_in_background` and a 600000 ms timeout from the first call, not after it times out. A timing test can fail under that load: when one fails, run that test alone by name (`cargo test -p ra-console -q <name>`) before changing code for it.
+- Clippy's warnings read whole in one call with `--message-format=short` (one line each, `file:line:col: warning: …`), filtered to the files you changed; never cut them with `head` or `tail`.
+- Wait on a long background job by its task notification, which says when it ends; `rc wait` gives up at nine minutes.
 - Narrow a long output to its end (`| tail -n 60`, `| Select-Object -Last 60`), never its start: the warnings and the failures of the crates you touched come last, and a `-First` cut ended a clippy run before it reached them.
 
 ## Conventions
@@ -31,6 +33,7 @@ A roadmap-driven, provider-independent AI development orchestrator in Rust. It b
 - Match the surrounding code: its comment density, naming and idiom. Doc comments say what and why, not how; comments inside functions name the reason, not the step.
 - Tests live in a `tests.rs` beside the code (`mod tests;`), named as sentences: `a_run_records_its_handoff`.
 - A new field on `Node` touches every `Node { .. }` literal: `crates/ra-roadmap/src/store.rs` (two), `markdown.rs` (`node_of_line`), `markdown/tests.rs`, `tree/tests.rs`; `ra-console` tests call `markdown::parse` and read `Vec<Node>`. Give it `#[serde(default)]` and a line in `detail_lines`/`parse` of `markdown.rs`.
+- A new field on `ra_context::Handoff` touches every `Handoff { .. }` literal in `crates/ra-context`, `crates/ra-console` and `apps/rc` tests: grep for `Handoff {` after adding it, and a merge from main may bring new literals without your field.
 - The scripted provider and the `says(...)` fixture the agent tests use live in `crates/ra-console/src/commands/tests.rs`; the toolbox is scripted with `Worker::with_script`, so a test never compiles a temp project for real.
 - Read the files the card names first, by the regions the outline points at; search with the Grep and Glob tools before exploring (`rg` is not on Git Bash's PATH here, the Grep tool is); do not read `rhipper.md` itself, the card's text is in your prompt.
 - Bash and PowerShell both run cargo, the read-only git commands and the read-only listing commands; pipe a long output through `tail`.
