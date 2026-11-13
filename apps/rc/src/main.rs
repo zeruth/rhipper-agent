@@ -1374,16 +1374,13 @@ async fn route(id: i64) -> anyhow::Result<()> {
     let node = store.read(id).await?;
     let root = ra_console::agent::workspace_of(&store);
     let router = Router::load(&root)?;
-    let choice = router.choose(&node, IMPLEMENTER, ra_console::ui::DEFAULT_MODEL);
+    let rejections = ra_console::agent::rejections(&root, node.id);
+    let choice = router.choose(&node, IMPLEMENTER, ra_console::ui::DEFAULT_MODEL, rejections);
     let effort = choice.effort.map_or_else(String::new, |effort| format!(" (effort {effort})"));
     println!("#{} {} → {}{effort}", node.id, node.title, choice.model);
     let reason = match choice.why {
-        Why::Card => "the card's own model".to_owned(),
-        Why::Rule(place) => format!("rule {place} of {ROUTES_FILE}: {}", router.rules[place - 1]),
-        Why::Default if router.rules.is_empty() => format!("the default: no {ROUTES_FILE} beside the roadmap"),
-        Why::Default => {
-            format!("the default: none of the {} rules of {ROUTES_FILE} fits c{} {}", router.rules.len(), node.complexity, node.kind)
-        }
+        Why::Rule(place) => format!("{} · rule {place} of {ROUTES_FILE}: {}", router.reason(&node, &choice), router.rules[place - 1]),
+        _ => router.reason(&node, &choice),
     };
     println!("    {reason}");
     Ok(())

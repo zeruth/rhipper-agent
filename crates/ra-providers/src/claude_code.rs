@@ -907,8 +907,9 @@ fn path_with_own_dir() -> Option<std::ffi::OsString> {
 /// (`<root>/var/worktrees/<id>`): `<root>/target/wt-<id>`, the worktree's own under the
 /// project's target, so a build of one card never reads another's artifacts (two worktrees
 /// editing one crate shared a target and each compiled against the other's copy, #176 and
-/// #181), while the project's target stays the one place the builds live. `None` for a
-/// workspace that is not a worktree.
+/// #181), while the project's target stays the one place the builds live. The orchestrator's
+/// check of the card builds in the same one, so its artifacts are warm and it never queues
+/// behind the project's target. `None` for a workspace that is not a worktree.
 #[must_use]
 pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
     let id = workspace.parent()?;
