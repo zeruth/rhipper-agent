@@ -2687,6 +2687,8 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     // day before, so the plan's claims are judged before the walk spends the next day
     lines.extend(crate::commands::plan::read_back(store, &root, worker).await);
     loop {
+        // the cards that wait on a red main are ready again once main moves
+        lines.extend(requeue_red_main(store, &root).await);
         let roadmap = store.load().await?;
         // the walk's end, whichever way, goes to the paired session's feed and the digest
         let done = async |lines: &mut Vec<String>, text: String| {
@@ -3147,9 +3149,36 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
     Ok((path, branch))
 }
 
+/// Where the walk runs a card's failed tests on the project's base commit: one detached
+/// worktree under the cards', moved to each base it is asked about, building in a target of
+/// its own beside theirs.
+const BASE_WORKTREE: &str = "base";
+
+/// The scratch worktree of the base runs, checked out detached at `sha`, the carried files in.
+async fn base_worktree(root: &Path, sha: &str) -> anyhow::Result<PathBuf> {
+    let path = root.join(WORKTREES_DIR).join(BASE_WORKTREE);
+    if path.join(".git").exists() {
+        git(&path, &["checkout", "-q", "-f", "--detach", sha]).await?;
+    } else {
+        std::fs::create_dir_all(root.join(WORKTREES_DIR)).with_context(|| format!("cannot create {WORKTREES_DIR}"))?;
+        // a worktree removed by hand leaves git's record of it, which a new add trips on
+        let _ = git(root, &["worktree", "prune"]).await;
+        git(root, &["worktree", "add", "-f", "--detach", &path.to_string_lossy(), sha]).await?;
+    }
+    if let Ok(router) = crate::router::Router::load(root) {
+        carry_into(root, &path, &router.worker.carry, "the base worktree");
+    }
+    Ok(path)
+}
+
 /// Brings the `[worker] carry` entries of the project at `root` into the worktree at `path`: a
 /// file copied as it is, a directory linked; one the worktree already has is left alone.
 fn carry(root: &Path, path: &Path, entries: &[String], id: i64) {
+    carry_into(root, path, entries, &format!("the worktree of #{id}"));
+}
+
+/// [`carry`] into the worktree `what` names in a warning.
+fn carry_into(root: &Path, path: &Path, entries: &[String], what: &str) {
     for file in entries {
         let from = root.join(file);
         let to = path.join(file);
@@ -3161,7 +3190,7 @@ fn carry(root: &Path, path: &Path, entries: &[String], id: i64) {
         }
         let carried = if from.is_dir() { link_dir(&from, &to) } else { std::fs::copy(&from, &to).map(drop) };
         if let Err(e) = carried {
-            tracing::warn!("cannot carry {file} into the worktree of #{id}: {e}");
+            tracing::warn!("cannot carry {file} into {what}: {e}");
         }
     }
 }
@@ -4472,6 +4501,8 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
         // no slot to take waits for one rather than end
         let mut starved = false;
         if stopped.is_none() {
+            // the cards that wait on a red main are ready again once main moves
+            lines.extend(requeue_red_main(store, &root).await);
             let roadmap = store.load().await?;
             let router = crate::router::Router::load(&root).unwrap_or_default();
             // the runners as the table says now: the dashboard's `+`/`-` changes them while the
@@ -5245,15 +5276,35 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 text,
                 failed_tests: 0,
                 failures: Vec::new(),
+                tests: Vec::new(),
                 setup: false,
             };
             (None, vec![run])
         }
     };
-    // a failure the base gives too is not the card's: in a worktree the failed command runs
-    // once more on the project's tree, and the failures the two share are marked, so the rerun
-    // does not spend its turns on what it did not break
-    if workspace_dir.is_some()
+    // a failure the base gives too is not the card's: in a card's worktree the failed tests run
+    // alone on the project's base commit, and the failures the two share are marked, so a rerun
+    // does not spend its turns on what it did not break. When every one fails there, main is
+    // red, and the card waits for main to move instead of going back to its worker (507 asm
+    // reruns hunted a defect of main's). A failure that names no test runs whole once more on
+    // the project's tree
+    let mut red_main = None;
+    if worker.branch.is_some()
+        && let Some(failed) = checks.iter_mut().find(|run| !run.passed && !run.tests.is_empty())
+    {
+        if let Some(base) = main_failures(worker, &root, &failed.command, &failed.tests, timeout).await {
+            let shared: Vec<String> = failed
+                .failures
+                .iter()
+                .map(|failure| failure.lines().next().unwrap_or_default().to_owned())
+                .filter(|head| base.failing.contains(&run_name(head)))
+                .collect();
+            failed.failures = ra_context::marked_on_base(&failed.failures, &shared);
+            if failed.tests.iter().all(|test| base.failing.contains(test)) {
+                red_main = Some(base);
+            }
+        }
+    } else if workspace_dir.is_some()
         && let Some(failed) = checks.iter_mut().find(|run| !run.passed && !run.failures.is_empty())
     {
         let base = base_failures(worker, &root, &failed.command, timeout).await;
@@ -5351,7 +5402,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         .find(|h| !h.outcome.starts_with("note from"))
         .and_then(ra_context::Handoff::fingerprint)
         .map(str::to_owned);
-    let held = held_reason(&session.text, &changed, failed, print.as_deref(), last_print.as_deref());
+    // a card whose failed tests fail on main too waits for main's next commit: neither a rerun
+    // nor a block for a person
+    let red = red_main.as_ref().map(|base| format!("main fails {} at {}", base.failing.join(", "), short_sha(&base.sha)));
+    let held = if red.is_some() { None } else { held_reason(&session.text, &changed, failed, print.as_deref(), last_print.as_deref()) };
     // the lint of what the run changed, once the check passed: the orchestrator finds the
     // warnings so the worker spends no turns on them. A lint that cannot run is a line, not a
     // verdict; a warning in a changed file is.
@@ -5379,8 +5433,22 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         }
     }
     // a card no rerun can move is held for a person on the first sight, with the line that
-    // says why on its check line, the feed and the run's lines; the walk does not send it again
-    if let Some(reason) = &held {
+    // says why on its check line, the feed and the run's lines; the walk does not send it again.
+    // A card that waits on main leads its notes with why, which the status reads and the
+    // re-queue takes off again
+    if let Some(reason) = &red {
+        let mut preface = format!("{reason}; {RED_MAIN_REQUEUE}\n\n");
+        if let Some(review) = carried_review(node.notes.as_deref()) {
+            let _ = write!(preface, "{review}\n\n");
+        }
+        report = format!("{preface}{report}");
+        store.set_notes(id, &report).await?;
+        store.set_state_by(id, TaskState::Blocked, Source::Run).await?;
+        if let Some(base) = &red_main {
+            wait_on_main(&root, id, &base.sha);
+        }
+        check_line = format!("{check_line} · waits: {reason}");
+    } else if let Some(reason) = &held {
         passed = false;
         if let Some(review) = carried_review(node.notes.as_deref()) {
             report = format!("{review}\n\n{report}");
@@ -5430,7 +5498,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let summary = worker.ask_role(roles, Role::Summary, Some(id), SUMMARY_INSTRUCTION, &session.text).await;
     let answer = summary.as_deref().unwrap_or(&session.text);
     let handed = if lint_warnings.is_empty() { format!("{lead}{answer}") } else { answer.to_owned() };
-    let outcome = if held.is_some() {
+    let outcome = if red.is_some() {
+        "waits on main"
+    } else if held.is_some() {
         "blocked"
     } else if passed {
         "implemented"
@@ -5469,6 +5539,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         ),
         check_line,
     ];
+    if let Some(reason) = &red {
+        lines.push(format!("  #{id} waits: {reason}; {RED_MAIN_REQUEUE}"));
+    }
     if let Some(reason) = &held {
         lines.push(format!("  #{id} blocked: {reason}; a person sets it defined again"));
     }
@@ -6348,6 +6421,9 @@ struct CheckRun {
     /// The failures of a failed command, read from its whole output by
     /// [`ra_context::failures_of`]; the next run reads them where the tail would have cut them.
     failures: Vec<String>,
+    /// The tests a failed command marks `FAILED`, named as a run of them alone names them;
+    /// empty for a passed command and for a failure that names no test.
+    tests: Vec<String>,
     /// The first line of a failed command's output that reads as its error, else its first
     /// line; empty for a passed one. The fingerprint and the reason of a block name it.
     first_error: String,
@@ -6503,11 +6579,13 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                 text: last_lines(&output, kept),
                 failed_tests: 0,
                 failures: Vec::new(),
+                tests: Vec::new(),
                 first_error: String::new(),
                 setup: false,
             },
             Ok((false, output)) => {
                 let failure = check_failure(&output);
+                let gradle = command.split_whitespace().next().is_none_or(|program| !program.to_lowercase().contains("cargo"));
                 CheckRun {
                     command: command.clone(),
                     passed: false,
@@ -6515,6 +6593,7 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                     text: failure.text,
                     failed_tests: failure.failed,
                     failures: ra_context::failures_of(&output),
+                    tests: failed_test_names(&output, gradle),
                     first_error: first_error(&output),
                     setup: is_setup_failure(&output),
                 }
@@ -6530,6 +6609,7 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                     text,
                     failed_tests: 0,
                     failures: Vec::new(),
+                    tests: Vec::new(),
                 }
             }
         };
@@ -6565,6 +6645,181 @@ async fn base_failures(worker: &Worker, root: &Path, command: &str, timeout: std
     match toolbox.check_acceptance(command).await {
         Ok((false, output)) => ra_context::failures_of(&output),
         _ => Vec::new(),
+    }
+}
+
+/// The runs of failed tests on a base commit, one line each: the commit, the tests asked about
+/// and the ones that failed there, tab-separated, each set of names space-separated.
+const BASE_RUNS_FILE: &str = "var/runs/base-tests.log";
+
+/// The cards that wait on a red main, one line each: the card and the commit it failed on,
+/// tab-separated.
+const RED_MAIN_FILE: &str = "var/runs/red-main";
+
+/// What a card that waits on main is told will move it.
+const RED_MAIN_REQUEUE: &str = "the card goes back on the queue when main's commit changes";
+
+/// What the project's base commit made of a card's failed tests.
+struct BaseRun {
+    /// The commit the tests ran on.
+    sha: String,
+    /// The card's tests that failed there too.
+    failing: Vec<String>,
+}
+
+/// The lock of each project's base runs: two cards failing at once ask about the same commit,
+/// and the second reads the first's answer rather than build it again.
+type BaseLocks = Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>;
+static BASE_LOCKS: std::sync::LazyLock<BaseLocks> = std::sync::LazyLock::new(BaseLocks::default);
+
+/// Which of `tests`, failed in a card's check `command`, fail on the project's base commit too:
+/// they run alone there, in a scratch worktree on the check's build slot, once per commit and
+/// test set, the answer kept by the commit's sha. The run that finds main red says so on the
+/// feed, once. `None` when the base cannot be read, the tests cannot run alone, or the base
+/// failed without naming a test.
+async fn main_failures(worker: &Worker, root: &Path, command: &str, tests: &[String], timeout: std::time::Duration) -> Option<BaseRun> {
+    let sha = git(root, &["rev-parse", "HEAD"]).await.ok()?;
+    let words = ra_tools::words(command).ok()?;
+    let mut asked = tests.to_vec();
+    asked.sort();
+    asked.dedup();
+    let rerun = rerun_words(&words, &asked)?;
+    let lock = BASE_LOCKS.lock().entry(root.to_path_buf()).or_default().clone();
+    let _held = lock.lock().await;
+    let key = asked.join(" ");
+    if let Some(failing) = cached_base_run(root, &sha, &key) {
+        return Some(BaseRun { sha, failing });
+    }
+    let path = match base_worktree(root, &sha).await {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!("the failed tests were not run on the base {}: {e:#}", short_sha(&sha));
+            return None;
+        }
+    };
+    let own_target = ra_providers::claude_code::shared_target(&path);
+    let toolbox = worker
+        .toolbox(&path)
+        .ok()?
+        .with_timeout(timeout)
+        .with_env(own_target.iter().map(|t| ("CARGO_TARGET_DIR".to_owned(), t.display().to_string())));
+    // the build slot is the card's check's, still held: a second one from the same run could
+    // wait the whole of [`HOLD_WAIT`] on a full machine
+    let _target = if command.trim_start().starts_with("cargo") {
+        let target = own_target.unwrap_or_else(|| crate::hub::cargo_target(root));
+        guard_target(root, &path, &target, timeout).await.ok()?
+    } else {
+        None
+    };
+    let (passed, output) = toolbox.check_args(&rerun).await.ok()?;
+    let gradle = !words[0].to_lowercase().contains("cargo");
+    let failing: Vec<String> =
+        if passed { Vec::new() } else { failed_test_names(&output, gradle).into_iter().filter(|name| asked.contains(name)).collect() };
+    // a base that fails without naming a test (a compile error, a timeout) says nothing of them
+    if !passed && failing.is_empty() {
+        return None;
+    }
+    keep_base_run(root, &sha, &key, &failing);
+    if !failing.is_empty() {
+        let text = format!("main is red: {} at {}", failing.join(", "), short_sha(&sha));
+        tracing::warn!("{text}");
+        crate::pair::event(root, &text);
+    }
+    Some(BaseRun { sha, failing })
+}
+
+/// The tests of `tests` that failed on `sha` when a base run asked about exactly them.
+fn cached_base_run(root: &Path, sha: &str, tests: &str) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(root.join(BASE_RUNS_FILE)).ok()?;
+    text.lines().rev().find_map(|line| {
+        let mut fields = line.split('\t');
+        (fields.next() == Some(sha) && fields.next() == Some(tests))
+            .then(|| fields.next().unwrap_or_default().split_whitespace().map(str::to_owned).collect())
+    })
+}
+
+/// Keeps a base run's answer for the next card that asks about the same commit and tests.
+fn keep_base_run(root: &Path, sha: &str, tests: &str, failing: &[String]) {
+    use std::io::Write as _;
+    let file = root.join(BASE_RUNS_FILE);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+        .and_then(|mut out| writeln!(out, "{sha}\t{tests}\t{}", failing.join(" ")));
+    if let Err(e) = written {
+        tracing::warn!("the base run on {} was not kept: {e}", short_sha(sha));
+    }
+}
+
+/// Notes card `id` as waiting on main at `sha`, in place of any earlier line of it.
+fn wait_on_main(root: &Path, id: i64, sha: &str) {
+    let file = root.join(RED_MAIN_FILE);
+    let own = format!("{id}\t");
+    let mut lines: Vec<String> =
+        std::fs::read_to_string(&file).unwrap_or_default().lines().filter(|line| !line.starts_with(&own)).map(str::to_owned).collect();
+    lines.push(format!("{id}\t{sha}"));
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&file, format!("{}\n", lines.join("\n"))) {
+        tracing::warn!("#{id} was not noted as waiting on main: {e}");
+    }
+}
+
+/// Puts the cards that wait on a red main back on the queue once the project's commit is not
+/// the one they failed on: main moved, and their tests may pass on it now. The reason leaves
+/// the head of their notes; a card a person moved meanwhile only leaves the list. One line per
+/// card put back, on the feed too.
+pub async fn requeue_red_main(store: &Store, root: &Path) -> Vec<String> {
+    let file = root.join(RED_MAIN_FILE);
+    let Ok(text) = std::fs::read_to_string(&file) else { return Vec::new() };
+    let Ok(head) = git(root, &["rev-parse", "HEAD"]).await else { return Vec::new() };
+    let mut kept = Vec::new();
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let Some((id, sha)) = line.split_once('\t') else { continue };
+        let Ok(id) = id.parse::<i64>() else { continue };
+        let Ok(node) = store.read(id).await else { continue };
+        if node.state != TaskState::Blocked {
+            continue;
+        }
+        if sha == head || store.set_state_by(id, TaskState::Defined, Source::Run).await.is_err() {
+            kept.push(line.to_owned());
+            continue;
+        }
+        if let Some(notes) = node.notes.as_deref()
+            && notes.starts_with("main fails ")
+        {
+            let rest = notes.split_once("\n\n").map_or("", |(_, rest)| rest);
+            let _ = store.set_notes(id, rest).await;
+        }
+        let text = format!("#{id} back on the queue: main moved from {} to {}", short_sha(sha), short_sha(&head));
+        tracing::info!(target: crate::trace::PROGRESS, "{text}");
+        crate::pair::event(root, &text);
+        lines.push(text);
+    }
+    let written = if kept.is_empty() { std::fs::remove_file(&file) } else { std::fs::write(&file, format!("{}\n", kept.join("\n"))) };
+    if let Err(e) = written {
+        tracing::warn!("the cards waiting on main were not rewritten: {e}");
+    }
+    lines
+}
+
+/// The first seven characters of a commit's sha, as git abbreviates it.
+fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+/// The name a run of a test alone takes for a failure's name line: gradle's `Class > method()`
+/// as `Class.method`, any other line as it is.
+fn run_name(head: &str) -> String {
+    match head.split_once(" > ") {
+        Some((class, method)) => format!("{class}.{}", method.trim_end_matches("()")),
+        None => head.to_owned(),
     }
 }
 

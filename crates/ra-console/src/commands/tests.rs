@@ -2061,6 +2061,102 @@ async fn a_third_failed_landing_check_waits_for_the_person() {
     assert_eq!(sent, 3);
 }
 
+/// A committed probe project with a card per title from #2 on, and a worker that writes
+/// `made.txt` and whose check fails the test `probe`, in the full run and alone. With
+/// `base_passes` the second run alone, the base's, passes. The runs alone are counted.
+async fn red_main_project(
+    dir: &std::path::Path,
+    titles: &[&str],
+    base_passes: bool,
+) -> (Store, Worker, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    cargo_project(dir, true);
+    git_ok(dir, &["init", "-q"]);
+    git_ok(dir, &["add", "-A"]);
+    git_ok(dir, &["commit", "-q", "-m", "probe"]);
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    for title in titles {
+        run(&format!("/add task {title} parent 1"), &store, &worker()).await.unwrap();
+    }
+    let alone = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = alone.clone();
+    let check: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        if command.contains("--exact") {
+            let call = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if base_passes && call == 1 {
+                return Ok((0, "test probe ... ok\n".to_owned()));
+            }
+            return Ok((101, "test probe ... FAILED\nthe probe broke alone\n".to_owned()));
+        }
+        Ok((101, "test probe ... FAILED\nthe probe broke\n".to_owned()))
+    });
+    let provider = std::sync::Arc::new(ByTurn { seen: parking_lot::Mutex::new(0) });
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider).with_script(check);
+    (store, runner, alone)
+}
+
+/// The feed lines of the project at `dir` that say main is red.
+fn red_main_lines(dir: &std::path::Path) -> Vec<String> {
+    crate::pair::recent(dir, 500).into_iter().filter(|l| l.contains("main is red: ")).collect()
+}
+
+#[tokio::test]
+async fn red_main_a_card_whose_test_fails_on_the_base_too_waits_naming_it_and_gets_no_rerun() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, runner, alone) = red_main_project(dir.path(), &["A", "B"], false).await;
+    let out = crate::agent::run_parallel(&store, &runner, 1, false).await.unwrap();
+    for id in [2, 3] {
+        let node = store.read(id).await.unwrap();
+        assert_eq!(node.state, ra_roadmap::model::TaskState::Blocked, "{out:?}");
+        assert!(node.notes.unwrap_or_default().starts_with("main fails probe at "), "{out:?}");
+        // one run of the card and no rerun
+        assert_eq!(ra_context::TaskContext::open(dir.path(), id).handoffs.len(), 1, "{out:?}");
+        assert!(out.iter().any(|l| l.starts_with(&format!("  #{id} waits: main fails probe at "))), "{out:?}");
+    }
+    // each card's test ran alone in its worktree, and once on the base for both
+    assert_eq!(alone.load(std::sync::atomic::Ordering::SeqCst), 3, "{out:?}");
+    // the feed says it once for the two cards
+    let red = red_main_lines(dir.path());
+    assert_eq!(red.len(), 1, "{red:?}");
+    let head = git_ok(dir.path(), &["rev-parse", "HEAD"]);
+    assert!(red[0].ends_with(&format!("main is red: probe at {}", &head[..7])), "{red:?}");
+    let waiting = crate::hub::waiting_of(&store.all().await.unwrap(), &[]);
+    assert!(waiting.iter().filter(|w| w.short() == "main red").count() == 2, "{waiting:?}");
+}
+
+#[tokio::test]
+async fn red_main_a_card_whose_test_passes_on_the_base_is_sent_back_to_its_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, runner, alone) = red_main_project(dir.path(), &["A"], true).await;
+    let out = crate::agent::run_in_worktree(&store, 2, &runner).await.unwrap();
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision, "{out:?}");
+    assert!(node.notes.unwrap_or_default().starts_with("check failed: cargo test --workspace -q"), "{out:?}");
+    assert_eq!(alone.load(std::sync::atomic::Ordering::SeqCst), 2, "the base did not run: {out:?}");
+    assert!(red_main_lines(dir.path()).is_empty());
+}
+
+#[tokio::test]
+async fn red_main_a_new_base_commit_puts_the_waiting_card_back_in_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, runner, _) = red_main_project(dir.path(), &["A"], false).await;
+    let out = crate::agent::run_in_worktree(&store, 2, &runner).await.unwrap();
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Blocked, "{out:?}");
+    // main has not moved: the card waits on
+    assert!(crate::agent::requeue_red_main(&store, dir.path()).await.is_empty());
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Blocked);
+    std::fs::write(dir.path().join("fixed.txt"), "main is green again\n").unwrap();
+    git_ok(dir.path(), &["add", "fixed.txt"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "main moves on"]);
+    let back = crate::agent::requeue_red_main(&store, dir.path()).await;
+    assert_eq!(back.len(), 1, "{back:?}");
+    assert!(back[0].starts_with("#2 back on the queue: main moved from "), "{back:?}");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Defined);
+    assert!(!node.notes.unwrap_or_default().starts_with("main fails"));
+    // the list is spent: nothing to put back a second time
+    assert!(crate::agent::requeue_red_main(&store, dir.path()).await.is_empty());
+}
+
 /// A committed probe project with card #2 `Probe` and its worktree, and a worker in the worktree
 /// on `answers` whose check commits `file` with `content` on the project's branch the first time
 /// it runs: the project moves on while the card's run goes.

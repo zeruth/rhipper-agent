@@ -446,7 +446,7 @@ const REASON_WIDTH: usize = 100;
 
 impl Waiting {
     /// The reason in a word or two, for the status line: `reviewer ×5`, `check ×2`, `landing`,
-    /// `idle`, `refused`, else the reason clipped.
+    /// `idle`, `refused`, `main red`, else the reason clipped.
     #[must_use]
     pub fn short(&self) -> String {
         let times = |after: &str| {
@@ -464,6 +464,8 @@ impl Waiting {
             String::from("idle")
         } else if self.reason.starts_with("refused:") {
             String::from("refused")
+        } else if self.reason.starts_with("main fails ") {
+            String::from("main red")
         } else {
             clip(&self.reason, 24)
         }
