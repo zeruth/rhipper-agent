@@ -939,38 +939,17 @@ fn hook_pre(
     // the full suite is the orchestrator's when it is the project's check: a worker's own run
     // of it goes to the crates the run has changed
     let suite_check = worker.is_none_or(ra_console::router::WorkerConfig::checks_the_suite);
-    let mut verdict = match catalogue.command_in(cwd, command, &held, suite_check, own) {
+    let verdict = match catalogue.command_in(cwd, command, &held, suite_check, own) {
         ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. } if own && id == "shell-outside-allowlist" => {
             ra_gotchas::Verdict::Pass
         }
         other => other,
     };
     // a build, under `rc hold` by the rewrite or by the worker's own hand, is the session's to
-    // spend from a small budget: the code comes first, the check compiles after the report
-    // a build is gradle, cargo or the contract runner: the other heavy work the slots hold (a
-    // script, a search, a WSL toolchain) is the worker's to run, budget or not
-    let is_build = |text: &str| {
-        let inner = text.trim_start().strip_prefix("rc hold").map(|rest| {
-            let rest = rest.trim_start();
-            rest.split_once("-- ").map_or(rest, |(_, command)| command)
-        });
-        inner.is_some_and(|command| {
-            let first = command.trim_start().trim_start_matches("& ").trim_start_matches(".\\").trim_start_matches("./");
-            first.starts_with("gw.ps1")
-                || first.starts_with("gradlew")
-                || (first.starts_with("cargo ") && !first.starts_with("cargo fmt"))
-                || command.contains("run-awt-contracts.py")
-        })
-    };
-    let (built, built_text) = match &verdict {
-        ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => (is_build(rewritten), rewritten.as_str()),
-        ra_gotchas::Verdict::Pass => (is_build(command), command),
-        ra_gotchas::Verdict::Deny { .. } => (false, command),
-    };
+    // spend from a small budget: the code comes first, the check compiles after the report; a
+    // refused command spends nothing
     let session = call.get("session_id").and_then(serde_json::Value::as_str).unwrap_or("-");
-    if let (true, Err(reason)) = (built, ra_console::agent::build_allowance(cwd, session, built_text)) {
-        verdict = ra_gotchas::Verdict::Deny { id: String::from("build-budget"), reason };
-    }
+    let verdict = ra_console::agent::budget_build(cwd, session, command, verdict);
     // the hook is the judge of a command's shape: every part allowed is an allow the static
     // allowlist, which cannot parse a chain or a prefix, would have refused; a part refused
     // denies the whole, a rewrite's allow included; a shape it cannot read is left to the

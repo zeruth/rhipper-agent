@@ -21,6 +21,14 @@ pub(crate) async fn run(root: &Path) -> anyhow::Result<()> {
         println!("{line}");
     }
     println!("{}", local_line(&local::probe().await));
+    // the machine's manifest probed afresh, the one every project's runs read today
+    let dir = root.to_path_buf();
+    let manifest = tokio::task::spawn_blocking(move || ra_console::hub::manifest::refresh(&dir)).await?;
+    println!();
+    println!("machine manifest of {} ({}):", manifest.day, ra_console::hub::dir().join(ra_console::hub::manifest::MANIFEST_FILE).display());
+    for line in manifest.lines() {
+        println!("   {line}");
+    }
     let blocking = Check::blocking(&checks);
     anyhow::ensure!(blocking.is_empty(), "a run needs: {}", blocking.join(", "));
     Ok(())

@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+pub mod manifest;
+
 /// The hub's directory: `%LOCALAPPDATA%\rhipper\agent` on Windows (the IDE keeps its own
 /// directories beside it under `rhipper`), `~/.local/share/rhipper/agent` elsewhere. `RHIPPER_HUB`
 /// names another, for the tests of the crates that build this one without `cfg(test)`; this

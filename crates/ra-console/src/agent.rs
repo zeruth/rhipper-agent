@@ -545,6 +545,10 @@ fn connect(route: Route) -> anyhow::Result<Arc<dyn ModelProvider>> {
                 }
                 Err(e) => tracing::warn!("the worker table is off: {e:#}"),
             }
+            // the machine's tools on the run's PATH, the ones the probe found off it as well
+            if let Some(manifest) = crate::hub::manifest::load() {
+                harness = harness.with_tool_dirs(manifest.dirs());
+            }
             // the project's catalogue when it has one, brought what the seed gained since it
             // was written; the seed otherwise, written by the hook in the run's own directory,
             // not here (a test runs where no var/ belongs)
@@ -1945,18 +1949,81 @@ pub fn build_allowance(tree: &Path, session: &str, command: &str) -> Result<(), 
             "nothing is changed yet: write the card's change first, then build once if a compile is in doubt; the project's check compiles after the report and a failure comes back as a rerun with its output",
         ));
     }
-    let dir = tree.join("var").join("builds");
-    let file = dir.join(session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>());
-    let spent: u32 = std::fs::read_to_string(&file).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
+    let file = builds_file(tree, session);
+    let spent = builds_spent(tree, session);
     if spent >= allowed {
         return Err(format!(
             "this session has built {spent} time(s), its budget: report the change as it stands and name what is unverified; the project's check compiles after the report, and a failure comes back as a rerun with its output"
         ));
     }
-    if std::fs::create_dir_all(&dir).is_ok() {
+    if file.parent().is_some_and(|dir| std::fs::create_dir_all(dir).is_ok()) {
         let _ = std::fs::write(&file, (spent + 1).to_string());
     }
     Ok(())
+}
+
+/// Whether a shell command is a build the session's budget counts: gradle, cargo or the
+/// contract runner under `rc hold`, by the hook's rewrite or the worker's own hand. The other
+/// heavy work the slots hold (a script, a search, a WSL toolchain) is the worker's to run.
+#[must_use]
+pub fn is_build(command: &str) -> bool {
+    let inner = command.trim_start().strip_prefix("rc hold").map(|rest| {
+        let rest = rest.trim_start();
+        rest.split_once("-- ").map_or(rest, |(_, command)| command)
+    });
+    inner.is_some_and(|command| {
+        let first = command.trim_start().trim_start_matches("& ").trim_start_matches(".\\").trim_start_matches("./");
+        first.starts_with("gw.ps1")
+            || first.starts_with("gradlew")
+            || (first.starts_with("cargo ") && !first.starts_with("cargo fmt"))
+            || command.contains("run-awt-contracts.py")
+    })
+}
+
+/// The hook's verdict on `command` once the session's build budget has its say: a build the
+/// catalogue lets start spends one of the session's builds, or is refused when they are spent;
+/// a command the catalogue refuses, or one that is no build, spends nothing. Only a build that
+/// starts counts (every call of the hook spent one before, refused or not, and a session that
+/// had run nothing found its budget gone).
+#[must_use]
+pub fn budget_build(tree: &Path, session: &str, command: &str, verdict: ra_gotchas::Verdict) -> ra_gotchas::Verdict {
+    let built = match &verdict {
+        ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => is_build(rewritten).then_some(rewritten.as_str()),
+        ra_gotchas::Verdict::Pass => is_build(command).then_some(command),
+        ra_gotchas::Verdict::Deny { .. } => None,
+    };
+    let Some(built) = built else {
+        return verdict;
+    };
+    match build_allowance(tree, session, built) {
+        Ok(()) => verdict,
+        Err(reason) => ra_gotchas::Verdict::Deny { id: String::from("build-budget"), reason },
+    }
+}
+
+/// The builds a session has spent in `tree`.
+#[must_use]
+pub fn builds_spent(tree: &Path, session: &str) -> u32 {
+    std::fs::read_to_string(builds_file(tree, session)).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0)
+}
+
+/// The file a session's build count lives in: `var/builds/<session>` of the tree.
+fn builds_file(tree: &Path, session: &str) -> PathBuf {
+    tree.join("var").join("builds").join(session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>())
+}
+
+/// Probes the machine at a walk's start when the hub's manifest is not today's, off the
+/// runtime's threads: the first walk of the day of any project pays for it.
+async fn probe_the_machine(root: &Path) {
+    let root = root.to_path_buf();
+    let probed = tokio::task::spawn_blocking(move || crate::hub::manifest::daily(&root)).await;
+    if let Ok(Some(manifest)) = probed {
+        tracing::debug!(
+            "the machine's manifest of {}: {} tool(s)",
+            manifest.day,
+            manifest.tools.iter().filter(|t| t.path.is_some()).count()
+        );
+    }
 }
 
 /// Gives `session` a fresh build budget in `tree`, for a rerun whose prompt is a lint fix: the
@@ -2383,8 +2450,10 @@ pub async fn adopt(
 ///
 /// # Errors
 /// When the roadmap cannot be read between runs.
+#[allow(clippy::too_many_lines)]
 pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> anyhow::Result<Vec<String>> {
     share_cpu_among_builds();
+    probe_the_machine(&workspace_of(store)).await;
     let mut lines = Vec::new();
     let mut ran = 0;
     // the card the last run continued and how many runs in a row it has had: a card the
@@ -3861,6 +3930,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     let Some(_lock) = take_walk_lock(&root) else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
     };
+    probe_the_machine(&root).await;
     let mut lines = Vec::new();
     // the cards a killed walk left in progress go back on the queue before this one reads it
     lines.extend(requeue_orphans(store, &root).await);
@@ -4424,7 +4494,15 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
-                messages: harness_messages(&task, node.acceptance.as_deref(), rerun.as_deref(), &project, &root, worker.debug),
+                messages: harness_messages(
+                    &task,
+                    node.acceptance.as_deref(),
+                    rerun.as_deref(),
+                    &project,
+                    &root,
+                    worker.debug,
+                    crate::hub::manifest::load().as_ref(),
+                ),
                 temperature: Some(0.4),
                 max_tokens: Some(4096),
                 tools: Vec::new(),
@@ -5067,25 +5145,30 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
 /// The messages of a harness run: the worker's role, the project context and the machine notes
 /// as system messages, the task as the user turn. The machine notes name what tripped the last
 /// runs, so the worker does not find out the hard way again, and the warnings the last run of
-/// the card left, so a second attempt opens on the exact lines. On a rerun the `rerun` block
-/// stands in for the handoffs. `acceptance` is the card's, which the notes are judged against.
-fn harness_messages(
+/// the card left, so a second attempt opens on the exact lines; the machine's `manifest` gives
+/// the lines of the tools the card names, so the worker does not go looking for them. On a
+/// rerun the `rerun` block stands in for the handoffs. `acceptance` is the card's, which the
+/// notes are judged against.
+pub(crate) fn harness_messages(
     task: &ra_context::TaskContext,
     acceptance: Option<&str>,
     rerun: Option<&str>,
     project: &str,
     root: &Path,
     debug: bool,
+    manifest: Option<&crate::hub::manifest::Manifest>,
 ) -> Vec<Message> {
     let mut messages = vec![Message::system(SYSTEM)];
     if !project.is_empty() {
         messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
     }
-    let notes = [machine_notes(root, project, (task.id, acceptance)), warnings_note(task), digest_block(&crate::hub::digest_lines(root))]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let tools = manifest.map(|m| m.block_for(&task.brief)).unwrap_or_default();
+    let notes =
+        [machine_notes(root, project, (task.id, acceptance)), tools, warnings_note(task), digest_block(&crate::hub::digest_lines(root))]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
     if !notes.is_empty() {
         messages.push(Message::system(notes));
     }
@@ -5180,7 +5263,15 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node, &acting, &root) } else { None };
     let resume = rerun_resume(&node, rerun.is_some(), unix_now());
     let messages = if harness {
-        harness_messages(&task, node.acceptance.as_deref(), rerun.as_deref(), &project, &root, worker.debug)
+        harness_messages(
+            &task,
+            node.acceptance.as_deref(),
+            rerun.as_deref(),
+            &project,
+            &root,
+            worker.debug,
+            crate::hub::manifest::load().as_ref(),
+        )
     } else {
         vec![Message::system(SYSTEM), Message::user(bare_context(&task, rerun.as_deref(), &project, worker.debug))]
     };

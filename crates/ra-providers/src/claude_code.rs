@@ -59,6 +59,9 @@ pub struct ClaudeCode {
     catalogue: Option<Catalogue>,
     /// The environment the harness runs with, on top of this process's own.
     env: Vec<(String, String)>,
+    /// The directories of the machine's tools, from the hub's manifest, which the harness's
+    /// PATH gets after its own: a tool the probe found off the PATH is found by the worker too.
+    tool_dirs: Vec<PathBuf>,
     /// The programs of the project's own `[worker] allow` rules, which the allowlist gotcha
     /// does not count against a run.
     own_prefixes: Vec<String>,
@@ -88,6 +91,7 @@ impl ClaudeCode {
             hooks: None,
             catalogue: None,
             env: Vec::new(),
+            tool_dirs: Vec::new(),
             own_prefixes: Vec::new(),
             suite_check: false,
         }
@@ -132,7 +136,50 @@ impl ClaudeCode {
         self
     }
 
+    /// The directories of the machine's tools, the hub's manifest's, for the harness's PATH.
+    #[must_use]
+    pub fn with_tool_dirs(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        for dir in dirs {
+            if !self.tool_dirs.contains(&dir) {
+                self.tool_dirs.push(dir);
+            }
+        }
+        self
+    }
+
+    /// The environment a run in `workspace` sets on top of this process's: the project's
+    /// variables; the PATH with this binary's directory first and the tools' directories after
+    /// it; the worktree's cargo target; and on Windows `MSYS_NO_PATHCONV`, so Git Bash hands a
+    /// `/c` or a `C:/…` argument to the program as written. A project's own setting wins.
+    #[must_use]
+    pub fn run_env(&self, workspace: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
+        let mut env: Vec<(String, std::ffi::OsString)> = self.env.iter().map(|(k, v)| (k.clone(), v.into())).collect();
+        let set = |env: &[(String, std::ffi::OsString)], key: &str| env.iter().any(|(k, _)| k.eq_ignore_ascii_case(key));
+        // a run in a worktree builds in the project's target, like the run beside it: one
+        // build directory under one lock, not one per worktree
+        if !set(&env, "CARGO_TARGET_DIR")
+            && let Some(target) = workspace.and_then(shared_target)
+        {
+            env.push(("CARGO_TARGET_DIR".to_owned(), target.into_os_string()));
+        }
+        // the worker's shell finds `rc` (its roadmap commands, `rc hold`) beside the binary that
+        // runs it: the PATH a walk inherits can predate the install directory's place on it, and
+        // every `rc show` of the agent's regeneration card was `command not found` (2026-11-12)
+        if !set(&env, "PATH") {
+            let own = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            if let Some(path) = path_with(own, &self.tool_dirs, &path) {
+                env.push(("PATH".to_owned(), path));
+            }
+        }
+        if cfg!(windows) && !set(&env, "MSYS_NO_PATHCONV") {
+            env.push(("MSYS_NO_PATHCONV".to_owned(), "1".into()));
+        }
+        env
+    }
+
     /// The effort level: `low`, `medium`, `high`, `xhigh` or `max`.
+    #[must_use]
     pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
         self.effort = effort.into();
         self
@@ -257,20 +304,7 @@ impl ClaudeCode {
         }
         // a nested session refuses to start; the console may itself run under Claude Code
         command.env_remove("CLAUDECODE");
-        command.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        // a run in a worktree builds in the project's target, like the run beside it: one
-        // build directory under one lock, not one per worktree; a project's own setting wins
-        if !self.env.iter().any(|(k, _)| k == "CARGO_TARGET_DIR")
-            && let Some(target) = request.workspace.as_deref().and_then(shared_target)
-        {
-            command.env("CARGO_TARGET_DIR", target);
-        }
-        // the worker's shell finds `rc` (its roadmap commands, `rc hold`) beside the binary that
-        // runs it: the PATH a walk inherits can predate the install directory's place on it, and
-        // every `rc show` of the agent's regeneration card was `command not found` (2026-11-12)
-        if let Some(path) = path_with_own_dir() {
-            command.env("PATH", path);
-        }
+        command.envs(self.run_env(request.workspace.as_deref()));
         // the scratch drive's temp directory and Gradle cache, when the machine has one
         if let Some(dir) = &request.workspace {
             command.envs(scratch_env(dir));
@@ -902,17 +936,29 @@ fn write_system_prompt(workspace: &Path, text: &str) -> std::io::Result<PathBuf>
     std::path::absolute(&path).or(Ok(path))
 }
 
-/// The PATH this process has with the directory of its own binary first, the installed `rc`
-/// beside it; `None` when either cannot be read. A PATH that has the directory already is left
-/// as it is.
-fn path_with_own_dir() -> Option<std::ffi::OsString> {
-    let own = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    if dirs.iter().any(|d| d == &own) {
-        return Some(path);
+/// `path` with `own`, the directory of this binary and the installed `rc` beside it, first and
+/// the `tools` directories after the rest; a directory already on it stays where it is (on
+/// Windows compared without case or a trailing separator). `None` when it cannot be joined.
+fn path_with(own: Option<PathBuf>, tools: &[PathBuf], path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let key = |dir: &Path| {
+        let text = dir.to_string_lossy();
+        let text = text.trim_end_matches(['\\', '/']);
+        if cfg!(windows) { text.to_lowercase() } else { text.to_owned() }
+    };
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    let mut seen: Vec<String> = dirs.iter().map(|d| key(d)).collect();
+    if let Some(own) = own
+        && !seen.contains(&key(&own))
+    {
+        seen.push(key(&own));
+        dirs.insert(0, own);
     }
-    dirs.insert(0, own);
+    for dir in tools {
+        if !seen.contains(&key(dir)) {
+            seen.push(key(dir));
+            dirs.push(dir.clone());
+        }
+    }
     std::env::join_paths(dirs).ok()
 }
 
