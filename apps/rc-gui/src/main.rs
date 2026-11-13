@@ -1282,12 +1282,10 @@ impl App {
             }
             let left = ctx.content_rect().bottom() - ui.next_widget_position().y - 8.0 - 4.0 - self.dash_slack;
             let small: Vec<bool> = self.tabs.iter().map(Workspace::dashboard_small).collect();
-            // the idle projects are off the dashboard while one works, and cost it nothing
-            let any_working = small.iter().any(|s| !*s);
-            let shown = if any_working { small.iter().filter(|s| !**s).count() } else { self.tabs.len() };
-            let count = shown.max(1) as f32;
-            let kept: f32 =
-                if any_working { 0.0 } else { self.tabs.iter().zip(&small).filter(|(_, s)| **s).map(|(t, _)| t.dash_height).sum() };
+            // every project shows, the idle ones at their natural height (the person, again:
+            // "i want the empty project bubbles in dashboard now")
+            let count = self.tabs.len().max(1) as f32;
+            let kept: f32 = self.tabs.iter().zip(&small).filter(|(_, s)| **s).map(|(t, _)| t.dash_height).sum();
             // the share of a working project weighs its run grid: a row of run cards (two
             // across) counts one, the queue beside them one more, so a project running six
             // cards gets twice the height of one running one, and its three rows of cards
@@ -1325,18 +1323,12 @@ impl App {
                 // takes the room a scroll area's content would otherwise be allowed
                 ui.set_width(page);
                 ui.set_max_width(page);
-                // a project with nothing running stays off the dashboard while another works
-                // (the person: "hide the inactive projects in dashboard"); with nothing
-                // running anywhere, every project shows its header line
                 // in the machine's order, the projects not in it after; each card takes a drop
                 // of another's grip, above its middle to go before it, below to go after
                 let mut by_place: Vec<usize> = (0..self.tabs.len()).collect();
                 by_place.sort_by_key(|&i| ra_console::allocation::priority_place(&self.tabs[i].root).unwrap_or(usize::MAX));
                 let mut dropped: Option<(String, String, bool)> = None;
                 for i in by_place {
-                    if any_working && small[i] {
-                        continue;
-                    }
                     let lane = theme::lane(1 + i % 9);
                     let budget = (pool * weights[i] / weight).floor();
                     let target = self.tabs[i].root.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
