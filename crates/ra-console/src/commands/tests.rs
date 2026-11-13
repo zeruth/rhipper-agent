@@ -3412,7 +3412,9 @@ async fn a_worktree_check_builds_in_the_worktrees_target() {
     assert!(out.iter().any(|l| l.contains("branch card/2")), "{out:?}");
     let targets = std::fs::read_to_string(outside.path().join("seen.txt")).unwrap();
     let first = targets.split(';').next().unwrap().replace('\\', "/");
-    assert!(first.ends_with("/target/wt-2"), "the worktree's check built in {first}: {out:?}");
+    // the worktree's own directory under the project's target, wherever the target lives: the
+    // project's tree, or a scratch root's target/<project> when the machine has one (`rc scratch`)
+    assert!(first.ends_with("/wt-2") && first.contains("/target/"), "the worktree's check built in {first}: {out:?}");
 }
 
 #[tokio::test]
