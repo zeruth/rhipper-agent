@@ -109,6 +109,8 @@ impl ClaudeCode {
                 "Bash(cut *)",
                 "Bash(paste *)",
                 "Bash(tr *)",
+                // the one sanctioned wait on a long job of the worker's own
+                "Bash(rc wait *)",
                 "PowerShell(cargo *)",
                 "PowerShell(rustfmt *)",
                 "PowerShell(git status*)",
@@ -124,6 +126,7 @@ impl ClaudeCode {
                 "PowerShell(New-Item *)",
                 "PowerShell(Write-Output *)",
                 "PowerShell(git check-ignore*)",
+                "PowerShell(rc wait *)",
             ]
             .map(str::to_owned)
             .to_vec(),
