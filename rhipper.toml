@@ -44,7 +44,17 @@ allow = [
     "PowerShell(rc set * cancelled)",
 ]
 
-# The implementer of every card here is Fable; the reviewer and the cheap roles keep theirs.
+# The implementer of a card, the first rule that fits; the reviewer and the cheap roles keep
+# theirs. A rule fits on its `complexity`, `kind`, `files` (globs on the card's files, `!` for
+# none under it), `words` (in the title) and `rejections` (the times the reviewer sent it back);
+# every condition it names must hold. `rc route <id>` and a dry run say which rule took a card.
+# A small card that touches no crate (a gotcha, a doc, the toml) goes to the cheaper model.
+[[route]]
+complexity = [1, 2]
+files = ["!crates/**"]
+model = "claude-sonnet-5-5"
+
+# Everything else, as before.
 [[route]]
 model = "claude-opus-5-5"
 

@@ -1621,6 +1621,29 @@ async fn a_dry_run_prints_the_prompt_and_leaves_the_card_as_it_was() {
 }
 
 #[tokio::test]
+async fn a_dry_run_of_a_routed_card_names_the_rule_and_the_condition_that_matched() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    std::fs::write(
+        dir.path().join(crate::router::ROUTES_FILE),
+        "[[route]]\nwords = [\"gotcha\"]\nmodel = \"claude-haiku-4-5\"\n\n[[route]]\nfiles = [\"apps/rc-gui/**\"]\nmodel = \"claude-opus-5-5\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("apps/rc-gui/src")).unwrap();
+    std::fs::write(dir.path().join("apps/rc-gui/src/main.rs"), "fn main() {}\n").unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    run("/files 2 apps/rc-gui/src/main.rs", &store, &worker()).await.unwrap();
+    let routed = Worker::new("claude-sonnet-5-5").with_routing(true);
+    let (out, _) = run("/run 2 dry", &store, &routed).await.unwrap();
+    let text = out.join("\n");
+    assert!(out[0].contains("claude-opus-5-5"), "{text}");
+    assert!(out.iter().any(|l| l == "  route claude-opus-5-5 by rule 2: files apps/rc-gui/**"), "{text}");
+    // an unrouted worker keeps its model and says nothing of the rules
+    let (out, _) = run("/run 2 dry", &store, &Worker::new("claude-sonnet-5-5")).await.unwrap();
+    assert!(!out.iter().any(|l| l.contains("by rule")), "{}", out.join("\n"));
+}
+
+#[tokio::test]
 async fn a_dry_run_shows_the_active_gambits_in_the_system_messages_and_not_the_parked_ones() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
