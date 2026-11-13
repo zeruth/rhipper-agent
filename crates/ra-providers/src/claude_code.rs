@@ -216,6 +216,13 @@ impl ClaudeCode {
         if cfg!(windows) && !set(&env, "MSYS_NO_PATHCONV") {
             env.push(("MSYS_NO_PATHCONV".to_owned(), "1".into()));
         }
+        // a build the hook does not rewrite (a script, a gradle wrapper) still meets the shell's
+        // 120 s default: raise the default and the maximum to ten minutes
+        for key in ["BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS"] {
+            if !set(&env, key) {
+                env.push((key.to_owned(), "600000".into()));
+            }
+        }
         env
     }
 

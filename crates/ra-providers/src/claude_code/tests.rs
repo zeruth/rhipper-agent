@@ -22,6 +22,17 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
 }
 
 #[test]
+fn shell_timeout_is_raised_to_ten_minutes_unless_the_project_sets_it() {
+    let value =
+        |env: &[(String, std::ffi::OsString)], key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.to_string_lossy().into_owned());
+    let env = ClaudeCode::new().run_env(None);
+    assert_eq!(value(&env, "BASH_DEFAULT_TIMEOUT_MS").as_deref(), Some("600000"));
+    assert_eq!(value(&env, "BASH_MAX_TIMEOUT_MS").as_deref(), Some("600000"));
+    let own = ClaudeCode::new().with_env([("BASH_MAX_TIMEOUT_MS".to_owned(), "900000".to_owned())]).run_env(None);
+    assert_eq!(value(&own, "BASH_MAX_TIMEOUT_MS").as_deref(), Some("900000"));
+}
+
+#[test]
 fn a_worktree_belongs_to_its_project_and_names_its_card() {
     let (root, card) = project_of(Path::new("C:/code/agent/var/worktrees/47"));
     assert_eq!((root, card), (PathBuf::from("C:/code/agent"), Some(47)));
