@@ -4346,7 +4346,7 @@ impl Workspace {
                                     header_row(ui, &nodes, node, &[], row_lane, &walk, &mut out);
                                 });
                             });
-                            waiting_subtree(ui, &nodes, &waiting, id, 1, &mut placed);
+                            waiting_subtree(ui, &nodes, &waiting, id, 1, &mut placed, &walk, &mut out);
                             rank += 1;
                             // past the three, one more ready card while a row of the height the
                             // rows so far averaged still fits the card's share
@@ -4584,7 +4584,17 @@ const WAITING_DEPTH: usize = 2;
 /// The cards waiting on `id` as a small tree under its queue row: a connector, the card's
 /// number and title cut to the column, what else it waits on dimmed, and the cards waiting on
 /// it one level deeper. A card already shown elsewhere in the queue is not repeated.
-fn waiting_subtree(ui: &mut egui::Ui, nodes: &[Node], waiting: &HashMap<i64, Vec<i64>>, id: i64, depth: usize, placed: &mut HashSet<i64>) {
+#[allow(clippy::too_many_arguments)]
+fn waiting_subtree(
+    ui: &mut egui::Ui,
+    nodes: &[Node],
+    waiting: &HashMap<i64, Vec<i64>>,
+    id: i64,
+    depth: usize,
+    placed: &mut HashSet<i64>,
+    walk: &Walk,
+    out: &mut Walked,
+) {
     if depth > WAITING_DEPTH {
         return;
     }
@@ -4597,30 +4607,21 @@ fn waiting_subtree(ui: &mut egui::Ui, nodes: &[Node], waiting: &HashMap<i64, Vec
         let last = i + 1 == shown && children.len() <= WAITING_SHOWN;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            // the row's rank column, then the tree's indent and connector
-            ui.add_space(22.0 + 16.0 * (depth as f32 - 1.0));
-            let font = egui::FontId::monospace(12.0);
-            ui.label(RichText::new(if last { "└─" } else { "├─" }).font(font.clone()).color(theme::rule()));
-            let state = if node.state == TaskState::Blocked { theme::accent() } else { theme::dim() };
-            ui.label(RichText::new(format!("#{}", node.id)).font(font.clone()).color(state));
-            // what else it waits on, besides this card, so the person sees the whole holdup
-            let others: Vec<String> = node.depends_on.iter().filter(|d| **d != id).map(|d| format!("#{d}")).collect();
-            let tail = if others.is_empty() { String::new() } else { format!("  ·  also {}", others.join(" ")) };
-            ui.add(egui::Label::new(RichText::new(format!("{}{tail}", node.title)).small().color(theme::dim())).truncate()).on_hover_text(
-                format!(
-                    "#{} {} [{}] waits on {}",
-                    node.id,
-                    node.title,
-                    node.state,
-                    node.depends_on.iter().map(|d| format!("#{d}")).collect::<Vec<_>>().join(" ")
-                ),
-            );
+            // the tree's indent and connector, then the row drawn as every queue row is: its
+            // jewel, its title cut to the column, its dots and state, and the card's tooltip
+            ui.add_space(4.0 + 16.0 * (depth as f32 - 1.0));
+            ui.label(RichText::new(if last { "└─" } else { "├─" }).monospace().color(theme::rule()));
+            ui.vertical(|ui| {
+                ui.set_max_width(ui.available_width());
+                let lane = theme::lane(walk.depths.get(&node.id).copied().unwrap_or(0));
+                header_row(ui, nodes, node, &[], lane, walk, out);
+            });
         });
-        waiting_subtree(ui, nodes, waiting, *child, depth + 1, placed);
+        waiting_subtree(ui, nodes, waiting, *child, depth + 1, placed, walk, out);
     }
     if children.len() > shown {
         ui.horizontal(|ui| {
-            ui.add_space(22.0 + 16.0 * (depth as f32 - 1.0));
+            ui.add_space(4.0 + 16.0 * (depth as f32 - 1.0));
             ui.label(RichText::new(format!("└─ +{} more waiting", children.len() - shown)).small().color(theme::dim()).italics());
         });
     }
