@@ -1052,6 +1052,68 @@ fn the_last_stop_line_of_the_walk_is_in_the_status() {
 }
 
 #[test]
+fn a_digest_carries_the_landed_cards_and_their_cost() {
+    let card =
+        |node: i64, cost: Option<f64>| ra_usage::CardCost { node, totals: ra_usage::Totals { cost_usd: cost, ..Default::default() } };
+    let cards = [card(4, Some(6.5)), card(7, Some(3.25)), card(8, Some(1.0)), card(9, Some(100.0)), card(11, None)];
+    let now = 1_700_000_000;
+    let today = crate::hub::day_of(now);
+    let feed = [
+        format!("{now}\tlanded #4 Four · merged"),
+        // a second landing of the same card counts once
+        format!("{}\tlanded #4 Four · merged again", now + 10),
+        format!("{now}\tlanded #7 Seven · merged"),
+        format!("{now}\tlanded #11 Unpriced · merged"),
+        // implemented is not landed, and yesterday is not today
+        format!("{now}\tend ✓ #8 Eight implemented"),
+        format!("{}\tlanded #9 Yesterday · merged", now - 86_400),
+    ];
+    assert_eq!(crate::hub::landed_of(&feed, &cards, &today), (3, Some(9.75)));
+    assert_eq!(crate::hub::landed_of(&feed[5..], &cards, &today), (0, None));
+    assert_eq!(crate::hub::landed_of(&feed[3..4], &cards, &today), (1, None));
+    let hub = tempfile::tempdir().unwrap();
+    let (me, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let digest = crate::hub::Digest {
+        name: crate::hub::project_name(me.path()),
+        path: me.path().display().to_string(),
+        pid: 1,
+        when: now,
+        ready: 3,
+        landed_today: (4, Some(9.8)),
+        waiting: 1,
+        ..Default::default()
+    };
+    crate::hub::write_digest_in(hub.path(), &digest).unwrap();
+    // the figures survive the file, for the window to read back
+    assert_eq!(crate::hub::own_digest_in(hub.path(), me.path()).unwrap(), digest);
+    let lines = crate::hub::digest_lines_with(hub.path(), other.path(), |_| true, now);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].ends_with(" · 3 ready · landed 4 ($9.80) · waits 1"), "{}", lines[0]);
+}
+
+#[tokio::test]
+async fn a_status_line_shows_the_waiting_count() {
+    use ra_roadmap::model::TaskState;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Parked parent 1", &store, &worker()).await.unwrap();
+    store.set_state(2, TaskState::Blocked).await.unwrap();
+    store.set_notes(2, "refused: sed").await.unwrap();
+    let header = crate::hub::Status::header();
+    assert!(header.contains(" landed ") && header.contains(" waits "), "{header}");
+    let mut status = crate::hub::status_with(dir.path(), |_| true, &[], "2026-11-12");
+    status.landed_today = (2, Some(9.75));
+    let line = status.line();
+    // the landed column, then the waits column, then the last end
+    assert!(line.contains("   2 ($9.75)     1  —"), "{line}");
+    assert!(line.ends_with(" · waits 1 (#2 refused)"), "{line}");
+    // a project where nothing landed and nothing waits shows a dash in both
+    status.waiting.clear();
+    status.landed_today = (0, None);
+    assert!(status.line().ends_with("           —     —  —"), "{}", status.line());
+}
+
+#[test]
 fn a_report_is_a_placeholder_when_it_names_no_file_and_says_nothing_beyond_the_check() {
     assert!(crate::agent::is_empty_handoff(""));
     assert!(crate::agent::is_empty_handoff("the suite is still running"));

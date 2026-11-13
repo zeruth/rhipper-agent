@@ -11,6 +11,8 @@ fn digest_of(name: &str, pid: u32, when: u64) -> Digest {
         ready: 3,
         changed: vec!["crates/ra-console/src/hub.rs".to_owned(), "crates/ra-console/src/agent.rs".to_owned()],
         leftovers: vec![],
+        landed_today: (0, None),
+        waiting: 0,
     }
 }
 
