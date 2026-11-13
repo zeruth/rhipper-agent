@@ -257,3 +257,27 @@ fn a_status_card_line_carries_the_cost_and_the_tokens_a_turn_and_is_blank_before
     let free = CardCost { node: 4, totals: Totals { calls: 1, prompt_tokens: 900, completion_tokens: 50, turns: 1, ..Totals::default() } };
     assert_eq!(status::card_line(&nodes[3], Some(&free)), "  #4 Second [needs_revision]  $— · 950 tok/turn");
 }
+
+#[test]
+fn rc_wait_on_a_live_pid_outlasts_ten_silent_seconds_and_returns_when_it_ends() {
+    #[cfg(windows)]
+    let mut child =
+        std::process::Command::new("ping").args(["-n", "14", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().expect("a child");
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("sleep").arg("13").spawn().expect("a child");
+    let started = std::time::Instant::now();
+    let code = ra_console::agent::wait(Path::new("."), &child.id().to_string(), std::time::Duration::from_secs(60));
+    assert_eq!(code, 0);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(11), "returned after {:?}", started.elapsed());
+    let _ = child.wait();
+}
+
+#[test]
+fn rc_wait_on_an_empty_file_does_not_settle_on_silence() {
+    let dir = std::env::temp_dir().join(format!("rc-wait-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a dir");
+    std::fs::write(dir.join("out.txt"), "").expect("a file");
+    let code = ra_console::agent::wait(&dir, "out.txt", std::time::Duration::from_secs(12));
+    assert_eq!(code, 124);
+    let _ = std::fs::remove_dir_all(&dir);
+}

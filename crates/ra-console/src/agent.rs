@@ -1909,7 +1909,8 @@ pub fn wait(dir: &Path, target: &str, limit: std::time::Duration) -> i32 {
         if now != last {
             last = now;
             still = std::time::Instant::now();
-        } else if last.is_some() && still.elapsed() >= WAIT_SETTLE {
+        } else if last.is_some_and(|(len, _)| len > 0) && still.elapsed() >= WAIT_SETTLE {
+            // an empty file is a job not yet writing (a compile), not a finished one
             break 0;
         }
     };
