@@ -97,7 +97,11 @@ enum Command {
     },
     /// Lints the roadmap: placeholder text, a card without acceptance or files, a waits-on that names
     /// no card or comes back to its own, a complexity outside 1..5, a command a dry run rejects; one line each, exit 1 when any.
-    Check,
+    /// With a card id, runs that card's checks here instead: the whole output goes to `var/checks/<card>-<run>.log`, whose path is the last line printed, and the exit is 1 when a check fails.
+    Check {
+        /// The card whose checks run in the current directory.
+        card: Option<i64>,
+    },
     /// Lists the gambits: the standing directions that order the walk, each with its weight, its state and its focus.
     Gambits,
     /// Adds a gambit or changes one: its state, its weight or the words a card matches on.
@@ -533,9 +537,13 @@ async fn run_main() -> anyhow::Result<()> {
             plain_tracing()?;
             next(why).await
         }
-        Command::Check => {
+        Command::Check { card: None } => {
             plain_tracing()?;
             check().await
+        }
+        Command::Check { card: Some(card) } => {
+            plain_tracing()?;
+            check_card(card).await
         }
         Command::Gambits => {
             plain_tracing()?;
@@ -1655,6 +1663,58 @@ async fn check() -> anyhow::Result<()> {
     let count = faults.len();
     eprintln!("{count} fault{} on the roadmap", if count == 1 { "" } else { "s" });
     std::process::exit(1)
+}
+
+/// The log of the next run of a card's checks under `var/checks`: `<card>-<run>.log`, the run
+/// being one past the highest the directory holds.
+fn next_check_log(dir: &Path, card: i64) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let prefix = format!("{card}-");
+    let last = std::fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter_map(|name| name.strip_prefix(&prefix)?.strip_suffix(".log")?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    Ok(dir.join(format!("{card}-{}.log", last + 1)))
+}
+
+/// Runs the checks of a card here, in the order written, and stops at the first failure. Each
+/// command's whole output, stdout and stderr, is kept in `var/checks/<card>-<run>.log` and the
+/// path is the last line printed, so a failure is read from the file and never lost to a `tail`.
+/// `TEMP` and `TMP` point outside the worktree's repo: the scratch root's, else the system's.
+async fn check_card(card: i64) -> anyhow::Result<()> {
+    let store = open_store().await?;
+    let node = store.read(card).await?;
+    let here = std::env::current_dir()?;
+    let (project, _) = ra_providers::claude_code::project_of(&here);
+    let log = next_check_log(&project.join("var").join("checks"), card)?;
+    let temp = ra_providers::claude_code::scratch_env(&here)
+        .into_iter()
+        .find(|(key, _)| key == "TEMP")
+        .map_or_else(|| std::env::temp_dir().join("rhipper"), |(_, dir)| dir);
+    std::fs::create_dir_all(&temp)?;
+    let temp = temp.to_string_lossy().into_owned();
+    let toolbox = ra_tools::Toolbox::new(&here)?.with_env([("TEMP".to_owned(), temp.clone()), ("TMP".to_owned(), temp)]);
+    let mut kept = String::new();
+    let mut passed = true;
+    for command in ra_console::agent::check_commands(node.acceptance.as_deref()) {
+        let (ok, output) = match toolbox.check_acceptance(&command).await {
+            Ok(done) => done,
+            Err(e) => (false, format!("{e:#}\n")),
+        };
+        kept.extend(["$ ", command.as_str(), "\n", output.as_str(), "\n"]);
+        println!("{} {command}", if ok { "passed" } else { "failed" });
+        if !ok {
+            passed = false;
+            break;
+        }
+    }
+    std::fs::write(&log, kept)?;
+    println!("{}", log.display());
+    if !passed {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 async fn add(kind: NodeKind, title: &str, parent: Option<i64>, card: &Card<'_>) -> anyhow::Result<()> {

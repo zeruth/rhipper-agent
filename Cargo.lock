@@ -3497,6 +3497,7 @@ dependencies = [
  "ra-gotchas",
  "ra-providers",
  "ra-roadmap",
+ "ra-tools",
  "ra-usage",
  "serde_json",
  "tempfile",
