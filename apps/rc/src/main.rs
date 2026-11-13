@@ -343,8 +343,11 @@ enum Command {
     },
     /// An observation for the next runs: what slowed one, a quirk of the machine, a direction. The workers read the latest with their own look-backs.
     Note {
-        /// The note, one line.
+        /// The note, one line; without one, the latest notes with the line numbers `--retire` takes.
         text: Vec<String>,
+        /// Retires the note on that line of var/retro.log, and its shared copy when it was a machine note: the line stays, marked, and rides into no run.
+        #[arg(long, value_name = "N")]
+        retire: Option<usize>,
     },
     /// Runs a build command on one of the machine's four build slots, shared by every project, waiting its turn while they are all taken; the hook puts a worker's gradle and cargo commands under it.
     Hold {
@@ -354,6 +357,14 @@ enum Command {
         /// The command, after `--`, as it was written.
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    /// Waits on a long job of the worker's own: a pid until it ends, a file until it holds still for ten seconds, then prints its last lines; the one sanctioned way for a worker to wait.
+    Wait {
+        /// The pid of the job, or the file its output goes to.
+        target: String,
+        /// The most seconds to wait; 540 when left out, under a worker's turn.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Makes this directory a project: drafts rhipper.md with a strong model from what the directory shows, imports a roadmap-shaped file, or starts empty.
     Init {
@@ -771,7 +782,20 @@ async fn run_main() -> anyhow::Result<()> {
             println!("\na pairing session follows it with `rc pair --follow --since <last seen>` and is told of each line");
             Ok(())
         }
-        Command::Note { text } => {
+        Command::Note { text, retire: Some(line) } => {
+            anyhow::ensure!(text.is_empty(), "--retire takes a line number, not a note");
+            let retired = ra_console::retro::retire(Path::new("."), line)?;
+            println!("retired: {retired}");
+            Ok(())
+        }
+        Command::Note { text, retire: None } if text.is_empty() => {
+            for (line, note) in ra_console::retro::numbered(Path::new("."), ra_console::retro::EVIDENCE_LINES) {
+                println!("{line:>5}  {}{}", if note.machine { "[machine] " } else { "" }, note.text);
+            }
+            println!("rc note --retire <n> retires the note on line n");
+            Ok(())
+        }
+        Command::Note { text, retire: None } => {
             ra_console::retro::record_pair(Path::new("."), &text.join(" "))?;
             println!("noted; the next runs read it with the workers' own look-backs");
             Ok(())
@@ -780,6 +804,11 @@ async fn run_main() -> anyhow::Result<()> {
             let shell = shell.unwrap_or_else(|| String::from(if cfg!(windows) { "powershell" } else { "sh" }));
             let dir = std::env::current_dir()?;
             std::process::exit(ra_console::agent::hold(&dir, &shell, &command.join(" ")));
+        }
+        Command::Wait { target, timeout } => {
+            let limit = timeout.filter(|s| *s > 0).map_or(ra_console::agent::WAIT_LIMIT, std::time::Duration::from_secs);
+            let dir = std::env::current_dir()?;
+            std::process::exit(ra_console::agent::wait(&dir, &target, limit));
         }
         Command::Init { import, empty, model } => {
             plain_tracing()?;

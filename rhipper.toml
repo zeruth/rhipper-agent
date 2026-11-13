@@ -9,7 +9,7 @@ context = 160000
 # One Fable worker (the person, 2026-11-12, new week): the agent's roadmap is pruned and
 # regenerated around workflow execution, its efficiency and the model chosen per task, then
 # walked one card at a time. A Fable walk sits outside the Opus pool.
-parallel = 4
+parallel = 12
 borrow = false
 # the roadmap commands a regeneration card reshapes the roadmap with; in a worktree `rc` opens
 # the project's roadmap. Not `rc set` (accepted lands a card) nor the walk's commands
