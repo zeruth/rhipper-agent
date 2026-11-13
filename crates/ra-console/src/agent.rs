@@ -115,6 +115,10 @@ pub struct Worker {
     /// Whether a run picks its model per card: the card's own, else the rule of `rhipper.toml`
     /// that fits, else [`Worker::model`] as the default. Off, every run is on the badge model.
     pub routed: bool,
+    /// What the ladder did to the route of the card this worker is for, `escalated to <model>
+    /// after 1 rejection` or `started one rung down (c2)`, which the start line and the handoff
+    /// say; `None` when the card runs on its route's model.
+    pub step: Option<String>,
     /// Whether a run on a `claude-*` model goes ahead past the plan's threshold, from `--force`;
     /// off, such a run falls to the local route when one is up and is refused otherwise.
     pub force: bool,
@@ -158,6 +162,7 @@ impl Worker {
             turns: None,
             effort: None,
             routed: false,
+            step: None,
             force: false,
             debug: !std::env::var("RHIPPER_DEBUG")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
@@ -300,6 +305,8 @@ impl Worker {
                 tracing::info!(target: crate::trace::PROGRESS, "  steer: {at}; this run goes to {model}");
                 let mut worker = self.clone();
                 worker.model = model;
+                // the steer line says why the model moved; the ladder's rung is not this one
+                worker.step = None;
                 Ok(worker)
             }
             None => anyhow::bail!("{at}; no local route is up, run with --force to spend the week"),
@@ -307,8 +314,8 @@ impl Worker {
     }
 
     /// The worker a run of `node` in `root` goes to: this one unless it is routed; then the one
-    /// on the model the card, the rules or the default name, with the rule's effort when
-    /// `--effort` named none.
+    /// on the model the card, the rules or the default name, moved up or down the ladder by the
+    /// card's size and its rejections, with the rule's effort when `--effort` named none.
     ///
     /// # Errors
     /// When `rhipper.toml` is there but cannot be read.
@@ -316,10 +323,12 @@ impl Worker {
         if !self.routed {
             return Ok(self.clone());
         }
-        let choice = crate::router::Router::load(root)?.choose(node, crate::router::IMPLEMENTER, &self.model, rejections(root, node.id));
+        let (choice, step) =
+            crate::router::Router::load(root)?.route(node, crate::router::IMPLEMENTER, &self.model, rejections(root, node.id));
         let mut worker = self.clone();
         worker.model = resolve(&choice.model);
         worker.effort = self.effort.or(choice.effort);
+        worker.step = step.map(|step| step.note);
         Ok(worker)
     }
 
@@ -884,7 +893,10 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     // then the plan's week: a claude-* pick past the threshold falls to the local route or is
     // refused here, before the start marker
     let worker = &worker.for_card(&root, &node)?.steered_by_plan(&root).await?;
-    let pick = if tight { format!(" · {TIGHT_PICK}") } else { String::new() };
+    let mut pick = worker.step.as_ref().map_or_else(String::new, |step| format!(" · {step}"));
+    if tight {
+        write!(pick, " · {TIGHT_PICK}").unwrap();
+    }
     // the pid on the start marker, last: a window coming up tells a run that died from one
     // still going
     tracing::info!(
@@ -3221,7 +3233,8 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             let (waiting, bare): (Vec<Node>, Vec<Node>) = bare.into_iter().partition(|n| investigating.contains(&n.id));
             let mut taken = std::collections::HashSet::new();
             for node in briefed.iter().chain(&bare).chain(&waiting) {
-                let kind = Pool::kind_of(&router.choose(node, crate::router::IMPLEMENTER, &worker.model, rejections(&root, node.id)).model);
+                let kind =
+                    Pool::kind_of(&router.route(node, crate::router::IMPLEMENTER, &worker.model, rejections(&root, node.id)).0.model);
                 let held = flight.iter().filter(|(_, _, s)| *s == Seat::Build(kind)).count();
                 let Some(slot) = Pool::take(&root, kind, held, width, others, router.worker.borrow()) else {
                     starved = starved || held == 0;
@@ -3815,7 +3828,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         check: check.to_owned(),
         verdict: None,
         changed,
-        report: report.to_owned(),
+        // the ladder's move leads the report, so the next run and the person see why this model
+        report: worker.step.as_ref().map_or_else(|| report.to_owned(), |step| format!("Route: {step}.\n{report}")),
         warnings: Vec::new(),
         read: Vec::new(),
     };
@@ -4367,8 +4381,9 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let route = if worker.routed {
         let root = workspace_of(store);
         let router = crate::router::Router::load(&root)?;
-        let choice = router.choose(&node, crate::router::IMPLEMENTER, &worker.model, rejections(&root, id));
-        Some(format!("  route {} {}", resolve(&choice.model), router.reason(&node, &choice)))
+        let (choice, step) = router.route(&node, crate::router::IMPLEMENTER, &worker.model, rejections(&root, id));
+        let step = step.map_or_else(String::new, |step| format!(" · {}", step.note));
+        Some(format!("  route {} {}{step}", resolve(&choice.model), router.reason(&node, &choice)))
     } else {
         None
     };

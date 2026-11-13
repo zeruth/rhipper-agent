@@ -1757,6 +1757,86 @@ async fn a_dry_run_of_a_routed_card_names_the_rule_and_the_condition_that_matche
     assert!(!out.iter().any(|l| l.contains("by rule")), "{}", out.join("\n"));
 }
 
+/// A store with card #2 at `complexity` and, when `rejections` is more than none, that many
+/// handoffs the reviewer sent back.
+async fn laddered_card(dir: &std::path::Path, complexity: u8, rejections: u64) -> Store {
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    store.set_complexity(2, complexity).await.unwrap();
+    let mut task = ra_context::TaskContext::open(dir, 2);
+    for when in 0..rejections {
+        task.record(ra_context::Handoff {
+            when,
+            model: "claude-opus-5-5".to_owned(),
+            outcome: "needs revision (substantive)".to_owned(),
+            check: "cargo test -q: passed".to_owned(),
+            verdict: Some("needs revision (substantive) · 1 point(s) by claude-opus-5-5".to_owned()),
+            changed: vec!["hello.txt".to_owned()],
+            report: "wrote hello.txt".to_owned(),
+            warnings: Vec::new(),
+            read: Vec::new(),
+        });
+    }
+    task.save(dir).unwrap();
+    store
+}
+
+#[tokio::test]
+async fn a_small_card_starts_one_rung_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = laddered_card(dir.path(), 2, 0).await;
+    let routed = Worker::new("claude-opus-5-5").with_routing(true);
+    let node = store.read(2).await.unwrap();
+    let picked = routed.for_card(dir.path(), &node).unwrap();
+    assert_eq!(picked.model, "claude-sonnet-4-5");
+    assert_eq!(picked.step.as_deref(), Some("started one rung down (c2)"));
+    // the dry run's route line says it too
+    let (out, _) = run("/run 2 dry", &store, &routed).await.unwrap();
+    let text = out.join("\n");
+    assert!(out.iter().any(|l| l.starts_with("  route claude-sonnet-4-5 by default") && l.contains("one rung down")), "{text}");
+    // a c3 card runs on the route's model
+    store.set_complexity(2, 3).await.unwrap();
+    let picked = routed.for_card(dir.path(), &store.read(2).await.unwrap()).unwrap();
+    assert_eq!((picked.model.as_str(), picked.step), ("claude-opus-5-5", None));
+}
+
+#[tokio::test]
+async fn a_rejected_card_steps_up_one_rung() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = laddered_card(dir.path(), 3, 1).await;
+    let routed = Worker::new("claude-opus-5-5").with_routing(true);
+    let picked = routed.for_card(dir.path(), &store.read(2).await.unwrap()).unwrap();
+    assert_eq!(picked.model, "claude-fable-5-1");
+    assert_eq!(picked.step.as_deref(), Some("escalated to claude-fable-5-1 after 1 rejection"));
+    // a small card rejected once climbs back to the route's model
+    store.set_complexity(2, 2).await.unwrap();
+    let picked = routed.for_card(dir.path(), &store.read(2).await.unwrap()).unwrap();
+    assert_eq!(picked.model, "claude-opus-5-5");
+    assert_eq!(picked.step.as_deref(), Some("escalated to claude-opus-5-5 after 1 rejection"));
+    // a rule's model is the ceiling: the rejected c3 card stays on it
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[[route]]\nmodel = \"opus\"\n").unwrap();
+    store.set_complexity(2, 3).await.unwrap();
+    let picked = routed.for_card(dir.path(), &store.read(2).await.unwrap()).unwrap();
+    assert_eq!((picked.model.as_str(), picked.step), ("claude-opus-5-5", None));
+    // the project's ladder steps one rung per `up_after` rejections
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[ladder]\nmodels = [\"sonnet\", \"opus\", \"fable\"]\nup_after = 2\n")
+        .unwrap();
+    let picked = routed.for_card(dir.path(), &store.read(2).await.unwrap()).unwrap();
+    assert_eq!((picked.model.as_str(), picked.step), ("claude-opus-5-5", None));
+}
+
+#[tokio::test]
+async fn a_card_naming_its_model_never_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = laddered_card(dir.path(), 1, 2).await;
+    run("/assign 2 claude-sonnet-4-5", &store, &worker()).await.unwrap();
+    let routed = Worker::new("claude-opus-5-5").with_routing(true);
+    let picked = routed.for_card(dir.path(), &store.read(2).await.unwrap()).unwrap();
+    assert_eq!((picked.model.as_str(), picked.step), ("claude-sonnet-4-5", None));
+    let (out, _) = run("/run 2 dry", &store, &routed).await.unwrap();
+    assert!(out.iter().any(|l| l == "  route claude-sonnet-4-5 by the card's own model"), "{}", out.join("\n"));
+}
+
 #[tokio::test]
 async fn a_dry_run_shows_the_active_gambits_in_the_system_messages_and_not_the_parked_ones() {
     let dir = tempfile::tempdir().unwrap();

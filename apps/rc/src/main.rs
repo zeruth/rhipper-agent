@@ -1154,17 +1154,44 @@ async fn usage_cards(limit: usize) -> anyhow::Result<()> {
         return Ok(());
     }
     let nodes = open_store().await?.load().await?.nodes;
-    for line in usage_card_lines(&cards, &nodes, limit) {
+    let mut models = std::collections::HashMap::new();
+    for card in cards.iter().take(limit) {
+        models.insert(card.node, run_models(&ledger.calls_of(Some(card.node)).await?));
+    }
+    for line in usage_card_lines(&cards, &nodes, limit, &models) {
         println!("{line}");
     }
     Ok(())
 }
 
+/// The models a card's runs were on, oldest first, a repeat folded into a count: `opus-5-5 ×2 →
+/// fable-5-1`, so the ladder's steps can be judged beside what they cost. `calls` is the
+/// ledger's, latest first; the cheap roles' calls are not runs.
+fn run_models(calls: &[ra_usage::Call]) -> String {
+    let mut steps: Vec<(&str, usize)> = Vec::new();
+    for call in calls.iter().rev().filter(|call| call.role.is_none()) {
+        let model = call.model.rsplit('/').next().unwrap_or(&call.model);
+        let model = model.strip_prefix("claude-").unwrap_or(model);
+        match steps.last_mut() {
+            Some((last, count)) if *last == model => *count += 1,
+            _ => steps.push((model, 1)),
+        }
+    }
+    let steps: Vec<String> =
+        steps.into_iter().map(|(model, count)| if count == 1 { model.to_owned() } else { format!("{model} ×{count}") }).collect();
+    steps.join(" → ")
+}
+
 /// The lines of `rc usage --cards`: the header, a row per card for the costliest `limit` of
 /// `cards` (the state `?` for a card the roadmap lost, the cost `?` when no call reported one),
 /// and a last line totalling the accepted cards of the whole ledger, with the median cost of
-/// those whose cost is known.
-fn usage_card_lines(cards: &[ra_usage::CardCost], nodes: &[ra_roadmap::model::Node], limit: usize) -> Vec<String> {
+/// those whose cost is known. With `models`, each row ends on the models its runs were on.
+fn usage_card_lines(
+    cards: &[ra_usage::CardCost],
+    nodes: &[ra_roadmap::model::Node],
+    limit: usize,
+    models: &std::collections::HashMap<i64, String>,
+) -> Vec<String> {
     let states = tree::effective_states(nodes);
     let state = |node: i64| states.get(&node).map_or_else(|| "?".to_owned(), ToString::to_string);
     let dollars = |cost: Option<f64>| cost.map_or_else(|| "?".to_owned(), |c| format!("${c:.2}"));
@@ -1172,10 +1199,14 @@ fn usage_card_lines(cards: &[ra_usage::CardCost], nodes: &[ra_roadmap::model::No
     let row = |card: &str, runs: &str, turns: &str, per_turn: &str, read_in: &str, cost: &str, state: &str| {
         format!("{card:<4}  {runs:>4}  {turns:>5}  {per_turn:>8}  {read_in:>7}  {cost:>4}  {state}")
     };
-    let mut lines = vec![row("card", "runs", "turns", "tok/turn", "read-in", "cost", "state")];
+    let mut header = row("card", "runs", "turns", "tok/turn", "read-in", "cost", "state");
+    if !models.is_empty() {
+        header.push_str("  models");
+    }
+    let mut lines = vec![header];
     for card in cards.iter().take(limit) {
         let t = &card.totals;
-        lines.push(row(
+        let mut line = row(
             &format!("#{}", card.node),
             &t.runs.to_string(),
             &t.turns.to_string(),
@@ -1183,7 +1214,12 @@ fn usage_card_lines(cards: &[ra_usage::CardCost], nodes: &[ra_roadmap::model::No
             &status::compact(t.read_in),
             &dollars(t.cost_usd),
             &state(card.node),
-        ));
+        );
+        if let Some(ran) = models.get(&card.node).filter(|ran| !ran.is_empty()) {
+            line.push_str("  ");
+            line.push_str(ran);
+        }
+        lines.push(line);
     }
     let landed: Vec<_> = cards.iter().filter(|c| states.get(&c.node) == Some(&TaskState::Accepted)).collect();
     let mut known: Vec<f64> = landed.iter().filter_map(|c| c.totals.cost_usd).collect();

@@ -191,7 +191,8 @@ fn usage_cards_rank_by_cost_under_the_header_and_total_the_landed_ones() {
     // as the ledger ranks them: the landed card, the card it unblocks (its state the effective
     // one), a card the roadmap lost, one with no cost known
     let cards = [card(3, 2, 10, Some(1.25)), card(4, 1, 3, Some(0.40)), card(99, 1, 1, Some(0.05)), card(2, 1, 2, None)];
-    let lines = usage_card_lines(&cards, &nodes, 3);
+    let none = std::collections::HashMap::new();
+    let lines = usage_card_lines(&cards, &nodes, 3, &none);
     assert_eq!(
         lines,
         [
@@ -204,13 +205,18 @@ fn usage_cards_rank_by_cost_under_the_header_and_total_the_landed_ones() {
     );
     // the cost unknown shows as `?`; the landed line counts the whole ledger, not the rows shown
     nodes[1].state = TaskState::Accepted;
-    let lines = usage_card_lines(&cards, &nodes, 1);
+    let lines = usage_card_lines(&cards, &nodes, 1, &none);
     assert_eq!(lines[1], "#3       2     10     12.3k     4.0k  $1.25  accepted");
     assert_eq!(lines[2], "landed: 2 cards, $1.25, median $1.25 a card");
-    let lines = usage_card_lines(&cards[..1], &nodes, 1);
+    let lines = usage_card_lines(&cards[..1], &nodes, 1, &none);
     assert_eq!(lines.len(), 3);
-    let lines = usage_card_lines(&[card(2, 1, 2, None)], &nodes, 5);
+    let lines = usage_card_lines(&[card(2, 1, 2, None)], &nodes, 5, &none);
     assert_eq!(lines[1], "#2       1      2     12.3k     4.0k     ?  accepted");
+    // with the models of the runs, each row ends on them
+    let ran = std::collections::HashMap::from([(2, "sonnet-4-5 → opus-5-5".to_owned())]);
+    let lines = usage_card_lines(&[card(2, 1, 2, None)], &nodes, 5, &ran);
+    assert!(lines[0].ends_with("state  models"), "{lines:?}");
+    assert_eq!(lines[1], "#2       1      2     12.3k     4.0k     ?  accepted  sonnet-4-5 → opus-5-5");
     assert_eq!(lines[2], "landed: 1 cards, $0.00, median ? a card");
     // the option parses bare and with a count
     let Options { command: Command::Usage { cards } } = Options::try_parse_from(["rc", "usage", "--cards"]).expect("parses") else {

@@ -443,8 +443,83 @@ impl PlanConfig {
     }
 }
 
-/// The rules of a project, in the order of the file, its worker table, its role table and its
-/// plan table.
+/// The `[ladder]` table: the models a routed card climbs, the cheapest first. A small card
+/// starts below the route's model and a card the reviewer sent back steps up, so a card that
+/// fails on a cheap model gets a stronger one instead of the same one again, and a small card
+/// does not spend the strongest. A rule's model is the ceiling of the cards it routes; the
+/// card's own model never moves, nor does a route model the ladder does not list.
+///
+/// ```toml
+/// [ladder]
+/// models = ["haiku", "sonnet", "opus", "fable"]
+/// start = [{ complexity = [1, 2], down = 1 }]   # c1–2 one rung below the route's model, c3+ on it
+/// up_after = 1                                  # a rung up for every rejection
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Ladder {
+    pub models: Vec<String>,
+    pub start: Vec<Start>,
+    /// The rejections a card takes for each rung up; zero never steps up.
+    pub up_after: usize,
+}
+
+/// Where the cards of a complexity span start: `down` rungs below the route's model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct Start {
+    pub complexity: Span,
+    #[serde(default)]
+    pub down: usize,
+}
+
+impl Default for Ladder {
+    fn default() -> Self {
+        Self {
+            models: ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-5-5", "claude-fable-5-1"].map(str::to_owned).to_vec(),
+            start: vec![Start { complexity: Span::Between(1, 2), down: 1 }],
+            up_after: 1,
+        }
+    }
+}
+
+/// A move on the ladder: the model a card runs on instead of its route's, and the words the
+/// start line, the handoff and the dry run say it with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub model: String,
+    pub note: String,
+}
+
+impl Ladder {
+    /// The rung `node` runs on when `choice` is its route and the reviewer sent it back
+    /// `rejections` times: `None` when it stays on the route's model.
+    #[must_use]
+    pub fn step(&self, node: &Node, choice: &Choice, rejections: usize) -> Option<Step> {
+        if choice.why == Why::Card {
+            return None;
+        }
+        let id = |model: &str| crate::agent::resolve(model);
+        let route = id(&choice.model);
+        let at = self.models.iter().position(|model| id(model) == route)?;
+        let ceiling = if matches!(choice.why, Why::Rule(_)) { at } else { self.models.len() - 1 };
+        let down = self.start.iter().find(|start| start.complexity.holds(node.complexity)).map_or(0, |start| start.down);
+        let base = at.saturating_sub(down);
+        let rung = (base + rejections.checked_div(self.up_after).unwrap_or(0)).min(ceiling);
+        let model = id(&self.models[rung]);
+        let note = if rung > base {
+            format!("escalated to {model} after {rejections} rejection{}", if rejections == 1 { "" } else { "s" })
+        } else if rung < at {
+            let rungs = if at - rung == 1 { "one rung".to_owned() } else { format!("{} rungs", at - rung) };
+            format!("started {rungs} down (c{})", node.complexity)
+        } else {
+            return None;
+        };
+        Some(Step { model, note })
+    }
+}
+
+/// The rules of a project, in the order of the file, its worker table, its role table, its
+/// plan table and its ladder.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Router {
     #[serde(default, rename = "route")]
@@ -455,6 +530,8 @@ pub struct Router {
     pub role: RoleConfig,
     #[serde(default)]
     pub plan: PlanConfig,
+    #[serde(default)]
+    pub ladder: Ladder,
 }
 
 /// Why a choice fell where it did.
@@ -516,6 +593,18 @@ impl Router {
             Some((position, hit)) => Choice { model: hit.model.clone(), effort: hit.effort, why: Why::Rule(position) },
             None => Choice { model: default.to_owned(), effort: None, why: Why::Default },
         }
+    }
+
+    /// [`Router::choose`], then the ladder for the implementer: the choice on the rung's model,
+    /// and the step that moved it there when one did.
+    #[must_use]
+    pub fn route(&self, node: &Node, role: &str, default: &str, rejections: usize) -> (Choice, Option<Step>) {
+        let mut choice = self.choose(node, role, default, rejections);
+        let step = if role.eq_ignore_ascii_case(IMPLEMENTER) { self.ladder.step(node, &choice, rejections) } else { None };
+        if let Some(step) = &step {
+            choice.model.clone_from(&step.model);
+        }
+        (choice, step)
     }
 
     /// Why `choice` fell where it did for `node`, as the route line says it: `by rule 2: files
