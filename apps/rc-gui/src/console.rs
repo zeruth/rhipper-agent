@@ -43,13 +43,13 @@ pub(crate) fn draw(ui: &mut Ui, sink: &Sink, show_debug: bool) {
                 live.push((index, line, id, run));
                 continue;
             }
-            Some((id, run)) if line.kind == Kind::Run => run_card(ui, sink, id, &line.text, &run, index, None),
+            Some((id, run)) if line.kind == Kind::Run => run_card(ui, sink, id, &line.text, &run, index, None, None),
             _ => bubble(ui, line, index),
         }
         ui.add_space(6.0);
     }
     for (index, line, id, run) in live {
-        run_card(ui, sink, id, &line.text, &run, index, None);
+        run_card(ui, sink, id, &line.text, &run, index, None, None);
         ui.add_space(6.0);
     }
 }
@@ -80,7 +80,7 @@ pub(crate) fn grid_columns(n: usize) -> usize {
     n.clamp(1, 2)
 }
 
-pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) -> bool {
+pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32, project_model: Option<&str>) -> bool {
     let runs: Vec<(usize, u64, String)> = sink.with_lines(|lines| {
         lines.iter().enumerate().filter(|(_, l)| l.kind == Kind::Run).filter_map(|(i, l)| l.run.map(|id| (i, id, l.text.clone()))).collect()
     });
@@ -131,7 +131,7 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
                     ui.set_clip_rect(across.intersect(ui.clip_rect()));
                     ui.set_width(width);
                     ui.set_max_width(width);
-                    run_card(ui, sink, *id, title, &run, *index, Some(height));
+                    run_card(ui, sink, *id, title, &run, *index, Some(height), project_model);
                 });
             }
         });
@@ -232,7 +232,7 @@ fn clipped(ui: &mut Ui, raw: &str, limit: usize, font: &FontId, color: Color32) 
 /// inside at the run's height, a soft light flowing along the border while it is live. The
 /// wheel over the card sizes the card, not the log; a click on the header folds the card to
 /// that one line, and a finished card folds itself after a minute.
-fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: usize, room: Option<f32>) {
+fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: usize, room: Option<f32>, project_model: Option<&str>) {
     let lane = theme::lane(1 + index % 9);
     // the animation runs on the window's clock, not the run's: every live card on the
     // dashboard breathes and its light laps in step, instead of each on its own start time
@@ -259,7 +259,7 @@ fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: us
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let folded = run.folded();
-            if run_title(ui, sink, id, title, run, lane, folded).clicked() {
+            if run_title(ui, sink, id, title, run, lane, folded, project_model).clicked() {
                 sink.toggle_fold(id);
             }
             if folded {
@@ -318,7 +318,16 @@ fn clock(d: Duration) -> String {
 /// them; the clock and the step count while the run is live, the outcome and how long it took
 /// when it ends; and the two buttons that size the card, which a folded card does without.
 /// The row answers a click, which folds or unfolds the card.
-fn run_title(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, lane: Color32, folded: bool) -> Response {
+fn run_title(
+    ui: &mut Ui,
+    sink: &Sink,
+    id: u64,
+    title: &str,
+    run: &Run,
+    lane: Color32,
+    folded: bool,
+    project_model: Option<&str>,
+) -> Response {
     let status = match (&run.outcome, run.took) {
         (Some(outcome), Some(took)) => format!("{outcome} · {}", clock(took)),
         (Some(outcome), None) => outcome.clone(),
@@ -352,20 +361,20 @@ fn run_title(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, lane: Co
     };
     let total = ui.available_width();
     let (status_shown, status_cut) = cut_to(ui, &status, (total / 3.0).max(60.0));
-    let model_width = title.rsplit_once(" · ").map_or(0.0, |(_, model)| measure(ui, model) + 34.0);
+    // the model's badge only when the card runs on another model than its project's: the
+    // project's header says that one already (the person: "hide the redundant model badges")
+    let model = title.rsplit_once(" · ").map(|(_, model)| model).filter(|m| project_model.is_none_or(|p| !p.eq_ignore_ascii_case(m)));
+    let model_width = model.map_or(0.0, |m| measure(ui, m) + 34.0);
     // the fold arrow, the two buttons, the badges' frames and marks, and the spacing between
-    let fixed = 14.0 + if folded { 0.0 } else { 52.0 } + 34.0 + 24.0;
+    let fixed = 14.0 + if folded { 0.0 } else { 52.0 } + 34.0 + 34.0;
     let task_room = (total - measure(ui, &status_shown) - model_width - fixed).max(40.0);
     let task = title.rsplit_once(" · ").map_or(title, |(task, _)| task);
-    let (shown_task, task_cut) = cut_to(ui, task, task_room);
     let row = ui.horizontal(|ui| {
         ui.label(RichText::new(if folded { "▸" } else { "▾" }).color(theme::dim()).small());
-        let badge = crate::cards::badge_marked(ui, "◇", &shown_task, theme::trace());
-        if task_cut {
-            badge.on_hover_text(task);
-        }
-        if let Some((_, model)) = title.rsplit_once(" · ") {
-            crate::cards::badge_marked(ui, "◉", model, theme::accent());
+        // the task in its room, running as a marquee when it is longer, whole on hover
+        crate::cards::marquee_badge(ui, "◇", task, task_room, theme::trace()).on_hover_text(task);
+        if let Some(model) = model {
+            crate::cards::badge_marked(ui, "◉", model, crate::cards::model_color(model));
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             // the height of the card, two rows a notch, by the buttons or the wheel
@@ -377,7 +386,8 @@ fn run_title(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, lane: Co
                     sink.resize_run(id, 2);
                 }
             }
-            let shown = ui.label(RichText::new(&status_shown).color(status_color).small());
+            // the clock and the steps, or the outcome, as a badge of their own
+            let shown = crate::cards::badge(ui, &status_shown, status_color);
             if status_cut {
                 shown.on_hover_text(&status);
             }

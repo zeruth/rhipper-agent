@@ -4260,7 +4260,7 @@ impl Workspace {
                         if ui.add(button).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("the project's tab").clicked() {
                             open = true;
                         }
-                        cards::badge(ui, &model, theme::accent());
+                        cards::badge(ui, &model, cards::model_color(&model));
                         let ready = format!("{} ready", order.len());
                         cards::badge(ui, &ready, if order.is_empty() { theme::dim() } else { theme::online() });
                         match (running, &job) {
@@ -4307,13 +4307,13 @@ impl Workspace {
                         // projects fit a maximized window at any height this way: a small window
                         // shows three cards a project, a tall one six
                         let must = usize::from(running.is_some()) + 3;
-                        let mut shown: Vec<i64> = rows.iter().copied().take(must).collect();
-                        let mut extra = rows.iter().copied().skip(must).chain(extra.iter().copied());
                         // the open cards waiting on each card, for the subtree under its row; a
                         // card that waits on several sits under the first shown (the person: "a
                         // nice subtree view in queue for tasks waiting on other tasks")
                         let waiting = waiting_on(&nodes);
                         let mut placed: HashSet<i64> = rows.iter().copied().chain(extra.iter().copied()).collect();
+                        let mut shown: Vec<i64> = rows.iter().copied().take(must).collect();
+                        let mut extra = rows.iter().copied().skip(must).chain(extra.iter().copied());
                         let mut rank = 0;
                         while rank < shown.len() {
                             let id = shown[rank];
@@ -4367,7 +4367,7 @@ impl Workspace {
                     ui.allocate_ui_with_layout(egui::vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
                         ui.set_width(right);
                         ui.set_max_width(right);
-                        if !console::draw_latest_run(ui, &self.sink, room, right) {
+                        if !console::draw_latest_run(ui, &self.sink, room, right, implementer.as_deref()) {
                             ui.label(RichText::new("no run in this session yet").color(theme::dim()).italics());
                         }
                     });
