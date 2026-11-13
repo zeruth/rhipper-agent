@@ -833,14 +833,13 @@ async fn git_check(root: &Path) -> Result<String, String> {
     Ok(format!("{}, {place}", printed_line(&version)))
 }
 
-/// The local server answering at its URL, and the model the roles default to on it.
+/// The local server answering at its URL with the model the roles take on it, or silent, which
+/// turns the roles off rather than sending them to a Claude model.
 async fn local_check() -> Result<String, String> {
     let url = ra_providers::openrouter::local_url();
     match ra_providers::local::default_model_at(&url).await {
-        Some(model) => Ok(format!("{url} answers; the roles default to {model}")),
-        None => {
-            Err(format!("nothing answers at {url}; set {} to a server, or the roles call nothing", ra_providers::openrouter::LOCAL_URL_VAR))
-        }
+        Some(model) => Ok(format!("{url} answers with {model}")),
+        None => Err(format!("{url} does not answer: the roles are off; set {} to a server", ra_providers::openrouter::LOCAL_URL_VAR)),
     }
 }
 
@@ -897,11 +896,15 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     if tight {
         write!(pick, " · {TIGHT_PICK}").unwrap();
     }
+    // the cheap roles of this run, resolved once: the local server is pinged here, not per role,
+    // and the start marker says where each role went, so the ledger is read against it
+    let roles = worker.roles(&root).await;
+    let roles_part = roles.summary();
     // the pid on the start marker, last: a window coming up tells a run that died from one
     // still going
     tracing::info!(
         target: crate::trace::PROGRESS,
-        "{}#{} {} · {}{pick} · pid {}",
+        "{}#{} {} · {}{pick} · {roles_part} · pid {}",
         crate::logs::RUN_START,
         id,
         node.title,
@@ -923,8 +926,6 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     // the other projects see the run while it goes, and what it came to once it ended
     let started = unix_now();
     write_digest(store, &root, Some(format!("#{id} {title} · pid {} · started {}", std::process::id(), clock(started))), None, None).await;
-    // the cheap roles of this run, resolved once: the local server is pinged here, not per role
-    let roles = worker.roles(&root).await;
     let mut outcome = run_task(store, node, worker, &roles).await;
     // an absolute card is one run until it is done: a failed check or a rejection sends it
     // straight back to work on its session, the verdict as the prompt, inside this run, not
@@ -947,6 +948,14 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
             && store.read(id).await.is_ok_and(|n| n.state == TaskState::Implemented)
         {
             lines.extend(review_after_run(store, id, worker).await);
+        }
+        // a run sent back that changed nothing and says why is idle: the next run starts fresh,
+        // and a second in a row parks the card (#185 went round seven times on its resumed
+        // session, 26k to 93k tokens a turn, every run refused the same command)
+        if let Ok((lines, _, _)) = &mut outcome
+            && let Some(line) = settle_idle(store, &root, id).await
+        {
+            lines.push(line);
         }
         let Ok(node) = store.read(id).await else { break };
         if outcome.is_err() || !node.is_absolute() || node.state != TaskState::NeedsRevision {
@@ -1044,15 +1053,16 @@ const LINT_FIX_INSTRUCTION: &str = "The lint of this card's run left the warning
 /// same card halts the fix passes.
 const TRIVIAL_TAG: &str = "needs revision (trivial)";
 
-/// The model of a fix pass: the `fix` role of `rhipper.toml` on the cheap route, else the cheap
-/// route's own pick; `None` when the role is off, and in the tests, which neither ping the
-/// local server nor fall to haiku.
+/// The model of a fix pass: the `fix` role of `rhipper.toml`, else the local server's model when
+/// it answers a ping; `None` when the role is off, when no server answers, and in the tests,
+/// which never ping. The pass never falls to a Claude model the table did not name: the ledger
+/// of 2026-11-12 showed haiku at 9.5M input tokens from passes that fell to it by default.
 async fn fix_model(root: &Path) -> Option<String> {
     let named = crate::router::Router::load(root).ok().and_then(|router| router.role.fix);
     match named.as_deref() {
-        Some(named) => ra_providers::route::cheap(Some(named), None),
+        Some(named) => ra_providers::route::role(Some(named), None),
         None if cfg!(test) => None,
-        None => ra_providers::route::cheap_model(None).await,
+        None => ra_providers::route::role(None, ra_providers::local::default_model().await.as_deref()),
     }
 }
 
@@ -1629,28 +1639,45 @@ async fn guard_landing(root: &Path) -> Option<crate::hub::Guard> {
     }
 }
 
-/// Takes the hub's lock on the cargo target of `root` for the check, waiting on a check of
-/// another project that builds in the same target; the wait is said once, on the progress
-/// channel and the paired feed. `None` when the lock cannot be opened: the check goes unguarded.
-async fn guard_target(root: &Path, target: &Path) -> Option<crate::hub::Guard> {
+/// Takes the hub's lock on the cargo `target` for the check of a run acting in `acting`,
+/// waiting on a check that builds in the same target; the wait is said once, naming the
+/// holder, on the progress channel and the paired feed, and gives up at `timeout`, the check's
+/// own bound (four checks queued behind one another's target for forty minutes on 2026-11-12).
+/// `Ok(None)` when the lock cannot be opened: the check goes unguarded.
+///
+/// # Errors
+/// The check's failure when the wait ran out: how long it waited, on what, held by whom.
+async fn guard_target(
+    root: &Path,
+    acting: &Path,
+    target: &Path,
+    timeout: std::time::Duration,
+) -> Result<Option<crate::hub::Guard>, String> {
     let name = crate::hub::target_lock_name(target);
+    let who = crate::hub::builder_name(acting);
     let mut said = false;
+    let started = std::time::Instant::now();
     loop {
-        match crate::hub::try_guard(&name) {
-            Ok(Some(guard)) => return Some(guard),
+        match crate::hub::try_guard_as(&name, &who) {
+            Ok(Some(guard)) => return Ok(Some(guard)),
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!("the check runs without the lock on {}: {e:#}", target.display());
-                return None;
+                return Ok(None);
             }
+        }
+        let holder = crate::hub::target_holder(target).unwrap_or_else(|| "a build the hub does not name".to_owned());
+        if started.elapsed() >= timeout {
+            return Err(format!("the check waited {} s on {} held by {holder}", timeout.as_secs(), target.display()));
         }
         if !said {
             said = true;
-            let text = format!("wait: the check waits on the cargo target {}, which another project's check builds in", target.display());
+            let text = format!("wait: the check waits on the cargo target {}, held by {holder}", target.display());
             tracing::info!(target: crate::trace::PROGRESS, "  {text}");
             crate::pair::event(root, &text);
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let left = timeout.saturating_sub(started.elapsed());
+        tokio::time::sleep(std::time::Duration::from_secs(2).min(left)).await;
     }
 }
 
@@ -1661,13 +1688,15 @@ async fn guard_target(root: &Path, target: &Path) -> Option<crate::hub::Guard> {
 const HOLD_WAIT: std::time::Duration = std::time::Duration::from_mins(15);
 
 /// Takes one of the project's build slots for the check, waiting on the builds of the workers
-/// and the other checks; the wait is said once, on the progress channel and the paired feed.
-/// `None` when the locks cannot be opened: the check goes unguarded.
-async fn hold_build(root: &Path) -> Option<crate::hub::Guard> {
+/// and the other checks; the wait is said once, on the progress channel and the paired feed of
+/// the project at `root`. The slot's note names `building`, the tree the check builds, a card's
+/// worktree or the project, with its target. `None` when the locks cannot be opened: the check
+/// goes unguarded.
+async fn hold_build(root: &Path, building: &Path) -> Option<crate::hub::Guard> {
     let mut said = false;
     let started = std::time::Instant::now();
     loop {
-        match crate::hub::try_build_slot(root) {
+        match crate::hub::try_build_slot(building) {
             Ok(Some(guard)) => return Some(guard),
             Ok(None) => {}
             Err(e) => {
@@ -2850,7 +2879,7 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
             let Checks { commands, timeout, .. } = checks_of(&root, &node);
             if !commands.is_empty() {
                 let toolbox = worker.toolbox(&root).map(|t| t.with_timeout(timeout));
-                let _slot = hold_build(&root).await;
+                let _slot = hold_build(&root, &root).await;
                 let runs = run_checks(&toolbox, &commands, &[]).await;
                 if let Some(failed) = runs.iter().find(|r| !r.passed) {
                     let _ = git(&root, &["reset", "--merge", "ORIG_HEAD"]).await;
@@ -3656,11 +3685,23 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the topic changes). The session is dropped only when it is stale: then the brief and the
     // handoffs carry it, and the run says so first
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
+    // a run after an idle one starts fresh, as `--clear-session` would: the session that changed
+    // nothing is only resumed to change nothing again at a heavier turn. Its prompt is the last
+    // report and the review, not the transcript
+    let idle = last_run(&task).and_then(idle_of).map(str::to_owned);
+    let rerun = rerun.map(|block| match last_run(&task) {
+        Some(last) if idle.is_some() => format!("{block}\nThe last run changed nothing; its report:\n{}\n", last.report.trim()),
+        _ => block,
+    });
+    if idle.is_some() && node.session.is_some() {
+        store.set_session(id, None, unix_now()).await?;
+    }
     // a rerun after a rejection or a failed check resumes only a lean session: the verdict and
     // the handoff carry what it needs, and a session already heavy paid its whole weight every
     // turn of every rerun (runelite #23 resumed at 132k tokens a turn, $7.39 for eleven turns;
     // #28 at 144k, $3.91 for four), where a fresh one cost a few tens of cents
     let resumed = match resume_of(&node, unix_now()) {
+        Ok(Some(_)) if idle.is_some() => Err(format!("the last run changed nothing ({})", idle.as_deref().unwrap_or_default())),
         // an absolute card keeps its session whatever its weight: its work is one run
         Ok(Some(_)) if rerun.is_some() && !node.is_absolute() && last_largest_turn(&task).is_some_and(|t| t > RERUN_RESUME_LIMIT) => {
             Err(format!(
@@ -3898,16 +3939,40 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // failure
     let Checks { commands, lint: project_lint, timeout, orchestrated } = checks_of(&root, &node);
     let command = commands.join(" · ");
-    let toolbox = worker.toolbox(workspace_dir.as_deref().unwrap_or(Path::new("."))).map(|toolbox| toolbox.with_timeout(timeout));
+    // a worktree's check builds in the target the worker built in, `target/wt-<id>` under the
+    // project's, whatever the process's own `CARGO_TARGET_DIR`: the artifacts are warm there,
+    // and the project's target is the one every tree's check would otherwise queue behind
+    let own_target = workspace_dir.as_deref().and_then(ra_providers::claude_code::shared_target);
+    let toolbox = worker.toolbox(workspace_dir.as_deref().unwrap_or(Path::new("."))).map(|toolbox| {
+        toolbox.with_timeout(timeout).with_env(own_target.iter().map(|t| ("CARGO_TARGET_DIR".to_owned(), t.display().to_string())))
+    });
     // a check is a build: it takes one of the project's build slots, as the workers' own
     // builds do, so six runs do not compile at once; a cargo check also takes the hub's lock
     // on a target another project may share, so two builds do not fight over the directory
-    let _slot = if commands.is_empty() { None } else { hold_build(&root).await };
+    // the wait goes to the project's feed, never a file in the worktree the branch commits
+    let _slot = if commands.is_empty() { None } else { hold_build(&root, &acting).await };
     // the lock is on the target the check builds in: a worktree's own under the project's,
     // not the project's (six asm checks on one lock waited for each other for nothing)
-    let target = if workspace_dir.is_some() { root.join("target").join(format!("wt-{id}")) } else { crate::hub::cargo_target(&root) };
-    let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root, &target).await } else { None };
-    let checks = run_checks(&toolbox, &commands, &orchestrated).await;
+    let target = own_target.unwrap_or_else(|| crate::hub::cargo_target(&root));
+    let waited = match commands.iter().find(|c| c.trim_start().starts_with("cargo")) {
+        Some(_) => guard_target(&root, &acting, &target, timeout).await,
+        None => Ok(None),
+    };
+    // a wait that ran out is the check's failure, named as the output a timed-out check leaves
+    let (_target, checks) = match waited {
+        Ok(guard) => {
+            let checks = run_checks(&toolbox, &commands, &orchestrated).await;
+            (guard, checks)
+        }
+        Err(text) => {
+            let command = commands.iter().find(|c| c.trim_start().starts_with("cargo")).cloned().unwrap_or_default();
+            tracing::info!(target: crate::trace::PROGRESS, "check failed: {command} · {text}");
+            // not a setup failure: a rerun once the holder is done can move the card
+            let run =
+                CheckRun { command, passed: false, exit: text.clone(), first_error: text.clone(), text, failed_tests: 0, setup: false };
+            (None, vec![run])
+        }
+    };
     let status_after = git_status(&acting).await;
     // the card's own set: on a tree other hands share, a dirty file joins it only when the run
     // wrote to it and the report or an earlier handoff names it (#157 lost a named file, #185
@@ -6071,6 +6136,87 @@ fn resume_of(node: &Node, now: u64) -> Result<Option<String>, String> {
         return Err("the session is older than a day".to_owned());
     }
     Ok(Some(session.to_owned()))
+}
+
+/// The mark of an idle run on its handoff's check line, last on the line: ` · idle: <reason>`.
+/// The line is kept in the file, so the next run of the card starts fresh and a second idle run
+/// parks it.
+const IDLE_MARK: &str = " · idle: ";
+
+/// The last run's handoff of a task, past the notes other cards left on it.
+fn last_run(task: &ra_context::TaskContext) -> Option<&ra_context::Handoff> {
+    task.handoffs.iter().rev().find(|h| !h.outcome.starts_with("note from"))
+}
+
+/// Why the run of a handoff was idle, as its check line carries it; `None` for a run that was not.
+fn idle_of(handoff: &ra_context::Handoff) -> Option<&str> {
+    handoff.check.split_once(IDLE_MARK).map(|(_, reason)| reason.trim())
+}
+
+/// Why the run of `last` was idle: it changed no file, and its report (or the notes it left)
+/// names a refused command, or it drew the verdict the run of `previous` drew. `None` for a run
+/// that changed a file or says nothing of why it did not.
+fn idle_reason(last: &ra_context::Handoff, previous: Option<&ra_context::Handoff>, notes: &str) -> Option<String> {
+    if !last.changed.is_empty() {
+        return None;
+    }
+    if let Some(line) = refused_line(&last.report).or_else(|| refused_line(notes)) {
+        return Some(line);
+    }
+    let verdict = last.verdict.as_deref()?;
+    (previous.and_then(|p| p.verdict.as_deref()) == Some(verdict)).then(|| format!("the same verdict again: {}", verdict.trim()))
+}
+
+/// The first `refused:` line of a report, with the line under it when the label stands alone,
+/// clipped to 200 characters; `None` when the report names no refusal.
+fn refused_line(report: &str) -> Option<String> {
+    let bare = |line: &str| line.trim().trim_start_matches(['-', '*', '#', '>', '`', ' ']).to_owned();
+    let mut lines = report.lines().map(bare);
+    let rest = lines.find_map(|line| line.strip_prefix("refused:").map(|rest| rest.trim_start_matches(['*', ' ']).trim().to_owned()))?;
+    // a label alone, `refused:` or **refused:**, names its refusal on the line under it
+    let alone = rest.trim_matches(['`', '*']).is_empty();
+    let what = if alone { lines.find(|line| !line.is_empty()).unwrap_or_default() } else { rest };
+    let line = format!("refused: {what}");
+    Some(line.trim_end().chars().take(200).collect())
+}
+
+/// Settles a run of card `id` that its check or its reviewer sent back: one that changed nothing
+/// and says why ([`idle_reason`]) is marked idle on its handoff, and when the run before it was
+/// idle too the card is blocked, the first run's reason at the top of its notes, and the feed
+/// says so ([`crate::pair::parked`]). The line for the run, `None` for a run that was not idle.
+async fn settle_idle(store: &Store, root: &Path, id: i64) -> Option<String> {
+    let node = store.read(id).await.ok()?;
+    if node.state != TaskState::NeedsRevision {
+        return None;
+    }
+    let mut task = ra_context::TaskContext::open(root, id);
+    let runs: Vec<usize> = task.handoffs.iter().enumerate().filter(|(_, h)| !h.outcome.starts_with("note from")).map(|(i, _)| i).collect();
+    let (&at, before) = runs.split_last()?;
+    let previous = before.last().map(|&i| &task.handoffs[i]);
+    let reason = idle_reason(&task.handoffs[at], previous, node.notes.as_deref().unwrap_or_default())?;
+    // the first idle run's reason names the card's trouble; the second only repeats it
+    let first = previous.and_then(idle_of).map(str::to_owned);
+    let last = &mut task.handoffs[at];
+    if idle_of(last).is_none() {
+        last.check = format!("{}{IDLE_MARK}{reason}", last.check.trim());
+        if let Err(e) = task.save(root) {
+            tracing::warn!("the idle run of #{id} was not marked on its handoff: {e:#}");
+        }
+    }
+    let Some(first) = first else {
+        return Some(format!("  idle: #{id} changed nothing ({reason}); its next run starts a fresh session"));
+    };
+    let notes = node.notes.as_deref().map_or_else(|| first.clone(), |notes| format!("{first}\n\n{notes}"));
+    if let Err(e) = store.set_notes(id, &notes).await {
+        tracing::warn!("the reason #{id} is parked was not noted: {e:#}");
+    }
+    if let Err(e) = store.set_state_by(id, TaskState::Blocked, Source::Run).await {
+        tracing::warn!("#{id} could not be parked: {e:#}");
+        return None;
+    }
+    let text = crate::pair::parked(root, id, &first);
+    tracing::warn!("{text}");
+    Some(format!("  {text}; a person sets it defined again"))
 }
 
 /// The turns a session spends reading in, a few past the harness's own reading-in allowance:
