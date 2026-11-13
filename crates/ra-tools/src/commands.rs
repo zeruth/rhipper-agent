@@ -2,7 +2,7 @@
 //! keeps a long output from carrying whole into a turn.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Context;
 

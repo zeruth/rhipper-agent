@@ -12,6 +12,7 @@ mod console;
 mod fonts;
 mod input;
 mod markdown;
+mod metrics;
 #[cfg(test)]
 mod tests;
 mod theme;
@@ -376,6 +377,10 @@ struct App {
     /// Where the dashboard's Blood Moon scroll bar was dragged to, for the scroll area of the
     /// next frame.
     dash_scroll_to: Option<f32>,
+    /// The report's pinned metrics and when they were read from the feeds; read again every
+    /// half minute while the report is up.
+    report_metrics: Vec<metrics::Metric>,
+    report_metrics_at: Option<Instant>,
     /// When the window started, for the dashboard's uptime.
     started: Instant,
     /// Whether the report is in front: the cards that landed across every project.
@@ -738,6 +743,8 @@ impl App {
             builders: Vec::new(),
             builders_at: None,
             dash_scroll_to: None,
+            report_metrics: Vec::new(),
+            report_metrics_at: None,
             started: Instant::now(),
             report: false,
             landed: Vec::new(),
@@ -1334,6 +1341,47 @@ impl App {
                 });
             });
             ui.add_space(6.0);
+            // the pinned metrics, above the scroll: what the walks are worth, the latest session
+            // and its trend (the person's six, 2026-11-12)
+            if self.report_metrics_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
+                let roots: Vec<PathBuf> = self.tabs.iter().map(|t| t.root.clone()).collect();
+                self.report_metrics = metrics::metrics(&metrics::sessions(&roots));
+                self.report_metrics_at = Some(Instant::now());
+            }
+            if !self.report_metrics.is_empty() {
+                let count = self.report_metrics.len() as f32;
+                let width = ((ui.available_width() - 10.0 * (count - 1.0)) / count).floor().max(120.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    for metric in &self.report_metrics {
+                        let shown = metric.current().map_or_else(|| "—".to_owned(), metric.format);
+                        let (arrow, color) = match metric.improved() {
+                            Some(true) => (if metric.delta().unwrap_or(0.0) > 0.0 { " ▲" } else { " ▼" }, theme::online()),
+                            Some(false) => (if metric.delta().unwrap_or(0.0) > 0.0 { " ▲" } else { " ▼" }, theme::accent()),
+                            None => ("", theme::dim()),
+                        };
+                        // the trend, scaled to the largest session: a session with nothing to
+                        // measure sits at the bottom
+                        let top = metric.values.iter().filter_map(|v| *v).fold(0.0_f64, f64::max).max(f64::EPSILON);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let samples: Vec<f32> = metric.values.iter().map(|v| (v.unwrap_or(0.0) / top) as f32).collect();
+                        ui.scope(|ui| cards::gauge(ui, metric.name, &format!("{shown}{arrow}"), &samples, color, width))
+                            .response
+                            .on_hover_text(format!(
+                                "{}\nthe last {} session(s), oldest first: {}",
+                                metric.hint,
+                                metric.values.len(),
+                                metric
+                                    .values
+                                    .iter()
+                                    .map(|v| v.map_or_else(|| "—".to_owned(), metric.format))
+                                    .collect::<Vec<_>>()
+                                    .join(" · ")
+                            ));
+                    }
+                });
+                ui.add_space(8.0);
+            }
             egui::ScrollArea::vertical().id_salt("report").auto_shrink([false, false]).show(ui, |ui| {
                 // the page's width, handed down: the columns are sized from it, so no bubble
                 // takes the room a scroll area's content would otherwise be allowed
