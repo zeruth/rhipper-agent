@@ -1781,7 +1781,7 @@ pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
 
 /// How long `rc wait` waits unless told otherwise: under a worker's 600-second turn, so the
 /// turn ends with an answer rather than a kill.
-pub const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(9 * 60);
+pub const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_mins(9);
 
 /// How long a file `rc wait` watches must hold still before its job counts as done.
 const WAIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
