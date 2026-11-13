@@ -1808,44 +1808,100 @@ async fn a_logic_verdict_stays_substantive_even_beside_a_lint_point() {
 }
 
 #[tokio::test]
-async fn a_review_diff_covers_the_reported_files() {
+async fn a_dirty_file_from_before_the_run_is_not_the_cards() {
     let dir = tempfile::tempdir().unwrap();
     git_ok(dir.path(), &["init", "-q"]);
     std::fs::write(dir.path().join("other.txt"), "old\n").unwrap();
+    std::fs::write(dir.path().join("mine.txt"), "old\n").unwrap();
     git_ok(dir.path(), &["add", "-A"]);
     git_ok(dir.path(), &["commit", "-q", "-m", "probe"]);
-    // another card left the file dirty before this run, and its time is older than the run:
-    // the status lines and the modification time alone say nothing of this card's hand in it
-    let other = dir.path().join("other.txt");
-    std::fs::write(&other, "edited by another card\n").unwrap();
+    // the person left both files dirty before the run, their times older than it
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    std::fs::File::options().write(true).open(&other).unwrap().set_modified(old).unwrap();
+    for (name, text) in [("other.txt", "edited by the person\n"), ("mine.txt", "the person's start\n")] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+    }
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     // the card names a file the run leaves alone: the reviewer still sees it listed
     run("/files 2 src/lib.rs", &store, &worker()).await.unwrap();
-    let script = Scripted::new(vec![says("edited `other.txt` and left `missing.txt` alone", vec![]), says("accepted", vec![])]);
+    // the run writes one of the dirty files and its report names both: only the one it wrote
+    // inside the run is the card's (#157 kept a named dirty file, #185 was judged on the other)
+    let write = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"mine.txt","content":"written by the worker\n"}"#.into(),
+    };
+    let script = Scripted::new(vec![
+        says("", vec![write]),
+        says("edited `mine.txt`, looked at `other.txt` and left `missing.txt` alone", vec![]),
+        says("accepted", vec![]),
+    ]);
     let check: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(check);
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(out[0].starts_with("✓ #2 Probe implemented"), "{out:?}");
-    // the handoff records the set: the named file that is in the tree and dirty, not the other
     let handoff = ra_context::TaskContext::open(dir.path(), 2).handoffs.pop().unwrap();
-    assert_eq!(handoff.changed, vec!["other.txt".to_owned()]);
-    // and the reviewer's diff extends to it
+    assert_eq!(handoff.changed, vec!["mine.txt".to_owned()]);
     let seen = script.seen.lock();
-    assert_eq!(seen.len(), 2);
-    let brief = &seen[1].messages.last().unwrap().content;
-    assert!(brief.contains("+edited by another card"), "{brief}");
+    assert_eq!(seen.len(), 3);
+    let brief = &seen[2].messages.last().unwrap().content;
+    assert!(brief.contains("+written by the worker"), "{brief}");
+    // the other dirty file is listed apart and kept out of the diff
+    let apart = brief.find(&format!("## {}", crate::review::NOT_THE_CARDS)).expect("the not-this-card heading");
+    assert!(brief[apart..].contains("\n- other.txt\n"), "{brief}");
+    assert!(!brief.contains("+edited by the person"), "{brief}");
     // the brief lists the card's files and the run's, then the stat of exactly those, before
     // the diff: a change in a file the reviewer did not expect is not a missing one (#159)
-    assert!(brief.contains("## Files of the card\n- src/lib.rs\n- other.txt (changed by the run, not on the card)\n"), "{brief}");
+    assert!(brief.contains("## Files of the card\n- src/lib.rs\n- mine.txt (changed by the run, not on the card)\n"), "{brief}");
     let stat = brief.find("## git diff --stat HEAD of the card's files\n").expect("the stat section");
-    assert!(brief[stat..].contains("other.txt | 2 +-"), "{brief}");
+    assert!(brief[stat..].contains("mine.txt | 2 +-"), "{brief}");
+    assert!(!brief[stat..].contains("other.txt |"), "{brief}");
     assert!(stat < brief.find("## git diff HEAD of the card's files\n").unwrap(), "{brief}");
-    assert!(seen[1].messages[0].content.contains("with their diff stat"), "{}", seen[1].messages[0].content);
+    assert!(seen[2].messages[0].content.contains("with their diff stat"), "{}", seen[2].messages[0].content);
     // the worker's instruction asks for the file of each change, which is what the list reads
     assert!(seen[0].messages[0].content.contains("naming the file each change landed in"), "{}", seen[0].messages[0].content);
+}
+
+#[tokio::test]
+async fn a_worktree_review_diffs_the_branch_from_its_merge_base() {
+    let dir = tempfile::tempdir().unwrap();
+    git_ok(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join(".gitignore"), "var/\nrhipper.md\n").unwrap();
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "base"]);
+    let tree = dir.path().join("var/worktrees/2");
+    git_ok(dir.path(), &["worktree", "add", "-q", "-b", "card/2", tree.to_str().unwrap()]);
+    // two runs of the card, each checkpointed on its branch
+    for name in ["first.txt", "second.txt"] {
+        std::fs::write(tree.join(name), "work\n").unwrap();
+        git_ok(&tree, &["add", "-A"]);
+        git_ok(&tree, &["commit", "-q", "-m", name]);
+    }
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // the last run's handoff names only its own file
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    task.record(ra_context::Handoff {
+        when: 7,
+        model: "z-ai/glm-5.3-flash".to_owned(),
+        outcome: "implemented".to_owned(),
+        check: "cargo test -q: passed".to_owned(),
+        verdict: None,
+        changed: vec!["second.txt".to_owned()],
+        report: "wrote `second.txt`".to_owned(),
+        warnings: Vec::new(),
+        read: Vec::new(),
+    });
+    task.save(dir.path()).unwrap();
+    let node = store.read(2).await.unwrap();
+    let brief = crate::agent::review_brief(dir.path(), &tree, &node).await;
+    assert!(brief.contains("- first.txt (changed by the run, not on the card)\n- second.txt"), "{brief}");
+    let stat = brief.find("## git diff --stat ").expect("the stat section");
+    assert!(!brief[stat..].starts_with("## git diff --stat HEAD "), "the base is the merge base: {brief}");
+    assert!(brief[stat..].contains("first.txt") && brief[stat..].contains("second.txt"), "{brief}");
+    assert!(!brief.contains(crate::review::NOT_THE_CARDS), "{brief}");
 }
 
 /// A trivial verdict of the reviewer.
