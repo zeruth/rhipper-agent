@@ -162,14 +162,14 @@ fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
 }
 
 #[test]
-fn a_run_reads_its_roots_and_writes_its_temp_inside_the_workspace() {
+fn a_run_reads_its_roots_and_its_temp_outside_the_workspace() {
     let registry = PathBuf::from(r"C:\Users\me\.cargo\registry");
     let jdk = PathBuf::from(r"C:\code\runelite\third-party\jdk8u");
     let provider = ClaudeCode::new().with_read_roots([registry.clone(), jdk.clone(), registry.clone()]);
     let worker = request(Some(PathBuf::from(".")));
     let args = provider.args(&worker);
     let at = args.iter().position(|a| a == "--add-dir").expect("the read roots are added directories");
-    let temp = std::path::absolute(PathBuf::from(".").join(RUN_TEMP)).unwrap().display().to_string();
+    let temp = run_temp(&worker).unwrap().display().to_string();
     assert_eq!(args[at + 1..at + 4], [registry.display().to_string(), jdk.display().to_string(), temp.clone()]);
     let env = provider.environment(&worker);
     for key in ["TMP", "TEMP", "TMPDIR"] {

@@ -90,10 +90,6 @@ pub struct ClaudeCode {
     web: bool,
 }
 
-/// The run's own temp directory under its workspace: a test's files land where the run may read
-/// them, not under a system temp outside the worktree.
-pub const RUN_TEMP: &str = "var/tmp";
-
 impl Default for ClaudeCode {
     fn default() -> Self {
         Self::new()
@@ -186,8 +182,8 @@ impl ClaudeCode {
     }
 
     /// The run's temp directory as `TMP`, `TEMP` and `TMPDIR`, each one the project does not set
-    /// itself: what a test writes to temp lands inside the worktree, where the run may read it
-    /// back.
+    /// itself: what a test writes to temp lands outside the worktree's repository, so a project a
+    /// test creates there never sees the branch's tree; the run may read it back (`--add-dir`).
     fn temp_env(&self, request: &CompletionRequest) -> Vec<(String, String)> {
         let Some(temp) = run_temp(request) else { return Vec::new() };
         ["TMP", "TEMP", "TMPDIR"]
@@ -1205,10 +1201,16 @@ pub fn scratch_env(workspace: &Path) -> Vec<(String, PathBuf)> {
     vec![("TEMP".into(), temp.clone()), ("TMP".into(), temp), ("GRADLE_USER_HOME".into(), scratch.join("gradle"))]
 }
 
-/// The temp directory of a run in a workspace, absolute: `var/tmp` under it; none for a chat
+/// The temp directory of a run in a workspace, absolute and outside its git repository (the
+/// scratch root's `tmp`, else the system temp), one per project and card; none for a chat
 /// completion, which runs nothing.
 fn run_temp(request: &CompletionRequest) -> Option<PathBuf> {
-    request.workspace.as_deref().and_then(|dir| std::path::absolute(dir.join(RUN_TEMP)).ok())
+    let workspace = std::path::absolute(request.workspace.as_deref()?).ok()?;
+    let (root, card) = project_of(&workspace);
+    let name = root.file_name().map_or_else(|| "project".into(), |n| n.to_string_lossy().into_owned());
+    let base = scratch().map_or_else(|| std::env::temp_dir().join("rhipper"), |s| s.join("tmp"));
+    let dir = base.join(name);
+    Some(card.map_or_else(|| dir.join("run"), |id| dir.join(format!("run-{id}"))))
 }
 
 /// The program a permission rule names: `python` of `Bash(python *)`, `gw.ps1` of
