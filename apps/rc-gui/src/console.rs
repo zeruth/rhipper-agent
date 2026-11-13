@@ -123,9 +123,12 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32) 
                 let Some(run) = sink.run(*id) else { continue };
                 // each card gets exactly its cell, clipped to it: a card whose text ran long grew
                 // past its half and pushed its neighbour (the person: "should never do that")
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
-                ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
-                    ui.set_clip_rect(rect.expand(2.0).intersect(ui.clip_rect()));
+                // clipped across only: the card's height is its own (a clip on all sides cut the
+                // bottom of the cards off), its width never more than its half
+                ui.allocate_ui_with_layout(egui::vec2(width, height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    let left = ui.max_rect().left();
+                    let across = egui::Rect::from_x_y_ranges(left - 2.0..=left + width + 2.0, ui.clip_rect().y_range());
+                    ui.set_clip_rect(across.intersect(ui.clip_rect()));
                     ui.set_width(width);
                     ui.set_max_width(width);
                     run_card(ui, sink, *id, title, &run, *index, Some(height));
