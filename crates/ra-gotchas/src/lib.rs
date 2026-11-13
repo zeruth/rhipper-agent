@@ -397,6 +397,14 @@ impl Catalogue {
         self.entries.iter().find(|g| g.id == id)
     }
 
+    /// Whether the gotcha `id` is routing, not friction: its remedy runs the command under
+    /// `rc hold`, which every build and heavy command takes by design, free slots or not. Its
+    /// hits are no warning and no evidence for a look-back.
+    #[must_use]
+    pub fn is_routine(&self, id: &str) -> bool {
+        self.get(id).is_some_and(|g| matches!(&g.remedy, Remedy::Rewrite { insert, .. } if insert.trim_start().starts_with("rc hold")))
+    }
+
     /// [`Catalogue::command`] for a worker's shell in `workspace`, as the pre-tool hook asks it:
     /// the changed crates are read from the work tree only for a full suite while it is the
     /// project's check, as they cost a `git status`.

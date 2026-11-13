@@ -27,7 +27,7 @@
 id = "contract-runner-slot"
 where = "command"
 pattern = '^\s*(python3?|py)(\.exe)?\s+(-\w+\s+)*\S*run-awt-contracts\.py\b'
-message = "the contract runner is a build: it takes one of the machine's four build slots, shared by every project, so the command runs under `rc hold --`, which waits its turn while they are all taken, then runs it as written"
+message = "the contract runner is a build: it takes one of the machine's build slots, shared by every project, so the command runs under `rc hold --`, which waits its turn while they are all taken, then runs it as written"
 remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 
 [[gotcha]]
@@ -47,7 +47,7 @@ remedy = { kind = "hint" }
 id = "heavy-work-slot"
 where = "command"
 pattern = '^\s*(python3?|py)(\.exe)?\s+(-[A-Za-z]+\s+)*[^-\s]\S*\.py\b|^\s*(powershell|pwsh)(\.exe)?\s.*-File\s|^\s*(&\s+)?\.?[\\/]?[\w.\\/-]+\.ps1\b|^\s*node(\.exe)?\s+\S+\.(m?js|cjs|ts)\b|^\s*java(\.exe)?\s|^\s*rg\s|^\s*grep\s+(-\w+\s+)*-\w*[rR]|^\s*(Get-ChildItem|gci|dir|ls)\b.*-Recurse.*\|\s*Select-String\b|^\s*wsl(\.exe)?\s'
-message = "heavy work (a script, a JVM, a recursive search, a WSL toolchain) takes one of the machine's four worker slots, shared by every project: the command runs under `rc hold --`, which waits its turn while they are all taken and runs it on its share of the slots' CPU"
+message = "heavy work (a script, a JVM, a recursive search, a WSL toolchain) takes one of the machine's worker slots, shared by every project: the command runs under `rc hold --`, which waits its turn while they are all taken and runs it on its share of the slots' CPU"
 remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 
 [[gotcha]]
@@ -100,11 +100,11 @@ remedy = { kind = "rewrite", insert = "2>&1 | tail -n 80", append = true, unless
 [[gotcha]]
 # the last of the command rewrites: the ones before it read the command's own first words.
 # A project's workers write code six at a time and compile two at a time: a gradle or cargo
-# build runs under `rc hold`, which waits for one of the machine's four shared build slots
+# build runs under `rc hold`, which waits for one of the machine's shared build slots
 id = "build-slot"
 where = "command"
 pattern = '^\s*(&\s+)?(\.[\\/])?(gw\.ps1|gradlew(\.bat)?)\b|^\s*cargo\s+(build|test|check|clippy|run|bench|doc|nextest|fmt)\b'
-message = "a build takes one of the machine's four build slots, shared by every project: the command runs under `rc hold --`, which waits its turn while they are all taken, then runs it as written"
+message = "a build takes one of the machine's build slots, shared by every project: the command runs under `rc hold --`, which waits its turn while they are all taken, then runs it as written"
 remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 
 [[gotcha]]

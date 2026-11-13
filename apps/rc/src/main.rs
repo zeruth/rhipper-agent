@@ -358,7 +358,7 @@ enum Command {
         #[arg(long, value_name = "N")]
         retire: Option<usize>,
     },
-    /// Runs a build command on one of the machine's four build slots, shared by every project, waiting its turn while they are all taken; the hook puts a worker's gradle and cargo commands under it.
+    /// Runs a build command on one of the machine's build slots (`build-slots.txt` in the hub, four unless set), shared by every project, waiting its turn while they are all taken; the hook puts a worker's gradle and cargo commands under it.
     Hold {
         /// The shell the command runs through: bash, sh or powershell; PowerShell on Windows and sh elsewhere when left out.
         #[arg(long)]

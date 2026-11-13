@@ -352,6 +352,12 @@ impl ClaudeCode {
                         if hit.id == "shell-outside-allowlist" && self.own_command(&hit.excerpt) {
                             continue;
                         }
+                        // a build put on a slot is the routing every build takes, not a warning:
+                        // a quiet step, out of the journal and the run's count
+                        if catalogue.is_routine(&hit.id) {
+                            tracing::info!(target: "ra::progress", "↳ on a slot: {}", hit.excerpt);
+                            continue;
+                        }
                         tracing::info!(target: "ra::progress", "⚠ {}: {}", hit.id, hit.excerpt);
                         // the journal is written here, as the hits come, so a run that ends badly
                         // still counts them

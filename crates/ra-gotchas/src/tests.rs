@@ -558,3 +558,13 @@ fn a_refresh_brings_the_seeds_new_entries_and_keeps_the_files_own() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before);
 }
+
+#[test]
+fn a_build_put_on_a_slot_is_routine_and_a_refusal_is_not() {
+    let seed = Catalogue::seed();
+    assert!(["build-slot", "heavy-work-slot", "contract-runner-slot"].iter().all(|id| seed.is_routine(id)));
+    // a rewrite that changes the command itself is still friction worth counting
+    assert!(!seed.is_routine("long-output"));
+    assert!(!seed.is_routine("refused"));
+    assert!(!seed.is_routine("no-such-gotcha"));
+}

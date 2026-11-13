@@ -118,10 +118,17 @@ pub fn digest_line(digest: &Digest) -> Line {
 pub const GOTCHAS_LOG: &str = "var/gotchas.log";
 
 /// The gotcha journal's lines: the last day's hits by gotcha, the most often first, then the
-/// refused commands no gotcha names with their tallies.
+/// refused commands no gotcha names with their tallies. The routine ones, a build put on a
+/// slot, are left out: they are how every build runs, not friction to plan against.
 #[must_use]
 pub fn gotchas(root: &Path) -> Vec<Line> {
-    gotcha_lines(&journal::summary(&root.join(GOTCHAS_LOG)))
+    let mut summary = journal::summary(&root.join(GOTCHAS_LOG));
+    let catalogue = std::fs::read_to_string(root.join("var/gotchas.toml"))
+        .ok()
+        .and_then(|text| ra_gotchas::Catalogue::parse(&text).ok())
+        .unwrap_or_else(ra_gotchas::Catalogue::seed);
+    summary.counts.retain(|(id, _)| !catalogue.is_routine(id));
+    gotcha_lines(&summary)
 }
 
 /// [`gotchas`] from a summary already read, for the tests.
