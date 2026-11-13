@@ -634,6 +634,25 @@ pub struct Handoff {
     pub failures: Vec<String>,
 }
 
+/// Where a card stands after a run: what is still open, read off the handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Standing {
+    /// The failures of the run's check.
+    pub failing: usize,
+    /// The points of the reviewer's verdict.
+    pub points: usize,
+    /// The warnings of the run's lint.
+    pub warnings: usize,
+}
+
+impl Standing {
+    /// Everything still open.
+    #[must_use]
+    pub fn total(self) -> usize {
+        self.failing + self.points + self.warnings
+    }
+}
+
 /// The heading of a handoff's warnings in the file.
 const WARNINGS_HEADING: &str = "### Warnings";
 
@@ -1063,6 +1082,22 @@ impl TaskContext {
         u32::try_from(idle).unwrap_or(u32::MAX)
     }
 
+    /// The stalled rounds the card is on: its last runs in a row that were sent back and made no
+    /// progress over the run before ([`Handoff::progressed_from`]), past the notes other cards
+    /// left. Unlike [`Self::idle_rounds`] a run that edits files still counts when the standing
+    /// holds. Read off the file, so a new walk or a restarted window counts on.
+    #[must_use]
+    pub fn stalled_rounds(&self) -> u32 {
+        let runs: Vec<&Handoff> = self.handoffs.iter().filter(|h| !h.outcome.starts_with("note from")).collect();
+        let stalled = runs
+            .iter()
+            .enumerate()
+            .rev()
+            .take_while(|(i, h)| h.outcome.starts_with("needs revision") && *i > 0 && !h.progressed_from(runs[i - 1]))
+            .count();
+        u32::try_from(stalled).unwrap_or(u32::MAX)
+    }
+
     /// Adds the handoff of a run, keeping the newest [`HANDOFFS_KEPT`].
     pub fn record(&mut self, handoff: Handoff) {
         self.handoffs.push(handoff);
@@ -1173,6 +1208,31 @@ impl Handoff {
     #[must_use]
     pub fn idle_round(&self) -> bool {
         self.outcome.starts_with("needs revision") && self.changed.is_empty()
+    }
+
+    /// Where the card stood when the run ended.
+    #[must_use]
+    pub fn standing(&self) -> Standing {
+        let points = self
+            .verdict
+            .as_deref()
+            .and_then(|v| v.split(" · ").find(|part| part.contains("point(s)")))
+            .and_then(|part| part.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        Standing { failing: self.failures.len(), points, warnings: self.warnings.len() }
+    }
+
+    /// The check's first error: the name line of its first failure.
+    fn first_error(&self) -> Option<&str> {
+        self.failures.first().and_then(|f| f.lines().next())
+    }
+
+    /// Whether the run moved the card on from `before`: its standing fell or the check's first
+    /// error changed.
+    #[must_use]
+    pub fn progressed_from(&self, before: &Handoff) -> bool {
+        self.standing().total() < before.standing().total() || self.first_error() != before.first_error()
     }
 
     /// The handoff as a block of the file and of the prompt.

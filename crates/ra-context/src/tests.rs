@@ -677,6 +677,34 @@ fn the_tree_since_the_last_run_reads_as_nothing_landed_merged_or_reset() {
     assert!(reset.starts_with("reset: the tree no longer holds abc123"), "{reset}");
 }
 
+fn standing_run(when: u64, failing: usize, points: usize) -> Handoff {
+    Handoff {
+        when,
+        model: "m".to_owned(),
+        outcome: "needs revision".to_owned(),
+        check: "cargo test".to_owned(),
+        verdict: (points > 0).then(|| format!("needs revision (substantive) · {points} point(s) by r")),
+        changed: vec!["a.rs".to_owned()],
+        report: String::new(),
+        warnings: vec![],
+        read: vec![],
+        failures: (0..failing).map(|_| "test x\nsame error".to_owned()).collect(),
+    }
+}
+
+#[test]
+fn stalled_rounds_count_the_runs_since_the_standing_last_fell() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut task = TaskContext::open(dir.path(), 9);
+    assert_eq!(task.stalled_rounds(), 0);
+    for (when, failing, points) in [(1, 5, 0), (2, 3, 1), (3, 3, 1), (4, 3, 1)] {
+        task.record(standing_run(when, failing, points));
+    }
+    assert_eq!(task.stalled_rounds(), 2);
+    task.record(standing_run(5, 1, 0));
+    assert_eq!(task.stalled_rounds(), 0);
+}
+
 #[test]
 fn a_handoff_head_names_the_tip_the_branch_s_commits_what_happened_and_what_is_open() {
     let tree = Tree {
