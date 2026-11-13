@@ -3788,7 +3788,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         Err(text) => {
             let command = commands.iter().find(|c| c.trim_start().starts_with("cargo")).cloned().unwrap_or_default();
             tracing::info!(target: crate::trace::PROGRESS, "check failed: {command} · {text}");
-            (None, vec![CheckRun { command, passed: false, exit: text.clone(), text, failed_tests: 0 }])
+            // not a setup failure: a rerun once the holder is done can move the card
+            let run = CheckRun { command, passed: false, exit: text.clone(), first_error: text.clone(), text, failed_tests: 0, setup: false };
+            (None, vec![run])
         }
     };
     let status_after = git_status(&acting).await;

@@ -2621,15 +2621,25 @@ async fn a_worktree_check_builds_in_the_worktrees_target() {
 async fn a_wait_on_a_target_ends_at_the_check_timeout_naming_the_holder() {
     let dir = tempfile::tempdir().unwrap();
     cargo_project(dir.path(), true);
+    git_ok(dir.path(), &["init", "-q"]);
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "probe"]);
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     run("/edit 2 acceptance `cargo test -q` passes", &store, &worker()).await.unwrap();
     std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 1\n").unwrap();
+    // the card runs in a worktree, so the target is its own `target/wt-2`: a project's target
+    // is the `CARGO_TARGET_DIR` the test process inherits, which every test's check shares
+    let worktree = dir.path().join("var").join("worktrees").join("2");
+    git_ok(dir.path(), &["worktree", "add", "-q", "-b", "card/2", &worktree.to_string_lossy()]);
     // another project's check holds the lock on the target for the whole run
-    let target = crate::hub::cargo_target(dir.path());
+    let target = ra_providers::claude_code::shared_target(&worktree).unwrap();
     let _held = crate::hub::try_guard_as(&crate::hub::target_lock_name(&target), "other #9").unwrap().expect("the target was free");
     let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
-    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])])).with_script(script);
+    let worker = Worker::new("z-ai/glm-5.3-flash")
+        .with_provider(Scripted::new(vec![says("done", vec![])]))
+        .with_script(script)
+        .with_worktree(worktree, "card/2");
     let started = std::time::Instant::now();
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(30), "the walk did not give up the wait: {out:?}");
