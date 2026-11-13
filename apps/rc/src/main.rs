@@ -184,6 +184,21 @@ enum Command {
         #[arg(long)]
         dry: bool,
     },
+    /// Moves named top-level items of a Rust file, with their doc comments and attributes, to a new file
+    /// under the `use` lines they need; the old file keeps a `mod` line and a re-export, so no caller
+    /// changes; no model call.
+    Carve {
+        /// The file the items leave, relative to the current directory.
+        file: String,
+        /// The new file: beside a `lib.rs`, `main.rs` or `mod.rs`, under the directory named after any other file.
+        new_file: String,
+        /// The names of the items to move.
+        #[arg(required = true)]
+        items: Vec<String>,
+        /// Prints what would move and writes nothing.
+        #[arg(long)]
+        dry: bool,
+    },
     /// Checks what a run needs, one line each: `claude` on the path and logged in, the hooks, the settings a
     /// worker loads, git, the local server, the `OpenRouter` key, the roadmap parsing, the ledger opening; exit
     /// code 1 when a required one fails.
@@ -648,6 +663,7 @@ async fn run_main() -> anyhow::Result<()> {
             plain_tracing()?;
             import(&file, under, dry).await
         }
+        Command::Carve { file, new_file, items, dry } => carve(&file, &new_file, &items, dry),
         Command::Doctor => {
             plain_tracing()?;
             doctor::run(Path::new(".")).await
@@ -1591,6 +1607,23 @@ async fn import(file: &Path, under: i64, dry: bool) -> anyhow::Result<()> {
         }
     }
     println!("added {} under #{under} {}", outline.summary(), root.title);
+    Ok(())
+}
+
+/// Moves `items` from `file` to `new_file`; with `dry`, prints what would move and writes nothing.
+fn carve(file: &str, new_file: &str, items: &[String], dry: bool) -> anyhow::Result<()> {
+    let root = Path::new(".");
+    let carve = ra_context::carve::carve(|f| std::fs::read_to_string(root.join(f)).ok(), file, new_file, items)?;
+    let verb = if dry { "would move" } else { "moved" };
+    for (name, start, end) in &carve.moved {
+        println!("{verb} {name} {start}-{end}");
+    }
+    if dry {
+        println!("{} lines to {new_file}; {file} keeps {} lines", carve.to.lines().count(), carve.from.lines().count());
+        return Ok(());
+    }
+    ra_context::carve::write(root, file, new_file, &carve)?;
+    println!("{new_file} written; {file} re-exports what left it");
     Ok(())
 }
 
