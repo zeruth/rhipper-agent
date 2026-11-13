@@ -2080,6 +2080,10 @@ async fn red_main_project(
     let alone = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = alone.clone();
     let check: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        // the checkpoint's proof only compiles the tests, and the probe compiles
+        if command.contains("--no-run") {
+            return Ok((0, String::new()));
+        }
         if command.contains("--exact") {
             let call = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if base_passes && call == 1 {
@@ -2697,8 +2701,8 @@ async fn a_rejected_card_steps_up_one_rung() {
     let store = laddered_card(dir.path(), 3, 1).await;
     let routed = Worker::new("claude-opus-5-5").with_routing(true);
     let picked = routed.for_card(dir.path(), &store.read(2).await.unwrap()).unwrap();
-    assert_eq!(picked.model, "claude-fable-5-1");
-    assert_eq!(picked.step.as_deref(), Some("escalated to claude-fable-5-1 after 1 rejection"));
+    assert_eq!(picked.model, "claude-fable-5-2");
+    assert_eq!(picked.step.as_deref(), Some("escalated to claude-fable-5-2 after 1 rejection"));
     // a small card rejected once climbs back to the route's model
     store.set_complexity(2, 2).await.unwrap();
     let picked = routed.for_card(dir.path(), &store.read(2).await.unwrap()).unwrap();
@@ -3157,7 +3161,7 @@ async fn the_reviewer_role_key_names_the_judge() {
 
 #[tokio::test]
 async fn without_a_key_the_reviewer_is_one_rung_below_the_implementer() {
-    let (line, asked, rows) = reviewed_on("claude-fable-5-1", "[[route]]\nmodel = \"fable\"\n").await;
+    let (line, asked, rows) = reviewed_on("claude-fable-5-2", "[[route]]\nmodel = \"fable\"\n").await;
     assert_eq!(asked, "claude-opus-5-5", "Fable never reviews Fable");
     assert!(line.contains(" (default, one rung down) · "), "{line}");
     assert_eq!(rows, [("claude-opus-5-5".to_owned(), Some("reviewer".to_owned()))]);

@@ -574,7 +574,7 @@ pub struct Start {
 impl Default for Ladder {
     fn default() -> Self {
         Self {
-            models: ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-5-5", "claude-fable-5-1"].map(str::to_owned).to_vec(),
+            models: ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-5-5", "claude-fable-5-2"].map(str::to_owned).to_vec(),
             start: vec![Start { complexity: Span::Between(1, 2), down: 1 }],
             up_after: 1,
         }

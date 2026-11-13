@@ -48,7 +48,7 @@ const LAYOUT_FILE: &str = "var/window.toml";
 
 /// The Claude models a card can be assigned from the card view, strongest first.
 const MODELS: [(&str, &str); 3] =
-    [("claude-fable-5-1", "Fable 5.1"), ("claude-opus-5-5", "Opus 5.5"), ("claude-haiku-4-5-20251001", "Haiku 4.5")];
+    [("claude-fable-5-2", "Fable 5.2"), ("claude-opus-5-5", "Opus 5.5"), ("claude-haiku-4-5-20251001", "Haiku 4.5")];
 
 /// The four tabs of the card area.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

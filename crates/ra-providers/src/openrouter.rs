@@ -116,7 +116,15 @@ impl Price {
 /// The Anthropic models' list prices, by the words of a model id, the first match standing: the
 /// Claude Code route reports a cost only with a result, and a run stopped before one is priced
 /// here; `OpenRouter` falls back to it for a Claude model its list leaves out.
-const ANTHROPIC: [(&str, Price); 8] = [
+const ANTHROPIC: [(&str, Price); 15] = [
+    // Fable 5.2 lowered Fable's price; 5.0 and 5.1 keep theirs (2026-11-13 list)
+    ("fable-5-2", Price::anthropic(8.0, 40.0)),
+    ("fable-5.2", Price::anthropic(8.0, 40.0)),
+    ("fable", Price::anthropic(10.0, 50.0)),
+    ("opus-5-5", Price::anthropic(4.0, 20.0)),
+    ("opus-5.5", Price::anthropic(4.0, 20.0)),
+    ("sonnet-5-5", Price::anthropic(2.0, 10.0)),
+    ("sonnet-5.5", Price::anthropic(2.0, 10.0)),
     ("opus-4-0", Price::anthropic(15.0, 75.0)),
     ("opus-4-1", Price::anthropic(15.0, 75.0)),
     ("opus-4.1", Price::anthropic(15.0, 75.0)),

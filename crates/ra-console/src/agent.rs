@@ -44,7 +44,7 @@ const HINT_RANGES: usize = 8;
 /// The short names of the Claude models and the ids they stand for on the Claude Code route: the
 /// ids move with the releases, the names stay, and a person types the name.
 pub const ALIASES: [(&str, &str); 4] =
-    [("fable", "claude-fable-5-1"), ("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5-5"), ("haiku", ra_providers::route::HAIKU)];
+    [("fable", "claude-fable-5-2"), ("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5-5"), ("haiku", ra_providers::route::HAIKU)];
 
 /// The id `model` stands for: the alias table's when it is one of the short names, `model`
 /// itself otherwise. Every place a model is typed goes through here, so the badge, the ledger and

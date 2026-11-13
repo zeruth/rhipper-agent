@@ -358,10 +358,10 @@ fn a_turn_past_the_context_cap_stops_the_run_once_its_tool_results_are_in() {
     assert_eq!(answer.usage.prompt_tokens, turns * 90_003 + 130_005);
     assert_eq!(answer.usage.completion_tokens, turns * 40 + 90);
     assert_eq!(answer.usage.cached_tokens, turns * 90_000 + 120_000);
-    // the capped run has a cost of its own, computed: 41 fresh tokens at $5/M, 1.2M cache
-    // reads at $0.50/M, 10k cache writes at $6.25/M, 570 out at $25/M
+    // the capped run has a cost of its own, computed at Opus 5.5's list price: 41 fresh tokens
+    // at $4/M, 1.2M cache reads at $0.40/M, 10k cache writes at $5/M, 570 out at $20/M
     let cost = answer.usage.cost_usd.expect("a capped run is priced from its turns");
-    assert!((cost - 0.676_955).abs() < 1e-9, "{cost}");
+    assert!((cost - 0.541_564).abs() < 1e-9, "{cost}");
     assert!(answer.usage.cost_computed);
     assert_eq!(answer.text, "editing");
     assert_eq!(answer.turn_usage.len(), READING_IN_TURNS + 1);

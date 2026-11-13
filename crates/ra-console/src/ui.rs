@@ -31,7 +31,7 @@ const PROMPT: &str = "❯ ";
 const WHEEL_ROWS: usize = 3;
 /// The model the console starts with; `model` swaps it. A bare Claude id runs on the local
 /// Claude Code; `local/<name>` goes to the local server; a vendor-prefixed id goes through OpenRouter.
-pub const DEFAULT_MODEL: &str = "claude-fable-5-1";
+pub const DEFAULT_MODEL: &str = "claude-fable-5-2";
 
 /// Whether stdout is a terminal; the console needs one.
 pub fn is_terminal() -> bool {

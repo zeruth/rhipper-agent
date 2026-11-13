@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::Context;
 
 /// The three implementers the dashboard chooses between.
-pub const FABLE: &str = "claude-fable-5-1";
+pub const FABLE: &str = "claude-fable-5-2";
 pub const OPUS: &str = "claude-opus-5-5";
 pub const HAIKU: &str = "claude-haiku-4-5-20251001";
 
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn the_model_is_read_from_the_first_route() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nmodel = \"no\"\n[[route]]\nmodel = \"claude-fable-5-1\"\n")
+        std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nmodel = \"no\"\n[[route]]\nmodel = \"claude-fable-5-2\"\n")
             .unwrap();
         assert_eq!(model(dir.path()).as_deref(), Some(FABLE));
         set_model(dir.path(), OPUS).unwrap();
