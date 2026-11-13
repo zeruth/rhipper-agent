@@ -1749,6 +1749,98 @@ async fn in_debug_mode_the_run_keeps_the_worker_s_look_back_for_the_next_one() {
     assert_eq!(crate::retro::recent(dir.path(), 10).len(), 2);
 }
 
+/// The system messages of a dry run of `id`, before the user turn.
+async fn dry_system(store: &Store, id: i64) -> String {
+    let (out, _) = run(&format!("/run {id} dry"), store, &Worker::new("claude-sonnet-5-5")).await.unwrap();
+    let end = out.iter().position(|l| l == "--- user ---").expect("the user turn follows the system messages");
+    out[..end].join("\n")
+}
+
+#[tokio::test]
+async fn a_retro_line_older_than_seven_days_is_retired() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let (hour, week) = (now - 3600, now - crate::retro::RIDES_FOR - 60);
+    let log = format!(
+        "{hour}\t2\t0\tthe card named no files; a files line would have saved the search\n\
+         {week}\t2\t1\tthe outline of agent.rs is long\n"
+    );
+    std::fs::create_dir_all(dir.path().join("var")).unwrap();
+    std::fs::write(dir.path().join(crate::retro::RETRO_FILE), log).unwrap();
+    let system = dry_system(&store, 2).await;
+    assert!(system.contains("the card named no files"), "{system}");
+    assert!(!system.contains("outline of agent.rs"), "a week-old note does not ride: {system}");
+    // the line stays in the log for the person to read
+    assert!(std::fs::read_to_string(dir.path().join(crate::retro::RETRO_FILE)).unwrap().contains("outline of agent.rs"));
+}
+
+#[tokio::test]
+async fn a_retro_line_about_a_changed_check_is_retired() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let print = crate::retro::acceptance_print(None);
+    let hour = now - 3600;
+    let log = format!(
+        "{hour}\t2\t0\t`cargo test --workspace` relinks rc.exe; run it with --exclude rc\t{print}\n\
+         {hour}\t2\t0\tthe card named no files; a files line would have saved the search\n\
+         {hour}\t2\t0\tthe [worker] route sent a cheap model\n\
+         {hour}\t2\t0\tthe acceptance's `cargo test -p ra-tools` was typed by hand\t{print}\n"
+    );
+    std::fs::create_dir_all(dir.path().join("var")).unwrap();
+    std::fs::write(dir.path().join(crate::retro::RETRO_FILE), log).unwrap();
+    let system = dry_system(&store, 2).await;
+    assert!(system.contains("`cargo test --workspace` relinks") && system.contains("was typed by hand"), "{system}");
+    assert!(system.contains("[worker] route"), "{system}");
+    // the project's check is configured after the note was written: the note naming a command
+    // retires, the plain observation rides on
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\ncheck = \"cargo test -p ra-console\"\n").unwrap();
+    let system = dry_system(&store, 2).await;
+    assert!(!system.contains("cargo test --workspace") && !system.contains("was typed by hand"), "{system}");
+    assert!(!system.contains("[worker] route"), "{system}");
+    assert!(system.contains("the card named no files"), "{system}");
+    // a note written after the config change, against the card's acceptance, retires once the
+    // acceptance changes
+    std::fs::remove_file(dir.path().join(crate::router::ROUTES_FILE)).unwrap();
+    let system = dry_system(&store, 2).await;
+    assert!(system.contains("was typed by hand"), "{system}");
+    run("/edit 2 acceptance `cargo test -p ra-console` passes", &store, &worker()).await.unwrap();
+    let system = dry_system(&store, 2).await;
+    assert!(!system.contains("was typed by hand") && system.contains("the card named no files"), "{system}");
+}
+
+#[test]
+fn rc_note_retire_marks_one_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path().join("hub").join("notes.log");
+    let notes = crate::retro::parse("## Faster next time\n- [machine] sed is refused\n- the card named no files\n");
+    crate::retro::record_with(dir.path(), &shared, Some(4), &notes).unwrap();
+    assert_eq!(std::fs::read_to_string(&shared).unwrap().lines().count(), 1);
+    let listed = crate::retro::numbered(dir.path(), 10);
+    assert_eq!(
+        listed.iter().map(|(line, n)| (*line, n.text.as_str())).collect::<Vec<_>>(),
+        [(2, "the card named no files"), (1, "sed is refused")]
+    );
+    assert_eq!(crate::retro::retire_with(dir.path(), &shared, 1).unwrap(), "[machine] sed is refused");
+    let left = crate::retro::recent(dir.path(), 10);
+    assert_eq!(left.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), ["the card named no files"]);
+    assert!(!crate::retro::machine_lines_with(dir.path(), &shared).contains("sed is refused"));
+    // the lines stay, marked, and keep their numbers
+    let log = std::fs::read_to_string(dir.path().join(crate::retro::RETRO_FILE)).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(lines[0].starts_with("retired\t") && lines[0].ends_with("sed is refused"), "{log}");
+    assert!(lines[1].ends_with("the card named no files"), "{log}");
+    assert!(std::fs::read_to_string(&shared).unwrap().starts_with("retired\t"));
+    assert_eq!(crate::retro::numbered(dir.path(), 10).iter().map(|(line, _)| *line).collect::<Vec<_>>(), [2]);
+    let err = crate::retro::retire_with(dir.path(), &shared, 1).unwrap_err().to_string();
+    assert!(err.contains("no note on line 1"), "a retired line is not retired twice: {err}");
+    let err = crate::retro::retire_with(dir.path(), &shared, 5).unwrap_err().to_string();
+    assert!(err.contains("no note on line 5"), "{err}");
+}
+
 #[tokio::test]
 async fn a_reviewer_with_points_leaves_the_card_needs_revision_with_the_points_first_in_its_notes() {
     let dir = tempfile::tempdir().unwrap();
@@ -2715,24 +2807,26 @@ async fn a_check_that_outlives_its_budget_is_killed() {
     cargo_project(dir.path(), true);
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
-    // a real process, so the limit has something to kill: the sleep outlives the budget by far
+    // a real process, so the limit has something to kill: the sleep outlives the budget by far,
+    // and the budget is wide enough for python to start and print on a machine busy with
+    // other builds (a 1s budget missed the line under load, #179)
     run(r#"/edit 2 acceptance `python -c "print('started', flush=True); import time; time.sleep(60)"` passes"#, &store, &worker())
         .await
         .unwrap();
-    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 1\n").unwrap();
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 5\n").unwrap();
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])]));
     let started = std::time::Instant::now();
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_secs(30), "the walk did not wait for the sleep: {out:?}");
-    assert!(out.iter().any(|l| l.contains("check failed: python -c") && l.contains(" · timed out after 1s")), "{out:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(40), "the walk did not wait for the sleep: {out:?}");
+    assert!(out.iter().any(|l| l.contains("check failed: python -c") && l.contains(" · timed out after 5s")), "{out:?}");
     let node = store.read(2).await.unwrap();
     assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
     // python ends its line the platform's way; the output before the limit and the line stay
     let notes = node.notes.unwrap_or_default().replace("\r\n", "\n");
     assert!(notes.starts_with("check failed: python -c"), "{notes}");
-    assert!(notes.contains("started\ntimed out after 1s\n\ndone"), "{notes}");
+    assert!(notes.contains("started\ntimed out after 5s\n\ndone"), "{notes}");
     let task = ra_context::TaskContext::open(dir.path(), 2);
-    assert!(task.handoffs.last().is_some_and(|h| h.report.contains("timed out after 1s")), "{:?}", task.handoffs.last());
+    assert!(task.handoffs.last().is_some_and(|h| h.report.contains("timed out after 5s")), "{:?}", task.handoffs.last());
 }
 
 #[tokio::test]
