@@ -393,6 +393,19 @@ impl Worker {
         }
     }
 
+    /// The ledger's cards, the costliest first, each summed over every run on it; `None`
+    /// without a ledger, or when it cannot be read.
+    pub async fn by_card(&self) -> Option<Vec<ra_usage::CardCost>> {
+        let ledger = self.ledger.as_ref()?;
+        match ledger.by_card().await {
+            Ok(cards) => Some(cards),
+            Err(e) => {
+                tracing::warn!("cannot read the usage ledger: {e:#}");
+                None
+            }
+        }
+    }
+
     /// The ledger's calls of one node, the latest first (`None` for the calls that served none);
     /// `None` as a whole without a ledger, or when it cannot be read.
     pub async fn calls_of(&self, node: Option<i64>) -> Option<Vec<ra_usage::Call>> {
@@ -3206,7 +3219,23 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 }
             }
             (Seat::Build(_), Err(error)) => {
-                stopped.get_or_insert(format!("stopped: the run of #{id} failed: {error:#}"));
+                // a full stop (the plan's limit, the provider gone) stops the walk; a card's own
+                // failure (the content filter on one card, runelite #56) is that card's: it waits
+                // for a person and the other runners go on (the walk stopped starting cards on
+                // it and runelite ran one card of four, 2026-11-12)
+                let text = format!("{error:#}");
+                let full_stop = ["unreachable", "limit", "week", "logged in", "authentication"]
+                    .iter()
+                    .any(|word| text.to_ascii_lowercase().contains(word));
+                if full_stop {
+                    stopped.get_or_insert(format!("stopped: the run of #{id} failed: {text}"));
+                } else {
+                    parked.insert(id);
+                    let line = format!("#{id} failed and waits for a person; the walk goes on: {}", first_line(&text));
+                    tracing::warn!("{line}");
+                    crate::pair::event(&root, &line);
+                    lines.push(line);
+                }
             }
         }
     }

@@ -188,7 +188,12 @@ enum Command {
         model: String,
     },
     /// The usage ledger: the calls, the tokens and the cost of every model, all time.
-    Usage,
+    Usage {
+        /// By card instead: the costliest `n` cards (20 when bare), each summed over every run on it,
+        /// landed or not, with its state from the roadmap, and a last line totalling the landed ones.
+        #[arg(long, value_name = "n", num_args = 0..=1, default_missing_value = "20")]
+        cards: Option<usize>,
+    },
     /// This project's state in one line: the live run (orphaned when its process is gone), the ready count, today's calls and the last end.
     Status {
         /// One line per project the hub remembers (the window's tabs, the digests), this one first.
@@ -594,9 +599,12 @@ async fn run_main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Usage => {
+        Command::Usage { cards } => {
             plain_tracing()?;
-            usage().await
+            match cards {
+                Some(limit) => usage_cards(limit).await,
+                None => usage().await,
+            }
         }
         // a read of files only, no trace: it runs from any directory, a project or not
         Command::Status { all } => {
@@ -1072,6 +1080,61 @@ async fn usage() -> anyhow::Result<()> {
         cost(all.cost_usd)
     );
     Ok(())
+}
+
+/// Prints the ledger by card, the costliest `limit` first, and what the landed cards cost in
+/// all: the measure a card of Phase V is judged by.
+async fn usage_cards(limit: usize) -> anyhow::Result<()> {
+    let ledger = open_ledger().await?;
+    let cards = ledger.by_card().await?;
+    if cards.is_empty() {
+        println!("the ledger is empty: no completion has run yet");
+        return Ok(());
+    }
+    let nodes = open_store().await?.load().await?.nodes;
+    for line in usage_card_lines(&cards, &nodes, limit) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The lines of `rc usage --cards`: the header, a row per card for the costliest `limit` of
+/// `cards` (the state `?` for a card the roadmap lost, the cost `?` when no call reported one),
+/// and a last line totalling the accepted cards of the whole ledger, with the median cost of
+/// those whose cost is known.
+fn usage_card_lines(cards: &[ra_usage::CardCost], nodes: &[ra_roadmap::model::Node], limit: usize) -> Vec<String> {
+    let states = tree::effective_states(nodes);
+    let state = |node: i64| states.get(&node).map_or_else(|| "?".to_owned(), ToString::to_string);
+    let dollars = |cost: Option<f64>| cost.map_or_else(|| "?".to_owned(), |c| format!("${c:.2}"));
+    // the widths are the header's, so the header reads as written and the rows line up under it
+    let row = |card: &str, runs: &str, turns: &str, per_turn: &str, read_in: &str, cost: &str, state: &str| {
+        format!("{card:<4}  {runs:>4}  {turns:>5}  {per_turn:>8}  {read_in:>7}  {cost:>4}  {state}")
+    };
+    let mut lines = vec![row("card", "runs", "turns", "tok/turn", "read-in", "cost", "state")];
+    for card in cards.iter().take(limit) {
+        let t = &card.totals;
+        lines.push(row(
+            &format!("#{}", card.node),
+            &t.runs.to_string(),
+            &t.turns.to_string(),
+            &status::compact(card.tokens_per_turn()),
+            &status::compact(t.read_in),
+            &dollars(t.cost_usd),
+            &state(card.node),
+        ));
+    }
+    let landed: Vec<_> = cards.iter().filter(|c| states.get(&c.node) == Some(&TaskState::Accepted)).collect();
+    let mut known: Vec<f64> = landed.iter().filter_map(|c| c.totals.cost_usd).collect();
+    known.sort_by(f64::total_cmp);
+    // folded from zero: `sum` of nothing is -0.0 and would print as `$-0.00`
+    let total = known.iter().fold(0.0, |total, cost| total + cost);
+    let median = match known.len() {
+        0 => "?".to_owned(),
+        n if n % 2 == 1 => format!("${:.2}", known[n / 2]),
+        n => format!("${:.2}", f64::midpoint(known[n / 2 - 1], known[n / 2])),
+    };
+    lines.push(format!("landed: {} cards, ${total:.2}, median {median} a card", landed.len()));
+    lines
 }
 
 /// The default roadmap file; the commands open it in the working directory.

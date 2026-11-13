@@ -174,6 +174,34 @@ async fn usage_prints_the_ledger_by_card_summed_up_the_tree() {
 }
 
 #[tokio::test]
+async fn usage_by_card_sums_every_run_of_a_card() {
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    let entry = |node: i64, turns: u64, cost: Option<f64>| ra_usage::Entry {
+        model: "m".to_owned(),
+        role: None,
+        node: Some(node),
+        prompt_tokens: 1_000,
+        completion_tokens: 100,
+        cached_tokens: 0,
+        cost_usd: cost,
+        cost_computed: false,
+        turns,
+        read_in: 300,
+    };
+    // two runs on card 3, one on card 4 whose model reports no cost
+    for e in [entry(3, 6, Some(0.30)), entry(3, 4, Some(0.20)), entry(4, 5, None)] {
+        ledger.record(&e).await.unwrap();
+    }
+    // a worker without a ledger reads nothing; with one, the costliest card first
+    assert!(worker().by_card().await.is_none());
+    let cards = worker().with_ledger(ledger).by_card().await.unwrap();
+    assert_eq!(
+        cards.iter().map(|c| (c.node, c.totals.runs, c.totals.turns, c.totals.cost_usd, c.tokens_per_turn())).collect::<Vec<_>>(),
+        [(3, 2, 10, Some(0.5), 220), (4, 1, 5, None, 220)]
+    );
+}
+
+#[tokio::test]
 async fn adds_a_task_under_its_parent() {
     let store = store().await;
     let (out, _) = run("/add task Write the decoder parent 1", &store, &worker()).await.unwrap();

@@ -236,6 +236,44 @@ async fn the_recent_cards_up_to_a_mark_come_newest_first_and_sum_their_rows_in_i
 }
 
 #[tokio::test]
+async fn usage_by_card_sums_every_run_of_a_card() {
+    let store = UsageStore::in_memory().await.unwrap();
+    // card 3 ran twice, the second run cheaper; card 4 once, on a model that reports no cost
+    store
+        .record(&Entry {
+            turns: 10,
+            prompt_tokens: 2_000,
+            completion_tokens: 500,
+            read_in: 800,
+            ..entry("claude-opus-5-5", Some(3), Some(0.40))
+        })
+        .await
+        .unwrap();
+    store
+        .record(&Entry {
+            turns: 5,
+            prompt_tokens: 400,
+            completion_tokens: 100,
+            read_in: 200,
+            ..entry("claude-opus-5-5", Some(3), Some(0.10))
+        })
+        .await
+        .unwrap();
+    store.record(&Entry { turns: 3, prompt_tokens: 300, completion_tokens: 60, ..entry("local/qwen", Some(4), None) }).await.unwrap();
+    // a role's call on card 3 and a chat outside any card: calls, not runs
+    store.record(&Entry { role: Some("summary".to_owned()), ..entry("local/qwen", Some(3), None) }).await.unwrap();
+    store.record(&entry("claude-opus-5-5", None, Some(9.0))).await.unwrap();
+    let cards = store.by_card().await.unwrap();
+    assert_eq!(
+        cards.iter().map(|c| (c.node, c.totals.runs, c.totals.calls, c.totals.turns, c.totals.cost_usd)).collect::<Vec<_>>(),
+        [(3, 2, 3, 16, Some(0.5)), (4, 1, 1, 3, None)]
+    );
+    assert_eq!((cards[0].tokens_per_turn(), cards[0].totals.read_in), (3_110 / 16, 1_000));
+    assert_eq!(cards[1].tokens_per_turn(), 120);
+    assert!(UsageStore::in_memory().await.unwrap().by_card().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_card_the_ledger_has_not_seen_costs_nothing() {
     let store = UsageStore::in_memory().await.unwrap();
     let card = store.card_cost(9).await.unwrap();
