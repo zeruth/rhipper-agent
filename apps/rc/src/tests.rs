@@ -299,6 +299,22 @@ fn rc_wait_on_a_live_pid_outlasts_ten_silent_seconds_and_returns_when_it_ends() 
 }
 
 #[test]
+fn wait_outlives_a_running_job() {
+    let dir = std::env::temp_dir().join(format!("rc-wait-job-{}", std::process::id()));
+    let job = wait::Job::start(&dir, "cargo build");
+    let finisher = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        job.finish(7);
+    });
+    let started = std::time::Instant::now();
+    let code = wait::run(&dir, Some(&std::process::id().to_string()), Some(std::time::Duration::from_secs(1)));
+    assert_eq!(code, 7);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(2), "gave up after {:?}", started.elapsed());
+    finisher.join().expect("the finisher");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bench_reads_the_hub() {
     let known = vec![PathBuf::from("no-such/asm"), PathBuf::from("no-such/agent"), PathBuf::from("no-such/runelite")];
     let order = vec!["Agent".to_owned(), "runelite".to_owned()];

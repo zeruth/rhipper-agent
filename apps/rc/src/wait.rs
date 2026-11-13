@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 /// How often a waiting job's exit line is looked for.
 const POLL: Duration = Duration::from_millis(500);
 
+/// How often a job that still runs says so.
+const PROGRESS: Duration = Duration::from_mins(1);
+
 fn jobs_dir(dir: &Path) -> PathBuf {
     dir.join("var").join("jobs")
 }
@@ -52,9 +55,9 @@ fn newest(dir: &Path) -> Option<u32> {
 }
 
 /// Waits for a job of `dir` for `rc wait`: `target` is its id, the newest job when left out; a
-/// target that is no job is a pid or a file, waited on as before. Without a `timeout` it blocks
-/// until the job's exit line. Answers the job's own exit code, 0 when the timeout ran out first
-/// (the job still runs), 1 when there is no job to wait for.
+/// target that is no job is a pid or a file, waited on as before under the `timeout`. A job is
+/// waited on until its exit line however long it runs, with a progress line a minute. Answers the
+/// job's own exit code, 1 when there is no job to wait for.
 #[must_use]
 pub(crate) fn run(dir: &Path, target: Option<&str>, timeout: Option<Duration>) -> i32 {
     let id = if let Some(t) = target {
@@ -69,9 +72,16 @@ pub(crate) fn run(dir: &Path, target: Option<&str>, timeout: Option<Duration>) -
         };
         id
     };
+    wait_job(dir, id, PROGRESS)
+}
+
+/// Waits for the exit line of job `id`, a line of progress every `progress`: a job that still runs
+/// is waited on whatever the limit, a compile is not a silence.
+fn wait_job(dir: &Path, id: u32, progress: Duration) -> i32 {
     println!("waiting {id}");
     let exit = jobs_dir(dir).join(format!("{id}.exit"));
     let started = Instant::now();
+    let mut last_line = started;
     loop {
         if let Ok(line) = std::fs::read_to_string(&exit) {
             print!("{line}");
@@ -81,9 +91,9 @@ pub(crate) fn run(dir: &Path, target: Option<&str>, timeout: Option<Duration>) -
             println!("{id} ended without an exit line");
             return 1;
         }
-        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-            println!("still running {id}");
-            return 0;
+        if last_line.elapsed() >= progress {
+            println!("still running {id} · {}s", started.elapsed().as_secs());
+            last_line = Instant::now();
         }
         std::thread::sleep(POLL);
     }
