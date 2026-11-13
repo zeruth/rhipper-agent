@@ -33,10 +33,11 @@ pub fn count_landing(root: &Path) {
     let _ = std::fs::write(root.join(COUNT_FILE), (landed_since(root) + 1).to_string());
 }
 
-/// Whether a pass is running now.
+/// Whether a pass is running now: its marker names a pid that is alive. A marker of a dead pass
+/// (or one with no readable pid) holds nothing.
 #[must_use]
 pub fn running(root: &Path) -> bool {
-    root.join(RUNNING_FILE).exists()
+    std::fs::read_to_string(root.join(RUNNING_FILE)).ok().and_then(|t| t.trim().parse::<u32>().ok()).is_some_and(crate::hub::pid_alive)
 }
 
 /// Whether a pass is due: [`EVERY`] cards landed and none running.
@@ -103,8 +104,21 @@ mod tests {
         count_landing(dir.path());
         assert_eq!(landed_since(dir.path()), 10);
         assert!(due(dir.path()));
-        std::fs::write(dir.path().join(RUNNING_FILE), "1").unwrap();
+        std::fs::write(dir.path().join(RUNNING_FILE), std::process::id().to_string()).unwrap();
         assert!(!due(dir.path()), "a pass running holds the next");
+    }
+
+    #[test]
+    fn a_stale_marker_of_a_dead_pass_holds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("var")).unwrap();
+        for _ in 0..EVERY {
+            count_landing(dir.path());
+        }
+        // a pid no process holds: the largest a pid can be
+        std::fs::write(dir.path().join(RUNNING_FILE), (u32::MAX - 1).to_string()).unwrap();
+        assert!(!running(dir.path()));
+        assert!(due(dir.path()));
     }
 
     #[test]

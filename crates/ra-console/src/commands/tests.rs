@@ -2547,7 +2547,7 @@ async fn a_stopped_walk_ends_after_the_current_card_with_its_rerun_still_queued(
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
-    crate::agent::stop_walk(dir.path());
+    let _ = crate::agent::stop_walk(dir.path());
     let failing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((1, "the probe broke\n".to_owned())));
     let provider = Scripted::new(vec![says("changed `src/lib.rs`", vec![])]);
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(failing);

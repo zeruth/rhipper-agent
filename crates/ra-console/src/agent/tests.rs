@@ -3,6 +3,24 @@
 
 use super::*;
 
+#[test]
+fn a_stale_marker_stop_for_another_walk_stops_nothing_and_one_for_this_walk_stops_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("var")).unwrap();
+    let stop = dir.path().join(WALK_STOP);
+    // a pid no process holds: a stop left for a dead walk
+    std::fs::write(&stop, (u32::MAX - 1).to_string()).unwrap();
+    assert!(!take_stop(dir.path()));
+    assert!(!stop.exists(), "a stop for a dead walk is removed");
+    std::fs::write(&stop, std::process::id().to_string()).unwrap();
+    assert!(take_stop(dir.path()));
+    assert!(!stop.exists());
+    // with the walk of the pid file dead, a stop leaves nothing behind
+    std::fs::write(dir.path().join(WALK_PID), (u32::MAX - 1).to_string()).unwrap();
+    let _ = stop_walk(dir.path());
+    assert!(!stop.exists());
+}
+
 /// A test that bounds elapsed time from above fails on a busy machine and proves nothing about
 /// the code: it asserts the thing that ended (the text, the child gone), not how fast.
 #[test]

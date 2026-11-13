@@ -2670,6 +2670,7 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     let Some(_lock) = lock else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
     };
+    note_walk_pid(&workspace_of(store));
     // what the install said at the start: a change since is a newer rc to move to
     let seen = worker.install.as_deref().and_then(crate::hub::installed);
     // set when the move failed: the walk finishes on its own rc rather than try at every card
@@ -2826,9 +2827,7 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             }
         }
         // `stop` from the console or the window: the walk ends after the run it was in
-        let stop = root.join(WALK_STOP);
-        if stop.exists() {
-            let _ = std::fs::remove_file(&stop);
+        if take_stop(&root) {
             done(&mut lines, format!("ran {ran} card(s) · stopped after #{id}, as asked")).await;
             return Ok(lines);
         }
@@ -2917,6 +2916,8 @@ pub fn rejections(root: &Path, id: i64) -> usize {
 const WALK_STOP: &str = "var/walk.stop";
 /// The file `rc walk` leaves for the window, which starts the walk as its own process.
 const WALK_START: &str = "var/walk.start";
+/// The pid of the walk that last took the lock, for a `stop` to name.
+const WALK_PID: &str = "var/walk.pid";
 /// The file a running walk holds open for exclusive use, so a second one does not start.
 const WALK_LOCK: &str = "var/walk.lock";
 
@@ -3064,13 +3065,47 @@ pub fn relaunch(dir: &Path, root: &Path) -> anyhow::Result<u32> {
     Ok(child.id())
 }
 
-/// Asks the walk to stop after the task it is in: leaves the file it reads between runs. A
-/// walk that is not running finds the file at its next start and stops after one card, so the
-/// line says what to do about that.
+/// Records the running walk's pid where a `stop` can read it: the walk lock cannot be read
+/// while it is held.
+fn note_walk_pid(root: &Path) {
+    let _ = std::fs::write(root.join(WALK_PID), std::process::id().to_string());
+}
+
+/// Whether a stop file is for this walk, taking it up. A stop carries the pid of the walk it is
+/// for: one for another walk is not this one's, and one for a dead walk is removed; one with no
+/// pid is for any walk.
+fn take_stop(root: &Path) -> bool {
+    let path = root.join(WALK_STOP);
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    match text.trim().parse::<u32>() {
+        Ok(pid) if pid != std::process::id() => {
+            if !crate::hub::pid_alive(pid) {
+                let _ = std::fs::remove_file(&path);
+            }
+            false
+        }
+        _ => {
+            let _ = std::fs::remove_file(&path);
+            true
+        }
+    }
+}
+
+/// Asks the walk to stop after the task it is in: leaves the file it reads between runs, with
+/// the pid of the walk it is for. With no walk running nothing is left behind, so no later walk
+/// stops after one card for it.
+#[must_use]
 pub fn stop_walk(root: &Path) -> String {
     let path = root.join(WALK_STOP);
     let _ = std::fs::create_dir_all(root.join("var"));
-    match std::fs::write(&path, "") {
+    let pid = std::fs::read_to_string(root.join(WALK_PID)).ok().and_then(|t| t.trim().parse::<u32>().ok());
+    if let Some(pid) = pid
+        && !crate::hub::pid_alive(pid)
+    {
+        let _ = std::fs::remove_file(&path);
+        return "no walk is running here, so there is nothing to stop".to_owned();
+    }
+    match std::fs::write(&path, pid.map(|p| p.to_string()).unwrap_or_default()) {
         Ok(()) => "the walk stops after the task it is in; `quit` is the word that closes the window".to_owned(),
         Err(e) => format!("cannot ask the walk to stop: {e}"),
     }
@@ -4833,6 +4868,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     let Some(_lock) = take_walk_lock(&root) else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
     };
+    note_walk_pid(&root);
     probe_the_machine(&root).await;
     let mut lines = Vec::new();
     // the cards a killed walk left in progress go back on the queue before this one reads it
@@ -4869,9 +4905,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     loop {
         // `stop` from the console or the window: nothing new starts, and the walk ends when
         // the runs it is in have ended
-        let stop = root.join(WALK_STOP);
-        if stopped.is_none() && stop.exists() {
-            let _ = std::fs::remove_file(&stop);
+        if stopped.is_none() && take_stop(&root) {
             stopped = Some("stopped as asked, after the cards it was in".to_owned());
         }
         // the slots: the machine's pool, shared by every project's walk (see [`Pool`]). A
@@ -8791,9 +8825,7 @@ fn ancestor_line(ancestor: &Node) -> String {
     };
     let end = objective
         .char_indices()
-        .find(|&(i, c)| {
-            matches!(c, '.' | '!' | '?' | '\n') && objective[i + c.len_utf8()..].chars().next().is_none_or(char::is_whitespace)
-        })
+        .find(|&(i, c)| matches!(c, '.' | '!' | '?' | '\n') && objective[i + c.len_utf8()..].chars().next().is_none_or(char::is_whitespace))
         .map_or(objective.len(), |(i, c)| if c == '\n' { i } else { i + c.len_utf8() });
     format!("Under #{} {}: {}\n", ancestor.id, ancestor.title, &objective[..end])
 }
