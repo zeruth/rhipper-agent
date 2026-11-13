@@ -102,7 +102,7 @@ remedy = { kind = "rewrite", insert = "2>&1 | tail -n 80", append = true, unless
 # build runs under `rc hold`, which waits for one of the machine's four shared build slots
 id = "build-slot"
 where = "command"
-pattern = '^\s*(&\s+)?(\.[\\/])?(gw\.ps1|gradlew(\.bat)?)\b|^\s*cargo\s+(build|test|check|clippy|run|bench|doc|nextest)\b'
+pattern = '^\s*(&\s+)?(\.[\\/])?(gw\.ps1|gradlew(\.bat)?)\b|^\s*cargo\s+(build|test|check|clippy|run|bench|doc|nextest|fmt)\b'
 message = "a build takes one of the machine's four build slots, shared by every project: the command runs under `rc hold --`, which waits its turn while they are all taken, then runs it as written"
 remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 

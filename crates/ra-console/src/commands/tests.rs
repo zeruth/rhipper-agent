@@ -2326,6 +2326,45 @@ async fn a_reviewer_that_accepts_moves_the_card_to_accepted_and_the_verdict_lead
     assert_eq!(verdict_of("the diff misses the test"), Verdict::NeedsRevision(vec!["the diff misses the test".into()]));
 }
 
+/// Reviews a fresh card run on `implementer` in a project whose `rhipper.toml` is `routes`:
+/// the verdict line, the model the reviewer was asked on, and the ledger's reviewer rows.
+async fn reviewed_on(implementer: &str, routes: &str) -> (String, String, Vec<(String, Option<String>)>) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("rhipper.toml"), routes).unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let reviewer = Scripted::new(vec![says("Accepted.", vec![])]);
+    let runner = Worker::new(implementer).with_provider(reviewer.clone()).with_ledger(ra_usage::UsageStore::in_memory().await.unwrap());
+    let (out, _) = run("/review 2", &store, &runner).await.unwrap();
+    let asked = reviewer.seen.lock()[0].model.clone();
+    let rows = runner.by_role().await.unwrap().into_iter().map(|(model, role, _)| (model, role)).collect();
+    (out[0].clone(), asked, rows)
+}
+
+#[tokio::test]
+async fn the_reviewer_role_key_names_the_judge() {
+    let (line, asked, rows) = reviewed_on("claude-opus-5-5", "[[route]]\nmodel = \"opus\"\n\n[role]\nreviewer = \"haiku\"\n").await;
+    let haiku = crate::agent::resolve("haiku");
+    assert_eq!(asked, haiku);
+    assert!(line.starts_with(&format!("✓ #2 Probe accepted by {} (role)", crate::agent::short(&haiku))), "{line}");
+    assert_eq!(rows, [(haiku, Some("reviewer".to_owned()))]);
+}
+
+#[tokio::test]
+async fn without_a_key_the_reviewer_is_one_rung_below_the_implementer() {
+    let (line, asked, rows) = reviewed_on("claude-fable-5-1", "[[route]]\nmodel = \"fable\"\n").await;
+    assert_eq!(asked, "claude-opus-5-5", "Fable never reviews Fable");
+    assert!(line.contains(" (default, one rung down) · "), "{line}");
+    assert_eq!(rows, [("claude-opus-5-5".to_owned(), Some("reviewer".to_owned()))]);
+    // a big card is never judged below the ladder's sonnet, and never by its own implementer
+    let ladder = crate::router::Ladder::default();
+    assert_eq!(ladder.judge("claude-opus-5-5", 2).as_deref(), Some("claude-sonnet-4-5"));
+    assert_eq!(ladder.judge("claude-sonnet-4-5", 2).as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(ladder.judge("claude-sonnet-4-5", 5).as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(ladder.judge("claude-haiku-4-5", 1).as_deref(), Some("claude-sonnet-4-5"));
+    assert_eq!(ladder.judge("z-ai/glm-5.3-flash", 3), None);
+}
+
 /// Reviews a card that has one handoff of a run with `answer` as the reviewer's verdict: the
 /// run line, the notes and the outcome the handoff was left with.
 async fn reviewed_after_a_run(answer: &str) -> (Vec<String>, String, String) {

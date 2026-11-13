@@ -392,6 +392,7 @@ fn prefix_of(entry: &str) -> Option<String> {
 /// digest = "local/qwen3-8b"      # the run's line in the project's digest
 /// classify = ""                  # whether an untagged look-back is [machine]: off
 /// fix = "local/qwen3-8b"         # the fix pass of a trivially rejected card; off without a server
+/// reviewer = "sonnet"            # the judge; one rung below the implementer when left out
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct RoleConfig {
@@ -405,6 +406,11 @@ pub struct RoleConfig {
     /// when no local server answers and the table names nothing.
     #[serde(default)]
     pub fix: Option<String>,
+    /// The judge of a card's run, read before the `reviewer` route rules; left out, it is one
+    /// rung below the implementer on the ladder ([`Ladder::judge`]), so a model never reviews
+    /// its own work.
+    #[serde(default)]
+    pub reviewer: Option<String>,
 }
 
 impl RoleConfig {
@@ -516,6 +522,24 @@ impl Ladder {
         };
         Some(Step { model, note: said })
     }
+
+    /// The default reviewer of a card of `complexity` run on `implementer`: one rung below it,
+    /// never under the ladder's first sonnet for c4–5, and a rung above when the floor or the
+    /// bottom of the ladder would leave the implementer judging itself. `None` when the
+    /// implementer is not on the ladder or the ladder has no other rung.
+    #[must_use]
+    pub fn judge(&self, implementer: &str, complexity: u8) -> Option<String> {
+        let id = |model: &str| crate::agent::resolve(model);
+        let own = id(implementer);
+        let at = self.models.iter().position(|model| id(model) == own)?;
+        let floor =
+            if complexity >= 4 { self.models.iter().position(|model| id(model).starts_with("claude-sonnet-")).unwrap_or(0) } else { 0 };
+        let mut rung = at.saturating_sub(1).max(floor);
+        if rung == at {
+            rung = at + 1;
+        }
+        self.models.get(rung).map(|model| id(model))
+    }
 }
 
 /// The rules of a project, in the order of the file, its worker table, its role table, its
@@ -605,6 +629,25 @@ impl Router {
             choice.model.clone_from(&step.model);
         }
         (choice, step)
+    }
+
+    /// The judge of `node` run on `implementer` and sent back `rejections` times, with the
+    /// words the review line says it with: the `[role] reviewer` key, else the first `reviewer`
+    /// rule, else one rung below the implementer ([`Ladder::judge`]); the implementer itself
+    /// only when it is off the ladder.
+    #[must_use]
+    pub fn reviewer(&self, node: &Node, implementer: &str, rejections: usize) -> (String, String) {
+        let resolve = crate::agent::resolve;
+        if let Some(model) = self.role.reviewer.as_deref().map(str::trim).filter(|model| !model.is_empty()) {
+            return (resolve(model), "role".to_owned());
+        }
+        if let Some((place, rule)) = self.pick(node, REVIEWER, rejections) {
+            return (resolve(&rule.model), format!("rule {place}"));
+        }
+        match self.ladder.judge(implementer, node.complexity) {
+            Some(model) => (model, "default, one rung down".to_owned()),
+            None => (resolve(implementer), "default, the implementer: off the ladder".to_owned()),
+        }
     }
 
     /// Why `choice` fell where it did for `node`, as the route line says it: `by rule 2: files

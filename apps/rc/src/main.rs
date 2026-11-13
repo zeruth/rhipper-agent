@@ -930,7 +930,7 @@ fn hook_pre(
             let first = command.trim_start().trim_start_matches("& ").trim_start_matches(".\\").trim_start_matches("./");
             first.starts_with("gw.ps1")
                 || first.starts_with("gradlew")
-                || first.starts_with("cargo ")
+                || (first.starts_with("cargo ") && !first.starts_with("cargo fmt"))
                 || command.contains("run-awt-contracts.py")
         })
     };
