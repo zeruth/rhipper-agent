@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 pub mod digest;
+pub mod map;
 pub mod plan;
 
 /// The project context, beside the roadmap file.
