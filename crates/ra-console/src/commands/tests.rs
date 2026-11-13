@@ -4167,27 +4167,47 @@ async fn a_check_that_outlives_its_budget_is_killed() {
     cargo_project(dir.path(), true);
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
-    // a real process, so the limit has something to kill: the sleep outlives the budget by far,
-    // and the budget is wide enough for python to start and print on a machine busy with
-    // other builds (a 1s budget missed the line under load, #179, and 5s did under the full
-    // suite on the builders' CPU share, #190)
-    run(r#"/edit 2 acceptance `python -c "print('started', flush=True); import time; time.sleep(120)"` passes"#, &store, &worker())
-        .await
-        .unwrap();
-    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 15\n").unwrap();
+    // a real process, so the limit has something to kill: the child blocks on an event nothing
+    // sets, so only the budget ends it, and the assertions are the text and the child gone, not
+    // how long the walk took
+    let pid_file = dir.path().join("child.pid");
+    let pid_path = pid_file.display().to_string().replace('\\', "/");
+    run(
+        &format!(
+            "/edit 2 acceptance `python -c \"import os, threading; open(r'{pid_path}', 'w').write(str(os.getpid())); print('started', flush=True); threading.Event().wait()\"` passes"
+        ),
+        &store,
+        &worker(),
+    )
+    .await
+    .unwrap();
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 1\n").unwrap();
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])]));
-    let started = std::time::Instant::now();
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_secs(90), "the walk did not wait for the sleep: {out:?}");
-    assert!(out.iter().any(|l| l.contains("check failed: python -c") && l.contains(" · timed out after 15s")), "{out:?}");
+    assert!(out.iter().any(|l| l.contains("check failed: python -c") && l.contains(" · timed out after 1s")), "{out:?}");
+    let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    assert!(process_is_gone(pid), "the child {pid} outlived the budget: {out:?}");
     let node = store.read(2).await.unwrap();
     assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
     // python ends its line the platform's way; the output before the limit and the line stay
     let notes = node.notes.unwrap_or_default().replace("\r\n", "\n");
     assert!(notes.starts_with("check failed: python -c"), "{notes}");
-    assert!(notes.contains("started\ntimed out after 15s\n\ndone"), "{notes}");
+    assert!(notes.contains("started\ntimed out after 1s\n\ndone"), "{notes}");
     let task = ra_context::TaskContext::open(dir.path(), 2);
-    assert!(task.handoffs.last().is_some_and(|h| h.report.contains("timed out after 15s")), "{:?}", task.handoffs.last());
+    assert!(task.handoffs.last().is_some_and(|h| h.report.contains("timed out after 1s")), "{:?}", task.handoffs.last());
+}
+
+/// Whether no process answers to `pid` any more.
+fn process_is_gone(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().unwrap();
+        !String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        !std::process::Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())
+    }
 }
 
 #[tokio::test]
@@ -4250,11 +4270,7 @@ async fn a_wait_on_a_target_ends_at_the_check_timeout_naming_the_holder() {
         .with_provider(Scripted::new(vec![says("done", vec![])]))
         .with_script(script)
         .with_worktree(worktree, "card/2");
-    let started = std::time::Instant::now();
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
-    // far under the 20 min a wait without the timeout would take, and wide enough for the run
-    // around it on a machine busy with the full suite and other projects' builds
-    assert!(started.elapsed() < std::time::Duration::from_secs(120), "the walk did not give up the wait: {out:?}");
     let failure = format!("the check waited 1 s on {} held by other #9", target.display());
     assert!(out.iter().any(|l| l.contains("check failed: cargo test -q") && l.contains(&failure)), "{out:?}");
     let node = store.read(2).await.unwrap();

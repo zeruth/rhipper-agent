@@ -3,6 +3,32 @@
 
 use super::*;
 
+/// A test that bounds elapsed time from above fails on a busy machine and proves nothing about
+/// the code: it asserts the thing that ended (the text, the child gone), not how fast.
+#[test]
+fn no_elapsed_ceiling_stands_in_the_suites() {
+    let files = [
+        ("crates/ra-tools/src/tests.rs", include_str!("../../../ra-tools/src/tests.rs")),
+        ("crates/ra-console/src/commands/tests.rs", include_str!("../commands/tests.rs")),
+        ("crates/ra-console/src/agent/tests.rs", include_str!("tests.rs")),
+        ("apps/rc/src/tests.rs", include_str!("../../../../apps/rc/src/tests.rs")),
+    ];
+    let mut found = Vec::new();
+    for (name, text) in files {
+        for (n, line) in text.lines().enumerate() {
+            let mut rest = line;
+            while let Some(at) = rest.find("elapsed") {
+                rest = &rest[at + "elapsed".len()..];
+                let after = rest.trim_start_matches("()").trim_start();
+                if after.starts_with('<') {
+                    found.push(format!("{name}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(found.is_empty(), "an assertion compares elapsed time with less-than:\n{}", found.join("\n"));
+}
+
 /// A toolbox whose commands answer from `script`, and the commands it saw.
 fn scripted_checks(answers: fn(&str, usize) -> (i32, String)) -> (anyhow::Result<ra_tools::Toolbox>, Arc<std::sync::Mutex<Vec<String>>>) {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));

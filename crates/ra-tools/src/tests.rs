@@ -212,17 +212,36 @@ async fn a_scripted_toolbox_answers_a_command_from_the_script() {
 
 #[tokio::test]
 async fn a_command_past_the_toolboxs_limit_is_stopped_and_names_the_limit() {
-    let (_dir, tools) = workspace().await;
-    // the quoted program is one argument, so the sleep keeps its space; what it printed before
-    // the limit stays
-    let sleep = r#"python -c "print('started', flush=True); import time; time.sleep(3)""#;
-    let (passed, text) = tools.clone().with_timeout(Duration::from_secs(1)).check_acceptance(sleep).await.unwrap();
+    let (dir, tools) = workspace().await;
+    // the quoted program is one argument, so the script keeps its spaces; the child blocks on an
+    // event nothing sets, so only the limit ends it, and what it printed before the limit stays
+    let pid_file = dir.path().join("child.pid");
+    let pid_path = pid_file.display().to_string().replace('\\', "/");
+    let block = format!(
+        r#"python -c "import os, threading; open(r'{pid_path}', 'w').write(str(os.getpid())); print('started', flush=True); threading.Event().wait()""#
+    );
+    let (passed, text) = tools.clone().with_timeout(Duration::from_secs(1)).check_acceptance(&block).await.unwrap();
     assert!(!passed);
     assert_eq!(text.replace("\r\n", "\n"), "started\ntimed out after 1s");
-    // under a longer limit the same command finishes
+    let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    assert!(process_is_gone(pid), "the child {pid} outlived the limit");
+    // under a longer limit a command that ends finishes
     let tools = tools.with_timeout(Duration::from_secs(1800));
     assert_eq!(tools.timeout(), Duration::from_secs(1800));
-    assert!(tools.check_acceptance(&sleep.replace('3', "0")).await.unwrap().0);
+    assert!(tools.check_acceptance(r#"python -c "print('ok')""#).await.unwrap().0);
+}
+
+/// Whether no process answers to `pid` any more.
+fn process_is_gone(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().unwrap();
+        !String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        !std::process::Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())
+    }
 }
 
 #[test]
