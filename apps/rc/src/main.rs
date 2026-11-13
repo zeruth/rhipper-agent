@@ -93,7 +93,7 @@ enum Command {
         why: bool,
     },
     /// Lints the roadmap: placeholder text, a card without acceptance or files, a waits-on that names
-    /// no card or comes back to its own, a complexity outside 1..5; one line each, exit code 1 when any.
+    /// no card or comes back to its own, a complexity outside 1..5, a command a dry run rejects; one line each, exit 1 when any.
     Check,
     /// Lists the gambits: the standing directions that order the walk, each with its weight, its state and its focus.
     Gambits,
@@ -1462,8 +1462,10 @@ async fn route(id: i64) -> anyhow::Result<()> {
 /// Prints every fault the lint finds and exits 1 when there is one, so a script or a hook can
 /// gate on a clean roadmap.
 async fn check() -> anyhow::Result<()> {
-    let nodes = open_store().await?.all().await?;
-    let faults = tree::lint(&nodes);
+    let store = open_store().await?;
+    let mut faults = tree::lint(&store.all().await?);
+    // a command the tool rejects is a fault of the card's text, found before a walk holds it
+    faults.extend(ra_console::agent::preflight_faults(&store).await?);
     if faults.is_empty() {
         println!("the roadmap is clean");
         return Ok(());

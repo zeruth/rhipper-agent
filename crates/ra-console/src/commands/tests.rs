@@ -3568,10 +3568,13 @@ async fn the_projects_check_stands_in_for_the_workspace_tests_and_an_empty_lint_
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     // before the table: the workspace tests, and clippy over what changed
     let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
-    assert!(out.iter().any(|l| l.contains("check: cargo test --workspace -q · lint: clippy over the changed crates")), "{out:?}");
+    assert!(
+        out.iter().any(|l| l.contains("check: project default cargo test --workspace -q · lint: clippy over the changed crates")),
+        "{out:?}"
+    );
     std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\ncheck = \".\\\\gw.ps1 :m:task\"\nlint = \"\"\n").unwrap();
     let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
-    assert!(out.iter().any(|l| l.contains("check: .\\gw.ps1 :m:task · lint: none")), "{out:?}");
+    assert!(out.iter().any(|l| l.contains("check: project default .\\gw.ps1 :m:task · lint: none")), "{out:?}");
     // a card without a backticked command runs the project's check and nothing lints the change
     let (seen, out) = run_writing_extra(dir.path()).await;
     assert_eq!(seen, [".\\gw.ps1 :m:task"]);
@@ -3579,7 +3582,10 @@ async fn the_projects_check_stands_in_for_the_workspace_tests_and_an_empty_lint_
     assert!(!out.iter().any(|l| l.contains("lint")), "{out:?}");
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Implemented);
     let pair = crate::pair::recent(dir.path(), 10);
-    assert!(pair.iter().any(|l| l.starts_with("start #2 Probe") && l.contains("check: .\\gw.ps1 :m:task · lint: none · pid ")), "{pair:?}");
+    assert!(
+        pair.iter().any(|l| l.starts_with("start #2 Probe") && l.contains("check: project default .\\gw.ps1 :m:task · lint: none · pid ")),
+        "{pair:?}"
+    );
     // a card with its own backticked check still wins
     run("/edit 2 acceptance `cargo test -q` passes", &store, &worker()).await.unwrap();
     let (seen, out) = run_writing_extra(dir.path()).await;
@@ -3595,21 +3601,25 @@ async fn the_projects_check_timeout_shows_on_the_dry_run_and_bounds_the_checks()
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     // without the key the agent's twenty minutes stand, and the line does not say so
     let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
-    assert!(out.iter().any(|l| l.contains("check: cargo test --workspace -q · lint: clippy over the changed crates")), "{out:?}");
+    assert!(
+        out.iter().any(|l| l.contains("check: project default cargo test --workspace -q · lint: clippy over the changed crates")),
+        "{out:?}"
+    );
     std::fs::write(
         dir.path().join(crate::router::ROUTES_FILE),
         "[worker]\ncheck = \".\\\\gw.ps1 :m:task\"\nlint = \"\"\ncheck_timeout = 1800\n",
     )
     .unwrap();
     let (out, _) = run("/run 2 dry", &store, &worker()).await.unwrap();
-    assert!(out.iter().any(|l| l.contains("check: .\\gw.ps1 :m:task · 1800 s · lint: none")), "{out:?}");
+    assert!(out.iter().any(|l| l.contains("check: project default .\\gw.ps1 :m:task · 1800 s · lint: none")), "{out:?}");
     // the check runs under the project's limit and passes; the start line carries the limit
     let (seen, out) = run_writing_extra(dir.path()).await;
     assert_eq!(seen, [".\\gw.ps1 :m:task"]);
     assert!(out.iter().any(|l| l.contains("check passed: .\\gw.ps1 :m:task")), "{out:?}");
     let pair = crate::pair::recent(dir.path(), 10);
     assert!(
-        pair.iter().any(|l| l.starts_with("start #2 Probe") && l.contains("check: .\\gw.ps1 :m:task · 1800 s · lint: none")),
+        pair.iter()
+            .any(|l| l.starts_with("start #2 Probe") && l.contains("check: project default .\\gw.ps1 :m:task · 1800 s · lint: none")),
         "{pair:?}"
     );
 }
@@ -4400,4 +4410,58 @@ async fn run_refuses_a_project_and_names_a_missing_key() {
         assert!(format!("{error:#}").contains("OPENROUTER_API_KEY") || format!("{error:#}").contains("key"), "{error:#}");
     }
     drop(guard);
+}
+
+/// A project with one card, `acceptance` on it, and a worker whose script logs every command and
+/// answers a dry run (`--no-run`) with `dry`; the model must not be called when `dry` fails.
+async fn preflight_run(
+    acceptance: &str,
+    dry: (i32, &'static str),
+    calls: Vec<ra_providers::Completion>,
+) -> (tempfile::TempDir, Store, Vec<String>, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    store.set_details(2, None, Some(acceptance)).await.unwrap();
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        log.lock().push(command.to_owned());
+        Ok(if command.contains("--no-run") { (dry.0, dry.1.to_owned()) } else { (0, "ok\n".to_owned()) })
+    });
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(calls)).with_script(script).with_preflight(true);
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    let seen = seen.lock().clone();
+    (dir, store, seen, out)
+}
+
+#[tokio::test]
+async fn preflight_blocks_a_card_whose_command_cargo_rejects_before_any_run() {
+    let rejected = (1, "error: unexpected argument '--ignored' found\n\nUsage: cargo test [OPTIONS]\n");
+    let (dir, store, seen, out) = preflight_run("`cargo test --ignored` passes", rejected, Vec::new()).await;
+    assert_eq!(seen, ["cargo test --ignored --no-run"]);
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Blocked);
+    assert!(out.iter().any(|l| l.contains("unexpected argument '--ignored' found")), "{out:?}");
+    let pair = crate::pair::recent(dir.path(), 10);
+    assert!(pair.iter().any(|l| l.contains("#2 blocked") && l.contains("unexpected argument '--ignored' found")), "{pair:?}");
+    assert!(!pair.iter().any(|l| l.contains("start #2")), "{pair:?}");
+}
+
+#[tokio::test]
+async fn preflight_dispatches_a_good_command_and_runs_it_after_the_dry_run() {
+    let (dir, store, seen, _) =
+        preflight_run("`cargo test -q` passes", (0, "ok\n"), vec![says("done", vec![]), says("accepted", vec![])]).await;
+    assert_eq!(seen.first().map(String::as_str), Some("cargo test -q --no-run"));
+    assert_ne!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Blocked);
+    let pair = crate::pair::recent(dir.path(), 10);
+    assert!(pair.iter().any(|l| l.starts_with("start #2 Probe") && l.contains("check: cargo test -q")), "{pair:?}");
+}
+
+#[tokio::test]
+async fn preflight_marks_a_card_with_no_command_as_the_project_default_on_its_start_line() {
+    let (dir, _, seen, _) =
+        preflight_run("it works when it is done", (0, "ok\n"), vec![says("done", vec![]), says("accepted", vec![])]).await;
+    assert!(!seen.iter().any(|c| c.contains("--no-run")), "{seen:?}");
+    let pair = crate::pair::recent(dir.path(), 10);
+    assert!(pair.iter().any(|l| l.starts_with("start #2 Probe") && l.contains("check: project default ")), "{pair:?}");
 }

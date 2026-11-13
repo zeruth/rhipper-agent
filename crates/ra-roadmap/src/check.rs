@@ -9,7 +9,7 @@ pub const WORKSPACE_TESTS: &str = "cargo test --workspace -q";
 
 /// The programs an acceptance runs a check through. `git` is not one: a backticked `git log`
 /// is a reference, and the tools run the read-only git commands by themselves.
-const CHECK_PROGRAMS: [&str; 34] = [
+pub const CHECK_PROGRAMS: [&str; 34] = [
     "cargo", "rustc", "python", "python3", "py", "pytest", "uv", "pip", "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "tsc", "go",
     "make", "cmake", "ctest", "ninja", "just", "gradle", "gradlew", "mvn", "dotnet", "java", "zig", "swift", "ruby", "bundle", "php",
     "composer", "bash",

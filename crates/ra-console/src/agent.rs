@@ -128,6 +128,9 @@ pub struct Worker {
     /// What answers the commands of a run instead of the shell; the tests script the check and
     /// the lint with it.
     script: Option<ra_tools::Script>,
+    /// Whether a dispatch dry-runs the acceptance's commands first; `None` is on for the shell
+    /// and off for a scripted worker, whose script counts the commands it is asked.
+    preflight: Option<bool>,
     /// The cheap roles when a test set them; a run resolves its own from `rhipper.toml` and the
     /// local server otherwise.
     pub(crate) roles: Option<Roles>,
@@ -167,6 +170,7 @@ impl Worker {
             debug: !std::env::var("RHIPPER_DEBUG")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
             script: None,
+            preflight: None,
             roles: None,
             workspace: None,
             branch: None,
@@ -232,6 +236,13 @@ impl Worker {
     #[must_use]
     pub fn with_script(mut self, script: ra_tools::Script) -> Self {
         self.script = Some(script);
+        self
+    }
+
+    /// The same worker, with the dispatch's dry run of the acceptance forced on or off.
+    #[must_use]
+    pub fn with_preflight(mut self, on: bool) -> Self {
+        self.preflight = Some(on);
         self
     }
 
@@ -906,9 +917,13 @@ pub async fn run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<
 async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> anyhow::Result<Vec<String>> {
     // the node first, so a bad id or a project is named before the key matters
     let node = store.read(id).await?;
-    anyhow::ensure!(node.kind != NodeKind::Project, "#{} is a project; run a task", id);
+    anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; run a task");
     // the model of this card, when the command left the choice to the card and the rules
     let root = workspace_of(store);
+    // a command the tool rejects holds the card before any worker is picked or started
+    if let Some(lines) = held_by_preflight(store, &root, &node, worker).await? {
+        return Ok(lines);
+    }
     // then the plan's week: a claude-* pick past the threshold falls to the local route or is
     // refused here, before the start marker
     let worker = &worker.for_card(&root, &node)?.steered_by_plan(&root, &node).await?;
@@ -4361,7 +4376,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the local checks before the card counts as done: no model call, the acceptance names
     // them (else the project, else the workspace tests), and they run in order up to the first
     // failure
-    let Checks { commands, lint: project_lint, timeout, orchestrated } = checks_of(&root, &node);
+    let Checks { commands, lint: project_lint, timeout, orchestrated, .. } = checks_of(&root, &node);
     let command = commands.join(" · ");
     // a worktree's check builds in the target the worker built in, `target/wt-<id>` under the
     // project's, whatever the process's own `CARGO_TARGET_DIR`: the artifacts are warm there,
@@ -5287,6 +5302,8 @@ struct Checks {
     /// The commands among them that are the orchestrator's alone ([`orchestrated_checks`]):
     /// their output rides the handoff, and the worker's prompt names them.
     orchestrated: Vec<String>,
+    /// Whether the card's acceptance names a command; the start line says so when it does not.
+    named: bool,
 }
 
 impl Checks {
@@ -5299,7 +5316,8 @@ impl Checks {
             Some(command) => command,
         };
         let limit = if self.timeout == CHECK_TIMEOUT { String::new() } else { format!(" · {} s", self.timeout.as_secs()) };
-        format!("check: {}{limit} · lint: {lint}", self.commands.join(" · then "))
+        let source = if self.named { "" } else { "project default " };
+        format!("check: {source}{}{limit} · lint: {lint}", self.commands.join(" · then "))
     }
 }
 
@@ -5310,7 +5328,8 @@ impl Checks {
 fn checks_of(root: &Path, node: &Node) -> Checks {
     let worker = crate::router::Router::load(root).map(|router| router.worker).unwrap_or_default();
     let own = named_checks(node.acceptance.as_deref());
-    let commands = if !own.is_empty() {
+    let named = !own.is_empty();
+    let commands = if named {
         own
     } else if let Some(check) = worker.check() {
         vec![check.to_owned()]
@@ -5318,7 +5337,102 @@ fn checks_of(root: &Path, node: &Node) -> Checks {
         ra_roadmap::check::commands(&node.files)
     };
     let orchestrated = orchestrated_checks(node.acceptance.as_deref(), &worker);
-    Checks { commands, lint: worker.lint().map(str::to_owned), timeout: worker.check_timeout(), orchestrated }
+    Checks { commands, lint: worker.lint().map(str::to_owned), timeout: worker.check_timeout(), orchestrated, named }
+}
+
+/// The words of a dry run of `command`, which the tool answers without running the check: cargo
+/// tests with `--no-run`, other cargo commands and the build tools with `--help` (a rejected
+/// argument fails before the help is printed), gradle with `--dry-run`, a python script parsed.
+/// `None` for a command no dry run is safe for: a script, or an interpreter that would run it.
+fn dry_words(command: &str) -> Option<Vec<String>> {
+    // an interpreter given `--help` after its script would run the script
+    const INTERPRETERS: [&str; 7] = ["bash", "node", "java", "ruby", "php", "deno", "bun"];
+    let mut words = ra_tools::words(command).ok()?;
+    let program = words.first()?.clone();
+    // what follows `--` is the test binary's, not the tool's
+    let stop = words.iter().position(|w| w == "--").unwrap_or(words.len());
+    match program.as_str() {
+        "cargo" => {
+            let tests = words.get(1).is_some_and(|w| matches!(w.as_str(), "test" | "t" | "bench"));
+            words.insert(stop, if tests { "--no-run" } else { "--help" }.to_owned());
+        }
+        "gradle" | "gradlew" => words.push("--dry-run".to_owned()),
+        "python" | "python3" | "py" => {
+            let script = words.get(1).filter(|w| Path::new(w).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("py")))?.clone();
+            return Some(vec![program, "-m".to_owned(), "py_compile".to_owned(), script]);
+        }
+        other if ra_roadmap::check::CHECK_PROGRAMS.contains(&other) && !INTERPRETERS.contains(&other) => {
+            words.insert(stop, "--help".to_owned());
+        }
+        _ => return None,
+    }
+    Some(words)
+}
+
+/// The first command of `commands` the tool rejects before building, with its first error
+/// line. A command that fails for another reason, or whose program cannot start, is the run's
+/// to find.
+async fn rejected_command(toolbox: &ra_tools::Toolbox, commands: &[String]) -> Option<(String, String)> {
+    for command in commands {
+        let Some(words) = dry_words(command) else { continue };
+        if let Ok((false, output)) = toolbox.check_args(&words).await
+            && is_setup_failure(&output)
+        {
+            return Some((command.clone(), first_error(&output)));
+        }
+    }
+    None
+}
+
+/// Dry-runs the acceptance's commands on the base tree, on a worker slot under the project's
+/// timeout, and holds the card when the tool rejects one: the worker could change nothing, and
+/// asm #131 and #132 ran 272 and 235 times on one malformed argument. The tool's line goes on
+/// the feed. `None` sends the card on to its worker.
+async fn held_by_preflight(store: &Store, root: &Path, node: &Node, worker: &Worker) -> anyhow::Result<Option<Vec<String>>> {
+    if !worker.preflight.unwrap_or(worker.script.is_none()) {
+        return Ok(None);
+    }
+    // a toolbox that cannot be made is the run's to report
+    let Some((command, error)) = preflight(root, node, worker.toolbox(root)).await else { return Ok(None) };
+    store.set_state_by(node.id, TaskState::Blocked, Source::Run).await?;
+    let text = format!("#{} blocked: `{command}` is rejected before any build: {error}; a person fixes the acceptance", node.id);
+    tracing::warn!("{text}");
+    crate::pair::event(root, &text);
+    Ok(Some(vec![format!("  {text}")]))
+}
+
+/// The cards still to run whose acceptance names a command the tool rejects before building,
+/// one line each: `rc check` lists them beside the lint, so the acceptance is fixed before a
+/// walk reaches the card and holds it.
+///
+/// # Errors
+///
+/// When the roadmap cannot be read.
+pub async fn preflight_faults(store: &Store) -> anyhow::Result<Vec<String>> {
+    let root = workspace_of(store);
+    let nodes = store.all().await?;
+    let open = ra_roadmap::tree::cards(&nodes)
+        .filter(|node| matches!(node.state, TaskState::Defined | TaskState::Ready | TaskState::NeedsRevision));
+    let mut faults = Vec::new();
+    for node in open {
+        if let Some((command, error)) = preflight(&root, node, ra_tools::Toolbox::new(&root)).await {
+            faults.push(format!("#{}: `{command}` is rejected before any build: {error}", node.id));
+        }
+    }
+    Ok(faults)
+}
+
+/// The acceptance command of `node` the tool rejects on a dry run in `toolbox`, under the
+/// project's timeout and on a worker slot, with its first error line; `None` when the acceptance
+/// names no command or the toolbox could not be made.
+async fn preflight(root: &Path, node: &Node, toolbox: anyhow::Result<ra_tools::Toolbox>) -> Option<(String, String)> {
+    let commands = named_checks(node.acceptance.as_deref());
+    if commands.is_empty() {
+        return None;
+    }
+    let toolbox = toolbox.ok()?.with_timeout(checks_of(root, node).timeout);
+    let _slot = hold_build(root, root).await;
+    rejected_command(&toolbox, &commands).await
 }
 
 /// The programs a worker's shell runs a check through by itself; any other is the
