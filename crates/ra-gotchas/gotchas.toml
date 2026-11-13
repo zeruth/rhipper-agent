@@ -41,6 +41,15 @@ message = "a file is not written from the shell, whatever the API: create it wit
 remedy = { kind = "hint" }
 
 [[gotcha]]
+# the hook cannot judge what a variable will hold, so `$?`, a `for` loop over a variable and a
+# PowerShell `& $var` call are refused whole; named before the run, ahead of the allowlist hint
+id = "shell-variable-command"
+where = "command"
+pattern = '\$\?|\bfor\s+\$?\w+\s+in\b[^\n]*\$\w|\bfor\s*\(\s*\$\w|(^|[;|&(]|&&)\s*&\s+\$\w'
+message = "the hook cannot check a variable before it runs: drop `$?` (the exit status comes back in the tool result), and instead of a `for` loop over a variable or `& $var`, write the literal path once per file, one command each"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 # the first word of a command; the parts after a pipe or a `;`, `&&` or `||` are judged by the
 # hook's shape table (`ra_gotchas::shape`), which names the form to use instead of each refusal
 id = "shell-outside-allowlist"
