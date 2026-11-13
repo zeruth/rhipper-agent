@@ -1293,33 +1293,47 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
 }
 
 /// What the reviewer reads: the card, the last handoff when there is one, and the diff of the
-/// card's files and the handoff's changed ones (what the run touched and the dirty files its
-/// report named, [`reported_files`]) against `HEAD`, clipped.
+/// card's own change ([`card_changed`]) and its files, clipped: in a worktree the branch from
+/// its merge base, every run of the card; in the project's tree the handoff's set against
+/// `HEAD`, with the tree's other dirty files listed apart and kept out of the diff.
 /// `project` holds the card's context (the handoffs live under the project's `var`); `root`
 /// is where the run acted and the diff is read: the project, or the card's worktree.
-async fn review_brief(project: &Path, root: &Path, node: &Node) -> String {
+pub(crate) async fn review_brief(project: &Path, root: &Path, node: &Node) -> String {
     let mut text = format!("# #{} {}\n", node.id, node.title);
     if let Some(objective) = &node.objective {
         let _ = writeln!(text, "\nObjective: {objective}");
     }
     let _ = writeln!(text, "\nAcceptance: {}", node.acceptance.as_deref().unwrap_or("none written; the workspace tests are the check"));
-    let mut files = node.files.clone();
+    let task = ra_context::TaskContext::open(project, node.id);
     let mut changed = Vec::new();
-    match ra_context::TaskContext::open(project, node.id).handoffs.last() {
+    match task.handoffs.last() {
         Some(last) => {
             let _ = writeln!(text, "\n## Handoff of the last run\n{} on {} · {}\n{}", last.outcome, last.model, last.check, last.report);
             changed.clone_from(&last.changed);
-            for file in &last.changed {
-                if !files.contains(file) {
-                    files.push(file.clone());
-                }
-            }
         }
         None => text.push_str("\n## Handoff of the last run\nnone: no run of this card left one\n"),
     }
+    // the card's change is the branch's in a worktree, whatever the last run alone touched: the
+    // reviewer judges the card, not its last session (#182, #183); in a shared tree the dirty
+    // files no handoff of the card names are someone else's
+    let stray = if same_tree(project, root) {
+        let named: Vec<&String> = task.handoffs.iter().flat_map(|h| &h.changed).collect();
+        dirty_paths(&git_status(root).await).into_iter().filter(|path| !changed.contains(path) && !named.contains(&path)).collect()
+    } else {
+        changed.extend(branch_files(project, root).await);
+        changed.sort();
+        changed.dedup();
+        Vec::new()
+    };
+    let mut files: Vec<String> = node.files.iter().filter(|f| !stray.contains(f)).cloned().collect();
+    for file in &changed {
+        if !files.contains(file) {
+            files.push(file.clone());
+        }
+    }
     // the list and the stat come before the diff: the reviewer of #159 looked for the change in
     // the one file it expected and judged the card unfinished for code that lived in another
-    text.push_str(&crate::review::files_section(&node.files, &changed));
+    text.push_str(&crate::review::files_section(&node.files, &changed, &stray));
     // the diff's base: HEAD in the project's own tree; in a card's worktree the merge base
     // with the project's branch, so the checkpoints the walk commits on the card's branch
     // after each run are in the reviewer's view and not behind it
@@ -1654,13 +1668,15 @@ async fn guard_target(
 const HOLD_WAIT: std::time::Duration = std::time::Duration::from_mins(15);
 
 /// Takes one of the project's build slots for the check, waiting on the builds of the workers
-/// and the other checks; the wait is said once, on the progress channel and the paired feed.
-/// `None` when the locks cannot be opened: the check goes unguarded.
-async fn hold_build(root: &Path) -> Option<crate::hub::Guard> {
+/// and the other checks; the wait is said once, on the progress channel and the paired feed of
+/// the project at `root`. The slot's note names `building`, the tree the check builds, a card's
+/// worktree or the project, with its target. `None` when the locks cannot be opened: the check
+/// goes unguarded.
+async fn hold_build(root: &Path, building: &Path) -> Option<crate::hub::Guard> {
     let mut said = false;
     let started = std::time::Instant::now();
     loop {
-        match crate::hub::try_build_slot(root) {
+        match crate::hub::try_build_slot(building) {
             Ok(Some(guard)) => return Some(guard),
             Ok(None) => {}
             Err(e) => {
@@ -1797,6 +1813,60 @@ pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
         ra_tools::cpu::attach(child.as_raw_handle())
     };
     child.wait().map_or(1, |status| status.code().unwrap_or(1))
+}
+
+/// How long `rc wait` waits unless told otherwise: under a worker's 600-second turn, so the
+/// turn ends with an answer rather than a kill.
+pub const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_mins(9);
+
+/// How long a file `rc wait` watches must hold still before its job counts as done.
+const WAIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The lines of the file `rc wait` prints once it settles.
+const WAIT_TAIL_LINES: usize = 40;
+
+/// Waits on a long job of the worker's own, for `rc wait`: a pid until the process is gone, a
+/// file until it exists and has not changed for [`WAIT_SETTLE`], whose last lines it then
+/// prints. The one sanctioned wait: a `sleep` loop is refused, and a background shell the
+/// session outlives is no result (#159). Answers 0 when the job ended within `limit`, 124 when
+/// the limit ran out first, as `timeout` does.
+#[must_use]
+pub fn wait(dir: &Path, target: &str, limit: std::time::Duration) -> i32 {
+    let started = std::time::Instant::now();
+    let poll = std::time::Duration::from_millis(500);
+    if let Ok(pid) = target.trim().parse::<u32>() {
+        while crate::hub::pid_alive(pid) {
+            if started.elapsed() >= limit {
+                eprintln!("rc wait: pid {pid} still runs after {} s", limit.as_secs());
+                return 124;
+            }
+            std::thread::sleep(poll);
+        }
+        println!("rc wait: pid {pid} has ended");
+        return 0;
+    }
+    let path = dir.join(target);
+    let seen = |path: &Path| std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()));
+    let mut last = seen(&path);
+    let mut still = std::time::Instant::now();
+    let code = loop {
+        if started.elapsed() >= limit {
+            eprintln!("rc wait: {target} still changes after {} s", limit.as_secs());
+            break 124;
+        }
+        std::thread::sleep(poll);
+        let now = seen(&path);
+        if now != last {
+            last = now;
+            still = std::time::Instant::now();
+        } else if last.is_some() && still.elapsed() >= WAIT_SETTLE {
+            break 0;
+        }
+    };
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        println!("{}", last_lines(&text, WAIT_TAIL_LINES));
+    }
+    code
 }
 
 /// The share of the processor every build on the machine runs at together: one build may use
@@ -2298,9 +2368,10 @@ pub fn spawn_walk(root: &Path, debug: bool, parallel: Option<u32>) -> anyhow::Re
     let rc = std::env::current_exe()?.with_file_name(format!("rc{}", std::env::consts::EXE_SUFFIX));
     let mut command = std::process::Command::new(&rc);
     command.args(["run", "--all"]).current_dir(root);
-    if let Some(n) = parallel.filter(|n| *n > 1) {
-        command.args(["--parallel", &n.to_string()]);
-    }
+    // every walk is the parallel one, one runner included: it works in worktrees and reads its
+    // runners again as it goes, so the dashboard's `+` on a one-runner project takes at once
+    // (a one-at-a-time walk never read the number again, 2026-11-12)
+    command.args(["--parallel", &parallel.unwrap_or(1).max(1).to_string()]);
     if !debug {
         command.arg("--no-debug");
     }
@@ -2477,15 +2548,34 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
 /// tree; in a worktree the merge base of the worktree's branch and the project's, so the
 /// checkpoints on the card's branch count as the card's change.
 async fn diff_base(project: &Path, root: &Path) -> String {
-    let same = match (std::fs::canonicalize(project), std::fs::canonicalize(root)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => project == root,
-    };
-    if same {
+    if same_tree(project, root) {
         return String::from("HEAD");
     }
     let Ok(main) = git(project, &["rev-parse", "--abbrev-ref", "HEAD"]).await else { return String::from("HEAD") };
     git(root, &["merge-base", "HEAD", &main]).await.unwrap_or_else(|_| String::from("HEAD"))
+}
+
+/// Whether `root`, where a run acted, is the project's own tree rather than a card's worktree.
+fn same_tree(project: &Path, root: &Path) -> bool {
+    match (std::fs::canonicalize(project), std::fs::canonicalize(root)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => project == root,
+    }
+}
+
+/// The files of a card's branch in its worktree: what differs from the merge base with the
+/// project's branch, committed in a checkpoint or not, and the new files not yet tracked.
+async fn branch_files(project: &Path, root: &Path) -> Vec<String> {
+    let base = diff_base(project, root).await;
+    let mut files = Vec::new();
+    for args in [&["diff", "--name-only", base.as_str()][..], &["ls-files", "--others", "--exclude-standard"][..]] {
+        if let Ok(out) = git(root, args).await {
+            files.extend(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned));
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
 /// What a commit of a card's work is for: the landing of an accepted card, a checkpoint
@@ -2751,8 +2841,8 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
             let Checks { commands, timeout, .. } = checks_of(&root, &node);
             if !commands.is_empty() {
                 let toolbox = worker.toolbox(&root).map(|t| t.with_timeout(timeout));
-                let _slot = hold_build(&root).await;
-                let runs = run_checks(&toolbox, &commands).await;
+                let _slot = hold_build(&root, &root).await;
+                let runs = run_checks(&toolbox, &commands, &[]).await;
                 if let Some(failed) = runs.iter().find(|r| !r.passed) {
                     let _ = git(&root, &["reset", "--merge", "ORIG_HEAD"]).await;
                     anyhow::bail!(
@@ -3559,7 +3649,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
-                messages: harness_messages(&task, rerun.as_deref(), &project, &root, worker.debug),
+                messages: harness_messages(&task, node.acceptance.as_deref(), rerun.as_deref(), &project, &root, worker.debug),
                 temperature: Some(0.4),
                 max_tokens: Some(4096),
                 tools: Vec::new(),
@@ -3704,7 +3794,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 store.set_notes(id, &over.to_string()).await?;
             }
             store.set_state_by(id, TaskState::Failed, Source::Run).await?;
-            let changed = run_changed(&acting, &dirty_before, &git_status(&acting).await, run_started);
+            let changed = card_changed(&root, &acting, &dirty_before, &git_status(&acting).await, run_started, "", &task).await;
             task.record(handoff("failed", "no check: the run failed", &format!("{error:#}"), changed));
             save_context(store, &root, &task).await;
             return Err(error);
@@ -3729,7 +3819,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the next run, which the walk starts right away, opens on a small context again
     if let Some(cap) = session.capped {
         store.set_session(id, None, unix_now()).await?;
-        let changed = run_changed(&acting, &dirty_before, &git_status(&acting).await, run_started);
+        let changed = card_changed(&root, &acting, &dirty_before, &git_status(&acting).await, run_started, &session.text, &task).await;
         let report = capped_report(cap, &session, &changed, &node);
         store.set_notes(id, &report).await?;
         let why = format!("{cap} ended the run; the card continues in a fresh session");
@@ -3759,7 +3849,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the local checks before the card counts as done: no model call, the acceptance names
     // them (else the project, else the workspace tests), and they run in order up to the first
     // failure
-    let Checks { commands, lint: project_lint, timeout } = checks_of(&root, &node);
+    let Checks { commands, lint: project_lint, timeout, orchestrated } = checks_of(&root, &node);
     let command = commands.join(" · ");
     // a worktree's check builds in the target the worker built in, `target/wt-<id>` under the
     // project's, whatever the process's own `CARGO_TARGET_DIR`: the artifacts are warm there,
@@ -3771,7 +3861,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // a check is a build: it takes one of the project's build slots, as the workers' own
     // builds do, so six runs do not compile at once; a cargo check also takes the hub's lock
     // on a target another project may share, so two builds do not fight over the directory
-    let _slot = if commands.is_empty() { None } else { hold_build(&acting).await };
+    // the wait goes to the project's feed, never a file in the worktree the branch commits
+    let _slot = if commands.is_empty() { None } else { hold_build(&root, &acting).await };
     // the lock is on the target the check builds in: a worktree's own under the project's,
     // not the project's (six asm checks on one lock waited for each other for nothing)
     let target = own_target.unwrap_or_else(|| crate::hub::cargo_target(&root));
@@ -3782,7 +3873,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // a wait that ran out is the check's failure, named as the output a timed-out check leaves
     let (_target, checks) = match waited {
         Ok(guard) => {
-            let checks = run_checks(&toolbox, &commands).await;
+            let checks = run_checks(&toolbox, &commands, &orchestrated).await;
             (guard, checks)
         }
         Err(text) => {
@@ -3794,12 +3885,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         }
     };
     let status_after = git_status(&acting).await;
-    let mut changed = run_changed(&acting, &dirty_before, &status_after, run_started);
-    // the worker's report names the files it worked in: on a tree other cards share, a file
-    // another run left dirty and this one edited through a path git status does not retell
-    // (a rename, an editor that keeps the old time) is the card's own and the reviewer would
-    // judge the card without it (#157). The named files that are dirty join the set
-    changed.extend(reported_files(&acting, &session.text, &status_after));
+    // the card's own set: on a tree other hands share, a dirty file joins it only when the run
+    // wrote to it and the report or an earlier handoff names it (#157 lost a named file, #185
+    // was judged on the person's edits); in a worktree it is the whole branch
+    let mut changed = card_changed(&root, &acting, &dirty_before, &status_after, run_started, &session.text, &task).await;
     // a fix pass edits the files the run before it dirtied, which `git status` shows no
     // differently: its change is the run's and its own together, so the lint reads the lines
     // it was sent to fix and the handoff still names them
@@ -3824,13 +3913,17 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     }
     let mut report = session.text.clone();
     // what leads the answer in the notes and the handoff alike: the failed check, when one did,
-    // else the agent's run of the checks when the worker's report claimed its own was running
+    // else the agent's run of the checks when the worker's report claimed its own was running,
+    // else the runs of the commands only the orchestrator ran, which the worker never saw
     let mut lead = String::new();
     let (mut passed, mut check_line) = match checks.iter().find(|run| !run.passed) {
         None => {
-            if placeholder {
-                let ran: Vec<String> =
-                    checks.iter().map(|run| format!("check passed: {} · {}\n{}", run.command, run.exit, run.text)).collect();
+            let ran: Vec<String> = checks
+                .iter()
+                .filter(|run| placeholder || orchestrated.contains(&run.command))
+                .map(|run| format!("check passed: {} · {}\n{}", run.command, run.exit, run.text))
+                .collect();
+            if !ran.is_empty() {
                 lead = format!("{}\n\n", ran.join("\n\n"));
                 report = format!("{lead}{}", session.text);
             }
@@ -4024,6 +4117,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 note.machine = machine;
             }
         }
+        // the acceptance the notes were written against, so a later change of it retires them
+        let print = crate::retro::acceptance_print(node.acceptance.as_deref());
+        for note in &mut notes {
+            note.against = Some(print.clone());
+        }
         if let Err(e) = crate::retro::record(&root, Some(id), &notes) {
             tracing::warn!("the look back of #{id} was not kept: {e:#}");
         }
@@ -4120,7 +4218,9 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     let workspace = worker.workspace.clone().or(project);
     let mut task = ra_context::TaskContext::open(&root, node.id);
     let brief = context_of(store, node).await?;
-    task.brief = brief.text;
+    // the commands of the acceptance the worker may not run, or that outlive its turn, are
+    // named under the card, so the session spends no turn on a refusal or a wait
+    task.brief = format!("{}{}", brief.text, orchestrated_line(&checks_of(&root, node)));
     task.outlines = ra_context::outline_files(&root, &brief.files, &last_change(&root, node, &task).await);
     // a card sent back by its reviewer carries the verdict's points in its context: the notes
     // that hold them are in the roadmap, which the worker does not read
@@ -4162,13 +4262,20 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
 /// as system messages, the task as the user turn. The machine notes name what tripped the last
 /// runs, so the worker does not find out the hard way again, and the warnings the last run of
 /// the card left, so a second attempt opens on the exact lines. On a rerun the `rerun` block
-/// stands in for the handoffs.
-fn harness_messages(task: &ra_context::TaskContext, rerun: Option<&str>, project: &str, root: &Path, debug: bool) -> Vec<Message> {
+/// stands in for the handoffs. `acceptance` is the card's, which the notes are judged against.
+fn harness_messages(
+    task: &ra_context::TaskContext,
+    acceptance: Option<&str>,
+    rerun: Option<&str>,
+    project: &str,
+    root: &Path,
+    debug: bool,
+) -> Vec<Message> {
     let mut messages = vec![Message::system(SYSTEM)];
     if !project.is_empty() {
         messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
     }
-    let notes = [machine_notes(root, project), warnings_note(task), digest_block(&crate::hub::digest_lines(root))]
+    let notes = [machine_notes(root, project, (task.id, acceptance)), warnings_note(task), digest_block(&crate::hub::digest_lines(root))]
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
@@ -4257,7 +4364,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
     let resume = resume_of(&node, unix_now());
     let messages = if harness {
-        harness_messages(&task, rerun.as_deref(), &project, &root, worker.debug)
+        harness_messages(&task, node.acceptance.as_deref(), rerun.as_deref(), &project, &root, worker.debug)
     } else {
         vec![Message::system(SYSTEM), Message::user(bare_context(&task, rerun.as_deref(), &project, worker.debug))]
     };
@@ -4523,17 +4630,58 @@ fn run_changed(root: &Path, before: &str, after: &str, since: std::time::SystemT
     changed
 }
 
+/// The card's change, which the handoff's `changed` line names and the reviewer judges. In a
+/// card's worktree the branch's files from its merge base ([`branch_files`]): every run of the
+/// card and no one else's edit; a run that moved nothing names nothing, so the walk still
+/// counts it idle. In the project's own tree what the run can be held to: a file whose status
+/// line is new since the run began, or one already dirty that was written to inside the run
+/// and that the report or an earlier handoff of the card names. A file dirty before the run
+/// that only its time ties to it is not the card's: the person's edits in the shared checkout
+/// sent #185 back three times.
+async fn card_changed(
+    project: &Path,
+    acting: &Path,
+    before: &str,
+    after: &str,
+    since: std::time::SystemTime,
+    report: &str,
+    task: &ra_context::TaskContext,
+) -> Vec<String> {
+    if !same_tree(project, acting) {
+        return if run_changed(acting, before, after, since).is_empty() { Vec::new() } else { branch_files(project, acting).await };
+    }
+    let mut changed = ra_context::changed_between(before, after);
+    let reported = reported_files(acting, report, after);
+    let named = |path: &String| reported.contains(path) || task.handoffs.iter().any(|h| h.changed.contains(path));
+    for path in dirty_paths(after) {
+        if changed.contains(&path) || !named(&path) {
+            continue;
+        }
+        if std::fs::metadata(acting.join(&path)).and_then(|m| m.modified()).is_ok_and(|m| m >= since) {
+            changed.push(path);
+        }
+    }
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
+/// The paths `git status --porcelain` lists, a rename by its new name.
+fn dirty_paths(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"').to_owned())
+        .collect()
+}
+
 /// The files a worker's report names in backticks that are in the tree and that `status`
 /// (`git status --porcelain`) lists as dirty or new: what the run says it changed, held to
 /// what git can show of it. A clean file would add nothing to the reviewer's diff and would
 /// read to the lint as new, so it stays out; a span with spaces or a line of a command is not
 /// a path.
 fn reported_files(root: &Path, report: &str, status: &str) -> Vec<String> {
-    let dirty: Vec<String> = status
-        .lines()
-        .filter_map(|line| line.get(3..))
-        .map(|path| path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"').to_owned())
-        .collect();
+    let dirty = dirty_paths(status);
     let mut files: Vec<String> = report
         .split('`')
         .skip(1)
@@ -4589,6 +4737,9 @@ struct Checks {
     lint: Option<String>,
     /// How long each check, and the lint, may run: the project's `check_timeout`.
     timeout: std::time::Duration,
+    /// The commands among them that are the orchestrator's alone ([`orchestrated_checks`]):
+    /// their output rides the handoff, and the worker's prompt names them.
+    orchestrated: Vec<String>,
 }
 
 impl Checks {
@@ -4619,7 +4770,53 @@ fn checks_of(root: &Path, node: &Node) -> Checks {
     } else {
         ra_roadmap::check::commands(&node.files)
     };
-    Checks { commands, lint: worker.lint().map(str::to_owned), timeout: worker.check_timeout() }
+    let orchestrated = orchestrated_checks(node.acceptance.as_deref(), &worker);
+    Checks { commands, lint: worker.lint().map(str::to_owned), timeout: worker.check_timeout(), orchestrated }
+}
+
+/// The programs a worker's shell runs a check through by itself; any other is the
+/// orchestrator's unless the project's `[worker] allow` names it.
+const WORKER_CHECKS: [&str; 2] = ["cargo", "rustfmt"];
+
+/// What marks a backticked command as long, right after its closing backtick: it outlives a
+/// worker's turn, so the orchestrator runs it whatever the worker may run.
+pub const LONG_MARK: &str = "(long)";
+
+/// The acceptance commands the orchestrator runs for the worker: the ones the worker may not
+/// run (runelite's contract runner), and the ones marked [`LONG_MARK`]. The worker is told not to
+/// run them, and their output, not only their exit, reaches the review and the handoff: the
+/// reviews of runelite #31, #51, #73 and #152 each asked again for the contract runner's result.
+fn orchestrated_checks(acceptance: Option<&str>, worker: &crate::router::WorkerConfig) -> Vec<String> {
+    let Some(text) = acceptance else { return Vec::new() };
+    let pieces: Vec<&str> = text.split('`').collect();
+    let mut found = Vec::new();
+    for at in (1..pieces.len()).step_by(2) {
+        let span = pieces[at].trim();
+        if !is_command(span) {
+            continue;
+        }
+        let long = pieces.get(at + 1).is_some_and(|after| after.trim_start().starts_with(LONG_MARK));
+        let program = span.split_whitespace().next().unwrap_or_default();
+        let may_run = WORKER_CHECKS.contains(&program) || worker.allows(span);
+        if (long || !may_run) && !found.iter().any(|c| c == span) {
+            found.push(span.to_owned());
+        }
+    }
+    found
+}
+
+/// The line of a worker's prompt that names the commands the orchestrator runs for it, under
+/// the project's time limit; empty when there are none.
+fn orchestrated_line(checks: &Checks) -> String {
+    if checks.orchestrated.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> = checks.orchestrated.iter().map(|c| format!("`{c}`")).collect();
+    format!(
+        "The orchestrator runs {} for you after your report, on a worker slot under the project's {} s limit, and attaches the output to the review and the handoff: do not run them yourself. To wait on a long job of your own, use `rc wait <file|pid>`.\n",
+        named.join(", "),
+        checks.timeout.as_secs()
+    )
 }
 
 /// The programs an acceptance runs a check through. `git` is not one: a backticked `git log`
@@ -4762,20 +4959,25 @@ fn held_reason(report: &str, changed: &[String], failed: Option<&CheckRun>, prin
 const PASSED_TAIL_LINES: usize = 5;
 
 /// Runs the checks of a card in the project directory, in the order written, and stops at the
-/// first failure; each command's verdict goes to the activity log as it comes.
-async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[String]) -> Vec<CheckRun> {
+/// first failure; each command's verdict goes to the activity log as it comes. Each command is
+/// split into its words once, here, and they reach the program as its arguments. A passed
+/// command among `orchestrated` keeps the tail a failed one would: the worker never saw its
+/// output, and the reviewer judges by it.
+async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[String], orchestrated: &[String]) -> Vec<CheckRun> {
     let mut runs = Vec::new();
     for command in commands {
-        let outcome = match toolbox {
-            Ok(toolbox) => toolbox.check_acceptance(command).await,
-            Err(e) => Err(anyhow::anyhow!("{e:#}")),
+        let outcome = match (toolbox, ra_tools::words(command)) {
+            (Ok(toolbox), Ok(words)) => toolbox.check_args(&words).await,
+            (Err(e), _) => Err(anyhow::anyhow!("{e:#}")),
+            (_, Err(e)) => Err(e),
         };
+        let kept = if orchestrated.contains(command) { TAIL_LINES } else { PASSED_TAIL_LINES };
         let run = match outcome {
             Ok((true, output)) => CheckRun {
                 command: command.clone(),
                 passed: true,
                 exit: output.lines().last().unwrap_or_default().to_owned(),
-                text: last_lines(&output, PASSED_TAIL_LINES),
+                text: last_lines(&output, kept),
                 failed_tests: 0,
                 first_error: String::new(),
                 setup: false,
@@ -4954,14 +5156,15 @@ fn warnings_note(task: &ra_context::TaskContext) -> String {
 
 /// The machine notes of a run: what the gotchas say about the last hits in the journal, for the
 /// system prompt, so the worker does not find out the hard way again, less what `project`, the
-/// context the prompt already carries, or an earlier note says. Empty when nothing fired.
-fn machine_notes(workspace: &Path, project: &str) -> String {
+/// context the prompt already carries, or an earlier note says. Empty when nothing fired. `card`
+/// is the id and the acceptance of the card the run works, which a look-back is judged against.
+fn machine_notes(workspace: &Path, project: &str, card: (i64, Option<&str>)) -> String {
     let gotchas = match Catalogue::load(&workspace.join(GOTCHAS_FILE)) {
         Ok(catalogue) => catalogue.notes(&Journal::at(&workspace.join(GOTCHAS_LOG)).recent(RECENT_HITS)),
         Err(_) => String::new(),
     };
     // what the earlier runs said themselves, in debug mode, rides along
-    let retro = crate::retro::machine_lines(workspace);
+    let retro = crate::retro::machine_lines_for(workspace, Some(card));
     let notes = [gotchas, retro].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     ra_context::dedupe_notes(&notes, project)
 }

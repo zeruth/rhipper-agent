@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use commands::clip;
+pub use commands::words;
 
 mod commands;
 pub mod cpu;
