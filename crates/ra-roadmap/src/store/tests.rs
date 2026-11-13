@@ -365,6 +365,83 @@ async fn gambits_and_a_priority_survive_the_node_mutations() {
     assert!(store.set_gambit_state(9, GambitState::Parked).await.unwrap_err().to_string().contains("no gambit g9"));
 }
 
+#[test]
+fn store_writes_whole_two_stores_setting_cards_at_once_lose_neither() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rhipper.md");
+    let ids: Vec<i64> = block_on(async {
+        let store = Store::open(&path, "Test").await.unwrap();
+        let mut ids = Vec::new();
+        for i in 0..20 {
+            ids.push(store.insert(Some(1), NodeKind::Task, &format!("Card {i}"), None, None, 3).await.unwrap());
+        }
+        ids
+    });
+    // two stores, as two processes hold them, each setting its own half of the cards
+    let writers: Vec<_> = [0, 1]
+        .into_iter()
+        .map(|half| {
+            let (path, ids) = (path.clone(), ids.clone());
+            std::thread::spawn(move || {
+                block_on(async {
+                    let store = Store::open(&path, "Test").await.unwrap();
+                    for id in ids.iter().skip(half).step_by(2) {
+                        store.set_notes(*id, &format!("set by {half}")).await.unwrap();
+                    }
+                });
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    let nodes = block_on(async { Store::open(&path, "Test").await.unwrap().all().await.unwrap() });
+    for (i, id) in ids.iter().enumerate() {
+        let node = nodes.iter().find(|n| n.id == *id).unwrap();
+        assert_eq!(node.notes.as_deref(), Some(format!("set by {}", i % 2).as_str()), "#{id} lost its change");
+    }
+}
+
+#[test]
+fn store_writes_whole_so_a_reader_never_sees_a_half_written_roadmap() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rhipper.md");
+    let id = block_on(async {
+        let store = Store::open(&path, "Test").await.unwrap();
+        store.insert(Some(1), NodeKind::Task, "Card", None, None, 3).await.unwrap()
+    });
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (path, done) = (path.clone(), done.clone());
+        std::thread::spawn(move || {
+            block_on(async {
+                let store = Store::open(&path, "Test").await.unwrap();
+                // long notes make every write big enough to be caught halfway
+                for i in 0..100 {
+                    store.set_notes(id, &format!("{i} {}", "word ".repeat(4000))).await.unwrap();
+                }
+            });
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let mut reads = 0;
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let roadmap = markdown::parse_file(&text).unwrap();
+        assert_eq!(roadmap.nodes.len(), 2, "a read saw a cut roadmap");
+        let words = roadmap.nodes[1].notes.as_deref().map_or(4000, |notes| notes.matches("word").count());
+        assert_eq!(words, 4000, "a read saw cut notes");
+        reads += 1;
+    }
+    writer.join().unwrap();
+    assert!(reads > 0);
+}
+
+/// Runs a future on a runtime of its own, as a separate process would.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future)
+}
+
 async fn node_depends(store: &Store, id: i64) -> Vec<i64> {
     store.read(id).await.unwrap().depends_on
 }

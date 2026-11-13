@@ -105,7 +105,7 @@ impl Store {
                 evidence: None,
                 saving: None,
             };
-            std::fs::write(path, render(std::slice::from_ref(&root))).with_context(|| format!("cannot write {}", path.display()))?;
+            write_whole(path, &render(std::slice::from_ref(&root)))?;
         }
         let store = Self { path: path.to_owned(), by: Source::default() };
         // a cancelled card does not exist: a file written before that rule loses them on open
@@ -183,54 +183,55 @@ impl Store {
         anyhow::ensure!((1..=5).contains(&card.complexity), "complexity is 1 to 5");
         anyhow::ensure!(card.files.iter().all(|f| !f.is_empty() && !f.contains(char::is_whitespace)), "a path holds no whitespace");
         anyhow::ensure!(card.model.is_none_or(|m| !m.is_empty() && !m.contains(char::is_whitespace)), "a model id is one word");
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        for waited in card.waits_on {
-            anyhow::ensure!(nodes.iter().any(|n| n.id == *waited), "no node {waited}");
-        }
-        let parent = parent.filter(|_| kind != NodeKind::Project);
-        // the new node goes after the last descendant of its parent, so the file keeps its tree
-        // order and the node reads back under the right parent; a project goes last
-        let position = match parent {
-            Some(parent) => {
-                anyhow::ensure!(nodes.iter().any(|n| n.id == parent), "no node {parent}");
-                let last = tree::subtree(nodes, parent).last().map(|n| n.id);
-                nodes.iter().position(|n| Some(n.id) == last).map_or(nodes.len(), |i| i + 1)
+        self.mutate(|roadmap| {
+            let nodes = &mut roadmap.nodes;
+            for waited in card.waits_on {
+                anyhow::ensure!(nodes.iter().any(|n| n.id == *waited), "no node {waited}");
             }
-            None => {
-                anyhow::ensure!(kind == NodeKind::Project, "a node below a project needs a parent");
-                nodes.len()
-            }
-        };
-        let id = nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
-        let node = Node {
-            id,
-            parent,
-            kind,
-            title: title.to_owned(),
-            objective: card.objective.map(str::to_owned),
-            acceptance: card.acceptance.map(str::to_owned),
-            files: card.files.to_vec(),
-            session: None,
-            session_at: None,
-            session_of: None,
-            depends_on: dedup(card.waits_on),
-            needs: Vec::new(),
-            state: TaskState::Defined,
-            assignee: card.model.map(|model| Assignment { model: model.to_owned(), role: "implementer".to_owned() }),
-            complexity: card.complexity,
-            effort: Effort::default(),
-            estimate: None,
-            notes: None,
-            assessed: None,
-            priority: None,
-            absolute: false,
-            evidence: card.evidence.map(str::to_owned),
-            saving: card.saving.map(str::to_owned),
-        };
-        nodes.insert(position, node);
-        self.write(roadmap).await?;
-        Ok(id)
+            let parent = parent.filter(|_| kind != NodeKind::Project);
+            // the new node goes after the last descendant of its parent, so the file keeps its tree
+            // order and the node reads back under the right parent; a project goes last
+            let position = match parent {
+                Some(parent) => {
+                    anyhow::ensure!(nodes.iter().any(|n| n.id == parent), "no node {parent}");
+                    let last = tree::subtree(nodes, parent).last().map(|n| n.id);
+                    nodes.iter().position(|n| Some(n.id) == last).map_or(nodes.len(), |i| i + 1)
+                }
+                None => {
+                    anyhow::ensure!(kind == NodeKind::Project, "a node below a project needs a parent");
+                    nodes.len()
+                }
+            };
+            let id = nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
+            let node = Node {
+                id,
+                parent,
+                kind,
+                title: title.to_owned(),
+                objective: card.objective.map(str::to_owned),
+                acceptance: card.acceptance.map(str::to_owned),
+                files: card.files.to_vec(),
+                session: None,
+                session_at: None,
+                session_of: None,
+                depends_on: dedup(card.waits_on),
+                needs: Vec::new(),
+                state: TaskState::Defined,
+                assignee: card.model.map(|model| Assignment { model: model.to_owned(), role: "implementer".to_owned() }),
+                complexity: card.complexity,
+                effort: Effort::default(),
+                estimate: None,
+                notes: None,
+                assessed: None,
+                priority: None,
+                absolute: false,
+                evidence: card.evidence.map(str::to_owned),
+                saving: card.saving.map(str::to_owned),
+            };
+            nodes.insert(position, node);
+            Ok(id)
+        })
+        .await
     }
 
     /// Renames a node; the same as [`Store::set_title`], kept for the commands that say `rename`.
@@ -247,10 +248,7 @@ impl Store {
         let title = title.trim();
         anyhow::ensure!(!title.is_empty(), "a title is not empty");
         anyhow::ensure!(!title.contains(['\n', '\r']), "a title is one line");
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        node_mut(nodes, id)?.title = title.to_owned();
-        self.write(roadmap).await
+        self.set_node(id, |node| title.clone_into(&mut node.title)).await
     }
 
     /// Sets the complexity of a node, 1 to 5.
@@ -259,9 +257,7 @@ impl Store {
     /// When the complexity is out of range, the node is not there or the file cannot be written.
     pub async fn set_complexity(&self, id: i64, complexity: u8) -> anyhow::Result<()> {
         ensure_weight(Some(complexity), "complexity")?;
-        let mut roadmap = self.load().await?;
-        node_mut(&mut roadmap.nodes, id)?.complexity = complexity;
-        self.write(roadmap).await
+        self.set_node(id, |node| node.complexity = complexity).await
     }
 
     /// Adds the items of an outline under `parent`: a milestone under the parent, a section
@@ -306,14 +302,12 @@ impl Store {
 
     /// Adds a dependency: `id` waits for `waits_for`.
     pub async fn depend_on(&self, id: i64, waits_for: i64) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        let node = node_mut(nodes, id)?;
-        if !node.depends_on.contains(&waits_for) {
-            node.depends_on.push(waits_for);
-            self.write(roadmap).await?;
-        }
-        Ok(())
+        self.set_node(id, |node| {
+            if !node.depends_on.contains(&waits_for) {
+                node.depends_on.push(waits_for);
+            }
+        })
+        .await
     }
 
     /// Sets the state of a node, recorded in the history under the store's source. A card set
@@ -327,14 +321,17 @@ impl Store {
     /// are the run's and not the surface's that started it. A state set again is no change
     /// and leaves no line.
     pub async fn set_state_by(&self, id: i64, state: TaskState, by: Source) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        let from = node_mut(&mut roadmap.nodes, id)?.state;
-        if state == TaskState::Cancelled {
-            self.remove(id, true).await?;
-        } else {
-            node_mut(&mut roadmap.nodes, id)?.state = state;
-            self.write(roadmap).await?;
-        }
+        let from = self
+            .mutate(|roadmap| {
+                let from = node_mut(&mut roadmap.nodes, id)?.state;
+                if state == TaskState::Cancelled {
+                    remove_from(&mut roadmap.nodes, id, true)?;
+                } else {
+                    node_mut(&mut roadmap.nodes, id)?.state = state;
+                }
+                Ok(from)
+            })
+            .await?;
         if from != state {
             let change = Change { at: unix_now(), id, from, to: state, by };
             history::append(&self.history_path(), &change)?;
@@ -346,24 +343,7 @@ impl Store {
     /// `tree`, and the project is never removed. Every `waits-on` reference to a removed id goes
     /// with it. Returns the ids removed, the node first.
     pub async fn remove(&self, id: i64, tree: bool) -> anyhow::Result<Vec<i64>> {
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        let node = nodes.iter().find(|n| n.id == id).with_context(|| format!("no node {id}"))?;
-        anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is the project; it stays");
-        let children: Vec<String> = nodes.iter().filter(|n| n.parent == Some(id)).map(|n| format!("#{}", n.id)).collect();
-        anyhow::ensure!(
-            tree || children.is_empty(),
-            "#{id} has {} card(s) under it ({}); remove them first, or the whole tree",
-            children.len(),
-            children.join(" ")
-        );
-        let removed: Vec<i64> = tree::subtree(nodes, id).iter().map(|n| n.id).collect();
-        nodes.retain(|n| !removed.contains(&n.id));
-        for n in nodes.iter_mut() {
-            n.depends_on.retain(|d| !removed.contains(d));
-        }
-        self.write(roadmap).await?;
-        Ok(removed)
+        self.mutate(|roadmap| remove_from(&mut roadmap.nodes, id, tree)).await
     }
 
     /// Moves a node with its subtree under `under`, after the sibling `after` or last among the
@@ -387,36 +367,7 @@ impl Store {
     }
 
     async fn relocate(&self, id: i64, under: i64, slot: Slot) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        let node = nodes.iter().find(|n| n.id == id).with_context(|| format!("no node {id}"))?;
-        anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is the project; it stays");
-        anyhow::ensure!(nodes.iter().any(|n| n.id == under), "no node {under}");
-        anyhow::ensure!(!tree::is_within(nodes, under, id), "#{under} is #{id} or under it; a card does not move under itself");
-        if let Slot::After(after) = slot {
-            let sibling = nodes.iter().find(|n| n.id == after).with_context(|| format!("no node {after}"))?;
-            anyhow::ensure!(sibling.parent == Some(under), "#{after} is not under #{under}");
-            anyhow::ensure!(after != id, "#{id} cannot follow itself");
-        }
-        // the subtree comes out whole, then goes back right behind the new parent's line when it
-        // goes first, else after the last descendant of the sibling it follows, or of the new
-        // parent when it goes last
-        let moved: Vec<i64> = tree::subtree(nodes, id).iter().map(|n| n.id).collect();
-        let mut lifted: Vec<Node> = Vec::with_capacity(moved.len());
-        let mut rest = Vec::with_capacity(nodes.len());
-        for n in nodes.drain(..) {
-            if moved.contains(&n.id) { lifted.push(n) } else { rest.push(n) }
-        }
-        *nodes = rest;
-        lifted[0].parent = Some(under);
-        let behind = match slot {
-            Slot::First => Some(under),
-            Slot::Last => tree::subtree(nodes, under).last().map(|n| n.id),
-            Slot::After(after) => tree::subtree(nodes, after).last().map(|n| n.id),
-        };
-        let position = nodes.iter().position(|n| Some(n.id) == behind).map_or(nodes.len(), |i| i + 1);
-        nodes.splice(position..position, lifted);
-        self.write(roadmap).await
+        self.mutate(|roadmap| relocate_in(&mut roadmap.nodes, id, under, slot)).await
     }
 
     /// Removes every cancelled card the file holds, with its subtree; how many went. An older
@@ -435,10 +386,7 @@ impl Store {
 
     /// Assigns a node to a worker, or clears the assignment with `None`.
     pub async fn assign(&self, id: i64, assignment: Option<&Assignment>) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        node_mut(nodes, id)?.assignee = assignment.cloned();
-        self.write(roadmap).await
+        self.set_node(id, |node| node.assignee = assignment.cloned()).await
     }
 
     /// Sets the effort a run of a node asks of its model.
@@ -446,10 +394,7 @@ impl Store {
     /// # Errors
     /// When the node is not there or the file cannot be written.
     pub async fn set_effort(&self, id: i64, effort: Effort) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        node_mut(nodes, id)?.effort = effort;
-        self.write(roadmap).await
+        self.set_node(id, |node| node.effort = effort).await
     }
 
     /// Sets a node's own estimate of what a run spends; `None` goes back to the complexity's.
@@ -457,10 +402,7 @@ impl Store {
     /// # Errors
     /// When the node is not there or the file cannot be written.
     pub async fn set_estimate(&self, id: i64, estimate: Option<Estimate>) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        node_mut(nodes, id)?.estimate = estimate;
-        self.write(roadmap).await
+        self.set_node(id, |node| node.estimate = estimate).await
     }
 
     /// Records the notes of the last execution on a node.
@@ -468,20 +410,14 @@ impl Store {
     /// # Errors
     /// When the node is not there or the file cannot be written.
     pub async fn set_notes(&self, id: i64, notes: &str) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        node_mut(nodes, id)?.notes = Some(notes.to_owned());
-        self.write(roadmap).await
+        self.set_node(id, |node| node.notes = Some(notes.to_owned())).await
     }
 
     /// Replaces the files a node names, the workspace-relative paths its worker reads first; an
     /// empty list clears them. A path holds no whitespace, since the file separates paths by spaces.
     pub async fn set_files(&self, id: i64, files: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(files.iter().all(|f| !f.is_empty() && !f.contains(char::is_whitespace)), "a path holds no whitespace");
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        node_mut(nodes, id)?.files = files.to_vec();
-        self.write(roadmap).await
+        self.set_node(id, |node| node.files = files.to_vec()).await
     }
 
     /// Keeps the harness session of a node's last worker run, with the fingerprint of the card it
@@ -497,28 +433,26 @@ impl Store {
             session.is_none_or(|(s, of)| !s.contains(char::is_whitespace) && !of.is_empty() && !of.contains(char::is_whitespace)),
             "a session id and its fingerprint hold no whitespace"
         );
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        let node = node_mut(nodes, id)?;
-        node.session = session.map(|(s, _)| s.to_owned());
-        node.session_of = session.map(|(_, of)| of.to_owned());
-        node.session_at = session.map(|_| now);
-        self.write(roadmap).await
+        self.set_node(id, |node| {
+            node.session = session.map(|(s, _)| s.to_owned());
+            node.session_of = session.map(|(_, of)| of.to_owned());
+            node.session_at = session.map(|_| now);
+        })
+        .await
     }
 
     /// Replaces the objective and the acceptance of a node, as a reassessment wrote them. A field
     /// of `None` keeps its text.
     pub async fn set_details(&self, id: i64, objective: Option<&str>, acceptance: Option<&str>) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        let node = node_mut(nodes, id)?;
-        if let Some(objective) = objective {
-            node.objective = Some(objective.to_owned());
-        }
-        if let Some(acceptance) = acceptance {
-            node.acceptance = Some(acceptance.to_owned());
-        }
-        self.write(roadmap).await
+        self.set_node(id, |node| {
+            if let Some(objective) = objective {
+                node.objective = Some(objective.to_owned());
+            }
+            if let Some(acceptance) = acceptance {
+                node.acceptance = Some(acceptance.to_owned());
+            }
+        })
+        .await
     }
 
     /// Rewrites the fields an edit names and nothing else, in one write, under the same rules
@@ -536,38 +470,35 @@ impl Store {
             edit.files.is_none_or(|files| files.iter().all(|f| !f.is_empty() && !f.contains(char::is_whitespace))),
             "a path holds no whitespace"
         );
-        let mut roadmap = self.load().await?;
-        let node = node_mut(&mut roadmap.nodes, id)?;
-        if let Some(title) = title {
-            title.clone_into(&mut node.title);
-        }
-        if let Some(objective) = edit.objective {
-            node.objective = Some(objective.to_owned());
-        }
-        if let Some(acceptance) = edit.acceptance {
-            node.acceptance = Some(acceptance.to_owned());
-        }
-        if let Some(complexity) = edit.complexity {
-            node.complexity = complexity;
-        }
-        if let Some(files) = edit.files {
-            node.files = files.to_vec();
-        }
-        if edit.clear_session {
-            node.session = None;
-            node.session_of = None;
-            node.session_at = None;
-        }
-        self.write(roadmap).await
+        self.set_node(id, |node| {
+            if let Some(title) = title {
+                title.clone_into(&mut node.title);
+            }
+            if let Some(objective) = edit.objective {
+                node.objective = Some(objective.to_owned());
+            }
+            if let Some(acceptance) = edit.acceptance {
+                node.acceptance = Some(acceptance.to_owned());
+            }
+            if let Some(complexity) = edit.complexity {
+                node.complexity = complexity;
+            }
+            if let Some(files) = edit.files {
+                node.files = files.to_vec();
+            }
+            if edit.clear_session {
+                node.session = None;
+                node.session_of = None;
+                node.session_at = None;
+            }
+        })
+        .await
     }
 
     /// Records what the last reassessment of a node saw: a fingerprint, or the word `final`;
     /// `None` clears the mark, so the next reassessment calls the model again.
     pub async fn set_assessed(&self, id: i64, assessed: Option<&str>) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        let nodes = &mut roadmap.nodes;
-        node_mut(nodes, id)?.assessed = assessed.map(str::to_owned);
-        self.write(roadmap).await
+        self.set_node(id, |node| node.assessed = assessed.map(str::to_owned)).await
     }
 
     /// Sets the person's priority on a node, 1 to 5; `None` clears it.
@@ -576,9 +507,7 @@ impl Store {
     /// When the priority is out of range, the node is not there or the file cannot be written.
     pub async fn set_priority(&self, id: i64, priority: Option<u8>) -> anyhow::Result<()> {
         ensure_weight(priority, "priority")?;
-        let mut roadmap = self.load().await?;
-        node_mut(&mut roadmap.nodes, id)?.priority = priority;
-        self.write(roadmap).await
+        self.set_node(id, |node| node.priority = priority).await
     }
 
     /// Marks a card absolute or not ([`crate::model::Node::absolute`]).
@@ -586,9 +515,7 @@ impl Store {
     /// # Errors
     /// When the node is not there or the file cannot be written.
     pub async fn set_absolute(&self, id: i64, absolute: bool) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        node_mut(&mut roadmap.nodes, id)?.absolute = absolute;
-        self.write(roadmap).await
+        self.set_node(id, |node| node.absolute = absolute).await
     }
 
     /// Adds a gambit, active, with its weight and the words of its focus; returns its id, the
@@ -601,33 +528,30 @@ impl Store {
         anyhow::ensure!(!text.trim().is_empty(), "a gambit is not empty");
         ensure_weight(Some(weight), "weight")?;
         anyhow::ensure!(focus.iter().all(|w| !w.is_empty() && !w.contains(char::is_whitespace)), "a focus word holds no whitespace");
-        let mut roadmap = self.load().await?;
-        let id = roadmap.gambits.iter().map(|g| g.id).max().unwrap_or(0) + 1;
-        roadmap.gambits.push(Gambit {
-            id,
-            text: text.trim().to_owned(),
-            weight,
-            state: GambitState::Active,
-            focus: focus.to_vec(),
-            plan_next: false,
-        });
-        self.write(roadmap).await?;
-        Ok(id)
+        self.mutate(|roadmap| {
+            let id = roadmap.gambits.iter().map(|g| g.id).max().unwrap_or(0) + 1;
+            roadmap.gambits.push(Gambit {
+                id,
+                text: text.trim().to_owned(),
+                weight,
+                state: GambitState::Active,
+                focus: focus.to_vec(),
+                plan_next: false,
+            });
+            Ok(id)
+        })
+        .await
     }
 
     /// Sets the state of a gambit. A done gambit stays in the file.
     pub async fn set_gambit_state(&self, id: u32, state: GambitState) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        gambit_mut(&mut roadmap.gambits, id)?.state = state;
-        self.write(roadmap).await
+        self.set_gambit(id, |gambit| gambit.state = state).await
     }
 
     /// Sets the weight of a gambit, 1 to 5.
     pub async fn set_gambit_weight(&self, id: u32, weight: u8) -> anyhow::Result<()> {
         ensure_weight(Some(weight), "weight")?;
-        let mut roadmap = self.load().await?;
-        gambit_mut(&mut roadmap.gambits, id)?.weight = weight;
-        self.write(roadmap).await
+        self.set_gambit(id, |gambit| gambit.weight = weight).await
     }
 
     /// Replaces the focus words of a gambit; none makes it match every card.
@@ -636,9 +560,7 @@ impl Store {
     /// When a word holds whitespace, the gambit is unknown or the file cannot be written.
     pub async fn set_gambit_focus(&self, id: u32, focus: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(focus.iter().all(|w| !w.is_empty() && !w.contains(char::is_whitespace)), "a focus word holds no whitespace");
-        let mut roadmap = self.load().await?;
-        gambit_mut(&mut roadmap.gambits, id)?.focus = focus.to_vec();
-        self.write(roadmap).await
+        self.set_gambit(id, |gambit| gambit.focus = focus.to_vec()).await
     }
 
     /// Sets whether a gambit lets the planner fill the roadmap when no card is ready.
@@ -646,20 +568,139 @@ impl Store {
     /// # Errors
     /// When the gambit is unknown or the file cannot be written.
     pub async fn set_gambit_plan_next(&self, id: u32, plan_next: bool) -> anyhow::Result<()> {
-        let mut roadmap = self.load().await?;
-        gambit_mut(&mut roadmap.gambits, id)?.plan_next = plan_next;
-        self.write(roadmap).await
+        self.set_gambit(id, |gambit| gambit.plan_next = plan_next).await
     }
 
-    /// Writes the file back as the `rhipper.md` text. The file is small, so a blocking write stays
-    /// fine.
-    async fn write(&self, roadmap: Roadmap) -> anyhow::Result<()> {
-        let text = markdown::render_file(&roadmap);
-        std::fs::write(&self.path, text).with_context(|| format!("cannot write {}", self.path.display()))
+    /// Loads the roadmap, lets `change` change it and writes it back, all under the lock beside
+    /// the file: the walk, the window, `rc` and the MCP server each hold a store of their own,
+    /// and without the lock two changes made at once would each write over the other. Nothing is
+    /// written when `change` fails. The file is small, so the blocking reads and writes stay fine.
+    ///
+    /// # Errors
+    /// When the lock cannot be taken, the file cannot be read or parsed, `change` fails, or the
+    /// file cannot be written.
+    pub async fn mutate<T>(&self, change: impl FnOnce(&mut Roadmap) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let _lock = self.lock()?;
+        let text = std::fs::read_to_string(&self.path).with_context(|| format!("cannot read {}", self.path.display()))?;
+        let mut roadmap = markdown::parse_file(&text)?;
+        let out = change(&mut roadmap)?;
+        write_whole(&self.path, &markdown::render_file(&roadmap))?;
+        Ok(out)
+    }
+
+    /// [`Store::mutate`] of one node.
+    async fn set_node(&self, id: i64, change: impl FnOnce(&mut Node)) -> anyhow::Result<()> {
+        self.mutate(|roadmap| {
+            change(node_mut(&mut roadmap.nodes, id)?);
+            Ok(())
+        })
+        .await
+    }
+
+    /// [`Store::mutate`] of one gambit.
+    async fn set_gambit(&self, id: u32, change: impl FnOnce(&mut Gambit)) -> anyhow::Result<()> {
+        self.mutate(|roadmap| {
+            change(gambit_mut(&mut roadmap.gambits, id)?);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Takes the OS lock on `rhipper.md.lock`, waiting while another store holds it; dropping the
+    /// file lets it go, and a process that dies lets it go with it.
+    fn lock(&self) -> anyhow::Result<std::fs::File> {
+        let mut name = self.path.file_name().unwrap_or_default().to_owned();
+        name.push(".lock");
+        let path = self.path.with_file_name(name);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        file.lock().with_context(|| format!("cannot lock {}", path.display()))?;
+        Ok(file)
     }
 }
 
-/// Seconds since the epoch, for a history line.
+/// Writes `text` to a temp file beside `path` and renames it over `path`, so a reader sees the
+/// old roadmap or the new one and never a cut one. A rename refused for a moment, as Windows does
+/// while another program holds the file open, is tried again for a short while.
+fn write_whole(path: &Path, text: &str) -> anyhow::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}.{seq}.tmp", std::process::id()));
+    let temp = path.with_file_name(name);
+    std::fs::write(&temp, text).with_context(|| format!("cannot write {}", temp.display()))?;
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(&temp, path) {
+            Ok(()) => return Ok(()),
+            Err(_) if tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(e).with_context(|| format!("cannot write {}", path.display()));
+            }
+        }
+    }
+}
+
+/// Removes a node, and with `tree` its subtree, with every `waits-on` reference to a removed id;
+/// the rules of [`Store::remove`].
+fn remove_from(nodes: &mut Vec<Node>, id: i64, tree: bool) -> anyhow::Result<Vec<i64>> {
+    let node = nodes.iter().find(|n| n.id == id).with_context(|| format!("no node {id}"))?;
+    anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is the project; it stays");
+    let children: Vec<String> = nodes.iter().filter(|n| n.parent == Some(id)).map(|n| format!("#{}", n.id)).collect();
+    anyhow::ensure!(
+        tree || children.is_empty(),
+        "#{id} has {} card(s) under it ({}); remove them first, or the whole tree",
+        children.len(),
+        children.join(" ")
+    );
+    let removed: Vec<i64> = tree::subtree(nodes, id).iter().map(|n| n.id).collect();
+    nodes.retain(|n| !removed.contains(&n.id));
+    for n in nodes.iter_mut() {
+        n.depends_on.retain(|d| !removed.contains(d));
+    }
+    Ok(removed)
+}
+
+/// Moves a node with its subtree under `under` at `slot`; the rules of [`Store::move_node`].
+fn relocate_in(nodes: &mut Vec<Node>, id: i64, under: i64, slot: Slot) -> anyhow::Result<()> {
+    let node = nodes.iter().find(|n| n.id == id).with_context(|| format!("no node {id}"))?;
+    anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is the project; it stays");
+    anyhow::ensure!(nodes.iter().any(|n| n.id == under), "no node {under}");
+    anyhow::ensure!(!tree::is_within(nodes, under, id), "#{under} is #{id} or under it; a card does not move under itself");
+    if let Slot::After(after) = slot {
+        let sibling = nodes.iter().find(|n| n.id == after).with_context(|| format!("no node {after}"))?;
+        anyhow::ensure!(sibling.parent == Some(under), "#{after} is not under #{under}");
+        anyhow::ensure!(after != id, "#{id} cannot follow itself");
+    }
+    // the subtree comes out whole, then goes back right behind the new parent's line when it
+    // goes first, else after the last descendant of the sibling it follows, or of the new
+    // parent when it goes last
+    let moved: Vec<i64> = tree::subtree(nodes, id).iter().map(|n| n.id).collect();
+    let mut lifted: Vec<Node> = Vec::with_capacity(moved.len());
+    let mut rest = Vec::with_capacity(nodes.len());
+    for n in nodes.drain(..) {
+        if moved.contains(&n.id) { lifted.push(n) } else { rest.push(n) }
+    }
+    *nodes = rest;
+    lifted[0].parent = Some(under);
+    let behind = match slot {
+        Slot::First => Some(under),
+        Slot::Last => tree::subtree(nodes, under).last().map(|n| n.id),
+        Slot::After(after) => tree::subtree(nodes, after).last().map(|n| n.id),
+    };
+    let position = nodes.iter().position(|n| Some(n.id) == behind).map_or(nodes.len(), |i| i + 1);
+    nodes.splice(position..position, lifted);
+    Ok(())
+}
+
 /// Where a moved subtree goes among the new parent's children.
 #[derive(Clone, Copy)]
 enum Slot {
@@ -668,6 +709,7 @@ enum Slot {
     After(i64),
 }
 
+/// Seconds since the epoch, for a history line.
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
