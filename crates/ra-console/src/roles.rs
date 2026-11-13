@@ -59,13 +59,24 @@ impl Roles {
     pub fn model(&self, role: Role) -> Option<&str> {
         self.of(role).map(|(model, _)| model)
     }
+
+    /// The resolution of every role for the start line, once per run: `roles: summary
+    /// local/qwen3-8b · digest off · classify off`, so the ledger's rows are read against what
+    /// the run said it would call.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let parts: Vec<String> =
+            Role::ALL.into_iter().map(|role| format!("{} {}", role.name(), self.model(role).unwrap_or("off"))).collect();
+        format!("roles: {}", parts.join(" · "))
+    }
 }
 
 impl Worker {
     /// The cheap roles of a run in `root`: the ones a test set, else each as the `[role]` table
     /// of `rhipper.toml` names it, with a key left out going to the local server when it answers
     /// a ping (once per run, whatever the number of roles) and to no model at all when it does
-    /// not. A role whose model has no provider is off, with a warning.
+    /// not. A role whose model has no provider is off, with a warning; so is one that resolved
+    /// to a Claude model the table did not name, since the cheap roles never fall to one.
     pub(crate) async fn roles(&self, root: &Path) -> Roles {
         if let Some(preset) = &self.roles {
             return preset.clone();
@@ -82,6 +93,10 @@ impl Worker {
         let local = if needs_local && !cfg!(test) { ra_providers::local::default_model().await } else { None };
         let mut roles = Roles::default();
         for (role, model) in Roles::resolve(&config, local.as_deref()) {
+            if crate::agent::Route::of(&model) == crate::agent::Route::ClaudeCode && config.model(role).is_none() {
+                tracing::warn!("the {} role is off: {model} is a Claude model the [role] table did not name", role.name());
+                continue;
+            }
             match self.provider_for(&model) {
                 Ok(provider) => roles.routes.push((role, model, provider)),
                 Err(e) => tracing::warn!("the {} role is off: {e:#}", role.name()),

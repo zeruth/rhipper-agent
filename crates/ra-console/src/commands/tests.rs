@@ -2143,6 +2143,64 @@ async fn without_a_local_server_the_roles_make_no_call_and_the_rule_based_path_s
 }
 
 #[tokio::test]
+async fn a_role_without_a_local_server_makes_no_call() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let card = Scripted::new(vec![says(ROLE_REPORT, vec![]), says("accepted", vec![])]);
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    // no `[role]` table and no server: every role resolves to off, and the start line says so
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger);
+    assert_eq!(runner.roles(dir.path()).await.summary(), "roles: summary off · digest off · classify off");
+    run("/run 2", &store, &runner).await.unwrap();
+    // the card's model answered as the worker and the reviewer; no role fell to a Claude model,
+    // so the ledger has no claude row and no row tagged with a cheap role
+    assert_eq!(card.seen.lock().len(), 2);
+    assert_eq!(runner.tally().calls, 2);
+    let rows = runner.by_model().await.unwrap();
+    assert!(rows.iter().all(|(model, _)| !model.starts_with("claude-")), "{rows:?}");
+    let calls = runner.calls_of(Some(2)).await.unwrap();
+    let tags: Vec<(&str, Option<&str>)> = calls.iter().map(|c| (c.model.as_str(), c.role.as_deref())).collect();
+    assert!(tags.iter().all(|(_, role)| !matches!(role, Some("summary" | "digest" | "classify"))), "{tags:?}");
+}
+
+#[tokio::test]
+async fn a_role_named_in_the_table_goes_to_that_model() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    // the table names the summary's model and turns the other two off; nothing pings a server
+    std::fs::write(
+        dir.path().join(crate::router::ROUTES_FILE),
+        "[role]\nsummary = \"z-ai/glm-5.3-flash\"\ndigest = \"\"\nclassify = \"\"\n",
+    )
+    .unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // the named model is the card's own, so its provider takes the report, the summary, then
+    // the verdict
+    let card =
+        Scripted::new(vec![says(ROLE_REPORT, vec![]), says("wrote hello.txt; verified by cargo test", vec![]), says("accepted", vec![])]);
+    let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger);
+    assert_eq!(runner.roles(dir.path()).await.summary(), "roles: summary z-ai/glm-5.3-flash · digest off · classify off");
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    {
+        let seen = card.seen.lock();
+        assert_eq!(seen.len(), 3, "{out:?}");
+        assert!(seen[1].tools.is_empty() && seen[1].workspace.is_none());
+        assert!(seen[1].messages[1].content.starts_with("wrote the greeting"), "{}", seen[1].messages[1].content);
+    }
+    assert_eq!(ra_context::TaskContext::open(dir.path(), 2).handoffs.last().unwrap().report, "wrote hello.txt; verified by cargo test");
+    // the role's row carries the role in its model column, as the reviewer's does
+    let calls = runner.calls_of(Some(2)).await.unwrap();
+    let mut tags: Vec<(&str, Option<&str>)> = calls.iter().map(|c| (c.model.as_str(), c.role.as_deref())).collect();
+    tags.sort_unstable();
+    assert_eq!(tags, [("z-ai/glm-5.3-flash", None), ("z-ai/glm-5.3-flash", Some("reviewer")), ("z-ai/glm-5.3-flash", Some("summary"))]);
+    assert!(runner.by_model().await.unwrap().iter().all(|(model, _)| !model.starts_with("claude-")));
+}
+
+#[tokio::test]
 async fn a_local_server_that_went_down_degrades_the_roles_to_no_call_and_never_to_the_cards_model() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let dir = tempfile::tempdir().unwrap();
