@@ -4305,7 +4305,7 @@ impl Workspace {
                     let grip_name = root.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                     let place_text =
                         place.map_or_else(|| "not in the machine's order".to_owned(), |p| format!("#{p} in the machine's order"));
-                    ui.dnd_drag_source(egui::Id::new(("dash-grip", &root)), grip_name, |ui| {
+                    ui.dnd_drag_source(ui.make_persistent_id(("dash-grip", &root)), grip_name, |ui| {
                         ui.label(RichText::new("⋮").size(20.0).strong().color(theme::dim()));
                     })
                     .response
