@@ -12,7 +12,7 @@ use eframe::egui;
 use egui::{Align, Color32, Frame, Layout, Margin, RichText};
 use ra_roadmap::model::TaskState;
 
-use crate::metrics::number_after;
+use crate::metrics::usd_of;
 use crate::{App, cards, dollars, theme};
 
 #[cfg(test)]
@@ -169,7 +169,7 @@ fn read_event(cards: &mut HashMap<i64, Card>, at: u64, body: &str) {
         let Some((id, rest)) = rest.find('#').and_then(|i| card_of(&rest[i + 1..])) else { return };
         let card = cards.entry(id).or_default();
         let start = card.open.take();
-        card.runs.push(Run { start, end: at, cost: number_after(body, "$").unwrap_or(0.0), landed: false });
+        card.runs.push(Run { start, end: at, cost: usd_of(body).unwrap_or(0.0), landed: false });
         let said = after_title(rest, &card.title);
         let word = if ok {
             (Group::Yours, "implemented", sentence_of(said))
@@ -184,7 +184,7 @@ fn read_event(cards: &mut HashMap<i64, Card>, at: u64, body: &str) {
         let Some((id, rest)) = rest.find('#').and_then(|i| card_of(&rest[i + 1..])) else { return };
         let card = cards.entry(id).or_default();
         if let Some(run) = card.runs.last_mut() {
-            run.cost += number_after(body, "$").unwrap_or(0.0);
+            run.cost += usd_of(body).unwrap_or(0.0);
         }
         let said = after_title(rest, &card.title);
         let word = if let Some(why) = said.strip_prefix("no verdict:") {

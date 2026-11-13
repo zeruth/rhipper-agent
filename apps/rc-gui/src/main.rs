@@ -378,9 +378,12 @@ struct App {
     /// Where the dashboard's Blood Moon scroll bar was dragged to, for the scroll area of the
     /// next frame.
     dash_scroll_to: Option<f32>,
-    /// The report's pinned metrics and when they were read from the feeds; read again every
-    /// half minute while the report is up.
+    /// The report's pinned metrics, the walks of every open project they are read from and
+    /// when; read again every half minute while the report is up. The scope is one project's
+    /// root, or every project's when `None`.
     report_metrics: Vec<metrics::Metric>,
+    report_walks: Vec<metrics::Walk>,
+    report_scope: Option<PathBuf>,
     report_metrics_at: Option<Instant>,
     /// When the window started, for the dashboard's uptime.
     started: Instant,
@@ -747,6 +750,8 @@ impl App {
             builders_at: None,
             dash_scroll_to: None,
             report_metrics: Vec::new(),
+            report_walks: Vec::new(),
+            report_scope: None,
             report_metrics_at: None,
             started: Instant::now(),
             report: false,
@@ -1175,6 +1180,71 @@ impl App {
         });
     }
 
+    /// The efficiency row under the machine's: what the walks are worth, each tile the latest
+    /// walk and its trend over the walks before, of every project or of the one its chip picks;
+    /// read from every open project's feed every half minute.
+    fn metrics_row(&mut self, ui: &mut egui::Ui, width: f32) {
+        if self.report_metrics_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
+            let roots: Vec<PathBuf> = self.tabs.iter().map(|t| t.root.clone()).collect();
+            // a closed project's scope falls back to all of them
+            if self.report_scope.as_ref().is_some_and(|scope| !roots.contains(scope)) {
+                self.report_scope = None;
+            }
+            self.report_walks = metrics::walks(&roots);
+            self.report_metrics = metrics::metrics(&self.report_walks, self.report_scope.as_deref());
+            self.report_metrics_at = Some(Instant::now());
+        }
+        if self.report_walks.is_empty() {
+            return;
+        }
+        if self.tabs.len() > 1 {
+            let mut picked: Option<Option<PathBuf>> = None;
+            ui.horizontal(|ui| {
+                if cards::chip(ui, "ALL", theme::accent(), self.report_scope.is_none()) {
+                    picked = Some(None);
+                }
+                for tab in &self.tabs {
+                    let name = tab.root.file_name().map_or_else(|| tab.root.display().to_string(), |n| n.to_string_lossy().into_owned());
+                    if cards::chip(ui, &name.to_uppercase(), theme::accent(), self.report_scope.as_ref() == Some(&tab.root)) {
+                        picked = Some(Some(tab.root.clone()));
+                    }
+                }
+            });
+            if let Some(scope) = picked {
+                self.report_scope = scope;
+                self.report_metrics = metrics::metrics(&self.report_walks, self.report_scope.as_deref());
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            for metric in &self.report_metrics {
+                let shown = metric.current().map_or_else(|| "—".to_owned(), metric.format);
+                let arrow = match metric.delta() {
+                    Some(d) if d > 0.0 => " ▲",
+                    Some(d) if d < 0.0 => " ▼",
+                    _ => "",
+                };
+                // green for better, red for worse, dim without a change
+                let color = match metric.improved() {
+                    Some(true) => theme::online(),
+                    Some(false) => theme::accent(),
+                    None => theme::dim(),
+                };
+                // the trend, scaled to the largest walk; a walk with nothing to measure sits at
+                // the bottom
+                let top = metric.values.iter().filter_map(|v| *v).fold(0.0_f64, f64::max).max(f64::EPSILON);
+                #[allow(clippy::cast_possible_truncation)]
+                let samples: Vec<f32> = metric.values.iter().map(|v| (v.unwrap_or(0.0) / top) as f32).collect();
+                let walks = metric.values.iter().map(|v| v.map_or_else(|| "—".to_owned(), metric.format)).collect::<Vec<_>>().join(" · ");
+                let latest = metric.details.last().map_or("", String::as_str);
+                ui.scope(|ui| cards::gauge(ui, metric.name, &format!("{shown}{arrow}"), &samples, color, width)).response.on_hover_text(
+                    format!("{}\nthe latest walk: {latest}\nthe last {} walk(s), oldest first: {walks}", metric.hint, metric.values.len()),
+                );
+            }
+        });
+        ui.add_space(4.0);
+    }
+
     /// The dashboard: one card per project, top to bottom, as many as the window has room for
     /// and a scroll for the rest. Each card is the project's name and state, the card a run is
     /// on (else the next ready ones) in the roadmap's own rows, and its latest run.
@@ -1198,48 +1268,7 @@ impl App {
                 self.tokens.row(ui, width);
             });
             ui.add_space(4.0);
-            // the efficiency row under the machine's: what the walks are worth, each metric's
-            // latest session and its trend over the sessions before (the person's six,
-            // 2026-11-12), read from every open project's feed every half minute
-            if self.report_metrics_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
-                let roots: Vec<PathBuf> = self.tabs.iter().map(|t| t.root.clone()).collect();
-                self.report_metrics = metrics::metrics(&metrics::sessions(&roots));
-                self.report_metrics_at = Some(Instant::now());
-            }
-            if !self.report_metrics.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    for metric in &self.report_metrics {
-                        let shown = metric.current().map_or_else(|| "—".to_owned(), metric.format);
-                        let arrow = match metric.delta() {
-                            Some(d) if d > 0.0 => " ▲",
-                            Some(d) if d < 0.0 => " ▼",
-                            _ => "",
-                        };
-                        // green for better, red for worse, dim without a change
-                        let color = match metric.improved() {
-                            Some(true) => theme::online(),
-                            Some(false) => theme::accent(),
-                            None => theme::dim(),
-                        };
-                        // the trend, scaled to the largest session; a session with nothing to
-                        // measure sits at the bottom
-                        let top = metric.values.iter().filter_map(|v| *v).fold(0.0_f64, f64::max).max(f64::EPSILON);
-                        #[allow(clippy::cast_possible_truncation)]
-                        let samples: Vec<f32> = metric.values.iter().map(|v| (v.unwrap_or(0.0) / top) as f32).collect();
-                        let sessions =
-                            metric.values.iter().map(|v| v.map_or_else(|| "—".to_owned(), metric.format)).collect::<Vec<_>>().join(" · ");
-                        ui.scope(|ui| cards::gauge(ui, metric.name, &format!("{shown}{arrow}"), &samples, color, width))
-                            .response
-                            .on_hover_text(format!(
-                                "{}\nthe last {} session(s), oldest first: {sessions}",
-                                metric.hint,
-                                metric.values.len()
-                            ));
-                    }
-                });
-                ui.add_space(4.0);
-            }
+            self.metrics_row(ui, width);
             // the builders: the machine's build slots, who holds each and for how long, read
             // once a second (the person: "a builders gauge row below the 6 gauges")
             if self.builders_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
