@@ -665,3 +665,50 @@ fn the_plan_context_carries_one_clipped_line_from_each_source_of_evidence() {
     assert!(block.lines().any(|l| l.starts_with("- retro.log:8 x") && l.ends_with('…')), "{block}");
     assert_eq!(plan::clip("short"), "short");
 }
+
+#[test]
+fn the_tree_since_the_last_run_reads_as_nothing_landed_merged_or_reset() {
+    assert_eq!(since_line("abc123", "abc123def", true, ""), None);
+    let landed = since_line("abc123", "def456", true, "def456 abc123\tCheckpoint: a card\n").unwrap();
+    assert!(landed.starts_with("landed: 1 commit(s)") && landed.contains("Checkpoint: a card"), "{landed}");
+    let merged = since_line("abc123", "def456", true, "def456 aaa111 bbb222\tMerge branch 'main' into card/7\naaa111 abc123\tx\n").unwrap();
+    assert!(merged.starts_with("merged: Merge branch 'main' into card/7") && merged.contains("2 commit(s)"), "{merged}");
+    let reset = since_line("abc123", "def456", false, "").unwrap();
+    assert!(reset.starts_with("reset: the tree no longer holds abc123"), "{reset}");
+}
+
+#[test]
+fn a_handoff_head_names_the_tip_the_branch_s_commits_what_happened_and_what_is_open() {
+    let tree = Tree {
+        tip: "abc123".to_owned(),
+        branch: Some("card/7".to_owned()),
+        commits: vec!["c2 Checkpoint: run 2".to_owned(), "c1 Checkpoint: run 1".to_owned()],
+        since: Some("merged: Merge branch 'main'".to_owned()),
+    };
+    let head = tree.head(&["cargo test -p x".to_owned()]);
+    assert_eq!(
+        head,
+        "tree: at abc123 on card/7 · 2 commit(s) on the branch since its base: c2 Checkpoint: run 2; c1 Checkpoint: run 1\nsince the last run: merged: Merge branch 'main'\nopen: `cargo test -p x`\n"
+    );
+    // the head rides the report through the file, and the next run reads its tip back
+    let report = format!("{head}the worker's words\nmore");
+    let handoff = Handoff {
+        when: 1,
+        model: "m".to_owned(),
+        outcome: "continues".to_owned(),
+        check: "no check".to_owned(),
+        verdict: None,
+        changed: vec![],
+        report: report.clone(),
+        warnings: vec![],
+        read: vec![],
+        failures: vec![],
+    };
+    assert_eq!(tip_of(&handoff), Some("abc123"));
+    assert_eq!(without_head(&report), "the worker's words\nmore");
+    assert_eq!(without_head("plain report"), "plain report");
+    assert_eq!(Tree::default().head(&[]), "");
+    // the project's own tree has no branch and no commits to name
+    let own = Tree { tip: "abc".to_owned(), ..Tree::default() };
+    assert_eq!(own.head(&[]), "tree: at abc\n");
+}

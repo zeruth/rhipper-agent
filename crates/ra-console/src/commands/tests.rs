@@ -3334,7 +3334,7 @@ async fn a_dirty_file_from_before_the_run_is_not_the_cards() {
     assert!(!brief.contains("+edited by the person"), "{brief}");
     // the brief lists the card's files and the run's, then the stat of exactly those, before
     // the diff: a change in a file the reviewer did not expect is not a missing one (#159)
-    assert!(brief.contains("## Files of the card\n- src/lib.rs\n- mine.txt (changed by the run, not on the card)\n"), "{brief}");
+    assert!(brief.contains("## Files of the card\n- src/lib.rs\n- mine.txt (changed by the card's runs, not on the card)\n"), "{brief}");
     let stat = brief.find("## git diff --stat HEAD of the card's files\n").expect("the stat section");
     assert!(brief[stat..].contains("mine.txt | 2 +-"), "{brief}");
     assert!(!brief[stat..].contains("other.txt |"), "{brief}");
@@ -3378,7 +3378,13 @@ async fn a_worktree_review_diffs_the_branch_from_its_merge_base() {
     task.save(dir.path()).unwrap();
     let node = store.read(2).await.unwrap();
     let brief = crate::agent::review_brief(dir.path(), &tree, &node).await;
-    assert!(brief.contains("- first.txt (changed by the run, not on the card)\n- second.txt"), "{brief}");
+    // the handoffs' files come first, then what the branch changed besides them
+    assert!(
+        brief.contains(
+            "- second.txt (changed by the card's runs, not on the card)\n- first.txt (changed by the card's runs, not on the card)\n"
+        ),
+        "{brief}"
+    );
     let stat = brief.find("## git diff --stat ").expect("the stat section");
     assert!(!brief[stat..].starts_with("## git diff --stat HEAD "), "the base is the merge base: {brief}");
     assert!(brief[stat..].contains("first.txt") && brief[stat..].contains("second.txt"), "{brief}");

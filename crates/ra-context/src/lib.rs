@@ -1353,6 +1353,118 @@ pub fn changed_between(before: &str, after: &str) -> Vec<String> {
     changed
 }
 
+/// The opening of the first line of a handoff's head: the commit the run's tree ended at.
+pub const TREE_PREFIX: &str = "tree: at ";
+
+/// The prefixes of the lines the orchestrator writes at the head of a handoff's report.
+const HEAD_PREFIXES: [&str; 3] = [TREE_PREFIX, "since the last run: ", "open: "];
+
+/// How many of the branch's commits the head names.
+const COMMITS_SHOWN: usize = 5;
+
+/// What the orchestrator knows of a task's tree when a run ends: the head of the run's handoff,
+/// written by the orchestrator and not the worker, so the next run reads the branch's commits
+/// and what happened to the tree as facts (asm #120 was rerun on a reset tree without a word).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tree {
+    /// The commit the tree is at, abbreviated.
+    pub tip: String,
+    /// The card's branch, when the run had one.
+    pub branch: Option<String>,
+    /// The branch's commits since its base, `<hash> <subject>`, newest first; empty on the
+    /// project's own tree.
+    pub commits: Vec<String>,
+    /// What happened to the tree between the last run's end and this run's start, as
+    /// [`since_line`] words it.
+    pub since: Option<String>,
+}
+
+impl Tree {
+    /// The head of a handoff: where the tree is, the branch's commits, what happened to it
+    /// since the last run, and the acceptance's checks still `open`; empty without a tip.
+    #[must_use]
+    pub fn head(&self, open: &[String]) -> String {
+        if self.tip.is_empty() {
+            return String::new();
+        }
+        let mut text = format!("{TREE_PREFIX}{}", self.tip);
+        if let Some(branch) = &self.branch {
+            let _ = write!(text, " on {branch}");
+        }
+        if self.branch.is_some() || !self.commits.is_empty() {
+            let shown = &self.commits[..self.commits.len().min(COMMITS_SHOWN)];
+            let more =
+                if self.commits.len() > shown.len() { format!("; … {} more", self.commits.len() - shown.len()) } else { String::new() };
+            match shown.len() {
+                0 => text.push_str(" · no commit on the branch since its base"),
+                n => {
+                    let _ = write!(text, " · {n} commit(s) on the branch since its base: {}{more}", shown.join("; "));
+                }
+            }
+        }
+        text.push('\n');
+        if let Some(since) = &self.since {
+            let _ = writeln!(text, "since the last run: {since}");
+        }
+        if !open.is_empty() {
+            let items: Vec<String> = open.iter().map(|item| format!("`{item}`")).collect();
+            let _ = writeln!(text, "open: {}", items.join(", "));
+        }
+        text
+    }
+}
+
+/// The commit a handoff's tree ended at, from the head the orchestrator wrote; `None` for a
+/// handoff written before heads were.
+#[must_use]
+pub fn tip_of(handoff: &Handoff) -> Option<&str> {
+    handoff.report.lines().next()?.strip_prefix(TREE_PREFIX)?.split_whitespace().next()
+}
+
+/// A handoff's report without the head the orchestrator wrote: the worker's own words.
+#[must_use]
+pub fn without_head(report: &str) -> &str {
+    let mut rest = report;
+    while HEAD_PREFIXES.iter().any(|prefix| rest.starts_with(prefix)) {
+        rest = rest.split_once('\n').map_or("", |(_, after)| after);
+    }
+    rest.trim_start_matches('\n')
+}
+
+/// What happened to a tree between `tip`, where the last run left it, and `now`: nothing,
+/// `reset` when `tip` is no longer an ancestor of `now`, `merged` when the commits since
+/// (`log`, one `<hash> <parents…>\t<subject>` a line, `git log --format=%h %p%x09%s`) hold a
+/// merge, else `landed` with the commits that came on top.
+#[must_use]
+pub fn since_line(tip: &str, now: &str, ancestor: bool, log: &str) -> Option<String> {
+    if tip.is_empty() || now.is_empty() || now.starts_with(tip) || tip.starts_with(now) {
+        return None;
+    }
+    if !ancestor {
+        return Some(format!(
+            "reset: the tree no longer holds {tip}, where the last run ended; it is at {now}, so the earlier handoffs may name work it lost: read the files before trusting them"
+        ));
+    }
+    let commits: Vec<(usize, &str)> = log
+        .lines()
+        .filter_map(|line| {
+            let (refs, subject) = line.split_once('\t')?;
+            Some((refs.split_whitespace().count().saturating_sub(1), subject.trim()))
+        })
+        .collect();
+    let merges: Vec<&str> = commits.iter().filter(|(parents, _)| *parents > 1).map(|(_, subject)| *subject).collect();
+    if merges.is_empty() {
+        let subjects: Vec<&str> = commits.iter().take(COMMITS_SHOWN).map(|(_, subject)| *subject).collect();
+        Some(format!("landed: {} commit(s) on the tree since the last run ended at {tip}: {}", commits.len(), subjects.join("; ")))
+    } else {
+        Some(format!(
+            "merged: {} since the last run ended at {tip}, {} commit(s) in all; the files may differ from what the last run left",
+            merges.join("; "),
+            commits.len()
+        ))
+    }
+}
+
 /// The prefix of a report line addressed to another card: `notes-for #<id>: …`.
 const NOTES_FOR: &str = "notes-for #";
 

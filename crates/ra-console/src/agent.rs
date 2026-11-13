@@ -1694,9 +1694,10 @@ fn last_round(task: &ra_context::TaskContext, node: &Node) -> String {
 }
 
 /// What the reviewer reads: the card, the last handoff when there is one, and the diff of the
-/// card's own change ([`card_changed`]) and its files, clipped: in a worktree the branch from
-/// its merge base, every run of the card; in the project's tree the handoff's set against
-/// `HEAD`, with the tree's other dirty files listed apart and kept out of the diff.
+/// card's whole work against its base, clipped: the card's files and every handoff's changed
+/// ones ([`card_changed`]), and in a worktree everything the branch changed since its merge
+/// base and every untracked file ([`crate::review::scope`]); in the project's tree the tree's
+/// other dirty files are listed apart and kept out of the diff.
 /// `project` holds the card's context (the handoffs live under the project's `var`); `root`
 /// is where the run acted and the diff is read: the project, or the card's worktree.
 pub(crate) async fn review_brief(project: &Path, root: &Path, node: &Node) -> String {
@@ -1706,40 +1707,32 @@ pub(crate) async fn review_brief(project: &Path, root: &Path, node: &Node) -> St
     }
     let _ = writeln!(text, "\nAcceptance: {}", node.acceptance.as_deref().unwrap_or("none written; the workspace tests are the check"));
     let task = ra_context::TaskContext::open(project, node.id);
-    let mut changed = Vec::new();
     match task.handoffs.last() {
         Some(last) => {
             let _ = writeln!(text, "\n## Handoff of the last run\n{} on {} · {}\n{}", last.outcome, last.model, last.check, last.report);
-            changed.clone_from(&last.changed);
         }
         None => text.push_str("\n## Handoff of the last run\nnone: no run of this card left one\n"),
     }
     text.push_str(&last_round(&task, node));
-    // the card's change is the branch's in a worktree, whatever the last run alone touched: the
-    // reviewer judges the card, not its last session (#182, #183); in a shared tree the dirty
-    // files no handoff of the card names are someone else's
-    let stray = if same_tree(project, root) {
-        let named: Vec<&String> = task.handoffs.iter().flat_map(|h| &h.changed).collect();
-        dirty_paths(&git_status(root).await).into_iter().filter(|path| !changed.contains(path) && !named.contains(&path)).collect()
-    } else {
-        changed.extend(branch_files(project, root).await);
-        changed.sort();
-        changed.dedup();
-        Vec::new()
-    };
-    let mut files: Vec<String> = node.files.iter().filter(|f| !stray.contains(f)).cloned().collect();
-    for file in &changed {
-        if !files.contains(file) {
-            files.push(file.clone());
-        }
-    }
-    // the list and the stat come before the diff: the reviewer of #159 looked for the change in
-    // the one file it expected and judged the card unfinished for code that lived in another
-    text.push_str(&crate::review::files_section(&node.files, &changed, &stray));
     // the diff's base: HEAD in the project's own tree; in a card's worktree the merge base
     // with the project's branch, so the checkpoints the walk commits on the card's branch
     // after each run are in the reviewer's view and not behind it
     let base = diff_base(project, root).await;
+    let shared = same_tree(project, root);
+    // the card's whole work, not the last run's: every run's changed files, and on the card's
+    // branch everything it changed since its base and every untracked file (runelite #44 was
+    // sent back four times for files an earlier checkpoint had landed; #182, #183); in a shared
+    // tree the dirty files no handoff of the card names are someone else's
+    let handed: Vec<String> = task.handoffs.iter().flat_map(|handoff| handoff.changed.iter().cloned()).collect();
+    let stray: Vec<String> =
+        if shared { dirty_paths(&git_status(root).await).into_iter().filter(|path| !handed.contains(path)).collect() } else { Vec::new() };
+    let mut named: Vec<String> = node.files.iter().filter(|f| !stray.contains(f)).cloned().collect();
+    named.extend(handed);
+    let files = crate::review::scope(root, &base, !shared, &named).await;
+    let changed: Vec<String> = files.iter().filter(|file| !node.files.contains(file)).cloned().collect();
+    // the list and the stat come before the diff: the reviewer of #159 looked for the change in
+    // the one file it expected and judged the card unfinished for code that lived in another
+    text.push_str(&crate::review::files_section(&node.files, &changed, &stray));
     if !files.is_empty() {
         text.push_str(&crate::review::diff_stat_section(root, &base, &files).await);
     }
@@ -3445,7 +3438,8 @@ fn card_commit_message(node: &Node, handoff: Option<&ra_context::Handoff>, kind:
     }
     if let Some(handoff) = handoff {
         // the report's first paragraph: what the run changed and verified, in its own words
-        let report: String = handoff.report.trim().split("\n\n").next().unwrap_or_default().trim().to_owned();
+        // the worker's words, not the head the orchestrator wrote above them
+        let report: String = ra_context::without_head(handoff.report.trim()).split("\n\n").next().unwrap_or_default().trim().to_owned();
         if !report.is_empty() {
             body.push(match kind {
                 CommitKind::Landing => format!("The implementing run reported:\n{report}"),
@@ -4837,7 +4831,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                         let why = ra_context::TaskContext::open(&root, id)
                             .handoffs
                             .last()
-                            .map(|h| first_line(&h.report).chars().take(200).collect::<String>())
+                            .map(|h| first_line(ra_context::without_head(&h.report)).chars().take(200).collect::<String>())
                             .unwrap_or_default();
                         let held = store.set_state_by(id, TaskState::Blocked, Source::Run).await.is_ok();
                         let text = if held {
@@ -5126,6 +5120,17 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     if let Some(block) = conflicts_block(&acting).await {
         task.brief = format!("{block}\n{}", task.brief);
     }
+    // what happened to the tree since the last run left it, a merge, a reset or commits on top:
+    // the rerun hears it first, and the head of this run's handoff keeps it (asm #120 was rerun
+    // on a tree reset and merged under it without a word)
+    let base = diff_base(&root, &acting).await;
+    let since = match task.handoffs.last().and_then(ra_context::tip_of) {
+        Some(tip) => crate::review::since_last(&acting, tip).await,
+        None => None,
+    };
+    if let Some(since) = &since {
+        task.brief = format!("The tree changed since the last run of this card: {since}\n\n{}", task.brief);
+    }
     // what is dirty before the run, so the handoff names only what the run changed
     let dirty_before = git_status(&acting).await;
     // set back by [`MTIME_SLACK`]: a file's time comes off a coarser clock than `now`, and a
@@ -5324,16 +5329,26 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         let context = bare_context(&task, rerun.as_deref(), &project, worker.debug);
         tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref(), budget, caps).await
     };
+    // the head of the handoff is the orchestrator's, not the worker's: where the tree is, the
+    // branch's commits, what happened to it since the last run, and the acceptance's checks
+    // still open, so the next run reads them as facts
+    let tree = crate::review::tree_of(&acting, &base, worker.branch.as_deref(), since).await;
+    let acceptance = named_checks(node.acceptance.as_deref());
     // the handoff of this run, for the next one of the card; the done cards' files go
-    let handoff = |outcome: &str, check: &str, report: &str, changed: Vec<String>| ra_context::Handoff {
+    let handoff = |outcome: &str, check: &str, report: &str, changed: Vec<String>, open: &[String]| ra_context::Handoff {
         when: unix_now(),
         model: worker.model.clone(),
         outcome: outcome.to_owned(),
         check: check.to_owned(),
         verdict: None,
         changed,
-        // the ladder's move leads the report, so the next run and the person see why this model
-        report: worker.step.as_ref().map_or_else(|| report.to_owned(), |step| format!("Route: {step}.\n{report}")),
+        // the tree's head comes first, then the ladder's move, so the next run and the person
+        // see where the tree is and why this model
+        report: format!(
+            "{}{}",
+            tree.head(open),
+            worker.step.as_ref().map_or_else(|| report.to_owned(), |step| format!("Route: {step}.\n{report}"))
+        ),
         warnings: Vec::new(),
         read: Vec::new(),
         failures: Vec::new(),
@@ -5347,7 +5362,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             }
             store.set_state_by(id, TaskState::Failed, Source::Run).await?;
             let changed = card_changed(&root, &acting, &dirty_before, &git_status(&acting).await, run_started, "", &task).await;
-            task.record(handoff("failed", "no check: the run failed", &format!("{error:#}"), changed));
+            task.record(handoff("failed", "no check: the run failed", &format!("{error:#}"), changed, &acceptance));
             save_context(store, &root, &task).await;
             return Err(error);
         }
@@ -5372,7 +5387,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     if let Some(cap) = session.capped {
         store.set_session(id, None, unix_now()).await?;
         let changed = card_changed(&root, &acting, &dirty_before, &git_status(&acting).await, run_started, &session.text, &task).await;
-        let report = capped_report(cap, &session, &changed, &node);
+        // the checkpoint names what is left: the checks still open and the card's files no run
+        // has touched yet, beside what this one changed
+        let touched: Vec<&String> = task.handoffs.iter().flat_map(|h| h.changed.iter()).chain(changed.iter()).collect();
+        let untouched: Vec<String> = node.files.iter().filter(|file| !touched.contains(file)).cloned().collect();
+        let report = capped_report(cap, &session, &changed, &node, &acceptance, &untouched);
         // the reviewer's points stand over a capped run as over a failed check: the next
         // session answers them still
         match carried_review(node.notes.as_deref()) {
@@ -5381,7 +5400,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         }
         let why = format!("{cap} ended the run; the card continues in a fresh session");
         let turns = session.cap.map_or_else(|| session.turns.to_string(), |limit| format!("{}/{limit}", session.turns));
-        let mut last = handoff("continues", &format!("no check: {why}"), &report, changed);
+        let mut last = handoff("continues", &format!("no check: {why}"), &report, changed, &acceptance);
         if let Some(branch) = &worker.branch {
             last.check = format!("{} · branch {branch}", last.check);
         }
@@ -5667,6 +5686,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let summary = worker.ask_role(roles, Role::Summary, Some(id), SUMMARY_INSTRUCTION, &session.text).await;
     let answer = summary.as_deref().unwrap_or(&session.text);
     let handed = if lint_warnings.is_empty() { format!("{lead}{answer}") } else { answer.to_owned() };
+    let open: Vec<String> =
+        acceptance.iter().filter(|item| !checks.iter().any(|run| run.passed && &run.command == *item)).cloned().collect();
     let outcome = if red.is_some() {
         "waits on main"
     } else if held.is_some() {
@@ -5679,7 +5700,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the checks' output, for the reviewer: it reads what the check showed, not only its line
     let output: Vec<String> = checks.iter().map(|run| format!("$ {} · {}\n{}", run.command, run.exit, run.text.trim_end())).collect();
     task.set_check_output(&output.join("\n\n"));
-    let mut last = handoff(outcome, check_line.trim(), &handed, changed);
+    let mut last = handoff(outcome, check_line.trim(), &handed, changed, &open);
     last.warnings = lint_warnings;
     // a run sent back by its check hands on what it read, as a capped one does, and every
     // failure of the check whole, which the clipped output in the notes may not hold
@@ -7271,8 +7292,9 @@ fn call_summary(call: &ra_providers::ToolCall) -> String {
 
 /// The report a run its cap ended leaves for the next run of the card, which starts fresh: how
 /// it ended, what changed, what the worker said and did, and what is left, which is the whole
-/// acceptance since no check ran.
-fn capped_report(cap: Capped, session: &Session, changed: &[String], node: &Node) -> String {
+/// acceptance since no check ran: its `open` checks by name, and the card's files no run has
+/// touched yet (`untouched`).
+fn capped_report(cap: Capped, session: &Session, changed: &[String], node: &Node, open: &[String], untouched: &[String]) -> String {
     let mut text = format!(
         "{cap} ended the run after {} turn(s), {} tool call(s); the card continues in a fresh session\n",
         session.turns, session.calls
@@ -7284,6 +7306,12 @@ fn capped_report(cap: Capped, session: &Session, changed: &[String], node: &Node
     }
     let acceptance = node.acceptance.as_deref().map(str::trim).filter(|a| !a.is_empty()).unwrap_or("none written");
     let _ = writeln!(text, "left: the check did not run; the acceptance stands: {acceptance}");
+    if !open.is_empty() {
+        let _ = writeln!(text, "left to pass: {}", open.iter().map(|item| format!("`{item}`")).collect::<Vec<_>>().join(", "));
+    }
+    if !untouched.is_empty() {
+        let _ = writeln!(text, "left to touch: {}, which the card names and no run has changed", untouched.join(", "));
+    }
     if !session.text.trim().is_empty() {
         let _ = write!(text, "\n{}", session.text.trim());
     }
