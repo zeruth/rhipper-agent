@@ -824,14 +824,13 @@ async fn git_check(root: &Path) -> Result<String, String> {
     Ok(format!("{}, {place}", printed_line(&version)))
 }
 
-/// The local server answering at its URL, and the model the roles default to on it.
+/// The local server answering at its URL with the model the roles take on it, or silent, which
+/// turns the roles off rather than sending them to a Claude model.
 async fn local_check() -> Result<String, String> {
     let url = ra_providers::openrouter::local_url();
     match ra_providers::local::default_model_at(&url).await {
-        Some(model) => Ok(format!("{url} answers; the roles default to {model}")),
-        None => {
-            Err(format!("nothing answers at {url}; set {} to a server, or the roles call nothing", ra_providers::openrouter::LOCAL_URL_VAR))
-        }
+        Some(model) => Ok(format!("{url} answers with {model}")),
+        None => Err(format!("{url} does not answer: the roles are off; set {} to a server", ra_providers::openrouter::LOCAL_URL_VAR)),
     }
 }
 
@@ -885,11 +884,15 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     // refused here, before the start marker
     let worker = &worker.for_card(&root, &node)?.steered_by_plan(&root).await?;
     let pick = if tight { format!(" · {TIGHT_PICK}") } else { String::new() };
+    // the cheap roles of this run, resolved once: the local server is pinged here, not per role,
+    // and the start marker says where each role went, so the ledger is read against it
+    let roles = worker.roles(&root).await;
+    let roles_part = roles.summary();
     // the pid on the start marker, last: a window coming up tells a run that died from one
     // still going
     tracing::info!(
         target: crate::trace::PROGRESS,
-        "{}#{} {} · {}{pick} · pid {}",
+        "{}#{} {} · {}{pick} · {roles_part} · pid {}",
         crate::logs::RUN_START,
         id,
         node.title,
@@ -911,8 +914,6 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     // the other projects see the run while it goes, and what it came to once it ended
     let started = unix_now();
     write_digest(store, &root, Some(format!("#{id} {title} · pid {} · started {}", std::process::id(), clock(started))), None, None).await;
-    // the cheap roles of this run, resolved once: the local server is pinged here, not per role
-    let roles = worker.roles(&root).await;
     let mut outcome = run_task(store, node, worker, &roles).await;
     // an absolute card is one run until it is done: a failed check or a rejection sends it
     // straight back to work on its session, the verdict as the prompt, inside this run, not
@@ -1040,15 +1041,16 @@ const LINT_FIX_INSTRUCTION: &str = "The lint of this card's run left the warning
 /// same card halts the fix passes.
 const TRIVIAL_TAG: &str = "needs revision (trivial)";
 
-/// The model of a fix pass: the `fix` role of `rhipper.toml` on the cheap route, else the cheap
-/// route's own pick; `None` when the role is off, and in the tests, which neither ping the
-/// local server nor fall to haiku.
+/// The model of a fix pass: the `fix` role of `rhipper.toml`, else the local server's model when
+/// it answers a ping; `None` when the role is off, when no server answers, and in the tests,
+/// which never ping. The pass never falls to a Claude model the table did not name: the ledger
+/// of 2026-11-12 showed haiku at 9.5M input tokens from passes that fell to it by default.
 async fn fix_model(root: &Path) -> Option<String> {
     let named = crate::router::Router::load(root).ok().and_then(|router| router.role.fix);
     match named.as_deref() {
-        Some(named) => ra_providers::route::cheap(Some(named), None),
+        Some(named) => ra_providers::route::role(Some(named), None),
         None if cfg!(test) => None,
-        None => ra_providers::route::cheap_model(None).await,
+        None => ra_providers::route::role(None, ra_providers::local::default_model().await.as_deref()),
     }
 }
 
@@ -1625,28 +1627,45 @@ async fn guard_landing(root: &Path) -> Option<crate::hub::Guard> {
     }
 }
 
-/// Takes the hub's lock on the cargo target of `root` for the check, waiting on a check of
-/// another project that builds in the same target; the wait is said once, on the progress
-/// channel and the paired feed. `None` when the lock cannot be opened: the check goes unguarded.
-async fn guard_target(root: &Path, target: &Path) -> Option<crate::hub::Guard> {
+/// Takes the hub's lock on the cargo `target` for the check of a run acting in `acting`,
+/// waiting on a check that builds in the same target; the wait is said once, naming the
+/// holder, on the progress channel and the paired feed, and gives up at `timeout`, the check's
+/// own bound (four checks queued behind one another's target for forty minutes on 2026-11-12).
+/// `Ok(None)` when the lock cannot be opened: the check goes unguarded.
+///
+/// # Errors
+/// The check's failure when the wait ran out: how long it waited, on what, held by whom.
+async fn guard_target(
+    root: &Path,
+    acting: &Path,
+    target: &Path,
+    timeout: std::time::Duration,
+) -> Result<Option<crate::hub::Guard>, String> {
     let name = crate::hub::target_lock_name(target);
+    let who = crate::hub::builder_name(acting);
     let mut said = false;
+    let started = std::time::Instant::now();
     loop {
-        match crate::hub::try_guard(&name) {
-            Ok(Some(guard)) => return Some(guard),
+        match crate::hub::try_guard_as(&name, &who) {
+            Ok(Some(guard)) => return Ok(Some(guard)),
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!("the check runs without the lock on {}: {e:#}", target.display());
-                return None;
+                return Ok(None);
             }
+        }
+        let holder = crate::hub::target_holder(target).unwrap_or_else(|| "a build the hub does not name".to_owned());
+        if started.elapsed() >= timeout {
+            return Err(format!("the check waited {} s on {} held by {holder}", timeout.as_secs(), target.display()));
         }
         if !said {
             said = true;
-            let text = format!("wait: the check waits on the cargo target {}, which another project's check builds in", target.display());
+            let text = format!("wait: the check waits on the cargo target {}, held by {holder}", target.display());
             tracing::info!(target: crate::trace::PROGRESS, "  {text}");
             crate::pair::event(root, &text);
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let left = timeout.saturating_sub(started.elapsed());
+        tokio::time::sleep(std::time::Duration::from_secs(2).min(left)).await;
     }
 }
 
@@ -1657,13 +1676,15 @@ async fn guard_target(root: &Path, target: &Path) -> Option<crate::hub::Guard> {
 const HOLD_WAIT: std::time::Duration = std::time::Duration::from_mins(15);
 
 /// Takes one of the project's build slots for the check, waiting on the builds of the workers
-/// and the other checks; the wait is said once, on the progress channel and the paired feed.
-/// `None` when the locks cannot be opened: the check goes unguarded.
-async fn hold_build(root: &Path) -> Option<crate::hub::Guard> {
+/// and the other checks; the wait is said once, on the progress channel and the paired feed of
+/// the project at `root`. The slot's note names `building`, the tree the check builds, a card's
+/// worktree or the project, with its target. `None` when the locks cannot be opened: the check
+/// goes unguarded.
+async fn hold_build(root: &Path, building: &Path) -> Option<crate::hub::Guard> {
     let mut said = false;
     let started = std::time::Instant::now();
     loop {
-        match crate::hub::try_build_slot(root) {
+        match crate::hub::try_build_slot(building) {
             Ok(Some(guard)) => return Some(guard),
             Ok(None) => {}
             Err(e) => {
@@ -2846,7 +2867,7 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
             let Checks { commands, timeout, .. } = checks_of(&root, &node);
             if !commands.is_empty() {
                 let toolbox = worker.toolbox(&root).map(|t| t.with_timeout(timeout));
-                let _slot = hold_build(&root).await;
+                let _slot = hold_build(&root, &root).await;
                 let runs = run_checks(&toolbox, &commands, &[]).await;
                 if let Some(failed) = runs.iter().find(|r| !r.passed) {
                     let _ = git(&root, &["reset", "--merge", "ORIG_HEAD"]).await;
@@ -3904,16 +3925,40 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // failure
     let Checks { commands, lint: project_lint, timeout, orchestrated } = checks_of(&root, &node);
     let command = commands.join(" · ");
-    let toolbox = worker.toolbox(workspace_dir.as_deref().unwrap_or(Path::new("."))).map(|toolbox| toolbox.with_timeout(timeout));
+    // a worktree's check builds in the target the worker built in, `target/wt-<id>` under the
+    // project's, whatever the process's own `CARGO_TARGET_DIR`: the artifacts are warm there,
+    // and the project's target is the one every tree's check would otherwise queue behind
+    let own_target = workspace_dir.as_deref().and_then(ra_providers::claude_code::shared_target);
+    let toolbox = worker.toolbox(workspace_dir.as_deref().unwrap_or(Path::new("."))).map(|toolbox| {
+        toolbox.with_timeout(timeout).with_env(own_target.iter().map(|t| ("CARGO_TARGET_DIR".to_owned(), t.display().to_string())))
+    });
     // a check is a build: it takes one of the project's build slots, as the workers' own
     // builds do, so six runs do not compile at once; a cargo check also takes the hub's lock
     // on a target another project may share, so two builds do not fight over the directory
-    let _slot = if commands.is_empty() { None } else { hold_build(&root).await };
+    // the wait goes to the project's feed, never a file in the worktree the branch commits
+    let _slot = if commands.is_empty() { None } else { hold_build(&root, &acting).await };
     // the lock is on the target the check builds in: a worktree's own under the project's,
     // not the project's (six asm checks on one lock waited for each other for nothing)
-    let target = if workspace_dir.is_some() { root.join("target").join(format!("wt-{id}")) } else { crate::hub::cargo_target(&root) };
-    let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root, &target).await } else { None };
-    let checks = run_checks(&toolbox, &commands, &orchestrated).await;
+    let target = own_target.unwrap_or_else(|| crate::hub::cargo_target(&root));
+    let waited = match commands.iter().find(|c| c.trim_start().starts_with("cargo")) {
+        Some(_) => guard_target(&root, &acting, &target, timeout).await,
+        None => Ok(None),
+    };
+    // a wait that ran out is the check's failure, named as the output a timed-out check leaves
+    let (_target, checks) = match waited {
+        Ok(guard) => {
+            let checks = run_checks(&toolbox, &commands, &orchestrated).await;
+            (guard, checks)
+        }
+        Err(text) => {
+            let command = commands.iter().find(|c| c.trim_start().starts_with("cargo")).cloned().unwrap_or_default();
+            tracing::info!(target: crate::trace::PROGRESS, "check failed: {command} · {text}");
+            // not a setup failure: a rerun once the holder is done can move the card
+            let run =
+                CheckRun { command, passed: false, exit: text.clone(), first_error: text.clone(), text, failed_tests: 0, setup: false };
+            (None, vec![run])
+        }
+    };
     let status_after = git_status(&acting).await;
     // the card's own set: on a tree other hands share, a dirty file joins it only when the run
     // wrote to it and the report or an earlier handoff names it (#157 lost a named file, #185

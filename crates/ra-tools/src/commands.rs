@@ -93,6 +93,7 @@ impl Toolbox {
             {
                 command.env("CARGO_TARGET_DIR", target);
             }
+            command.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
             let mut child = command.spawn().with_context(|| format!("cannot start {program}"))?;
             // the check is a build: it runs on its share of the builders' CPU, which follows
             // the number of builds running until it ends

@@ -4313,6 +4313,11 @@ impl Workspace {
                         let must = usize::from(running.is_some()) + 3;
                         let mut shown: Vec<i64> = rows.iter().copied().take(must).collect();
                         let mut extra = rows.iter().copied().skip(must).chain(extra.iter().copied());
+                        // the open cards waiting on each card, for the subtree under its row; a
+                        // card that waits on several sits under the first shown (the person: "a
+                        // nice subtree view in queue for tasks waiting on other tasks")
+                        let waiting = waiting_on(&nodes);
+                        let mut placed: HashSet<i64> = order.iter().copied().chain(running).collect();
                         let mut rank = 0;
                         while rank < shown.len() {
                             let id = shown[rank];
@@ -4336,6 +4341,7 @@ impl Workspace {
                                     header_row(ui, &nodes, node, &[], row_lane, &walk, &mut out);
                                 });
                             });
+                            waiting_subtree(ui, &nodes, &waiting, id, 1, &mut placed);
                             rank += 1;
                             // past the three, one more ready card while a row of the height the
                             // rows so far averaged still fits the card's share
@@ -4549,6 +4555,72 @@ fn draw_bubble(ui: &mut egui::Ui, nodes: &[Node], node: &Node, walk: &Walk, out:
 /// The header row of a bubble, or the row of a task: the fold arrow, the kind's mark, the id and
 /// the title; at the right the badges, the progress of a bubble, and the run and reassess
 /// buttons of the selected card. The row selects on click and folds on double click.
+/// The open cards waiting on each card: for every card, the defined, sent-back or blocked tasks
+/// whose waits-on name it and are not all accepted yet, in the roadmap's order.
+fn waiting_on(nodes: &[Node]) -> HashMap<i64, Vec<i64>> {
+    let accepted = |id: &i64| nodes.iter().any(|n| n.id == *id && n.state == TaskState::Accepted);
+    let mut map: HashMap<i64, Vec<i64>> = HashMap::new();
+    for node in nodes {
+        let open = matches!(node.state, TaskState::Defined | TaskState::NeedsRevision | TaskState::Blocked);
+        if !open || !matches!(node.kind, NodeKind::Task | NodeKind::Subtask) || node.depends_on.iter().all(accepted) {
+            continue;
+        }
+        for dep in node.depends_on.iter().filter(|d| !accepted(d)) {
+            map.entry(*dep).or_default().push(node.id);
+        }
+    }
+    map
+}
+
+/// How many waiting cards a queue row shows under it before `+N more`, and how deep the tree goes.
+const WAITING_SHOWN: usize = 3;
+const WAITING_DEPTH: usize = 2;
+
+/// The cards waiting on `id` as a small tree under its queue row: a connector, the card's
+/// number and title cut to the column, what else it waits on dimmed, and the cards waiting on
+/// it one level deeper. A card already shown elsewhere in the queue is not repeated.
+fn waiting_subtree(ui: &mut egui::Ui, nodes: &[Node], waiting: &HashMap<i64, Vec<i64>>, id: i64, depth: usize, placed: &mut HashSet<i64>) {
+    if depth > WAITING_DEPTH {
+        return;
+    }
+    let Some(children) = waiting.get(&id) else { return };
+    let children: Vec<i64> = children.iter().copied().filter(|c| !placed.contains(c)).collect();
+    let shown = children.len().min(WAITING_SHOWN);
+    for (i, child) in children.iter().take(shown).enumerate() {
+        placed.insert(*child);
+        let Some(node) = nodes.iter().find(|n| n.id == *child) else { continue };
+        let last = i + 1 == shown && children.len() <= WAITING_SHOWN;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            // the row's rank column, then the tree's indent and connector
+            ui.add_space(22.0 + 16.0 * (depth as f32 - 1.0));
+            let font = egui::FontId::monospace(12.0);
+            ui.label(RichText::new(if last { "└─" } else { "├─" }).font(font.clone()).color(theme::rule()));
+            let state = if node.state == TaskState::Blocked { theme::accent() } else { theme::dim() };
+            ui.label(RichText::new(format!("#{}", node.id)).font(font.clone()).color(state));
+            // what else it waits on, besides this card, so the person sees the whole holdup
+            let others: Vec<String> = node.depends_on.iter().filter(|d| **d != id).map(|d| format!("#{d}")).collect();
+            let tail = if others.is_empty() { String::new() } else { format!("  ·  also {}", others.join(" ")) };
+            ui.add(egui::Label::new(RichText::new(format!("{}{tail}", node.title)).small().color(theme::dim())).truncate()).on_hover_text(
+                format!(
+                    "#{} {} [{}] waits on {}",
+                    node.id,
+                    node.title,
+                    node.state,
+                    node.depends_on.iter().map(|d| format!("#{d}")).collect::<Vec<_>>().join(" ")
+                ),
+            );
+        });
+        waiting_subtree(ui, nodes, waiting, *child, depth + 1, placed);
+    }
+    if children.len() > shown {
+        ui.horizontal(|ui| {
+            ui.add_space(22.0 + 16.0 * (depth as f32 - 1.0));
+            ui.label(RichText::new(format!("└─ +{} more waiting", children.len() - shown)).small().color(theme::dim()).italics());
+        });
+    }
+}
+
 fn header_row(ui: &mut egui::Ui, nodes: &[Node], node: &Node, children: &[&Node], lane: Color32, walk: &Walk, out: &mut Walked) {
     let has_children = !children.is_empty();
     let selected = walk.selected == Some(node.id);

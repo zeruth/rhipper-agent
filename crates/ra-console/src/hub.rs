@@ -844,7 +844,65 @@ fn build_wanting() -> Vec<String> {
 
 /// The project a build slot's note names: `runelite #42` is runelite's.
 fn holder_project(who: &str) -> &str {
-    who.split(" #").next().unwrap_or(who).trim()
+    builder_of(who).split(" #").next().unwrap_or(who).trim()
+}
+
+/// What separates the builder from the target in a build slot's note.
+const TARGET_NOTE: &str = " · target ";
+
+/// The builder a note names, without the target it builds in.
+fn builder_of(note: &str) -> &str {
+    note.split(TARGET_NOTE).next().unwrap_or(note).trim()
+}
+
+/// The name a build in `root` goes by in the hub's notes: the project, and the card too when
+/// the build is a worktree's (`runelite #42`), for the window's builders row and the wait lines.
+#[must_use]
+pub fn builder_name(root: &Path) -> String {
+    let project = project_name(&project_root_of(root));
+    match worktree_card(root) {
+        Some(card) => format!("{project} #{card}"),
+        None => project,
+    }
+}
+
+/// The card whose worktree `root` is (`<root>/var/worktrees/<id>`), else `None`.
+fn worktree_card(root: &Path) -> Option<String> {
+    std::fs::canonicalize(root)
+        .ok()
+        .filter(|dir| dir.parent().and_then(Path::file_name).is_some_and(|n| n == "worktrees"))
+        .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
+}
+
+/// The cargo target a build in `root` writes: a worktree's own under the project's
+/// (`target/wt-<id>`), else the target of the cargo workspace `root` is in; `None` where no
+/// `Cargo.toml` is, since a gradle build has none.
+#[must_use]
+pub fn build_target(root: &Path) -> Option<PathBuf> {
+    if !root.join("Cargo.toml").exists() {
+        return None;
+    }
+    Some(match worktree_card(root) {
+        Some(card) => project_root_of(root).join("target").join(format!("wt-{card}")),
+        None => cargo_target(root),
+    })
+}
+
+/// Who builds in `target` right now, for a wait line: the check holding the hub's lock on it,
+/// else a build slot whose note names it; `None` when nobody the hub knows of does.
+#[must_use]
+pub fn target_holder(target: &Path) -> Option<String> {
+    let name = target_lock_name(target);
+    if matches!(try_guard(&name), Ok(None))
+        && let Ok(who) = std::fs::read_to_string(locks_dir().join(format!("{name}.who")))
+        && !who.trim().is_empty()
+    {
+        return Some(who.trim().to_owned());
+    }
+    (0..build_slot_count()).filter_map(slot_note).find_map(|note| {
+        let (who, built) = note.split_once(TARGET_NOTE)?;
+        (target_lock_name(Path::new(built.trim())) == name).then(|| who.trim().to_owned())
+    })
 }
 
 /// How many builds run on the machine right now, every project's.
@@ -880,17 +938,13 @@ pub fn build_lock_name(slot: usize) -> String {
 /// # Errors
 /// When a lock file cannot be made or opened.
 pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
-    let project_root = project_root_of(root);
-    let project = project_name(&project_root);
+    let project = project_name(&project_root_of(root));
     // the slot's note names the card too when the build is a worktree's, for the window's
-    // builders row: `runelite #42`
-    let card = std::fs::canonicalize(root)
-        .ok()
-        .filter(|dir| dir.parent().and_then(Path::file_name).is_some_and(|n| n == "worktrees"))
-        .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().into_owned()));
-    let who = match &card {
-        Some(card) => format!("{project} #{card}"),
-        None => project.clone(),
+    // builders row (`runelite #42`), and the cargo target it builds in, so a check waiting on
+    // that target can say who holds it
+    let who = match build_target(root) {
+        Some(target) => format!("{}{TARGET_NOTE}{}", builder_name(root), target.display()),
+        None => builder_name(root),
     };
     let held: Vec<String> = build_slots().into_iter().flatten().map(|(w, _)| holder_project(&w).to_ascii_lowercase()).collect();
     let free = build_slot_count().saturating_sub(held.len());
@@ -911,20 +965,16 @@ pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
     Ok(None)
 }
 
-/// The machine's build slots as the window shows them: for each, who holds it (`runelite #42`)
-/// and since when (unix seconds), or `None` when it is free. A slot is asked by taking its lock
-/// and letting it go at once; a builder that tries in that instant tries again on its next poll.
+/// The machine's build slots as the window shows them: for each, who holds it (`runelite #42`,
+/// without the target the note also names) and since when (unix seconds), or `None` when it is
+/// free. A slot is asked by taking its lock and letting it go at once; a builder that tries in
+/// that instant tries again on its next poll.
 #[must_use]
 pub fn build_slots() -> Vec<Option<(String, u64)>> {
     (0..build_slot_count())
         .map(|slot| {
-            let name = build_lock_name(slot);
-            if !matches!(try_guard(&name), Ok(None)) {
-                return None;
-            }
-            let note = locks_dir().join(format!("{name}.who"));
-            let who = std::fs::read_to_string(&note).map(|w| w.trim().to_owned()).unwrap_or_default();
-            let since = std::fs::metadata(&note)
+            let who = builder_of(&slot_note(slot)?).to_owned();
+            let since = std::fs::metadata(locks_dir().join(format!("{}.who", build_lock_name(slot))))
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -932,6 +982,15 @@ pub fn build_slots() -> Vec<Option<(String, u64)>> {
             Some((if who.is_empty() { "a build".to_owned() } else { who }, since))
         })
         .collect()
+}
+
+/// The whole note beside a held build slot, builder and target; `None` when the slot is free.
+fn slot_note(slot: usize) -> Option<String> {
+    let name = build_lock_name(slot);
+    if !matches!(try_guard(&name), Ok(None)) {
+        return None;
+    }
+    Some(std::fs::read_to_string(locks_dir().join(format!("{name}.who"))).map(|w| w.trim().to_owned()).unwrap_or_default())
 }
 
 /// The cargo target a check in `root` builds in: `CARGO_TARGET_DIR` when set (a relative one

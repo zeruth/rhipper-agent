@@ -3035,6 +3035,72 @@ async fn a_check_that_outlives_its_budget_is_killed() {
 }
 
 #[tokio::test]
+async fn a_worktree_check_builds_in_the_worktrees_target() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    git_ok(dir.path(), &["init", "-q"]);
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "probe"]);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // a real process, so the environment of the check is the one seen: each run of the check
+    // appends the target it was given, the worktree's first, the merged tree's after, to a
+    // file outside the repository
+    let outside = tempfile::tempdir().unwrap();
+    let seen = outside.path().join("seen.txt").display().to_string().replace('\\', "/");
+    run(
+        &format!(
+            "/edit 2 acceptance `python -c \"import os; open(r'{seen}', 'a').write(str(os.environ.get('CARGO_TARGET_DIR')) + ';')\"` passes"
+        ),
+        &store,
+        &worker(),
+    )
+    .await
+    .unwrap();
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(std::sync::Arc::new(ByTurn { seen: parking_lot::Mutex::new(0) }));
+    let out = crate::agent::run_parallel(&store, &runner, 1, false).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("branch card/2")), "{out:?}");
+    let targets = std::fs::read_to_string(outside.path().join("seen.txt")).unwrap();
+    let first = targets.split(';').next().unwrap().replace('\\', "/");
+    assert!(first.ends_with("/target/wt-2"), "the worktree's check built in {first}: {out:?}");
+}
+
+#[tokio::test]
+async fn a_wait_on_a_target_ends_at_the_check_timeout_naming_the_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    git_ok(dir.path(), &["init", "-q"]);
+    git_ok(dir.path(), &["add", "-A"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "probe"]);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    run("/edit 2 acceptance `cargo test -q` passes", &store, &worker()).await.unwrap();
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 1\n").unwrap();
+    // the card runs in a worktree, so the target is its own `target/wt-2`: a project's target
+    // is the `CARGO_TARGET_DIR` the test process inherits, which every test's check shares
+    let worktree = dir.path().join("var").join("worktrees").join("2");
+    git_ok(dir.path(), &["worktree", "add", "-q", "-b", "card/2", &worktree.to_string_lossy()]);
+    // another project's check holds the lock on the target for the whole run
+    let target = ra_providers::claude_code::shared_target(&worktree).unwrap();
+    let _held = crate::hub::try_guard_as(&crate::hub::target_lock_name(&target), "other #9").unwrap().expect("the target was free");
+    let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let worker = Worker::new("z-ai/glm-5.3-flash")
+        .with_provider(Scripted::new(vec![says("done", vec![])]))
+        .with_script(script)
+        .with_worktree(worktree, "card/2");
+    let started = std::time::Instant::now();
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "the walk did not give up the wait: {out:?}");
+    let failure = format!("the check waited 1 s on {} held by other #9", target.display());
+    assert!(out.iter().any(|l| l.contains("check failed: cargo test -q") && l.contains(&failure)), "{out:?}");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
+    assert!(node.notes.unwrap_or_default().starts_with(&format!("check failed: cargo test -q\n{failure}")), "{out:?}");
+    let pair = crate::pair::recent(dir.path(), 10);
+    assert!(pair.iter().any(|l| l.contains("wait: the check waits on the cargo target") && l.contains("held by other #9")), "{pair:?}");
+}
+
+#[tokio::test]
 async fn a_long_check_output_is_clipped() {
     let dir = tempfile::tempdir().unwrap();
     cargo_project(dir.path(), true);
