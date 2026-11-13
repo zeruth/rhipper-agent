@@ -1548,6 +1548,8 @@ struct Workspace {
     allocation_at: Option<Instant>,
     /// The cards that wait on the person, read with the allocation.
     waiting: Vec<ra_console::hub::Waiting>,
+    /// The cards landed today and their cost, read with the allocation.
+    landed: (u32, Option<f64>),
     store: Store,
     worker: Worker,
     sink: Sink,
@@ -1765,6 +1767,7 @@ impl Workspace {
             allocation: (None, 1, None),
             allocation_at: None,
             waiting: Vec::new(),
+            landed: (0, None),
             job_tx,
             job_done,
             ledger: Ledger::default(),
@@ -4176,9 +4179,11 @@ impl Workspace {
                 ra_console::allocation::priority_place(&self.root),
             );
             self.waiting = ra_console::hub::waiting(&self.root, &nodes);
+            self.landed = ra_console::allocation::landed(&self.root);
             self.allocation_at = Some(Instant::now());
         }
         let waiting = self.waiting.clone();
+        let landed = self.landed;
         let (implementer, runners, place) = self.allocation.clone();
         // the header's model badge is the project's implementer, as the toggle sets it, not the
         // window's default model
@@ -4256,6 +4261,11 @@ impl Workspace {
                     if step != 0 {
                         changed |= ra_console::allocation::move_priority(&root, step > 0).is_ok();
                     }
+                    // what a landed card costs here, beside the allocation it is judged against;
+                    // the waits badge is the row's already
+                    let landed_shown = format!("landed {}", ra_console::hub::landed_text(landed));
+                    ui.label(RichText::new(landed_shown).small().color(theme::dim()))
+                        .on_hover_text("the cards accepted today and their cost over every run, from the ledger");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let button = egui::Button::new(RichText::new("open ›").color(theme::text()))

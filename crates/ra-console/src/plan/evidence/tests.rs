@@ -90,6 +90,8 @@ fn a_hub_with_two_other_projects_digests_yields_two_lines_and_never_this_project
         ready: 3,
         changed: vec![],
         leftovers: vec![],
+        landed_today: (0, None),
+        waiting: 0,
     };
     hub::write_digest_in(&dir, &digest("alpha", Some("#12 The digest · pid 4242 · started 10:04Z"), Some("✓ #11 Notes"))).unwrap();
     hub::write_digest_in(&dir, &digest("beta", None, Some("✓ #7 The ledger accepted"))).unwrap();

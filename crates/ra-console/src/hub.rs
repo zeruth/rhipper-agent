@@ -142,7 +142,7 @@ pub fn quit_requested() -> bool {
 /// A project's digest, under `digest/<project>.txt`: what it is doing, for the runs of the other
 /// projects to read as one line rather than its roadmap or its files. A run's end and a walk's
 /// start and end write it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Digest {
     /// The project's directory name, which names the file too.
     pub name: String,
@@ -160,6 +160,11 @@ pub struct Digest {
     /// The uncommitted leftovers: the files changed by cards that need revision and still dirty
     /// in the tree, each as `path (#id …)`, so a later card knows the tree it inherits.
     pub leftovers: Vec<String>,
+    /// The cards accepted today and what they cost over every run, from the ledger, so the
+    /// person allocates the week where a landed card is cheapest.
+    pub landed_today: (u32, Option<f64>),
+    /// How many cards wait on the person.
+    pub waiting: u32,
 }
 
 /// The longest a digest line gets in a system prompt: about fifty tokens a project.
@@ -204,6 +209,18 @@ pub fn write_digest_in(dir: &Path, digest: &Digest) -> anyhow::Result<()> {
     if !digest.leftovers.is_empty() {
         let _ = writeln!(text, "leftovers: {}", digest.leftovers.join(", "));
     }
+    match digest.landed_today {
+        (0, _) => {}
+        (n, Some(cost)) => {
+            let _ = writeln!(text, "landed: {n} {cost}");
+        }
+        (n, None) => {
+            let _ = writeln!(text, "landed: {n}");
+        }
+    }
+    if digest.waiting > 0 {
+        let _ = writeln!(text, "waiting: {}", digest.waiting);
+    }
     std::fs::write(dir.join(format!("{}.txt", digest.name)), text).context("cannot write the project's digest")
 }
 
@@ -234,6 +251,11 @@ fn parse_digest(text: &str) -> Option<Digest> {
             "ready" => digest.ready = value.parse().ok()?,
             "changed" => digest.changed = value.split_whitespace().map(str::to_owned).collect(),
             "leftovers" => digest.leftovers = value.split(", ").map(str::to_owned).collect(),
+            "landed" => {
+                let mut words = value.split_whitespace();
+                digest.landed_today = (words.next()?.parse().ok()?, words.next().and_then(|c| c.parse().ok()));
+            }
+            "waiting" => digest.waiting = value.parse().ok()?,
             _ => {}
         }
     }
@@ -294,6 +316,13 @@ fn digest_line(digest: &Digest) -> String {
         parts.push(format!("last: {last}"));
     }
     parts.push(format!("{} ready", digest.ready));
+    // before the file lists, which the width clips first
+    if digest.landed_today.0 > 0 {
+        parts.push(format!("landed {}", landed_text(digest.landed_today)));
+    }
+    if digest.waiting > 0 {
+        parts.push(format!("waits {}", digest.waiting));
+    }
     if !digest.changed.is_empty() {
         parts.push(format!("changed: {}", digest.changed.join(" ")));
     }
@@ -307,6 +336,61 @@ fn digest_line(digest: &Digest) -> String {
     let mut clipped: String = line.chars().take(DIGEST_WIDTH - 1).collect();
     clipped.push('…');
     clipped
+}
+
+/// Landed cards and their cost as the digest and the status show them: `4 ($9.80)`, `4` when no
+/// run of them reported a cost, `—` when none landed.
+#[must_use]
+pub fn landed_text((cards, cost): (u32, Option<f64>)) -> String {
+    match (cards, cost) {
+        (0, _) => String::from("—"),
+        (n, Some(cost)) => format!("{n} (${cost:.2})"),
+        (n, None) => n.to_string(),
+    }
+}
+
+/// The cards that landed on `today` (`YYYY-MM-DD`, UTC) by the stamped feed lines `feed`
+/// (`time<TAB>text`, as [`crate::pair::since`] gives them), and their cost over every run from
+/// the ledger's `cards`; a card that landed twice counts once, and the cost is `None` while no
+/// landed card has one.
+#[must_use]
+pub fn landed_of(feed: &[String], cards: &[ra_usage::CardCost], today: &str) -> (u32, Option<f64>) {
+    let mut ids: Vec<i64> = feed
+        .iter()
+        .filter_map(|line| {
+            let (when, text) = line.split_once('\t')?;
+            if day_of(when.parse().ok()?) != today {
+                return None;
+            }
+            let rest = text.strip_prefix("landed #")?;
+            rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let cost =
+        cards.iter().filter(|c| ids.contains(&c.node)).filter_map(|c| c.totals.cost_usd).fold(None, |sum, c| Some(sum.unwrap_or(0.0) + c));
+    (u32::try_from(ids.len()).unwrap_or(u32::MAX), cost)
+}
+
+/// [`landed_of`] for the project at `root` on today, its feed and its ledger read; the ledger is
+/// not created where there is none.
+pub async fn landed_today(root: &Path) -> (u32, Option<f64>) {
+    let now = unix_now();
+    let feed = crate::pair::since(root, now.saturating_sub(86_400));
+    if feed.is_empty() {
+        return (0, None);
+    }
+    let ledger = root.join("var/usage.db");
+    let cards = if ledger.is_file() {
+        match ra_usage::UsageStore::open(&ledger).await {
+            Ok(ledger) => ledger.by_card().await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    landed_of(&feed, &cards, &day_of(now))
 }
 
 /// How a project is named in the hub: its directory's name.
@@ -337,6 +421,8 @@ pub struct Status {
     pub waiting: Vec<Waiting>,
     /// Why the walk last stopped, as its end line on the feed says it.
     pub stopped: Option<String>,
+    /// The cards that landed today and their cost over every run, as [`landed_of`] reads them.
+    pub landed_today: (u32, Option<f64>),
 }
 
 /// A card that waits on the person: blocked, sent back past the walk's reruns, or implemented
@@ -469,15 +555,19 @@ const TODAY_ROWS: u32 = 5000;
 pub async fn status(root: &Path) -> Status {
     // a project without a ledger gets none opened for it: the open would create the file
     let ledger = root.join("var/usage.db");
-    let spends = if ledger.is_file() {
+    let (spends, cards) = if ledger.is_file() {
         match ra_usage::UsageStore::open(&ledger).await {
-            Ok(ledger) => ledger.recent(0, TODAY_ROWS).await.unwrap_or_default(),
-            Err(_) => Vec::new(),
+            Ok(ledger) => (ledger.recent(0, TODAY_ROWS).await.unwrap_or_default(), ledger.by_card().await.unwrap_or_default()),
+            Err(_) => (Vec::new(), Vec::new()),
         }
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
-    status_with(root, pid_alive, &spends, &day_of(unix_now()))
+    let now = unix_now();
+    let today = day_of(now);
+    let mut status = status_with(root, pid_alive, &spends, &today);
+    status.landed_today = landed_of(&crate::pair::since(root, now.saturating_sub(86_400)), &cards, &today);
+    status
 }
 
 /// The status of every project the hub remembers, this one first: the window's open tabs and
@@ -526,6 +616,7 @@ pub fn status_with(root: &Path, alive: impl Fn(u32) -> bool, spends: &[ra_usage:
         spend_today,
         waiting,
         stopped: crate::pair::stop_of(&feed),
+        landed_today: (0, None),
     }
 }
 
@@ -542,9 +633,13 @@ pub fn spend_on(spends: &[ra_usage::Spend], today: &str) -> (u64, Option<f64>) {
 /// The width of the run column of a status line.
 const RUN_WIDTH: usize = 44;
 
+/// The width of the landed column: `12 ($123.45)`.
+const LANDED_WIDTH: usize = 12;
+
 impl Status {
     /// The line of the status: the project, the run (or `idle`, or `orphaned: …`), the ready
-    /// count, today's calls and dollars, and the last end.
+    /// count, today's calls and dollars, the cards landed today and their cost, how many cards
+    /// wait, and the last end.
     #[must_use]
     pub fn line(&self) -> String {
         let run = match &self.run {
@@ -560,7 +655,10 @@ impl Status {
         };
         // the end line's head says the card and how it ended; its tail is the cost, which `today` has
         let last = self.last.as_deref().map_or("—", |last| last.split_once(" · ").map_or(last, |(head, _)| head));
-        let line = format!("{:<20} {run:<RUN_WIDTH$} {ready:>5} {today:>16}  {last}", clip(&self.name, 20));
+        let landed = landed_text(self.landed_today);
+        let waits = if self.waiting.is_empty() { String::from("—") } else { self.waiting.len().to_string() };
+        let line =
+            format!("{:<20} {run:<RUN_WIDTH$} {ready:>5} {today:>16} {landed:>LANDED_WIDTH$} {waits:>5}  {last}", clip(&self.name, 20));
         match self.waits() {
             Some(waits) => format!("{line} · {waits}"),
             None => line,
@@ -581,7 +679,10 @@ impl Status {
     /// The header the lines go under.
     #[must_use]
     pub fn header() -> String {
-        format!("{:<20} {:<RUN_WIDTH$} {:>5} {:>16}  {}", "project", "run", "ready", "today", "last")
+        format!(
+            "{:<20} {:<RUN_WIDTH$} {:>5} {:>16} {:>LANDED_WIDTH$} {:>5}  {}",
+            "project", "run", "ready", "today", "landed", "waits", "last"
+        )
     }
 }
 
@@ -1170,7 +1271,9 @@ fn unix_nanos() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
 }
 
-fn unix_now() -> u64 {
+/// The time now, in seconds since the epoch.
+#[must_use]
+pub fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
