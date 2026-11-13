@@ -116,6 +116,31 @@ fn a_chat_request_runs_with_no_tools_and_one_turn() {
 }
 
 #[test]
+fn tools_for_gives_a_card_the_tools_it_can_use() {
+    let names = |provider: &ClaudeCode, request: &CompletionRequest| -> Vec<String> {
+        provider.tools_for(request).split(',').map(str::to_owned).collect()
+    };
+    let plain = names(&ClaudeCode::new(), &request(Some(PathBuf::from("."))));
+    for tool in ["Read", "Edit", "Write", "Glob", "Grep", "Bash"] {
+        assert!(plain.iter().any(|t| t == tool), "{tool}: {plain:?}");
+    }
+    for tool in ["WebFetch", "WebSearch", "NotebookEdit", "TodoWrite"] {
+        assert!(!plain.iter().any(|t| t == tool), "{tool}: {plain:?}");
+    }
+    let mut investigation = request(Some(PathBuf::from(".")));
+    investigation.read_only = true;
+    let reader = names(&ClaudeCode::new(), &investigation);
+    assert!(reader.iter().any(|t| t == "WebSearch") && reader.iter().any(|t| t == "WebFetch"), "{reader:?}");
+    let bash = names(&ClaudeCode::new().with_shell("bash"), &request(Some(PathBuf::from("."))));
+    assert!(bash.iter().any(|t| t == "Bash") && !bash.iter().any(|t| t == "PowerShell"), "{bash:?}");
+    let web = names(&ClaudeCode::new().with_web(true), &request(Some(PathBuf::from("."))));
+    assert!(web.iter().any(|t| t == "WebFetch"), "{web:?}");
+    let mut notebook = request(Some(PathBuf::from(".")));
+    notebook.messages.push(Message::user("Fix the plot in analysis.ipynb"));
+    assert!(names(&ClaudeCode::new(), &notebook).iter().any(|t| t == "NotebookEdit"));
+}
+
+#[test]
 fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
     let args = ClaudeCode::new().with_max_turns(7).args(&request(Some(PathBuf::from("."))));
     assert!(!args.contains(&"--bare".to_owned()), "{args:?}");

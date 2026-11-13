@@ -589,7 +589,10 @@ pub(crate) fn harness_of(
     if !worker.env.is_empty() {
         harness = harness.with_env(worker.env.clone());
     }
-    harness.with_read_roots(read_roots(root, worker, var))
+    if let Some(shell) = &worker.shell {
+        harness = harness.with_shell(shell);
+    }
+    harness.with_web(worker.web.unwrap_or(false)).with_read_roots(read_roots(root, worker, var))
 }
 
 /// The directories outside its worktree a run of the project at `root` may read, absolute and

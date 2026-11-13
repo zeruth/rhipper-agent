@@ -210,6 +210,8 @@ impl fmt::Display for Rule {
 /// carry = ["local.properties"]         # untracked files a new worktree gets a copy of, directories a link to
 /// read = ["third-party/jdk8u"]         # directories outside the worktree a run may read
 /// borrow = false                       # no borrowing of the pool's spare Opus slots past `parallel`; true without it
+/// shell = "bash"                       # the one shell a worker gets; both without it
+/// web = true                           # the web tools for builders; investigators have them anyway
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -283,6 +285,14 @@ pub struct WorkerConfig {
     /// touched. (58 GB of asm's test fixtures had piled up by 2026-11-12.)
     #[serde(default)]
     pub temp: Vec<String>,
+    /// The one shell the project's workers get, `bash` or `powershell`: each shell tool's schema
+    /// is read at the start of every run, and the allowed shapes serve both. Absent, both.
+    #[serde(default)]
+    pub shell: Option<String>,
+    /// Whether the project's builders get the web tools (`WebFetch`, `WebSearch`); an
+    /// investigator has them regardless. Absent, no.
+    #[serde(default)]
+    pub web: Option<bool>,
 }
 
 impl WorkerConfig {

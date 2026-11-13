@@ -26,10 +26,11 @@ pub const LIMITS_LOG: &str = "var/limits.log";
 /// the console's `log` to save with the run. A new run replaces it.
 pub const STREAM_FILE: &str = "var/runs/last.jsonl";
 
-/// The built-in tools a worker gets: the files, the search, both shells, the web and the plan.
-/// Not the subagents: one card is one worker's work, and a subagent only multiplies the context
-/// it reads.
-const WORKER_TOOLS: &str = "Bash,PowerShell,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,WebSearch,NotebookEdit";
+/// The built-in tools every worker gets: the files and the search. Each tool's schema is read
+/// before the prompt of every fresh run, so the rest come by [`ClaudeCode::tools_for`] only to
+/// the card that can use them. Never the subagents or the plan: one card is one worker's work,
+/// and a subagent only multiplies the context it reads.
+const WORKER_TOOLS: [&str; 5] = ["Read", "Edit", "Write", "Glob", "Grep"];
 
 /// The built-in tools of a read-only run, an investigator: it reads and searches the tree and
 /// the web, and has no shell to build with and no tool to edit with.
@@ -71,6 +72,10 @@ pub struct ClaudeCode {
     /// The directories outside the workspace a run may read: the project's declared read paths,
     /// the toolchain caches its builds use, what it carries into a worktree.
     read_roots: Vec<PathBuf>,
+    /// The one shell the project's workers get (`Bash` or `PowerShell`); `None` gives both.
+    shell: Option<String>,
+    /// The project lets its builders use the web tools.
+    web: bool,
 }
 
 /// The run's own temp directory under its workspace: a test's files land where the run may read
@@ -102,7 +107,49 @@ impl ClaudeCode {
             own_prefixes: Vec::new(),
             suite_check: false,
             read_roots: Vec::new(),
+            shell: None,
+            web: false,
         }
+    }
+
+    /// The one shell a worker gets, by the tool's name or in any case (`bash`, `powershell`,
+    /// `pwsh`); a blank or unknown name leaves both.
+    #[must_use]
+    pub fn with_shell(mut self, shell: &str) -> Self {
+        self.shell = match shell.trim().to_ascii_lowercase().as_str() {
+            "bash" | "sh" => Some("Bash".to_owned()),
+            "powershell" | "pwsh" => Some("PowerShell".to_owned()),
+            _ => None,
+        };
+        self
+    }
+
+    /// Whether a builder gets the web tools too, not only an investigator.
+    #[must_use]
+    pub fn with_web(mut self, web: bool) -> Self {
+        self.web = web;
+        self
+    }
+
+    /// The built-in tools of one request, comma-separated: an investigator the reading tools
+    /// and the web; a builder the files, the shell(s), the web only when the project says so,
+    /// and `NotebookEdit` only when the prompt names an `.ipynb` file.
+    fn tools_for(&self, request: &CompletionRequest) -> String {
+        if request.read_only {
+            return READER_TOOLS.to_owned();
+        }
+        let mut tools: Vec<&str> = match self.shell.as_deref() {
+            Some(shell) => vec![shell],
+            None => vec!["Bash", "PowerShell"],
+        };
+        tools.extend(WORKER_TOOLS);
+        if self.web {
+            tools.extend(["WebFetch", "WebSearch"]);
+        }
+        if request.messages.iter().any(|m| m.role != "system" && m.content.contains(".ipynb")) {
+            tools.push("NotebookEdit");
+        }
+        tools.join(",")
     }
 
     /// Directories outside the workspace a run may read, passed to the harness as added
@@ -328,7 +375,7 @@ impl ClaudeCode {
             }
             // the built-in tools of a worker, and the project's settings only: with the user's
             // hooks along, the worker on this machine had no shell (card #25 found out)
-            args.extend(["--tools".to_owned(), WORKER_TOOLS.to_owned(), "--setting-sources".to_owned(), WORKER_SETTING_SOURCES.to_owned()]);
+            args.extend(["--tools".to_owned(), self.tools_for(request), "--setting-sources".to_owned(), WORKER_SETTING_SOURCES.to_owned()]);
             if let Some(rc) = &self.hooks {
                 args.extend(["--settings".to_owned(), hook_settings(rc)]);
             }
