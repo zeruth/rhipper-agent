@@ -6170,12 +6170,17 @@ pub(crate) fn harness_messages(
         messages.push(Message::system(format!("The project, from {}:\n{project}", ra_context::PROJECT_FILE)));
     }
     let tools = manifest.map(|m| m.block_for(&task.brief)).unwrap_or_default();
-    let notes =
-        [machine_notes(root, project, (task.id, acceptance)), tools, warnings_note(task), digest_block(&crate::hub::digest_lines(root))]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+    let notes = [
+        BUILD_RULES.to_owned(),
+        machine_notes(root, project, (task.id, acceptance)),
+        tools,
+        warnings_note(task),
+        digest_block(&crate::hub::digest_lines(root)),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
     if !notes.is_empty() {
         messages.push(Message::system(notes));
     }
@@ -7467,6 +7472,14 @@ fn warnings_note(task: &ra_context::TaskContext) -> String {
         warnings.join("\n\n")
     )
 }
+
+/// The build rules every run carries, stated once here: a worker that learns them from a refused
+/// or timed-out command has already spent the turns.
+const BUILD_RULES: &str = "machine:\n\
+- start `cargo build` and `cargo test` with `run_in_background` on the first call\n\
+- a first compile behind other projects can exceed nine minutes\n\
+- wait on a background job with `rc wait <id>`\n\
+- write tool outputs under `var/`, never `%TEMP%`";
 
 /// The machine notes of a run: what the gotchas say about the last hits in the journal, for the
 /// system prompt, so the worker does not find out the hard way again, less what `project`, the
