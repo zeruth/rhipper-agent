@@ -68,7 +68,14 @@ pub struct ClaudeCode {
     /// The project's check is the full suite, so the count reads a worker's own run of it as
     /// the hook narrows it: to the crates the run has changed.
     suite_check: bool,
+    /// The directories outside the workspace a run may read: the project's declared read paths,
+    /// the toolchain caches its builds use, what it carries into a worktree.
+    read_roots: Vec<PathBuf>,
 }
+
+/// The run's own temp directory under its workspace: a test's files land where the run may read
+/// them, not under a system temp outside the worktree.
+pub const RUN_TEMP: &str = "var/tmp";
 
 impl Default for ClaudeCode {
     fn default() -> Self {
@@ -94,7 +101,41 @@ impl ClaudeCode {
             tool_dirs: Vec::new(),
             own_prefixes: Vec::new(),
             suite_check: false,
+            read_roots: Vec::new(),
         }
+    }
+
+    /// Directories outside the workspace a run may read, passed to the harness as added
+    /// directories; one named twice goes once.
+    #[must_use]
+    pub fn with_read_roots(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        for root in roots {
+            if !self.read_roots.contains(&root) {
+                self.read_roots.push(root);
+            }
+        }
+        self
+    }
+
+    /// The environment of a run on top of this process's own: `run_env` of its workspace and
+    /// the run's temp directory under it. A key the project names itself keeps the project's
+    /// value.
+    #[must_use]
+    pub fn environment(&self, request: &CompletionRequest) -> Vec<(String, String)> {
+        let env = self.run_env(request.workspace.as_deref()).into_iter().map(|(k, v)| (k, v.to_string_lossy().into_owned()));
+        env.chain(self.temp_env(request)).collect()
+    }
+
+    /// The run's temp directory as `TMP`, `TEMP` and `TMPDIR`, each one the project does not set
+    /// itself: what a test writes to temp lands inside the worktree, where the run may read it
+    /// back.
+    fn temp_env(&self, request: &CompletionRequest) -> Vec<(String, String)> {
+        let Some(temp) = run_temp(request) else { return Vec::new() };
+        ["TMP", "TEMP", "TMPDIR"]
+            .into_iter()
+            .filter(|key| !self.env.iter().any(|(k, _)| k.eq_ignore_ascii_case(key)))
+            .map(|key| (key.to_owned(), temp.display().to_string()))
+            .collect()
     }
 
     /// Whether the project's check is the full suite, the orchestrator's after the report.
@@ -288,6 +329,16 @@ impl ClaudeCode {
             // a chat completion: no tools, one turn
             args.extend(["--tools".to_owned(), String::new(), "--max-turns".to_owned(), "1".to_owned()]);
         }
+        if request.workspace.is_some() {
+            // the reads a run needs outside its worktree (a gitignored source tree, the cargo
+            // registry, a JDK's src.zip) and its own temp: refused, they cost a turn each, or a
+            // worker wrote from memory what it could have read
+            let dirs: Vec<String> = self.read_roots.iter().cloned().chain(run_temp(request)).map(|d| d.display().to_string()).collect();
+            if !dirs.is_empty() {
+                args.push("--add-dir".to_owned());
+                args.extend(dirs);
+            }
+        }
         if let Some(budget) = request.budget_usd {
             // the harness stops the run itself once it has spent this much
             args.extend(["--max-budget-usd".to_owned(), format!("{budget:.2}")]);
@@ -304,11 +355,16 @@ impl ClaudeCode {
         }
         // a nested session refuses to start; the console may itself run under Claude Code
         command.env_remove("CLAUDECODE");
-        command.envs(self.run_env(request.workspace.as_deref()));
-        // the scratch drive's temp directory and Gradle cache, when the machine has one
+        // the scratch drive's Gradle cache, when the machine has one; its temp directory gives
+        // way to the run's own below, which the run may read back
         if let Some(dir) = &request.workspace {
             command.envs(scratch_env(dir));
         }
+        if let Some(temp) = run_temp(&request) {
+            let _ = std::fs::create_dir_all(temp);
+        }
+        command.envs(self.run_env(request.workspace.as_deref()));
+        command.envs(self.temp_env(&request));
         let mut child = command.spawn().map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 ProviderError::Unavailable(format!("{} is not installed or not on the path", self.binary.display()))
@@ -1047,6 +1103,12 @@ pub fn scratch_env(workspace: &Path) -> Vec<(String, PathBuf)> {
     let temp = scratch.join("tmp").join(name);
     let _ = std::fs::create_dir_all(&temp);
     vec![("TEMP".into(), temp.clone()), ("TMP".into(), temp), ("GRADLE_USER_HOME".into(), scratch.join("gradle"))]
+}
+
+/// The temp directory of a run in a workspace, absolute: `var/tmp` under it; none for a chat
+/// completion, which runs nothing.
+fn run_temp(request: &CompletionRequest) -> Option<PathBuf> {
+    request.workspace.as_deref().and_then(|dir| std::path::absolute(dir.join(RUN_TEMP)).ok())
 }
 
 /// The program a permission rule names: `python` of `Bash(python *)`, `gw.ps1` of

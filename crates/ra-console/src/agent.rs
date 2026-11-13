@@ -529,22 +529,17 @@ fn connect(route: Route) -> anyhow::Result<Arc<dyn ModelProvider>> {
         Route::ClaudeCode => {
             // the gotchas guard every harness run: the hooks call this very binary, and the
             // catalogue lives beside the roadmap; without either, the harness runs unguarded
-            let mut harness = ra_providers::claude_code::ClaudeCode::new();
-            // the project's own commands and environment, from the `[worker]` table of
+            // the project's own commands, environment and reads, from the `[worker]` table of
             // its rhipper.toml, when it has one
-            match crate::router::Router::load(Path::new(".")) {
-                Ok(router) => {
-                    let worker = router.worker;
-                    harness = harness.with_suite_check(worker.checks_the_suite());
-                    if !worker.allow.is_empty() {
-                        harness = harness.with_allowed(worker.rules());
-                    }
-                    if !worker.env.is_empty() {
-                        harness = harness.with_env(worker.env);
-                    }
+            let root = Path::new(".");
+            let worker = match crate::router::Router::load(root) {
+                Ok(router) => router.worker,
+                Err(e) => {
+                    tracing::warn!("the worker table is off: {e:#}");
+                    crate::router::WorkerConfig::default()
                 }
-                Err(e) => tracing::warn!("the worker table is off: {e:#}"),
-            }
+            };
+            let mut harness = harness_of(root, &worker, |key| std::env::var_os(key));
             // the machine's tools on the run's PATH, the ones the probe found off it as well
             if let Some(manifest) = crate::hub::manifest::load() {
                 harness = harness.with_tool_dirs(manifest.dirs());
@@ -579,7 +574,114 @@ fn connect(route: Route) -> anyhow::Result<Arc<dyn ModelProvider>> {
     Ok(provider)
 }
 
+/// The Claude Code harness of the project at `root` under its `[worker]` table: its own
+/// commands, its environment, and the directories outside a worktree its runs may read. `var`
+/// reads the environment, so a test names the toolchains it finds.
+pub(crate) fn harness_of(
+    root: &Path,
+    worker: &crate::router::WorkerConfig,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> ra_providers::claude_code::ClaudeCode {
+    let mut harness = ra_providers::claude_code::ClaudeCode::new().with_suite_check(worker.checks_the_suite());
+    if !worker.allow.is_empty() {
+        harness = harness.with_allowed(worker.rules());
+    }
+    if !worker.env.is_empty() {
+        harness = harness.with_env(worker.env.clone());
+    }
+    harness.with_read_roots(read_roots(root, worker, var))
+}
+
+/// The directories outside its worktree a run of the project at `root` may read, absolute and
+/// existing: the table's `read` paths, the directories it carries into a worktree (a link the
+/// harness may follow to its real place), and the caches of the toolchains the project builds
+/// with. About 225 look-backs of 2026-11-12 were reads refused out there.
+pub(crate) fn read_roots(
+    root: &Path,
+    worker: &crate::router::WorkerConfig,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut add = |path: PathBuf| {
+        if path.is_dir()
+            && let Ok(path) = std::path::absolute(&path)
+            && !roots.contains(&path)
+        {
+            roots.push(path);
+        }
+    };
+    for entry in worker.read.iter().map(|e| e.trim()).filter(|e| !e.is_empty()) {
+        let path = root.join(entry);
+        if !path.is_dir() {
+            tracing::warn!("[worker] read names {entry}, which is no directory here");
+        }
+        add(path);
+    }
+    for entry in worker.carry.iter().map(|e| e.trim()).filter(|e| !e.is_empty()) {
+        add(root.join(entry));
+    }
+    for cache in toolchain_caches(root, &var) {
+        add(cache);
+    }
+    roots
+}
+
+/// The dependency and source caches of the toolchains the project at `root` builds with, as the
+/// toolchains place them: cargo's registry and git checkouts under its home, rustup's
+/// toolchains (the standard library's source), Gradle's caches under its user home, Maven's
+/// repository, and the Java home with its `src.zip`. Only the caches: a home's credentials stay
+/// out. The ones that do not exist are left to the caller.
+fn toolchain_caches(root: &Path, var: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let home = || {
+        let (first, second) = if cfg!(windows) { ("USERPROFILE", "HOME") } else { ("HOME", "USERPROFILE") };
+        var(first).or_else(|| var(second)).filter(|h| !h.is_empty()).map(PathBuf::from)
+    };
+    let home_of = |key: &str, dir: &str| var(key).filter(|v| !v.is_empty()).map(PathBuf::from).or_else(|| home().map(|h| h.join(dir)));
+    let has = |files: &[&str]| files.iter().any(|f| root.join(f).is_file());
+    let mut caches = Vec::new();
+    if has(&["Cargo.toml"]) {
+        if let Some(cargo) = home_of("CARGO_HOME", ".cargo") {
+            caches.extend([cargo.join("registry"), cargo.join("git")]);
+        }
+        if let Some(rustup) = home_of("RUSTUP_HOME", ".rustup") {
+            caches.push(rustup.join("toolchains"));
+        }
+    }
+    let gradle = has(&["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]);
+    let maven = has(&["pom.xml"]);
+    if gradle && let Some(user_home) = home_of("GRADLE_USER_HOME", ".gradle") {
+        caches.push(user_home.join("caches"));
+    }
+    if maven && let Some(home) = home() {
+        caches.push(home.join(".m2").join("repository"));
+    }
+    if (gradle || maven)
+        && let Some(java) = var("JAVA_HOME").filter(|v| !v.is_empty()).map(PathBuf::from).or_else(|| java_on_path(var))
+    {
+        caches.push(java);
+    }
+    caches
+}
+
+/// The Java home of the `java` on the path, its links followed: the directory above its `bin`,
+/// when that has a `lib`, as a JDK has.
+fn java_on_path(var: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let program = if cfg!(windows) { "java.exe" } else { "java" };
+    let found = std::env::split_paths(&var("PATH")?).map(|dir| dir.join(program)).find(|p| p.is_file())?;
+    let real = std::fs::canonicalize(&found).ok()?;
+    // canonical on Windows is the verbatim form, which the harness reads as a different path
+    let real = match real.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(plain) => PathBuf::from(plain),
+        None => real,
+    };
+    let home = real.parent()?.parent()?.to_path_buf();
+    home.join("lib").is_dir().then_some(home)
+}
+
 /// Sends one message and returns the answer and the usage as log lines.
+///
+/// # Errors
+/// When the connection cannot be established or the ping fails.
 pub async fn ping(worker: &Worker) -> anyhow::Result<Vec<String>> {
     let provider = worker.provider()?;
     let answer = provider
@@ -2944,22 +3046,60 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
         git(root, &["worktree", "add", "-b", &branch, &target, "HEAD"]).await?;
     }
     // the untracked files the project's build needs, which a checkout does not bring
-    // (`[worker] carry`): copied into the new worktree, each one as it is in the project
+    // (`[worker] carry`): a file copied into the new worktree as it is in the project, a
+    // directory linked, so a source tree of gigabytes is there at once and once on the disk
     if let Ok(router) = crate::router::Router::load(root) {
-        for file in &router.worker.carry {
-            let from = root.join(file);
-            if from.is_file() {
-                let to = path.join(file);
-                if let Some(dir) = to.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                if let Err(e) = std::fs::copy(&from, &to) {
-                    tracing::warn!("cannot carry {file} into the worktree of #{id}: {e}");
-                }
-            }
-        }
+        carry(root, &path, &router.worker.carry, id);
     }
     Ok((path, branch))
+}
+
+/// Brings the `[worker] carry` entries of the project at `root` into the worktree at `path`: a
+/// file copied as it is, a directory linked; one the worktree already has is left alone.
+fn carry(root: &Path, path: &Path, entries: &[String], id: i64) {
+    for file in entries {
+        let from = root.join(file);
+        let to = path.join(file);
+        if !from.exists() || to.exists() {
+            continue;
+        }
+        if let Some(dir) = to.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let carried = if from.is_dir() { link_dir(&from, &to) } else { std::fs::copy(&from, &to).map(drop) };
+        if let Err(e) = carried {
+            tracing::warn!("cannot carry {file} into the worktree of #{id}: {e}");
+        }
+    }
+}
+
+/// Links the directory `to` to `from`: a symbolic link, or on Windows, where one needs a
+/// privilege the person may not have, a junction when the link is refused.
+fn link_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    // absolute on both ends: an entry of the table is written with `/`, which `mklink` refuses
+    let from = std::path::absolute(from)?;
+    let to = std::path::absolute(to)?;
+    let to = to.as_path();
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(&from, to);
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(&from, to).is_ok() {
+            return Ok(());
+        }
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(to)
+            .arg(&from)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() { Ok(()) } else { Err(std::io::Error::other(format!("mklink /J exited with {status}"))) }
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(std::io::Error::other("no directory links on this platform"))
 }
 
 /// The base a card's diff is read against: `HEAD` when the run acted in the project's own

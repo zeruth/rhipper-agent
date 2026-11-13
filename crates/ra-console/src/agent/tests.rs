@@ -703,3 +703,82 @@ fn a_whole_file_read_of_a_long_file_is_answered_with_the_outline_once_per_run() 
     assert!(hint_of(root, &read_event(root, "src/big.rs", None, None), Some(7)).is_some());
     unsafe { std::env::remove_var(CARD_VAR) };
 }
+
+#[test]
+fn the_read_roots_of_a_project_and_its_temp_reach_the_harness() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let made = |path: PathBuf| {
+        std::fs::create_dir_all(&path).unwrap();
+        std::path::absolute(path).unwrap()
+    };
+    // a Rust and Gradle project with a gitignored source tree, and toolchains of its own
+    let jdk8u = made(project.join("third-party").join("jdk8u"));
+    std::fs::write(project.join("Cargo.toml"), "").unwrap();
+    std::fs::write(project.join("build.gradle"), "").unwrap();
+    let registry = made(dir.path().join("cargo").join("registry"));
+    let gradle = made(dir.path().join("gradle").join("caches"));
+    let java = made(dir.path().join("jdk"));
+    let var = |key: &str| {
+        let value = match key {
+            "CARGO_HOME" => dir.path().join("cargo"),
+            "GRADLE_USER_HOME" => dir.path().join("gradle"),
+            "JAVA_HOME" => dir.path().join("jdk"),
+            // no home: the rustup and Maven caches are not found, and nothing else is guessed
+            _ => return None,
+        };
+        Some(value.into_os_string())
+    };
+    let worker = crate::router::WorkerConfig { read: vec!["third-party/jdk8u".to_owned(), "no-such-dir".to_owned()], ..Default::default() };
+    let roots = read_roots(&project, &worker, var);
+    assert_eq!(roots, [jdk8u.clone(), registry.clone(), gradle.clone(), java.clone()]);
+
+    let worktree = made(project.join("var").join("worktrees").join("208"));
+    let request = CompletionRequest {
+        model: "claude-opus-5-5".to_owned(),
+        messages: vec![Message::user("go")],
+        temperature: None,
+        max_tokens: None,
+        tools: Vec::new(),
+        workspace: Some(worktree.clone()),
+        budget_usd: None,
+        resume: None,
+        max_turns: None,
+        max_context: None,
+        effort: None,
+        read_only: false,
+    };
+    let harness = harness_of(&project, &worker, var);
+    let line = harness.command_line(&request).unwrap();
+    let at = line.iter().position(|a| a == "--add-dir").expect("the read roots are added directories");
+    let temp = worktree.join("var").join("tmp");
+    let shown = |p: &PathBuf| p.display().to_string();
+    assert_eq!(line[at + 1..at + 6], [&jdk8u, &registry, &gradle, &java, &temp].map(shown));
+    let env = harness.environment(&request);
+    for key in ["TMP", "TEMP", "TMPDIR"] {
+        assert!(env.iter().any(|(k, v)| k == key && *v == shown(&temp)), "{env:?}");
+    }
+}
+
+#[test]
+fn a_carried_directory_is_linked_into_the_worktree_and_a_carried_file_copied() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let worktree = dir.path().join("worktree");
+    std::fs::create_dir_all(project.join("third-party").join("jdk8u")).unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(project.join("local.properties"), "sdk.dir=C:/sdk").unwrap();
+    std::fs::write(project.join("third-party").join("jdk8u").join("A.java"), "class A {}").unwrap();
+    let entries = ["local.properties".to_owned(), "third-party/jdk8u".to_owned(), "absent".to_owned()];
+    carry(&project, &worktree, &entries, 208);
+
+    let file = worktree.join("local.properties");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "sdk.dir=C:/sdk");
+    assert!(!std::fs::symlink_metadata(&file).unwrap().file_type().is_symlink(), "a file is a copy");
+    let linked = worktree.join("third-party").join("jdk8u");
+    assert!(std::fs::symlink_metadata(&linked).unwrap().file_type().is_symlink(), "a directory is a link");
+    // a link, not a copy: what the project's tree gains afterwards is there through it
+    std::fs::write(project.join("third-party").join("jdk8u").join("B.java"), "class B {}").unwrap();
+    assert_eq!(std::fs::read_to_string(linked.join("B.java")).unwrap(), "class B {}");
+    assert!(!worktree.join("absent").exists());
+}

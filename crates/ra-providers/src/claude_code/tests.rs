@@ -126,6 +126,37 @@ fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
 }
 
 #[test]
+fn a_run_reads_its_roots_and_writes_its_temp_inside_the_workspace() {
+    let registry = PathBuf::from(r"C:\Users\me\.cargo\registry");
+    let jdk = PathBuf::from(r"C:\code\runelite\third-party\jdk8u");
+    let provider = ClaudeCode::new().with_read_roots([registry.clone(), jdk.clone(), registry.clone()]);
+    let worker = request(Some(PathBuf::from(".")));
+    let args = provider.args(&worker);
+    let at = args.iter().position(|a| a == "--add-dir").expect("the read roots are added directories");
+    let temp = std::path::absolute(PathBuf::from(".").join(RUN_TEMP)).unwrap().display().to_string();
+    assert_eq!(args[at + 1..at + 4], [registry.display().to_string(), jdk.display().to_string(), temp.clone()]);
+    let env = provider.environment(&worker);
+    for key in ["TMP", "TEMP", "TMPDIR"] {
+        assert!(env.iter().any(|(k, v)| k == key && *v == temp), "{env:?}");
+    }
+    // a chat completion runs nothing, so it reads nothing outside and has no temp of its own
+    assert!(!provider.args(&request(None)).contains(&"--add-dir".to_owned()));
+    assert!(!provider.environment(&request(None)).iter().any(|(k, _)| k == "TMP"));
+    // the project's own TEMP stands
+    let own = ClaudeCode::new().with_env([("TEMP".to_owned(), r"D:\tmp".to_owned())]).environment(&worker);
+    assert_eq!(own.iter().filter(|(k, _)| k == "TEMP").map(|(_, v)| v.as_str()).collect::<Vec<_>>(), [r"D:\tmp"]);
+    // and so does its own build directory, which a worktree's shared target does not replace
+    let worktree = request(Some(PathBuf::from("var").join("worktrees").join("208")));
+    let target = ClaudeCode::new().with_env([("CARGO_TARGET_DIR".to_owned(), r"D:\target".to_owned())]).environment(&worktree);
+    let targets: Vec<&str> = target.iter().filter(|(k, _)| k == "CARGO_TARGET_DIR").map(|(_, v)| v.as_str()).collect();
+    assert_eq!(targets, [r"D:\target"]);
+    // without read roots a worker run still adds its temp
+    let bare = ClaudeCode::new().args(&worker);
+    let at = bare.iter().position(|a| a == "--add-dir").expect("the temp is an added directory");
+    assert_eq!(bare[at + 1], temp);
+}
+
+#[test]
 fn a_workers_system_prompt_carries_the_allowed_shapes_and_a_chats_does_not() {
     let provider = ClaudeCode::new().with_allowed(["Bash(ninja *)".to_owned()]);
     let system = provider.system_of(&request(Some(PathBuf::from("."))));

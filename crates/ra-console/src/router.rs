@@ -207,7 +207,8 @@ impl fmt::Display for Rule {
 /// context = 120000                      # and after a turn whose input passes this many tokens; 120000 without it
 /// check_timeout = 1800                 # the seconds a check or the lint may run; 1200 without it
 /// parallel = 2                         # the cards a walk runs at once, in worktrees sharing one build; one without it
-/// carry = ["local.properties"]         # untracked files a new worktree gets a copy of
+/// carry = ["local.properties"]         # untracked files a new worktree gets a copy of, directories a link to
+/// read = ["third-party/jdk8u"]         # directories outside the worktree a run may read
 /// borrow = false                       # no borrowing of the pool's spare Opus slots past `parallel`; true without it
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
@@ -251,9 +252,16 @@ pub struct WorkerConfig {
     pub parallel: Option<u32>,
     /// Files of the project a new worktree gets a copy of: the ones git does not track that a
     /// build needs all the same, such as `local.properties` with the Android SDK's location.
-    /// Without it every worktree run of runelite failed its compile at once.
+    /// Without it every worktree run of runelite failed its compile at once. A directory is
+    /// linked rather than copied: a JDK source tree is gigabytes, and one copy serves them all.
     #[serde(default)]
     pub carry: Vec<String>,
+    /// Directories a run may read outside its worktree, relative to the project or absolute:
+    /// a gitignored source tree such as runelite's `third-party/jdk8u`, which a worktree does
+    /// not have and some 130 refused reads asked for (2026-11-12). They go to the harness as
+    /// added directories, beside the toolchain caches the agent finds on its own.
+    #[serde(default)]
+    pub read: Vec<String>,
     /// Whether a walk here may borrow the pool's Opus slots no other walk needs, past its
     /// `parallel`; absent, it may. `false` holds a project to its own count exactly.
     #[serde(default)]
