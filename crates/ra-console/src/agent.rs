@@ -5347,12 +5347,12 @@ impl Pool {
     pub fn take(root: &Path, kind: PoolKind, held: usize, width: usize, others: usize, borrow: bool) -> Option<crate::hub::Guard> {
         match kind {
             PoolKind::Fable => {
-                if held >= 1 {
+                // the project's runners, named by the project: no pool across them
+                if held >= width.max(1) {
                     return None;
                 }
-                // one a project, named by the project: no pool across them
                 let name = root.file_name().map_or_else(|| "project".to_owned(), |n| n.to_string_lossy().to_ascii_lowercase());
-                crate::hub::try_guard(&format!("fable-{name}")).ok().flatten()
+                (0..width.max(1)).find_map(|seat| crate::hub::try_guard(&format!("fable-{name}-{seat}")).ok().flatten())
             }
             PoolKind::Opus => {
                 let size = Self::OPUS;
@@ -5367,7 +5367,8 @@ impl Pool {
                             let name = crate::hub::project_name(dir);
                             let ready =
                                 crate::hub::digests().into_iter().find(|d| d.name.eq_ignore_ascii_case(&name)).map_or(0, |d| d.ready);
-                            crate::hub::held_by("pool-opus", size, &name) + ready
+                            let held = crate::hub::held_by("pool-opus", size, &name);
+                            ahead_demand(held, ready, crate::allocation::runners(dir) as usize)
                         })
                         .sum();
                     // never past the project's own runners: the order decides who is served
@@ -5389,6 +5390,14 @@ impl Pool {
             }
         }
     }
+}
+
+/// The seats a project ahead in the order keeps from the ones behind it: what it holds and what
+/// it has ready, but never more than its runners can use (or than it already holds). Uncapped,
+/// the agent's dozens of ready cards at six runners left asm no seat with the pool half free
+/// (2026-11-13).
+pub(crate) fn ahead_demand(held: usize, ready: usize, runners: usize) -> usize {
+    (held + ready).min(runners.max(held))
 }
 
 /// The projects ahead of `root` in the hub's priority order that are walking now on Opus

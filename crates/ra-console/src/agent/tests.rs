@@ -1031,3 +1031,13 @@ fn a_carried_directory_is_linked_into_the_worktree_and_a_carried_file_copied() {
     assert_eq!(std::fs::read_to_string(linked.join("B.java")).unwrap(), "class B {}");
     assert!(!worktree.join("absent").exists());
 }
+
+#[test]
+fn a_project_ahead_keeps_no_more_seats_than_its_runners_can_use() {
+    // six runners and thirty ready cards keep six seats, not thirty
+    assert_eq!(ahead_demand(2, 30, 6), 6);
+    // fewer ready cards than runners keep only what they can fill
+    assert_eq!(ahead_demand(1, 2, 6), 3);
+    // seats already held stay held, even past the runners after a change of setting
+    assert_eq!(ahead_demand(8, 5, 6), 8);
+}
