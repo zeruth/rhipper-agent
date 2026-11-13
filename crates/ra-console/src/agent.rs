@@ -2803,29 +2803,41 @@ async fn catch_up_for_review(store: &Store, id: i64, worker: &Worker) -> Result<
     if commands.is_empty() {
         return Ok(Some(caught));
     }
-    let toolbox = worker.toolbox(&path).map(|toolbox| toolbox.with_timeout(timeout));
+    // the merged tree's check is a build like the run's: a slot, the worktree's own target and
+    // the lock on it, a wait that runs out failing the check
+    let own_target = ra_providers::claude_code::shared_target(&path);
+    let toolbox = worker.toolbox(&path).map(|toolbox| {
+        toolbox.with_timeout(timeout).with_env(own_target.iter().map(|t| ("CARGO_TARGET_DIR".to_owned(), t.display().to_string())))
+    });
     let failed = {
-        // the merged tree's check is a build like the run's: a slot, and the lock on the
-        // worktree's own target
-        let _slot = hold_build(&root).await;
-        let target = root.join("target").join(format!("wt-{id}"));
-        let _target = if commands.iter().any(|c| c.trim_start().starts_with("cargo")) { guard_target(&root, &target).await } else { None };
-        run_checks(&toolbox, &commands, &[]).await.into_iter().find(|run| !run.passed)
+        let _slot = hold_build(&root, &path).await;
+        let target = own_target.unwrap_or_else(|| crate::hub::cargo_target(&root));
+        let cargo = commands.iter().find(|c| c.trim_start().starts_with("cargo")).cloned();
+        let waited = match &cargo {
+            Some(_) => guard_target(&root, &path, &target, timeout).await,
+            None => Ok(None),
+        };
+        match waited {
+            Ok(_target) => {
+                run_checks(&toolbox, &commands, &[]).await.into_iter().find(|run| !run.passed).map(|run| (run.command, run.text))
+            }
+            Err(text) => Some((cargo.unwrap_or_default(), text)),
+        }
     };
-    let Some(failed) = failed else {
+    let Some((command, output)) = failed else {
         return Ok(Some(format!("{caught} · check passed on the merged tree: {}", commands.join(" · "))));
     };
     // a failure on the merged tree is the card's check failure: its output leads the notes,
     // where the rerun reads it, and the walk counts it against the check's retries
     let notes = node.notes.unwrap_or_default();
-    let lead = format!("check failed: {}\n{}\n\n{notes}", failed.command, failed.text);
+    let lead = format!("check failed: {command}\n{output}\n\n{notes}");
     let sent = match store.set_notes(id, lead.trim_end()).await {
         Ok(()) => store.set_state_by(id, TaskState::NeedsRevision, Source::Run).await,
         Err(e) => Err(e),
     };
     let text = match sent {
-        Ok(()) => format!("#{id} not reviewed: the merged tree fails {}; sent back to its worker", failed.command),
-        Err(e) => format!("#{id} not reviewed: the merged tree fails {}; it could not be sent back ({e:#})", failed.command),
+        Ok(()) => format!("#{id} not reviewed: the merged tree fails {command}; sent back to its worker"),
+        Err(e) => format!("#{id} not reviewed: the merged tree fails {command}; it could not be sent back ({e:#})"),
     };
     crate::pair::event(&root, &text);
     Err(vec![caught, format!("  {text}")])
