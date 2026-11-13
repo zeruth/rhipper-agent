@@ -118,6 +118,21 @@ fn a_worker_request_gets_the_file_tools_and_the_allowed_shell() {
 }
 
 #[test]
+fn a_workers_system_prompt_carries_the_allowed_shapes_and_a_chats_does_not() {
+    let provider = ClaudeCode::new().with_allowed(["Bash(ninja *)".to_owned()]);
+    let system = provider.system_of(&request(Some(PathBuf::from("."))));
+    assert!(system.starts_with("You answer in one word.\n\nAllowed shell shapes"), "{system}");
+    assert!(system.contains(&ra_gotchas::shape::block()), "{system}");
+    assert!(system.contains("the project's own commands run too: ninja"), "{system}");
+    // the allowlist is the same table's
+    assert_eq!(provider.new_allowed()[..ra_gotchas::shape::rules().len()], ra_gotchas::shape::rules()[..]);
+    let mut reader = request(Some(PathBuf::from(".")));
+    reader.read_only = true;
+    assert_eq!(provider.system_of(&reader), "You answer in one word.");
+    assert_eq!(provider.system_of(&request(None)), "You answer in one word.");
+}
+
+#[test]
 fn a_known_session_is_resumed() {
     let mut worker = request(Some(PathBuf::from(".")));
     worker.resume = Some("3f2a9c1e".to_owned());

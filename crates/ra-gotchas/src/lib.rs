@@ -8,7 +8,9 @@
 //! card outlines. The post-tool hook and the provider's stream reader ask [`Catalogue::scan`]
 //! what a result or an answer shows. The [`Journal`] keeps every hit, so `rc gotchas` can say
 //! which ones keep coming back and the next run can read [`Catalogue::notes`] about them. The
-//! refused commands no gotcha names grow the catalogue through [`Catalogue::promote`].
+//! refused commands no gotcha names grow the catalogue through [`Catalogue::promote`]. A
+//! command's shape, the simple commands it is made of, is judged by [`shape::judge`], from the
+//! table that also writes the worker's allowlist and the rules of its prompt.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -19,6 +21,7 @@ use serde::Deserialize;
 
 pub mod catalog;
 pub mod journal;
+pub mod shape;
 
 pub use journal::Journal;
 

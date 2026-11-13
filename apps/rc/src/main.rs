@@ -847,8 +847,117 @@ async fn plan_context() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Answers one Claude Code tool hook from the gotchas. `pre` prints a deny with the reason, or
-/// an allow with the rewritten command; `post` prints the hints the result calls for. Anything
+/// The answer to one `pre` hook for a shell command: the catalogue's verdict, the build budget,
+/// and the command's shape, which denies the whole when one part is refused and allows it
+/// outright when every part is allowed. `None` leaves the command to the static allowlist.
+fn hook_pre(
+    catalogue: &ra_gotchas::Catalogue,
+    call: &serde_json::Value,
+    cwd: &Path,
+    command: &str,
+    worker: Option<&ra_console::router::WorkerConfig>,
+) -> Option<serde_json::Value> {
+    // a command the project's `[worker] allow` names is the project's own: the shell
+    // allowlist gotcha stands aside for it, the other gotchas do not
+    // a worker's own `rc hold -- <command>` is the command inside, as the catalogue judges it
+    let judged = ra_gotchas::self_held(command).unwrap_or(command);
+    let own = worker.is_some_and(|w| w.allows(judged));
+    // a running console or window holds its binary only while it runs from target/; an
+    // installed one leaves the build free, so the lock itself is asked, not the pid file
+    let console_running = {
+        let locked = |name: &str| {
+            let path = cwd.join("target").join("debug").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            path.exists() && std::fs::OpenOptions::new().append(true).open(&path).is_err()
+        };
+        locked("rc") || locked("rc-gui")
+    };
+    // the full suite is the orchestrator's when it is the project's check: a worker's own run
+    // of it goes to the crates the run has changed
+    let suite_check = worker.is_none_or(ra_console::router::WorkerConfig::checks_the_suite);
+    let mut verdict = match catalogue.command_in(cwd, command, console_running, suite_check, own) {
+        ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. } if own && id == "shell-outside-allowlist" => {
+            ra_gotchas::Verdict::Pass
+        }
+        other => other,
+    };
+    // a build, under `rc hold` by the rewrite or by the worker's own hand, is the session's to
+    // spend from a small budget: the code comes first, the check compiles after the report
+    // a build is gradle, cargo or the contract runner: the other heavy work the slots hold (a
+    // script, a search, a WSL toolchain) is the worker's to run, budget or not
+    let is_build = |text: &str| {
+        let inner = text.trim_start().strip_prefix("rc hold").map(|rest| {
+            let rest = rest.trim_start();
+            rest.split_once("-- ").map_or(rest, |(_, command)| command)
+        });
+        inner.is_some_and(|command| {
+            let first = command.trim_start().trim_start_matches("& ").trim_start_matches(".\\").trim_start_matches("./");
+            first.starts_with("gw.ps1")
+                || first.starts_with("gradlew")
+                || first.starts_with("cargo ")
+                || command.contains("run-awt-contracts.py")
+        })
+    };
+    let built = match &verdict {
+        ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => is_build(rewritten),
+        ra_gotchas::Verdict::Pass => is_build(command),
+        ra_gotchas::Verdict::Deny { .. } => false,
+    };
+    let session = call.get("session_id").and_then(serde_json::Value::as_str).unwrap_or("-");
+    if let (true, Err(reason)) = (built, ra_console::agent::build_allowance(cwd, session)) {
+        verdict = ra_gotchas::Verdict::Deny { id: String::from("build-budget"), reason };
+    }
+    // the hook is the judge of a command's shape: every part allowed is an allow the static
+    // allowlist, which cannot parse a chain or a prefix, would have refused; a part refused
+    // denies the whole, a rewrite's allow included; a shape it cannot read is left to the
+    // allowlist
+    let shape = call.get("tool_name").and_then(serde_json::Value::as_str).and_then(ra_gotchas::shape::Shell::of_tool).map_or(
+        ra_gotchas::shape::Shape::Unknown,
+        |shell| {
+            let own_part = |part: &str| worker.is_some_and(|w| w.allows(part));
+            ra_gotchas::shape::judge(judged, shell, cwd, &own_part)
+        },
+    );
+    let final_verdict = match (verdict, shape) {
+        (ra_gotchas::Verdict::Deny { id, reason }, _) => ra_gotchas::Verdict::Deny { id, reason },
+        (_, ra_gotchas::shape::Shape::Denied(reason)) => ra_gotchas::Verdict::Deny { id: String::from("shell-shape"), reason },
+        (ra_gotchas::Verdict::Pass, ra_gotchas::shape::Shape::Allowed) => {
+            return Some(serde_json::json!({
+                "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "every part of the command is allowed"}
+            }));
+        }
+        (verdict, _) => verdict,
+    };
+    match final_verdict {
+        ra_gotchas::Verdict::Pass => None,
+        ra_gotchas::Verdict::Deny { reason, .. } => Some(serde_json::json!({
+            "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
+        })),
+        ra_gotchas::Verdict::Rewrite { command, reason, .. } => {
+            // a command put under `rc hold` runs through the shell of the tool that called it:
+            // the Bash tool's bash, the PowerShell tool's powershell
+            let shell = match call.get("tool_name").and_then(serde_json::Value::as_str) {
+                Some("Bash") => "bash",
+                _ => "powershell",
+            };
+            let command = match command.strip_prefix("rc hold -- ") {
+                Some(rest) => format!("rc hold --shell {shell} -- {rest}"),
+                None => command,
+            };
+            Some(serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": reason,
+                    "updatedInput": {"command": command}
+                }
+            }))
+        }
+    }
+}
+
+/// Answers one Claude Code tool hook from the gotchas. `pre` prints a deny with the reason, an
+/// allow with the rewritten command, or an allow for a command whose every part the shape table
+/// allows; `post` prints the hints the result calls for. Anything
 /// the hook cannot judge, a missing catalogue included, gets no answer at all: the run goes on.
 fn hook(event: &str) -> anyhow::Result<()> {
     use std::io::Read;
@@ -879,88 +988,12 @@ fn hook(event: &str) -> anyhow::Result<()> {
     // the seed's new entries reach a project's catalogue here too: a worker started from an
     // installed rc, not the console, has only the hook to bring them
     let Ok((catalogue, _)) = ra_gotchas::Catalogue::refresh(&cwd.join("var/gotchas.toml")) else { return Ok(()) };
-    // a running console or window holds its binary only while it runs from target/; an
-    // installed one leaves the build free, so the lock itself is asked, not the pid file
-    let locked = |name: &str| {
-        let path = cwd.join("target").join("debug").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        path.exists() && std::fs::OpenOptions::new().append(true).open(&path).is_err()
-    };
-    let console_running = locked("rc") || locked("rc-gui");
     let answer = match event {
         "pre" => {
             let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str).unwrap_or("");
             // the project's table, read above a worktree, which has no copy of it
             let worker = ra_console::router::Router::load(&ra_console::hub::project_root_of(&cwd)).map(|r| r.worker).ok();
-            // a command the project's `[worker] allow` names is the project's own: the shell
-            // allowlist gotcha stands aside for it, the other gotchas do not
-            // a worker's own `rc hold -- <command>` is the command inside, as the catalogue judges it
-            let judged = ra_gotchas::self_held(command).unwrap_or(command);
-            let own = worker.as_ref().is_some_and(|w| w.allows(judged));
-            // the full suite is the orchestrator's when it is the project's check: a worker's
-            // own run of it goes to the crates the run has changed
-            let suite_check = worker.as_ref().is_none_or(ra_console::router::WorkerConfig::checks_the_suite);
-            let verdict = match catalogue.command_in(&cwd, command, console_running, suite_check, own) {
-                ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. }
-                    if own && id == "shell-outside-allowlist" =>
-                {
-                    ra_gotchas::Verdict::Pass
-                }
-                other => other,
-            };
-            // a build, under `rc hold` by the rewrite or by the worker's own hand, is the
-            // session's to spend from a small budget: the code comes first, the check
-            // compiles after the report
-            // a build is gradle, cargo or the contract runner: the other heavy work the slots
-            // hold (a script, a search, a WSL toolchain) is the worker's to run, budget or not
-            let is_build = |text: &str| {
-                let inner = text.trim_start().strip_prefix("rc hold").map(|rest| {
-                    let rest = rest.trim_start();
-                    rest.split_once("-- ").map_or(rest, |(_, command)| command)
-                });
-                inner.is_some_and(|command| {
-                    let first = command.trim_start().trim_start_matches("& ").trim_start_matches(".\\").trim_start_matches("./");
-                    first.starts_with("gw.ps1")
-                        || first.starts_with("gradlew")
-                        || first.starts_with("cargo ")
-                        || command.contains("run-awt-contracts.py")
-                })
-            };
-            let built = match &verdict {
-                ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => is_build(rewritten),
-                ra_gotchas::Verdict::Pass => is_build(command),
-                ra_gotchas::Verdict::Deny { .. } => false,
-            };
-            let session = call.get("session_id").and_then(serde_json::Value::as_str).unwrap_or("-");
-            let verdict = match (built, ra_console::agent::build_allowance(&cwd, session)) {
-                (true, Err(reason)) => ra_gotchas::Verdict::Deny { id: String::from("build-budget"), reason },
-                _ => verdict,
-            };
-            match verdict {
-                ra_gotchas::Verdict::Pass => None,
-                ra_gotchas::Verdict::Deny { reason, .. } => Some(serde_json::json!({
-                    "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
-                })),
-                ra_gotchas::Verdict::Rewrite { command, reason, .. } => {
-                    // a command put under `rc hold` runs through the shell of the tool that
-                    // called it: the Bash tool's bash, the PowerShell tool's powershell
-                    let shell = match call.get("tool_name").and_then(serde_json::Value::as_str) {
-                        Some("Bash") => "bash",
-                        _ => "powershell",
-                    };
-                    let command = match command.strip_prefix("rc hold -- ") {
-                        Some(rest) => format!("rc hold --shell {shell} -- {rest}"),
-                        None => command,
-                    };
-                    Some(serde_json::json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "allow",
-                            "permissionDecisionReason": reason,
-                            "updatedInput": {"command": command}
-                        }
-                    }))
-                }
-            }
+            hook_pre(&catalogue, &call, &cwd, command, worker.as_ref())
         }
         "post" => {
             // what a shell said is read one way, what an edit tool said another
