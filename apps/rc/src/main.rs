@@ -16,6 +16,7 @@ mod tests;
 
 mod doctor;
 mod status;
+mod wait;
 
 #[derive(Parser)]
 #[command(name = "rc", version = ra_console::VERSION, about = "Rhipper Agent: the roadmap-driven multi-model development orchestrator")]
@@ -369,11 +370,11 @@ enum Command {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Waits on a long job of the worker's own: a pid until it ends, a file until it holds still for ten seconds, then prints its last lines; the one sanctioned way for a worker to wait.
+    /// Waits on a background job of the run until its exit line: the id `rc hold` gave it, the newest job when left out; a pid or a file also waits (a file until it holds still for ten seconds, then prints its last lines). The one sanctioned way for a worker to wait.
     Wait {
-        /// The pid of the job, or the file its output goes to.
-        target: String,
-        /// The most seconds to wait; 540 when left out, under a worker's turn.
+        /// The id of the job, a pid, or the file its output goes to; the newest job when left out.
+        target: Option<String>,
+        /// The most seconds to wait, then says the job still runs; without it a job is waited on to its end.
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -848,12 +849,16 @@ async fn run_main() -> anyhow::Result<()> {
         Command::Hold { shell, command } => {
             let shell = shell.unwrap_or_else(|| String::from(if cfg!(windows) { "powershell" } else { "sh" }));
             let dir = std::env::current_dir()?;
-            std::process::exit(ra_console::agent::hold(&dir, &shell, &command.join(" ")));
+            let command = command.join(" ");
+            let job = wait::Job::start(&dir, &command);
+            let code = ra_console::agent::hold(&dir, &shell, &command);
+            job.finish(code);
+            std::process::exit(code);
         }
         Command::Wait { target, timeout } => {
-            let limit = timeout.filter(|s| *s > 0).map_or(ra_console::agent::WAIT_LIMIT, std::time::Duration::from_secs);
+            let limit = timeout.filter(|s| *s > 0).map(std::time::Duration::from_secs);
             let dir = std::env::current_dir()?;
-            std::process::exit(ra_console::agent::wait(&dir, &target, limit));
+            std::process::exit(wait::run(&dir, target.as_deref(), limit));
         }
         Command::Init { import, empty, model } => {
             plain_tracing()?;
