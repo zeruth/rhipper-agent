@@ -39,6 +39,8 @@ pub struct Toolbox {
     script: Option<Script>,
     /// How long a command may run before it is stopped.
     timeout: Duration,
+    /// The environment a command gets beyond the process's own; set last, so it wins.
+    env: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for Toolbox {
@@ -55,7 +57,14 @@ impl Toolbox {
     pub fn new(root: &Path) -> anyhow::Result<Self> {
         let root = root.canonicalize().with_context(|| format!("no workspace at {}", root.display()))?;
         anyhow::ensure!(root.is_dir(), "the workspace {} is not a directory", root.display());
-        Ok(Self { root, script: None, timeout: DEFAULT_TIMEOUT })
+        Ok(Self { root, script: None, timeout: DEFAULT_TIMEOUT, env: Vec::new() })
+    }
+
+    /// The same toolbox, giving every command `env` over the process's own environment.
+    #[must_use]
+    pub fn with_env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.env.extend(env);
+        self
     }
 
     /// The same toolbox, with `script` answering every command instead of the shell.
