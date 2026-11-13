@@ -255,6 +255,19 @@ fn with_session(age: u64, now: u64) -> Node {
 }
 
 #[test]
+fn brief_of_ancestors_skips_one_without_an_objective_and_cuts_the_others_to_a_sentence() {
+    let mut node = with_session(0, 1);
+    node.id = 7;
+    node.title = "Sec".into();
+    node.objective = Some("Moves the tokens. Target 14k or less.".into());
+    assert_eq!(ancestor_line(&node), "Under #7 Sec: Moves the tokens.\n");
+    node.objective = Some("Version 1.5 is out and more".into());
+    assert_eq!(ancestor_line(&node), "Under #7 Sec: Version 1.5 is out and more\n");
+    node.objective = None;
+    assert_eq!(ancestor_line(&node), "");
+}
+
+#[test]
 fn a_session_within_the_day_is_resumed_and_an_older_one_is_not() {
     let now = 1_800_000_000;
     assert_eq!(resume_of(&with_session(SESSION_LIFE - 60, now), now), Ok(Some("sess-1".to_owned())));

@@ -8784,6 +8784,20 @@ struct Brief {
     files: Vec<String>,
 }
 
+/// The line an ancestor adds to the brief: its objective's first sentence, nothing without one.
+fn ancestor_line(ancestor: &Node) -> String {
+    let Some(objective) = ancestor.objective.as_deref().map(str::trim).filter(|o| !o.is_empty()) else {
+        return String::new();
+    };
+    let end = objective
+        .char_indices()
+        .find(|&(i, c)| {
+            matches!(c, '.' | '!' | '?' | '\n') && objective[i + c.len_utf8()..].chars().next().is_none_or(char::is_whitespace)
+        })
+        .map_or(objective.len(), |(i, c)| if c == '\n' { i } else { i + c.len_utf8() });
+    format!("Under #{} {}: {}\n", ancestor.id, ancestor.title, &objective[..end])
+}
+
 /// The prompt of one task: the node, its ancestors, and its dependencies. One read of the store
 /// serves them all, and names the files a card without its own takes from a section above it.
 async fn context_of(store: &Store, node: &Node) -> anyhow::Result<Brief> {
@@ -8813,7 +8827,7 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<Brief> {
     // the ancestors: the chain of parents above the task, nearest first
     let mut parent = node.parent.and_then(find);
     while let Some(ancestor) = parent {
-        text.push_str(&format!("Under #{} {}: {}\n", ancestor.id, ancestor.title, ancestor.objective.as_deref().unwrap_or("no objective")));
+        text.push_str(&ancestor_line(ancestor));
         parent = ancestor.parent.and_then(find);
     }
     // the dependencies, with their own context and the notes of earlier attempts; a dangling id
