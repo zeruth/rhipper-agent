@@ -625,6 +625,7 @@ pub async fn doctor(root: &Path) -> Vec<Check> {
         Check::new("ledger", true, ledger_check(root).await),
         Check::new("landing", false, landing_check(root).await),
         Check::new("temp", false, temp_check(root)),
+        Check::new("line endings", false, crate::setup::line_endings_check(root)),
     ]
 }
 

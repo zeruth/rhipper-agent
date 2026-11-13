@@ -138,7 +138,7 @@ remedy = { kind = "hint" }
 id = "edit-missed"
 where = "edit"
 pattern = '(?i)string to replace not found|old_string .*not found|not found in (the )?file|has not been read yet|has been modified since|found \d+ matches of the string|must be unique|no changes to make|is identical to'
-message = "an edit missed: its old text was not current or not unique, and the turn went on nothing; Read the lines first, quote them exactly, whitespace included, and make each edit at one place"
+message = "an edit missed: its old text was not current or not unique, and the turn went on nothing; Read the lines first, quote them exactly, whitespace included, and make each edit at one place. When the text was quoted right and still missed, the cause is the line ending: the file is CRLF and Read shows no CR, so a multi-line old text never matches; edit one line at a time, and `rc doctor` gives the project the .gitattributes that keeps its files LF"
 remedy = { kind = "hint" }
 
 [[gotcha]]
