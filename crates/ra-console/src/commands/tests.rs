@@ -1682,6 +1682,61 @@ fn a_compile_error_or_a_dependent_crate_is_never_an_outside_failure() {
     assert_eq!(crate::agent::outside_failure(dir.path(), apart, &changed).as_deref(), Some("killed (crates/ra-tools/src/lib.rs)"));
 }
 
+/// A committed probe project with card #2 whose acceptance is a check filtered to one test and
+/// whose branch `card/2` adds the crate `probe`.
+async fn project_with_a_crate_card(dir: &std::path::Path) -> Store {
+    cargo_project(dir, true);
+    git_ok(dir, &["init", "-q"]);
+    git_ok(dir, &["add", "-A"]);
+    git_ok(dir, &["commit", "-q", "-m", "probe"]);
+    git_ok(dir, &["checkout", "-q", "-b", "card/2"]);
+    std::fs::create_dir_all(dir.join("crates/probe/src")).unwrap();
+    std::fs::write(dir.join("crates/probe/Cargo.toml"), "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n").unwrap();
+    std::fs::write(dir.join("crates/probe/src/lib.rs"), "\n").unwrap();
+    git_ok(dir, &["add", "crates"]);
+    git_ok(dir, &["commit", "-q", "-m", "the card's work"]);
+    git_ok(dir, &["checkout", "-q", "-"]);
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    run("/edit 2 acceptance `cargo test -p probe -q filtered` passes", &store, &worker()).await.unwrap();
+    store
+}
+
+#[tokio::test]
+async fn merged_suite_refuses_a_card_whose_filtered_check_passes_but_whose_crate_has_another_failing_test() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_crate_card(dir.path()).await;
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    let script: ra_tools::Script = std::sync::Arc::new(|command: &str| {
+        if command.ends_with("filtered") {
+            Ok((0, "ok\n".to_owned()))
+        } else {
+            Ok((101, "thread 'the_other_test' panicked at crates/probe/src/lib.rs:1:1:\nbroke\n".to_owned()))
+        }
+    });
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_script(script);
+    let out = crate::agent::land_or_say(&store, 2, &runner).await;
+    assert_eq!(out, ["#2 not landed: the merged tree fails cargo test -p probe -q; sent back to its worker"]);
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
+    assert!(node.notes.unwrap_or_default().contains("the_other_test"));
+}
+
+#[tokio::test]
+async fn merged_suite_lands_a_clean_card_after_the_suite_of_its_crate_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_crate_card(dir.path()).await;
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_script(script);
+    let out = crate::agent::land_or_say(&store, 2, &runner).await;
+    assert!(
+        out.iter().any(|l| l == "check passed on the merged tree: cargo test -p probe -q filtered · cargo test -p probe -q"),
+        "{out:?}"
+    );
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Accepted);
+}
+
 #[tokio::test]
 async fn a_failure_in_the_cards_own_crate_still_sends_it_back_not_an_outside_failure() {
     let dir = tempfile::tempdir().unwrap();

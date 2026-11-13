@@ -2929,6 +2929,37 @@ async fn catch_up_for_review(store: &Store, id: i64, worker: &Worker) -> Result<
     Err(vec![caught, format!("  {text}")])
 }
 
+/// The card's checks and, after them, the whole suite of every crate the squash changed
+/// (`cargo test -p <crate> -q`): a card's own check is often filtered to its own tests, and a
+/// landing that proved only that let a card that broke another test of its crate land. A tree
+/// without crates keeps its checks as they are.
+pub(crate) fn merged_suite(root: &Path, mut commands: Vec<String>, changed: &[String]) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for file in changed {
+        let dir = crate_dir(file);
+        if dir.starts_with("crates/") && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    for dir in dirs {
+        let Ok(manifest) = std::fs::read_to_string(root.join(&dir).join("Cargo.toml")) else { continue };
+        let package = manifest
+            .lines()
+            .map(str::trim)
+            .skip_while(|l| *l != "[package]")
+            .skip(1)
+            .take_while(|l| !l.starts_with('['))
+            .find_map(|l| l.strip_prefix("name").and_then(|r| r.trim_start().strip_prefix('=')))
+            .map(|v| v.trim().trim_matches('"').to_owned());
+        let Some(package) = package else { continue };
+        let command = format!("cargo test -p {package} -q");
+        if !commands.contains(&command) {
+            commands.push(command);
+        }
+    }
+    commands
+}
+
 /// The tests a failed check of the merged tree names when every one of them panics in a crate
 /// the card neither changed nor is a direct dependent of, as `name (path)` joined by commas.
 /// `None` leaves the failure the card's: a compile error (a card that breaks an API breaks its
@@ -3208,6 +3239,7 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
             // card ran it on the caught-up tree already; this is the last guard, for a project
             // that moved on since the review
             let Checks { commands, timeout, .. } = checks_of(&root, &node);
+            let commands = if commands.is_empty() { commands } else { merged_suite(&root, commands, &staged) };
             if !commands.is_empty() && !staged.is_empty() {
                 let toolbox = worker.toolbox(&root).map(|t| t.with_timeout(timeout));
                 let _slot = hold_build(&root, &root).await;
