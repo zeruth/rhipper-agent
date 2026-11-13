@@ -274,10 +274,12 @@ enum Command {
     },
     /// Without an id, plans the next cards from the evidence of the runs themselves: the ledger's costliest
     /// cards, the cards run more than once, the look-backs, the gotcha journal and the other projects'
-    /// digests. Each card that cites a line and names a saving and a check lands under the last open
-    /// milestone with its evidence and saving, one run each under the turn cap; the next day's walk reads
-    /// the saving back into var/retro.log. With an id, asks the architect model to split that milestone or
-    /// section into cards, shows them, and adds them on confirmation.
+    /// digests. Each card that cites a line and names a saving and a check lands under the project's
+    /// Look-back milestone with its evidence and saving, one run each under the turn cap; a card whose
+    /// friction is the agent's goes to the agent's own Look-back milestone when the agent is an open
+    /// project, or joins the open agent card that already names it. The next day's walk reads the saving
+    /// back into var/retro.log. With an id, asks the architect model to split that milestone or section
+    /// into cards, shows them, and adds them on confirmation.
     Plan {
         /// The milestone or section to split; left out, the plan comes from the evidence.
         id: Option<i64>,
@@ -287,7 +289,7 @@ enum Command {
         /// Shows the evidence plan and adds nothing.
         #[arg(long, conflicts_with = "id")]
         dry: bool,
-        /// The milestone or section the evidence plan's cards go under; the last open milestone without it.
+        /// The milestone or section the evidence plan's own cards go under; the Look-back milestone without it.
         #[arg(long, conflicts_with = "id")]
         under: Option<i64>,
     },

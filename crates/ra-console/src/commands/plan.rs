@@ -20,11 +20,21 @@ use ra_usage::Totals;
 
 use crate::agent::{self, Worker};
 use crate::plan::evidence::{self, GOTCHAS_LOG, Line};
+use crate::plan::home::{self, Owner};
 use crate::plan::propose;
 use crate::retro;
 
 /// The most complexity a planned card gets: one run under the turn cap finishes it.
 pub const MAX_COMPLEXITY: u8 = 3;
+
+/// How many of the agent's open cards the planner is shown, so it proposes none of them again.
+const OPEN_TITLES: usize = 40;
+
+/// Whether two roots are one project, however each is spelled.
+fn same_project(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
 
 /// A day: the window a saving is read back over, and how long after a card's last run the
 /// walk waits before reading it.
@@ -49,73 +59,95 @@ pub async fn gather(store: &Store, root: &Path, worker: &Worker) -> anyhow::Resu
     Ok(lines)
 }
 
-/// Where the planned cards go: `under` when it names a milestone or a section, else the last
-/// open milestone in the file's order, the phase being defined.
+/// The milestone or section `under` names, where the person sends the planned cards.
 ///
 /// # Errors
-/// No such node, one that is no milestone or section, or no open milestone at all.
-pub fn target(nodes: &[Node], under: Option<i64>) -> anyhow::Result<&Node> {
-    match under {
-        Some(id) => {
-            let node = nodes.iter().find(|n| n.id == id).with_context(|| format!("no node {id}"))?;
-            anyhow::ensure!(
-                matches!(node.kind, NodeKind::Milestone | NodeKind::Section),
-                "#{id} is a {}; plan under a milestone or a section",
-                node.kind
-            );
-            Ok(node)
-        }
-        None => nodes
-            .iter()
-            .rev()
-            .find(|n| n.kind == NodeKind::Milestone && !matches!(n.state, TaskState::Accepted | TaskState::Cancelled))
-            .context("no open milestone to plan under; add one, or name one with --under"),
-    }
+/// No such node, or one that is no milestone or section.
+pub fn target(nodes: &[Node], under: i64) -> anyhow::Result<&Node> {
+    let node = nodes.iter().find(|n| n.id == under).with_context(|| format!("no node {under}"))?;
+    anyhow::ensure!(
+        matches!(node.kind, NodeKind::Milestone | NodeKind::Section),
+        "#{under} is a {}; plan under a milestone or a section",
+        node.kind
+    );
+    Ok(node)
 }
 
-/// Plans from the evidence and adds the cards under the milestone; with `dry`, shows them and
-/// adds nothing. The lines: the head with the planner and its cost, one line per card with what
-/// it cites and saves, the dropped ones with their reasons, and the end line with the turn cap
-/// each run is budgeted under.
+/// Plans from the evidence and adds the cards; with `dry`, shows them and adds nothing. A
+/// project's cards go under `under` when it is named, else the project's standing Look-back
+/// milestone; the agent's cards go to the agent's own Look-back milestone when the agent is a
+/// loaded project ([`home::agent_home`]), one card per change. The lines: the head with the
+/// planner and its cost, one line per card with what it cites and saves, the dropped ones with
+/// their reasons, and the end line with the turn cap each run is budgeted under.
 ///
 /// # Errors
-/// No milestone to plan under, no evidence, a failed call, or a refusal ([`propose::Refusal`]).
+/// No such milestone, no evidence, a failed call, or a refusal ([`propose::Refusal`]).
 pub async fn plan(store: &Store, worker: &Worker, under: Option<i64>, dry: bool) -> anyhow::Result<Vec<String>> {
     let root = agent::workspace_of(store);
+    plan_to(store, worker, under, dry, home::agent_home(&root).as_deref()).await
+}
+
+/// [`plan`] with the agent's project given: `None` keeps the agent's cards at home.
+///
+/// # Errors
+/// As [`plan`]; and when the agent's roadmap cannot be read or written.
+pub async fn plan_to(
+    store: &Store,
+    worker: &Worker,
+    under: Option<i64>,
+    dry: bool,
+    agent_root: Option<&Path>,
+) -> anyhow::Result<Vec<String>> {
+    let root = agent::workspace_of(store);
     let nodes = store.all().await?;
-    let target = target(&nodes, under)?;
-    let (under, title) = (target.id, target.title.clone());
+    let named = match under {
+        Some(id) => Some(target(&nodes, id).map(|n| (n.id, n.title.clone()))?),
+        None => None,
+    };
+    // the agent's roadmap when it is another project's; the agent planning itself is at home
+    let away = match agent_root.filter(|agent| !same_project(agent, &root)) {
+        Some(agent) => Some((agent.to_path_buf(), Store::open(&agent.join("rhipper.md"), "Rhipper Agent").await?)),
+        None => None,
+    };
+    let agent_nodes = match &away {
+        Some((_, agent)) => agent.all().await?,
+        None if agent_root.is_some() => nodes.clone(),
+        None => Vec::new(),
+    };
     let lines = gather(store, &root, worker).await?;
-    let proposal = propose::propose(&root, worker, &lines).await?;
-    let cost = proposal.usage.cost_usd.map_or_else(|| "cost unreported".to_owned(), |c| format!("${c:.4}"));
-    let mut out = vec![format!(
-        "{} card(s) from {} evidence line(s) by {} · in {} out {} · {cost}",
-        proposal.cards.len(),
-        lines.len(),
-        agent::short(&proposal.model),
-        proposal.usage.prompt_tokens,
-        proposal.usage.completion_tokens
-    )];
-    for dropped in &proposal.dropped {
-        out.push(format!("  dropped {dropped}"));
-    }
+    let proposal = propose::propose(&root, worker, &lines, &home::open_titles(&agent_nodes, OPEN_TITLES)).await?;
+    let mut out = vec![head_line(&proposal, lines.len())];
+    out.extend(proposal.dropped.iter().map(|dropped| format!("  dropped {dropped}")));
+    let place = named.as_ref().map_or_else(|| format!("the {} milestone", home::MILESTONE), |(id, title)| format!("#{id} {title}"));
     if dry {
-        for card in &proposal.cards {
-            out.push(format!(
-                "  {} {{c{}}} · evidence: {} · saves: {}",
-                card.item.title,
-                planned_complexity(&card.item),
-                cited(&lines, card),
-                card.saves
-            ));
-        }
-        out.push(format!("dry run: nothing added under #{under} {title}"));
+        out.extend(dry_lines(&proposal.cards, &lines, away.is_some()));
+        out.push(format!("dry run: nothing added under {place}"));
         return Ok(out);
     }
+    let project = home::name_of(&root);
+    let (mut here, mut there) = (0, 0);
     for card in &proposal.cards {
         let sources = cited(&lines, card);
         let complexity = planned_complexity(&card.item);
-        let id = store
+        let agent_store = if card.owner == Owner::Agent { away.as_ref().map(|(_, s)| s).or(agent_root.map(|_| store)) } else { None };
+        if let Some(agent) = agent_store
+            && let Some(line) = join_known(agent, &project, card, &sources).await?
+        {
+            out.push(line);
+            continue;
+        }
+        let (target, under, evidence) = match (agent_store, &away) {
+            (Some(agent), Some(_)) => (agent, home::ensure_milestone(agent).await?, format!("{project}: {sources}")),
+            _ => (
+                store,
+                match &named {
+                    Some((id, _)) => *id,
+                    None => home::ensure_milestone(store).await?,
+                },
+                sources.clone(),
+            ),
+        };
+        let id = target
             .insert_card(
                 Some(under),
                 NodeKind::Task,
@@ -125,7 +157,7 @@ pub async fn plan(store: &Store, worker: &Worker, under: Option<i64>, dry: bool)
                     acceptance: card.item.acceptance.as_deref(),
                     complexity,
                     files: &card.item.files,
-                    evidence: Some(&sources),
+                    evidence: Some(&evidence),
                     saving: Some(&card.saves),
                     ..Card::new()
                 },
@@ -133,9 +165,18 @@ pub async fn plan(store: &Store, worker: &Worker, under: Option<i64>, dry: bool)
             .await?;
         // the human clause rides the notes, which the window shows, and stays out of the acceptance
         if let Some(person) = &card.person {
-            store.set_notes(id, &format!("person: {person}")).await?;
+            target.set_notes(id, &format!("person: {person}")).await?;
         }
-        out.push(format!("#{id} {} {{c{complexity}}} · evidence: {sources} · saves: {}", card.item.title, card.saves));
+        if std::ptr::eq(target, store) {
+            here += 1;
+            out.push(format!("#{id} {} {{c{complexity}}} · evidence: {sources} · saves: {}", card.item.title, card.saves));
+        } else {
+            there += 1;
+            out.push(format!("→ agent #{id} {} {{c{complexity}}} · evidence: {evidence} · saves: {}", card.item.title, card.saves));
+            if let Some((agent_root, _)) = &away {
+                crate::pair::event(agent_root, &format!("the {project} look-back added #{id} {} to the agent's roadmap", card.item.title));
+            }
+        }
     }
     // the cap each run is budgeted under is the project's, named so the person sees the budget
     let cap = crate::router::Router::load(&root).ok().and_then(|router| router.worker.turns());
@@ -143,11 +184,53 @@ pub async fn plan(store: &Store, worker: &Worker, under: Option<i64>, dry: bool)
         || "no turn cap: [worker] turns in rhipper.toml would hold each to one run".to_owned(),
         |turns| format!("one run each under the turn cap of {turns} turn(s)"),
     );
-    let notice =
-        format!("added {} planned card(s) under #{under} {title} by {} · {budget}", proposal.cards.len(), agent::short(&proposal.model));
+    let to_agent = if there > 0 { format!(", {there} to the agent's roadmap") } else { String::new() };
+    let joined = proposal.cards.len() - here - there;
+    let joined = if joined > 0 { format!(", {joined} joined an open agent card") } else { String::new() };
+    let notice = format!("added {here} planned card(s) under {place}{to_agent}{joined} by {} · {budget}", agent::short(&proposal.model));
     crate::pair::event(&root, &notice);
     out.push(notice);
     Ok(out)
+}
+
+/// The plan's first line: how many cards from how many lines, by which planner, at what cost.
+fn head_line(proposal: &propose::Proposal, evidence: usize) -> String {
+    let cost = proposal.usage.cost_usd.map_or_else(|| "cost unreported".to_owned(), |c| format!("${c:.4}"));
+    format!(
+        "{} card(s) from {evidence} evidence line(s) by {} · in {} out {} · {cost}",
+        proposal.cards.len(),
+        agent::short(&proposal.model),
+        proposal.usage.prompt_tokens,
+        proposal.usage.completion_tokens
+    )
+}
+
+/// The lines of a dry run: each card with what it cites and saves, and where an agent card goes.
+fn dry_lines(cards: &[propose::Card], lines: &[Line], agent_away: bool) -> Vec<String> {
+    cards
+        .iter()
+        .map(|card| {
+            let to = if card.owner == Owner::Agent && agent_away { " · to the agent" } else { "" };
+            format!(
+                "  {} {{c{}}} · evidence: {} · saves: {}{to}",
+                card.item.title,
+                planned_complexity(&card.item),
+                cited(lines, card),
+                card.saves
+            )
+        })
+        .collect()
+}
+
+/// An agent card one of the agent's open cards already covers joins it as a note, and the line
+/// says so; `None` when no open card names the same change.
+async fn join_known(agent: &Store, project: &str, card: &propose::Card, sources: &str) -> anyhow::Result<Option<String>> {
+    let nodes = agent.all().await?;
+    let Some(known) = home::duplicate(&nodes, &card.item.title) else { return Ok(None) };
+    let report = format!("also reported by the {project} look-back: {} · evidence: {sources}", card.item.title);
+    let joined = known.notes.as_deref().map_or_else(|| report.clone(), |old| format!("{old}\n{report}"));
+    agent.set_notes(known.id, &joined).await?;
+    Ok(Some(format!("= #{} {} on the agent already · {}", known.id, known.title, card.item.title)))
 }
 
 /// The sources of the lines a card cites, each once, in the card's order: what its `evidence:`

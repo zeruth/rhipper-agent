@@ -12,6 +12,7 @@ use ra_roadmap::model::NodeKind;
 use ra_roadmap::outline::{self, Item};
 
 use super::evidence::Line;
+use super::home::Owner;
 use super::prompt::{self, MAX_CARDS, MIN_CARDS};
 use crate::agent::{self, Worker};
 
@@ -26,6 +27,8 @@ pub struct Card {
     /// What only a person, CI or an emulator can give, off the `person:` line: a note the
     /// window shows, not a criterion the review asks for.
     pub person: Option<String>,
+    /// Whose problem it is, off the `owner:` line: the project's own, or the agent's.
+    pub owner: Owner,
 }
 
 /// One card the verdict dropped, and why.
@@ -73,12 +76,13 @@ impl std::error::Error for Refusal {}
 
 /// Sends the numbered evidence to the planning route and judges the cards it answers with. The
 /// planner's model is the `planner` rule of `rhipper.toml` that names no kind, else the worker's
-/// own; the call is booked under it as the planner's.
+/// own; the call is booked under it as the planner's. `agent_open` are the agent's open cards,
+/// which the planner is told not to propose again.
 ///
 /// # Errors
 /// No evidence to plan from, an unreadable `rhipper.toml`, no provider for the model, a failed
 /// call, or a [`Refusal`] when fewer than [`MIN_CARDS`] or more than [`MAX_CARDS`] cards stand.
-pub async fn propose(root: &Path, worker: &Worker, lines: &[Line]) -> anyhow::Result<Proposal> {
+pub async fn propose(root: &Path, worker: &Worker, lines: &[Line], agent_open: &[String]) -> anyhow::Result<Proposal> {
     anyhow::ensure!(!lines.is_empty(), "no evidence to plan from");
     let planner = crate::router::Router::load(root)?;
     let model = planner
@@ -91,7 +95,7 @@ pub async fn propose(root: &Path, worker: &Worker, lines: &[Line]) -> anyhow::Re
     let answer = provider
         .complete(CompletionRequest {
             model: model.clone(),
-            messages: vec![Message::system(prompt::INSTRUCTION), Message::user(prompt::brief(lines))],
+            messages: vec![Message::system(prompt::INSTRUCTION), Message::user(prompt::brief(lines, agent_open))],
             temperature: Some(0.2),
             max_tokens: Some(4000),
             tools: Vec::new(),
@@ -148,6 +152,7 @@ fn card_of(block: &[&str], evidence: usize) -> Result<Card, Dropped> {
     let mut cited = Vec::new();
     let mut saves = String::new();
     let mut person = None;
+    let mut owner = Owner::Project;
     let mut rest = String::new();
     for line in block {
         match line.trim().split_once(':') {
@@ -159,6 +164,7 @@ fn card_of(block: &[&str], evidence: usize) -> Result<Card, Dropped> {
             Some((field, value)) if field.trim().eq_ignore_ascii_case("person") => {
                 person = Some(value.trim().to_owned()).filter(|v| !v.is_empty());
             }
+            Some((field, value)) if field.trim().eq_ignore_ascii_case("owner") => owner = Owner::of(value),
             _ => {
                 rest.push_str(line);
                 rest.push('\n');
@@ -184,7 +190,7 @@ fn card_of(block: &[&str], evidence: usize) -> Result<Card, Dropped> {
         reasons.push("names no check in backticks".to_owned());
     }
     if reasons.is_empty() {
-        Ok(Card { item, evidence: cited, saves, person })
+        Ok(Card { item, evidence: cited, saves, person, owner })
     } else {
         Err(Dropped { title: item.title, reason: reasons.join(", ") })
     }

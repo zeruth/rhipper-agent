@@ -14,14 +14,21 @@ pub const MAX_CARDS: usize = 8;
 
 /// What the planner is told: the cards come from the numbered evidence and from nothing else,
 /// as a plain outline with two fields of its own beside the store's three.
-pub const INSTRUCTION: &str = "You plan the next cards of a development agent from the evidence of its own runs: the numbered lines you get are the costliest cards of the last day, the cards that needed more than one run, the look-backs, the refused commands and what the other projects on the machine are doing. Propose between 4 and 8 small cards, each a change one worker finishes in one run under the turn cap. Answer with a plain outline and nothing else: one `- Title {cN}` line per card, N the complexity 1..3, followed by indented `evidence:`, `saves:`, `objective:`, `acceptance:` and `files:` lines. `evidence:` names the numbers of the lines the card comes from, as `#3 #5`; `saves:` says what the card saves in one phrase: turns, tokens, a refused command, a person's intervention; the acceptance is the command that checks the card in backticks and what it prints, nothing a reviewer must judge in prose; what only a person, CI or an emulator can give goes on a `person:` line, which the window shows as a note and no review asks for; the files are the paths the change lands in, separated by spaces. A card you cannot tie to a numbered line is not a card: leave it out. No headings, no prose.";
+pub const INSTRUCTION: &str = "You plan the next cards of a development agent from the evidence of its own runs: the numbered lines you get are the costliest cards of the last day, the cards that needed more than one run, the look-backs, the refused commands and what the other projects on the machine are doing. Propose between 4 and 8 small cards, each a change one worker finishes in one run under the turn cap. Answer with a plain outline and nothing else: one `- Title {cN}` line per card, N the complexity 1..3, followed by indented `evidence:`, `saves:`, `objective:`, `acceptance:` and `files:` lines. `evidence:` names the numbers of the lines the card comes from, as `#3 #5`; `saves:` says what the card saves in one phrase: turns, tokens, a refused command, a person's intervention; the acceptance is the command that checks the card in backticks and what it prints, nothing a reviewer must judge in prose; what only a person, CI or an emulator can give goes on a `person:` line, which the window shows as a note and no review asks for; the files are the paths the change lands in, separated by spaces. Each card also has an `owner:` line, `project` or `agent`. The agent is the orchestrator the runs ran under, the person's own local fork of it, whose source sits in its own repository (crates/ and apps/): a hook or gotcha that refused or misled a command, a check, lint, review or landing that judged wrong, a prompt or handoff that left something out, an `rc` command that fell short. That friction is the agent's, and fixing it once in the agent fixes it for every project, so name it `owner: agent` with the agent's files, never a workaround in this project. What only this project's code can fix is `owner: project`. Do not propose an agent card one of the agent's open cards below already covers. A card you cannot tie to a numbered line is not a card: leave it out. No headings, no prose.";
 
-/// The brief: the evidence lines numbered from 1, one per line, as the cards cite them.
+/// The brief: the evidence lines numbered from 1, one per line, as the cards cite them, then
+/// the agent's open cards, which no card proposes again.
 #[must_use]
-pub fn brief(lines: &[Line]) -> String {
+pub fn brief(lines: &[Line], agent_open: &[String]) -> String {
     let mut text = String::from("# Evidence\n");
     for (index, line) in lines.iter().enumerate() {
         let _ = writeln!(text, "{}. {line}", index + 1);
+    }
+    if !agent_open.is_empty() {
+        text.push_str("\n# The agent's open cards\n");
+        for title in agent_open {
+            let _ = writeln!(text, "- {title}");
+        }
     }
     text
 }

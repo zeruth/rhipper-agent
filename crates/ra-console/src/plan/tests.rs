@@ -45,7 +45,7 @@ async fn an_uncited_card_is_dropped_with_its_reason_and_the_rest_stand() {
     let text = format!("{}{}", well_formed(4), card("Guess", "", "turns", "`cargo test -p x` passes"));
     let script = Scripted::new(vec![says(&text, vec![])]);
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
-    let plan = propose::propose(dir.path(), &worker, &evidence()).await.unwrap();
+    let plan = propose::propose(dir.path(), &worker, &evidence(), &[]).await.unwrap();
     assert_eq!(plan.cards.iter().map(|c| c.item.title.as_str()).collect::<Vec<_>>(), ["Card 1", "Card 2", "Card 3", "Card 4"]);
     assert_eq!(plan.dropped.iter().map(ToString::to_string).collect::<Vec<_>>(), ["Guess: cites no evidence line"]);
     // the planner read the numbered brief under the instruction
@@ -59,7 +59,7 @@ async fn a_well_formed_outline_of_five_is_kept_with_what_each_card_cites_and_sav
     let dir = tempfile::tempdir().unwrap();
     let text = format!("```\n{}```\n", well_formed(5));
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(&text, vec![])]));
-    let plan = propose::propose(dir.path(), &worker, &evidence()).await.unwrap();
+    let plan = propose::propose(dir.path(), &worker, &evidence(), &[]).await.unwrap();
     assert_eq!(plan.cards.len(), 5, "{:?}", plan.dropped);
     assert!(plan.dropped.is_empty(), "{:?}", plan.dropped);
     let third = &plan.cards[2];
@@ -73,7 +73,7 @@ async fn a_well_formed_outline_of_five_is_kept_with_what_each_card_cites_and_sav
 async fn a_three_card_outline_is_refused_not_planned() {
     let dir = tempfile::tempdir().unwrap();
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(&well_formed(3), vec![])]));
-    let error = propose::propose(dir.path(), &worker, &evidence()).await.unwrap_err();
+    let error = propose::propose(dir.path(), &worker, &evidence(), &[]).await.unwrap_err();
     let refusal = error.downcast_ref::<Refusal>().unwrap_or_else(|| panic!("{error:#}"));
     assert_eq!(refusal.kept, 3);
     assert_eq!(format!("{error:#}"), "the planner's 3 card(s) are no plan: 4 to 8 must stand");
@@ -132,7 +132,7 @@ async fn a_dry_run_shows_the_plan_with_what_each_card_cites_and_adds_nothing() {
     assert!(out[0].starts_with("4 card(s) from ") && out[0].contains(" by glm-5.3-flash · in 100 out 10 · $0.0100"), "{out:?}");
     assert!(out.iter().any(|l| l == "  Card 1 {c2} · evidence: retro.log:1 · saves: turns"), "{out:?}");
     assert!(out.iter().any(|l| l == "  Big {c3} · evidence: retro.log:1 · saves: a refused command"), "{out:?}");
-    assert_eq!(out.last().unwrap(), "dry run: nothing added under #2 Phase N");
+    assert_eq!(out.last().unwrap(), "dry run: nothing added under the Look-back milestone");
     assert_eq!(store.all().await.unwrap().len(), 2);
     // the planner read this project's look-back as the first line of the brief
     let seen = script.seen.lock();
@@ -140,29 +140,68 @@ async fn a_dry_run_shows_the_plan_with_what_each_card_cites_and_adds_nothing() {
 }
 
 #[tokio::test]
-async fn a_run_adds_the_cards_under_the_last_open_milestone_with_their_evidence_and_saving() {
+async fn a_run_adds_the_cards_under_the_look_back_milestone_with_their_evidence_and_saving() {
     let (dir, store) = planning_project().await;
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(&cites_the_first(), vec![])]));
     let out = command::plan(&store, &worker, None, false).await.unwrap();
-    assert_eq!(out[1], "#3 Card 1 {c2} · evidence: retro.log:1 · saves: turns");
-    assert_eq!(out[4], "#6 Big {c3} · evidence: retro.log:1 · saves: a refused command");
+    // the first pass made the standing milestone, #3, beside the open Phase N
+    assert_eq!(out[1], "#4 Card 1 {c2} · evidence: retro.log:1 · saves: turns");
+    assert_eq!(out[4], "#7 Big {c3} · evidence: retro.log:1 · saves: a refused command");
     assert_eq!(
         out.last().unwrap(),
-        "added 4 planned card(s) under #2 Phase N by glm-5.3-flash · no turn cap: [worker] turns in rhipper.toml would hold each to one run"
+        "added 4 planned card(s) under the Look-back milestone by glm-5.3-flash · no turn cap: [worker] turns in rhipper.toml would hold each to one run"
     );
     // the cards are on the file with both fields, read back through a fresh store
     let reopened = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     let nodes = reopened.all().await.unwrap();
-    assert_eq!(nodes.len(), 6);
-    let big = &nodes[5];
-    assert_eq!((big.id, big.parent, big.kind, big.complexity, big.state), (6, Some(2), NodeKind::Task, 3, TaskState::Defined));
+    assert_eq!(nodes.len(), 7);
+    assert_eq!((nodes[2].id, nodes[2].kind, nodes[2].title.as_str()), (3, NodeKind::Milestone, "Look-back"));
+    let big = &nodes[6];
+    assert_eq!((big.id, big.parent, big.kind, big.complexity, big.state), (7, Some(3), NodeKind::Task, 3, TaskState::Defined));
     assert_eq!((big.evidence.as_deref(), big.saving.as_deref()), (Some("retro.log:1"), Some("a refused command")));
     assert_eq!((big.acceptance.as_deref(), big.files.as_slice()), (Some("`cargo test -p x` passes"), ["src/lib.rs".to_owned()].as_slice()));
-    assert!(nodes[2..].iter().all(|n| n.evidence.is_some() && n.saving.is_some()), "{nodes:?}");
+    assert!(nodes[3..].iter().all(|n| n.evidence.is_some() && n.saving.is_some()), "{nodes:?}");
     // the pair feed heard of it, and a card is no place to plan under
-    assert!(crate::pair::recent(dir.path(), 5).iter().any(|l| l.starts_with("added 4 planned card(s) under #2 Phase N")));
-    let error = command::target(&nodes, Some(3)).unwrap_err();
-    assert_eq!(format!("{error:#}"), "#3 is a task; plan under a milestone or a section");
+    assert!(crate::pair::recent(dir.path(), 5).iter().any(|l| l.starts_with("added 4 planned card(s) under the Look-back milestone")));
+    let error = command::target(&nodes, 4).unwrap_err();
+    assert_eq!(format!("{error:#}"), "#4 is a task; plan under a milestone or a section");
+    // a second pass reuses the milestone, and a named milestone takes the cards instead
+    let again = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(&cites_the_first(), vec![])]));
+    let out = command::plan(&store, &again, Some(2), false).await.unwrap();
+    assert!(out.last().unwrap().starts_with("added 4 planned card(s) under #2 Phase N"), "{out:?}");
+    let nodes = store.all().await.unwrap();
+    assert_eq!(nodes.iter().filter(|n| n.title == "Look-back").count(), 1);
+}
+
+#[tokio::test]
+async fn a_projects_agent_cards_go_to_the_agents_roadmap_once_and_its_own_stay_home() {
+    let (dir, store) = planning_project().await;
+    let agent_dir = tempfile::tempdir().unwrap();
+    let agent = Store::open(&agent_dir.path().join("rhipper.md"), "Rhipper Agent").await.unwrap();
+    let known = agent.insert(Some(1), NodeKind::Task, "Allow git merge-base in the read-only list", None, None, 2).await.unwrap();
+    let mut text = cites_the_first();
+    text.push_str("- Let workers run git merge-base, read-only {c1}\n  owner: agent\n  evidence: #1\n  saves: a refused command\n  acceptance: `cargo test -p ra-gotchas` passes\n  files: crates/ra-gotchas/src/shape.rs\n");
+    text.push_str("- Quote the clippy warnings in the rerun prompt {c2}\n  owner: agent\n  evidence: #1\n  saves: turns\n  acceptance: `cargo test -p ra-console` passes\n  files: crates/ra-console/src/agent.rs\n");
+    let script = Scripted::new(vec![says(&text, vec![])]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let out = command::plan_to(&store, &worker, None, false, Some(agent_dir.path())).await.unwrap();
+    // the planner saw the agent's open card
+    assert!(script.seen.lock()[0].messages[1].content.contains(&format!("# The agent's open cards\n- #{known} Allow git merge-base")));
+    // the project's four stayed home; the merge-base report joined the open card; the clippy one went to the agent
+    assert_eq!(store.all().await.unwrap().iter().filter(|n| n.kind == NodeKind::Task).count(), 4);
+    assert!(out.iter().any(|l| l.starts_with(&format!("= #{known} Allow git merge-base"))), "{out:?}");
+    let nodes = agent.all().await.unwrap();
+    let joined = nodes.iter().find(|n| n.id == known).unwrap();
+    let project = super::home::name_of(dir.path());
+    assert!(
+        joined.notes.as_deref().unwrap().starts_with(&format!("also reported by the {project} look-back: Let workers run")),
+        "{joined:?}"
+    );
+    let added = nodes.iter().find(|n| n.title == "Quote the clippy warnings in the rerun prompt").unwrap();
+    let milestone = nodes.iter().find(|n| n.title == "Look-back").unwrap();
+    assert_eq!((added.parent, added.evidence.as_deref()), (Some(milestone.id), Some(format!("{project}: retro.log:1").as_str())));
+    assert!(out.last().unwrap().contains(", 1 to the agent's roadmap, 1 joined an open agent card"), "{out:?}");
+    assert!(crate::pair::recent(agent_dir.path(), 5).iter().any(|l| l.contains(&format!("the {project} look-back added #{}", added.id))));
 }
 
 #[test]
