@@ -1648,6 +1648,60 @@ async fn a_landing_whose_merged_check_fails_sends_the_card_back() {
 }
 
 #[tokio::test]
+async fn land_reason_a_dirty_tree_lands_after_its_files_are_set_aside() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_card_branch(dir.path()).await;
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    // the person's own file stands where the card's lands
+    std::fs::write(dir.path().join("made.txt"), "the person's\n").unwrap();
+    let passing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_script(passing);
+    let out = crate::agent::land(&store, 2, &runner).await.unwrap();
+    assert!(out.iter().any(|l| l.contains("set aside for the squash") && l.contains("would be overwritten")), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Accepted);
+    assert_eq!(git_ok(dir.path(), &["show", "HEAD:made.txt"]).trim_end(), "by the worker");
+}
+
+#[tokio::test]
+async fn land_reason_a_real_conflict_names_its_file_and_goes_to_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_card_branch(dir.path()).await;
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    std::fs::write(dir.path().join("made.txt"), "by the project\n").unwrap();
+    git_ok(dir.path(), &["add", "made.txt"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "the project's own"]);
+    let runner = Worker::new("z-ai/glm-5.3-flash");
+    let out = crate::agent::land_or_say(&store, 2, &runner).await;
+    assert!(out.iter().any(|l| l.contains("conflicts in made.txt") && l.contains("sent back to its worker")), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+}
+
+#[tokio::test]
+async fn land_reason_an_accepted_card_is_never_counted_toward_the_park() {
+    let dir = tempfile::tempdir().unwrap();
+    let _store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    let handoff = |verdict: &str| ra_context::Handoff {
+        when: 1_700_000_000,
+        model: "m".into(),
+        outcome: "implemented".into(),
+        check: String::new(),
+        verdict: Some(verdict.into()),
+        changed: vec![],
+        report: "done".into(),
+        warnings: vec![],
+        read: vec![],
+    };
+    task.record(handoff("accepted by m"));
+    task.save(dir.path()).unwrap();
+    assert!(crate::agent::accepted_by_review(dir.path(), 2));
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    task.record(handoff("needs revision (trivial) · 1 point(s) by m"));
+    task.save(dir.path()).unwrap();
+    assert!(!crate::agent::accepted_by_review(dir.path(), 2));
+}
+
+#[tokio::test]
 async fn a_third_failed_landing_check_waits_for_the_person() {
     let dir = tempfile::tempdir().unwrap();
     let store = project_with_a_card_branch(dir.path()).await;

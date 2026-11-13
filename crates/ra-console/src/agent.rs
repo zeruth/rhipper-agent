@@ -3043,14 +3043,41 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
             // merges stay on its branch, which goes once it lands, and the commit is written
             // about the change, not the card (the person: the history "should be concise and
             // changes focused, not roadmap focused", 2026-11-12)
+            let mut aside = false;
             if let Err(e) = git(&root, &["merge", "--squash", &branch]).await {
                 let conflicts = git(&root, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
                 let _ = git(&root, &["reset", "--merge"]).await;
-                tracing::debug!("the merge of {branch} failed: {e:#}");
-                return Err(anyhow::Error::new(LandConflict {
-                    branch,
-                    files: if conflicts.is_empty() { "files git did not name".to_owned() } else { conflicts.replace('\n', ", ") },
-                }));
+                if !conflicts.trim().is_empty() {
+                    return Err(anyhow::Error::new(LandConflict { branch, files: conflicts.replace('\n', ", ") }));
+                }
+                // no unmerged file: not a conflict, and the card stays accepted. Git's own line
+                // is the reason (asm and runelite cards went back to their workers 15 times
+                // for a dirty tree)
+                let why = first_line(&format!("{e:#}"));
+                let text = format!("{e:#}");
+                let named = overwritten_files(&text);
+                if text.contains("would be overwritten") && !named.is_empty() {
+                    let mut args = vec!["stash", "push", "-q", "-u", "--"];
+                    args.extend(named.iter().map(String::as_str));
+                    git(&root, &args).await?;
+                    aside = true;
+                    lines.push(format!("the person's {} file(s) set aside for the squash: {why}", named.len()));
+                } else if ["index.lock", "Permission denied", "being used by another process", "Unable to create"]
+                    .iter()
+                    .any(|word| text.contains(word))
+                {
+                    lines.push(format!("a file was locked, retrying: {why}"));
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                } else {
+                    return Err(anyhow::anyhow!("the squash of {branch} failed without a conflict: {text}"));
+                }
+                if let Err(again) = git(&root, &["merge", "--squash", &branch]).await {
+                    let _ = git(&root, &["reset", "--merge"]).await;
+                    if aside {
+                        let _ = git(&root, &["stash", "pop", "-q"]).await;
+                    }
+                    return Err(anyhow::anyhow!("the squash of {branch} failed again without a conflict: {again:#}"));
+                }
             }
             // the files the squash staged: the card's own, and the only ones this commit takes;
             // whatever else the checkout holds uncommitted stays the person's
@@ -3081,6 +3108,12 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
                     git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()
                 ));
             }
+            if aside {
+                match git(&root, &["stash", "pop", "-q"]).await {
+                    Ok(_) => lines.push("the person's files are back".to_owned()),
+                    Err(e) => lines.push(format!("the person's files stay in `git stash`: {}", first_line(&format!("{e:#}")))),
+                }
+            }
             // the project's check on the merged tree: two cards right on their own are not
             // always right together (#176 and #181 compiled apart and not merged). A reviewed
             // card ran it on the caught-up tree already; this is the last guard, for a project
@@ -3110,6 +3143,20 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
     let line = format!("landed #{id} {} · {}", node.title, lines.join(" · "));
     crate::pair::event(&root, &line);
     Ok(lines)
+}
+
+/// The paths git's refusal lists as "would be overwritten by merge": the tab-indented lines.
+fn overwritten_files(text: &str) -> Vec<String> {
+    text.lines().filter_map(|l| l.strip_prefix('\t')).map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect()
+}
+
+/// Whether the reviewer accepted card `id` on its last handoff.
+pub(crate) fn accepted_by_review(root: &Path, id: i64) -> bool {
+    ra_context::TaskContext::open(root, id)
+        .handoffs
+        .last()
+        .and_then(|last| last.verdict.as_deref())
+        .is_some_and(|verdict| verdict.starts_with("accepted"))
 }
 
 /// The runs in a row a parallel walk gives a card that each end sent back for revision before
@@ -3583,7 +3630,9 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 let task = ra_context::TaskContext::open(&root, id);
                 let idle = task.handoffs.last().is_none_or(|h| h.changed.is_empty());
                 let absolute = store.read(id).await.is_ok_and(|n| n.is_absolute());
-                if sent_back && (!absolute || idle) {
+                // a card the reviewer accepted is sent back by the landing, not by its work: it
+                // never counts toward the park
+                if sent_back && !accepted_by_review(&root, id) && (!absolute || idle) {
                     let count = reruns.entry(id).or_insert(0);
                     *count += 1;
                     if *count >= RERUNS_A_WALK {
