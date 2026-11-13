@@ -1790,17 +1790,22 @@ pub const BUILDS_A_SESSION: u32 = 2;
 /// session's [`BUILDS_A_SESSION`] and `Err` is the refusal's reason. A tree with nothing
 /// changed yet is refused outright (a build before the first edit measures nothing the card
 /// did not already say), and so is a session past its budget. The count lives in the tree's
-/// `var/builds/<session>`; a tree that cannot keep it allows the build.
+/// `var/builds/<session>`; a tree that cannot keep it allows the build. A `command` that names
+/// test filters ([`names_tests`]) is a diagnosis of a failure the worker has read: it is allowed
+/// on an unchanged tree and is not counted.
 ///
 /// # Errors
 /// The reason the build is refused, for the worker.
-pub fn build_allowance(tree: &Path, session: &str) -> Result<(), String> {
+pub fn build_allowance(tree: &Path, session: &str, command: &str) -> Result<(), String> {
     // the project's table, read above a worktree, which has no copy of it
     let allowed = crate::router::Router::load(&crate::hub::project_root_of(tree)).map_or(BUILDS_A_SESSION, |r| r.worker.builds());
     if allowed == 0 {
         return Err(String::from(
             "the builds are the orchestrator's in this project, not the workers': report the change as it stands, naming what you verified by reading; the project's check compiles it on a build slot after your report, and a failure comes back to this session with the compiler's output",
         ));
+    }
+    if names_tests(command) {
+        return Ok(());
     }
     // the tree's `var/` is the orchestrator's, not the card's change
     let changed = std::process::Command::new("git")
@@ -1825,6 +1830,54 @@ pub fn build_allowance(tree: &Path, session: &str) -> Result<(), String> {
         let _ = std::fs::write(&file, (spent + 1).to_string());
     }
     Ok(())
+}
+
+/// Gives `session` a fresh build budget in `tree`, for a rerun whose prompt is a lint fix: the
+/// builds of the run before it were spent on the card's change, and the fix runs the checks.
+pub fn reset_builds(tree: &Path, session: &str) {
+    let name: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+    let _ = std::fs::remove_file(tree.join("var").join("builds").join(name));
+}
+
+/// Whether a `cargo test` or gradle `test` command names test filters: a run of the failing
+/// tests by name, not the suite. A cargo filter is a positional word after `test` (before or
+/// after `--`) that is not the value of a flag; gradle's is `--tests`.
+#[must_use]
+pub fn names_tests(command: &str) -> bool {
+    // flags of cargo test that take the next word as their value
+    const VALUED: [&str; 11] =
+        ["-p", "--package", "--features", "-F", "--target", "--manifest-path", "--test", "--bin", "--example", "-j", "--jobs"];
+    let words: Vec<&str> = command.split_whitespace().collect();
+    if words.iter().any(|w| *w == "--tests" || w.starts_with("--tests=")) {
+        return true;
+    }
+    let Some(at) = words.windows(2).position(|w| w[0].ends_with("cargo") && w[1] == "test") else {
+        return false;
+    };
+    let mut rest = words[at + 2..].iter();
+    let mut after_dashes = false;
+    while let Some(word) = rest.next() {
+        // the command ends at a pipe or a chain, and a redirect (the `2>&1 | tail` a gotcha
+        // appends) is the shell's, not a filter
+        if matches!(*word, "|" | "||" | "&&") || word.ends_with(';') {
+            break;
+        }
+        if word.contains(['>', '<']) {
+            // a bare `>` or `2>` takes the next word as its target
+            if word.ends_with(['>', '<']) {
+                rest.next();
+            }
+            continue;
+        }
+        if *word == "--" {
+            after_dashes = true;
+        } else if !after_dashes && VALUED.contains(word) {
+            rest.next();
+        } else if !word.starts_with('-') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Runs a build command in `dir` on one of its project's build slots, for `rc hold`: waits for
@@ -4167,6 +4220,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         // a harness acts in the workspace by itself: one call carries the whole task, and the
         // harness holds it to the budget; its hooks learn the card from the environment
         begin_run(&acting, id);
+        if let (Some(fix), Some(session)) = (&worker.fix, &resume)
+            && fix.starts_with(LINT_FIX_INSTRUCTION)
+        {
+            reset_builds(&acting, session);
+        }
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),

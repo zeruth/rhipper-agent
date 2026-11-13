@@ -57,6 +57,47 @@ fn a_report_commit_section_gives_the_landing_its_message() {
 }
 
 #[test]
+fn build_allowance_lets_a_named_test_run_through_uncounted() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path();
+    let git = std::process::Command::new("git").arg("init").arg("-q").current_dir(tree).status();
+    if !git.is_ok_and(|s| std::process::ExitStatus::success(&s)) {
+        return;
+    }
+    let suite = "rc hold -- cargo test -p ra-console -q";
+    let named = "rc hold -- cargo test -p ra-console -q a_run_records_its_handoff";
+    // an unchanged tree refuses the suite and allows the named test, as often as asked
+    assert!(build_allowance(tree, "s1", suite).is_err());
+    for _ in 0..5 {
+        assert!(build_allowance(tree, "s1", named).is_ok());
+    }
+    assert!(build_allowance(tree, "s1", "rc hold -- ./gradlew test --tests Foo").is_ok());
+    // a changed tree spends the budget on the suite alone
+    std::fs::write(tree.join("a.txt"), "x").unwrap();
+    for _ in 0..BUILDS_A_SESSION {
+        assert!(build_allowance(tree, "s1", suite).is_ok());
+    }
+    assert!(build_allowance(tree, "s1", suite).is_err());
+    assert!(build_allowance(tree, "s1", named).is_ok());
+    // a lint fix rerun starts afresh
+    reset_builds(tree, "s1");
+    assert!(build_allowance(tree, "s1", suite).is_ok());
+}
+
+#[test]
+fn build_allowance_takes_a_cargo_test_as_named_only_with_a_filter() {
+    assert!(names_tests("cargo test -p x -q some_test"));
+    assert!(names_tests("rc hold -- cargo test -p x -q some_test 2>&1 | tail -n 80"));
+    assert!(!names_tests("rc hold -- cargo test -p x -q 2>&1 | tail -n 80"));
+    assert!(!names_tests("cargo test -p x -q > /dev/null && echo done"));
+    assert!(names_tests("cargo test -p x -- --nocapture some_test"));
+    assert!(!names_tests("cargo test --test it"));
+    assert!(!names_tests("cargo test -p x -q"));
+    assert!(!names_tests("cargo test --workspace -q -- --nocapture"));
+    assert!(!names_tests("cargo build -p x name"));
+}
+
+#[test]
 fn the_end_line_marks_a_computed_cost_as_an_estimate_and_names_the_cached_share() {
     let computed =
         Usage { prompt_tokens: 1_000_000, completion_tokens: 0, cached_tokens: 900_000, cost_usd: Some(4.12), cost_computed: true };

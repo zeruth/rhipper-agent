@@ -457,6 +457,9 @@ fn main() -> anyhow::Result<()> {
     worker.join().map_err(|_| anyhow::anyhow!("the command's thread panicked"))?
 }
 
+/// Dispatches the parsed subcommand to its handler: one arm per subcommand, so its length grows
+/// with the CLI rather than with any one command's logic.
+#[allow(clippy::too_many_lines)]
 async fn run_main() -> anyhow::Result<()> {
     let options = Options::parse();
     match options.command {
@@ -963,13 +966,13 @@ fn hook_pre(
                 || command.contains("run-awt-contracts.py")
         })
     };
-    let built = match &verdict {
-        ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => is_build(rewritten),
-        ra_gotchas::Verdict::Pass => is_build(command),
-        ra_gotchas::Verdict::Deny { .. } => false,
+    let (built, built_text) = match &verdict {
+        ra_gotchas::Verdict::Rewrite { command: rewritten, .. } => (is_build(rewritten), rewritten.as_str()),
+        ra_gotchas::Verdict::Pass => (is_build(command), command),
+        ra_gotchas::Verdict::Deny { .. } => (false, command),
     };
     let session = call.get("session_id").and_then(serde_json::Value::as_str).unwrap_or("-");
-    if let (true, Err(reason)) = (built, ra_console::agent::build_allowance(cwd, session)) {
+    if let (true, Err(reason)) = (built, ra_console::agent::build_allowance(cwd, session, built_text)) {
         verdict = ra_gotchas::Verdict::Deny { id: String::from("build-budget"), reason };
     }
     // the hook is the judge of a command's shape: every part allowed is an allow the static
