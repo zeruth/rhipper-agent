@@ -23,6 +23,9 @@ pub struct Card {
     /// The numbers of the brief's lines, from 1.
     pub evidence: Vec<usize>,
     pub saves: String,
+    /// What only a person, CI or an emulator can give, off the `person:` line: a note the
+    /// window shows, not a criterion the review asks for.
+    pub person: Option<String>,
 }
 
 /// One card the verdict dropped, and why.
@@ -144,6 +147,7 @@ pub fn judge(text: &str, evidence: usize) -> (Vec<Card>, Vec<Dropped>) {
 fn card_of(block: &[&str], evidence: usize) -> Result<Card, Dropped> {
     let mut cited = Vec::new();
     let mut saves = String::new();
+    let mut person = None;
     let mut rest = String::new();
     for line in block {
         match line.trim().split_once(':') {
@@ -151,6 +155,10 @@ fn card_of(block: &[&str], evidence: usize) -> Result<Card, Dropped> {
                 cited.extend(value.split(|c: char| !c.is_ascii_digit()).filter_map(|n| n.parse::<usize>().ok()));
             }
             Some((field, value)) if field.trim().eq_ignore_ascii_case("saves") => value.trim().clone_into(&mut saves),
+            // a human clause is a note for the window, not a criterion of the card
+            Some((field, value)) if field.trim().eq_ignore_ascii_case("person") => {
+                person = Some(value.trim().to_owned()).filter(|v| !v.is_empty());
+            }
             _ => {
                 rest.push_str(line);
                 rest.push('\n');
@@ -176,7 +184,7 @@ fn card_of(block: &[&str], evidence: usize) -> Result<Card, Dropped> {
         reasons.push("names no check in backticks".to_owned());
     }
     if reasons.is_empty() {
-        Ok(Card { item, evidence: cited, saves })
+        Ok(Card { item, evidence: cited, saves, person })
     } else {
         Err(Dropped { title: item.title, reason: reasons.join(", ") })
     }

@@ -131,6 +131,10 @@ pub async fn plan(store: &Store, worker: &Worker, under: Option<i64>, dry: bool)
                 },
             )
             .await?;
+        // the human clause rides the notes, which the window shows, and stays out of the acceptance
+        if let Some(person) = &card.person {
+            store.set_notes(id, &format!("person: {person}")).await?;
+        }
         out.push(format!("#{id} {} {{c{complexity}}} · evidence: {sources} · saves: {}", card.item.title, card.saves));
     }
     // the cap each run is budgeted under is the project's, named so the person sees the budget

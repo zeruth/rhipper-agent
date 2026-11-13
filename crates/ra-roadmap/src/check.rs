@@ -7,6 +7,33 @@ use std::path::Path;
 /// The check of a card whose files name no crate.
 pub const WORKSPACE_TESTS: &str = "cargo test --workspace -q";
 
+/// The programs an acceptance runs a check through. `git` is not one: a backticked `git log`
+/// is a reference, and the tools run the read-only git commands by themselves.
+const CHECK_PROGRAMS: [&str; 34] = [
+    "cargo", "rustc", "python", "python3", "py", "pytest", "uv", "pip", "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "tsc", "go",
+    "make", "cmake", "ctest", "ninja", "just", "gradle", "gradlew", "mvn", "dotnet", "java", "zig", "swift", "ruby", "bundle", "php",
+    "composer", "bash",
+];
+
+/// The extensions of a script named by a relative path.
+const SCRIPT_EXTENSIONS: [&str; 5] = ["ps1", "sh", "py", "bat", "cmd"];
+
+/// Whether a backticked span is a command line: one line whose first token is a check program
+/// or a relative script path.
+#[must_use]
+pub fn is_command(span: &str) -> bool {
+    if span.lines().count() != 1 {
+        return false;
+    }
+    let Some(first) = span.split_whitespace().next() else { return false };
+    if CHECK_PROGRAMS.contains(&first) {
+        return true;
+    }
+    let is_script = Path::new(first).extension().and_then(|e| e.to_str()).is_some_and(|e| SCRIPT_EXTENSIONS.contains(&e));
+    let is_relative = !first.starts_with('/') && !first.starts_with('\\') && !first.contains(':');
+    is_script && is_relative
+}
+
 /// The directories a crate keeps its sources under; the component before one of them is the
 /// crate's directory, and its name is the package name by the workspace's convention.
 const SOURCE_DIRS: [&str; 4] = ["src", "tests", "benches", "examples"];

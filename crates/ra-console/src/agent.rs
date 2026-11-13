@@ -2897,6 +2897,12 @@ async fn catch_up_for_review(store: &Store, id: i64, worker: &Worker) -> Result<
     let Some((command, output)) = failed else {
         return Ok(Some(format!("{caught} · check passed on the merged tree: {}", commands.join(" · "))));
     };
+    // a failure outside the card's own files and crates is the project's: the review goes on
+    let changed = git(&path, &["diff", "--name-only", &format!("{main}...HEAD")]).await.unwrap_or_default();
+    let changed: Vec<String> = changed.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
+    if let Some(outside) = outside_failure(&path, &output, &changed) {
+        return Ok(Some(format!("{caught} · {}", outside_note(&root, id, &command, &outside))));
+    }
     // a failure on the merged tree is the card's check failure: its output leads the notes,
     // where the rerun reads it, and the walk counts it against the check's retries
     let notes = node.notes.unwrap_or_default();
@@ -2911,6 +2917,76 @@ async fn catch_up_for_review(store: &Store, id: i64, worker: &Worker) -> Result<
     };
     crate::pair::event(&root, &text);
     Err(vec![caught, format!("  {text}")])
+}
+
+/// The tests a failed check of the merged tree names when every one of them panics in a crate
+/// the card neither changed nor is a direct dependent of, as `name (path)` joined by commas.
+/// `None` leaves the failure the card's: a compile error (a card that breaks an API breaks its
+/// dependents' build), output without a panic (a timeout), or a panic in a crate the card
+/// changed or one whose `Cargo.toml` names a changed crate. A dependent further down the graph
+/// reads as outside.
+pub(crate) fn outside_failure(root: &Path, output: &str, changed: &[String]) -> Option<String> {
+    if output.contains("error[") || output.contains("could not compile") {
+        return None;
+    }
+    let own: Vec<String> = changed.iter().map(|f| crate_dir(f)).collect();
+    let names: Vec<&str> = own.iter().filter_map(|dir| dir.strip_prefix("crates/")).collect();
+    let mut seen: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let Some((_, rest)) = line.split_once("panicked at ") else { continue };
+        let mut path = rest.split_whitespace().next().unwrap_or_default();
+        while let Some((head, tail)) = path.rsplit_once(':')
+            && tail.chars().all(|c| c.is_ascii_digit())
+        {
+            path = head;
+        }
+        let dir = crate_dir(path);
+        if path.is_empty() || own.contains(&dir) || depends_on_any(root, &dir, &names) {
+            return None;
+        }
+        let test = line.split_once("thread '").and_then(|(_, t)| t.split_once('\'')).map(|(name, _)| name);
+        let entry = test.map_or_else(|| path.to_owned(), |name| format!("{name} ({path})"));
+        if !seen.contains(&entry) {
+            seen.push(entry);
+        }
+    }
+    (!seen.is_empty()).then(|| seen.join(", "))
+}
+
+/// The directory a file belongs to for [`outside_failure`]: `crates/<name>` under the
+/// workspace's convention, else the first component, else the root; an absolute path is read
+/// from its `crates/`.
+fn crate_dir(file: &str) -> String {
+    let file = file.replace('\\', "/");
+    let file = file.find("crates/").map_or(file.as_str(), |at| &file[at..]);
+    let mut parts = file.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("crates"), Some(name), Some(_)) => format!("crates/{name}"),
+        (Some(first), Some(_), _) => first.to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Whether the manifest of the crate at `dir` names one of the packages as a dependency, by a
+/// line that opens on the name (`ra-roadmap = …`, `ra-roadmap.workspace = true`).
+fn depends_on_any(root: &Path, dir: &str, names: &[&str]) -> bool {
+    let Ok(manifest) = std::fs::read_to_string(root.join(dir).join("Cargo.toml")) else { return false };
+    manifest
+        .lines()
+        .map(str::trim_start)
+        .any(|line| names.iter().any(|name| line.strip_prefix(name).is_some_and(|rest| rest.starts_with([' ', '=', '.']))))
+}
+
+/// Records a failure of the merged tree outside the card as a project note, for the runs that
+/// follow to read, and answers the line the card lands with.
+fn outside_note(root: &Path, id: i64, command: &str, outside: &str) -> String {
+    let text = format!(
+        "#{id} landed over a failing {command} outside its files and their direct dependents (a crate further down may still be its): {outside}"
+    );
+    if let Err(e) = crate::retro::record_pair(root, &text) {
+        tracing::debug!("the project note of #{id} was not written: {e:#}");
+    }
+    format!("check failed outside the card on the merged tree: {outside}; noted for the project")
 }
 
 /// The block at the head of a worker's brief when its tree has unmerged files: the merge of
@@ -3124,15 +3200,22 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
                 let _slot = hold_build(&root, &root).await;
                 let runs = run_checks(&toolbox, &commands, &[]).await;
                 if let Some(failed) = runs.iter().find(|r| !r.passed) {
-                    // the squash commit goes; what the checkout held uncommitted stays
-                    let _ = git(&root, &["reset", "--merge", "HEAD~1"]).await;
-                    return Err(anyhow::Error::new(LandCheck {
-                        command: failed.command.clone(),
-                        exit: failed.exit.clone(),
-                        text: failed.text.clone(),
-                    }));
+                    // a failure outside the card's files and crates is the project's: the card
+                    // lands and a note carries the failure (#207 failed another card's test)
+                    if let Some(outside) = outside_failure(&root, &failed.text, &staged) {
+                        lines.push(outside_note(&root, id, &failed.command, &outside));
+                    } else {
+                        // the squash commit goes; what the checkout held uncommitted stays
+                        let _ = git(&root, &["reset", "--merge", "HEAD~1"]).await;
+                        return Err(anyhow::Error::new(LandCheck {
+                            command: failed.command.clone(),
+                            exit: failed.exit.clone(),
+                            text: failed.text.clone(),
+                        }));
+                    }
+                } else {
+                    lines.push(format!("check passed on the merged tree: {}", commands.join(" · ")));
                 }
-                lines.push(format!("check passed on the merged tree: {}", commands.join(" · ")));
             }
         }
     }
@@ -5183,31 +5266,7 @@ fn orchestrated_line(checks: &Checks) -> String {
     )
 }
 
-/// The programs an acceptance runs a check through. `git` is not one: a backticked `git log`
-/// is a reference, and the tools run the read-only git commands by themselves.
-const CHECK_PROGRAMS: [&str; 34] = [
-    "cargo", "rustc", "python", "python3", "py", "pytest", "uv", "pip", "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "tsc", "go",
-    "make", "cmake", "ctest", "ninja", "just", "gradle", "gradlew", "mvn", "dotnet", "java", "zig", "swift", "ruby", "bundle", "php",
-    "composer", "bash",
-];
-
-/// The extensions of a script named by a relative path.
-const SCRIPT_EXTENSIONS: [&str; 5] = ["ps1", "sh", "py", "bat", "cmd"];
-
-/// Whether a backticked span is a command line: one line whose first token is a check program
-/// or a relative script path.
-fn is_command(span: &str) -> bool {
-    if span.lines().count() != 1 {
-        return false;
-    }
-    let Some(first) = span.split_whitespace().next() else { return false };
-    if CHECK_PROGRAMS.contains(&first) {
-        return true;
-    }
-    let is_script = Path::new(first).extension().and_then(|e| e.to_str()).is_some_and(|e| SCRIPT_EXTENSIONS.contains(&e));
-    let is_relative = !first.starts_with('/') && !first.starts_with('\\') && !first.contains(':');
-    is_script && is_relative
-}
+use ra_roadmap::check::is_command;
 
 /// What one command of a check came to, for the notes and the activity log.
 struct CheckRun {

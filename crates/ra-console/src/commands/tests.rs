@@ -1648,6 +1648,53 @@ async fn a_landing_whose_merged_check_fails_sends_the_card_back() {
 }
 
 #[tokio::test]
+async fn an_outside_failure_on_the_merged_tree_lands_the_card_with_a_project_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_card_branch(dir.path()).await;
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    // the failing test lives in a crate the card did not touch
+    let output = "thread 'a_check_that_outlives_its_budget_is_killed' panicked at crates/ra-tools/src/lib.rs:10:5:\nnot killed\n";
+    let failing: ra_tools::Script = std::sync::Arc::new(move |_: &str| Ok((101, output.to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_script(failing);
+    let out = crate::agent::land_or_say(&store, 2, &runner).await;
+    assert!(out.iter().any(|l| l.starts_with("check failed outside the card on the merged tree: a_check_that_outlives")), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Accepted);
+    assert!(dir.path().join("made.txt").exists());
+    let notes = crate::retro::recent(dir.path(), 5);
+    assert!(notes.iter().any(|n| n.text.contains("#2 landed over a failing") && n.text.contains("ra-tools")), "{notes:?}");
+}
+
+#[test]
+fn a_compile_error_or_a_dependent_crate_is_never_an_outside_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let changed = ["crates/ra-roadmap/src/tree.rs".to_owned()];
+    // the card broke an API: the error points into a crate it did not touch, and stays its own
+    let compile =
+        "error[E0061]: this function takes 2 arguments\n  --> crates/ra-tools/src/lib.rs:3:5\nerror: could not compile `ra-tools`\n";
+    assert_eq!(crate::agent::outside_failure(dir.path(), compile, &changed), None);
+    // a test of a crate that depends on the changed one is the card's
+    std::fs::create_dir_all(dir.path().join("crates/ra-console")).unwrap();
+    std::fs::write(dir.path().join("crates/ra-console/Cargo.toml"), "[dependencies]\nra-roadmap.workspace = true\n").unwrap();
+    let dependent = "thread 't' panicked at crates/ra-console/src/lib.rs:1:1:\n";
+    assert_eq!(crate::agent::outside_failure(dir.path(), dependent, &changed), None);
+    // one that does not is the project's
+    let apart = "thread 'killed' panicked at crates/ra-tools/src/lib.rs:9:1:\n";
+    assert_eq!(crate::agent::outside_failure(dir.path(), apart, &changed).as_deref(), Some("killed (crates/ra-tools/src/lib.rs)"));
+}
+
+#[tokio::test]
+async fn a_failure_in_the_cards_own_crate_still_sends_it_back_not_an_outside_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_card_branch(dir.path()).await;
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    // a root-level file of the card, a panic in the root's own sources
+    let failing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((101, "thread 't' panicked at made.txt:1:1:\nbroke\n".to_owned())));
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_script(failing);
+    let out = crate::agent::land_or_say(&store, 2, &runner).await;
+    assert_eq!(out, ["#2 not landed: the merged tree fails cargo test --workspace -q; sent back to its worker"]);
+}
+
+#[tokio::test]
 async fn land_reason_a_dirty_tree_lands_after_its_files_are_set_aside() {
     let dir = tempfile::tempdir().unwrap();
     let store = project_with_a_card_branch(dir.path()).await;

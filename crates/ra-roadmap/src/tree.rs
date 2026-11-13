@@ -20,6 +20,7 @@ pub fn cards(nodes: &[Node]) -> impl Iterator<Item = &Node> {
 
 /// The subtree of `root` in preorder: the node, then each child's subtree, in the order of the
 /// list. Empty when no node has that id.
+#[must_use]
 pub fn subtree(nodes: &[Node], root: i64) -> Vec<&Node> {
     let mut kids: HashMap<i64, Vec<&Node>> = HashMap::new();
     for node in nodes {
@@ -55,12 +56,14 @@ pub fn is_within(nodes: &[Node], id: i64, ancestor: i64) -> bool {
 }
 
 /// The depth of the node with `id`: the distance from its project root. A missing id is depth 0.
+#[must_use]
 pub fn depth(nodes: &[Node], id: i64) -> usize {
     let by_id: HashMap<i64, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
     depth_in(&by_id, id)
 }
 
 /// The depth of every node, by id.
+#[must_use]
 pub fn depths(nodes: &[Node]) -> HashMap<i64, usize> {
     let by_id: HashMap<i64, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
     nodes.iter().map(|n| (n.id, depth_in(&by_id, n.id))).collect()
@@ -185,8 +188,8 @@ fn milestone_in<'a>(by_id: &HashMap<i64, &'a Node>, node: &'a Node) -> Option<&'
 
 /// The faults `rc check` reports, one line each with the id, in tree order: placeholder text in
 /// a title, objective or acceptance; a task or subtask without acceptance or without files, its
-/// own or an ancestor's; a waits-on that names no node; a waits-on cycle; a complexity outside
-/// 1..=5 on a card. Accepted
+/// own or an ancestor's; an acceptance that fails the definition of done ([`definition_of_done`]);
+/// a waits-on that names no node; a waits-on cycle; a complexity outside 1..=5 on a card. Accepted
 /// and cancelled cards are past fixing and are only checked for the structural faults, the
 /// dangling and cyclic waits-on. Empty when the roadmap is clean.
 #[must_use]
@@ -209,6 +212,9 @@ pub fn lint(nodes: &[Node]) -> Vec<String> {
             if card && node.acceptance.as_deref().is_none_or(|a| a.trim().is_empty()) {
                 out.push(format!("#{id}: no acceptance"));
             }
+            if card && let Some(acceptance) = node.acceptance.as_deref().filter(|a| !is_placeholder(a)) {
+                out.extend(definition_of_done(id, acceptance));
+            }
             if card && files_in(&by_id, node).0.is_empty() {
                 out.push(format!("#{id}: no files"));
             }
@@ -224,6 +230,28 @@ pub fn lint(nodes: &[Node]) -> Vec<String> {
         if cyclic.contains(&id) {
             out.push(format!("#{id}: its waits-on come back to it"));
         }
+    }
+    out
+}
+
+/// The words of an acceptance that ask for what only a person, a CI run or an emulator gives.
+const HUMAN_CLAUSES: [&str; 9] =
+    ["manually", "by hand", "a person", "the person", "reviewer confirms", "on ci", "ci run", "emulator", "on a device"];
+
+/// The two defects of an acceptance against the shared definition of done: it names no command
+/// to run (the check falls back to the whole workspace and the reviewer judges prose), or it
+/// asks of a person, CI or an emulator (the reviewer cannot give it, so the card is sent back
+/// for it). The second belongs on a `person:` line, which the window shows as a note.
+fn definition_of_done(id: i64, acceptance: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if !acceptance.split('`').skip(1).step_by(2).any(|span| crate::check::is_command(span.trim())) {
+        out.push(format!("#{id}: the acceptance names no command to run"));
+    }
+    let lower = acceptance.to_ascii_lowercase();
+    // a clause already moved to a `person:` line is no criterion
+    let criteria = lower.lines().filter(|l| !l.trim_start().starts_with("person:")).collect::<Vec<_>>().join("\n");
+    if HUMAN_CLAUSES.iter().any(|clause| criteria.contains(clause)) {
+        out.push(format!("#{id}: the acceptance asks of a person, CI or an emulator; move it to a `person:` line"));
     }
     out
 }

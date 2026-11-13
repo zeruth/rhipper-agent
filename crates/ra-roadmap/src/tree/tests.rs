@@ -168,7 +168,7 @@ fn whole(id: i64, state: TaskState, depends_on: &[i64]) -> Node {
     Node {
         title: format!("card {id}"),
         objective: Some("does a thing".to_owned()),
-        acceptance: Some("the thing is done".to_owned()),
+        acceptance: Some("`cargo test -p x` passes".to_owned()),
         files: vec!["src/lib.rs".to_owned()],
         ..task(id, state, depends_on)
     }
@@ -201,6 +201,24 @@ fn the_lint_trips_each_rule_once() {
     assert!(lines[4].starts_with("#7:") && lines[4].contains("waits-on"), "{}", lines[4]);
     assert!(lines[5].starts_with("#8:") && lines[5].contains("waits-on"), "{}", lines[5]);
     assert!(lines[6].starts_with("#9:") && lines[6].contains("complexity 0"), "{}", lines[6]);
+}
+
+#[test]
+fn definition_of_done_reports_an_acceptance_without_a_command_and_one_that_asks_a_person() {
+    let nodes = vec![
+        whole(2, TaskState::Defined, &[]),
+        Node { acceptance: Some("the thing is done".to_owned()), ..whole(3, TaskState::Defined, &[]) },
+        Node { acceptance: Some("`cargo test -p x` passes and CI run is green".to_owned()), ..whole(4, TaskState::Defined, &[]) },
+        Node {
+            acceptance: Some("`cargo test -p x` passes\nperson: confirms it on the emulator".to_owned()),
+            ..whole(5, TaskState::Defined, &[])
+        },
+        Node { acceptance: Some("the thing is done".to_owned()), ..whole(6, TaskState::Accepted, &[]) },
+    ];
+    let lines = lint(&nodes);
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert!(lines[0].starts_with("#3:") && lines[0].contains("no command"), "{}", lines[0]);
+    assert!(lines[1].starts_with("#4:") && lines[1].contains("`person:`"), "{}", lines[1]);
 }
 
 #[test]
