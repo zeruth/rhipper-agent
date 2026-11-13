@@ -333,6 +333,122 @@ pub struct Status {
     pub ready: Option<usize>,
     pub calls_today: u64,
     pub spend_today: Option<f64>,
+    /// The cards that wait on the person, in the roadmap's order.
+    pub waiting: Vec<Waiting>,
+    /// Why the walk last stopped, as its end line on the feed says it.
+    pub stopped: Option<String>,
+}
+
+/// A card that waits on the person: blocked, sent back past the walk's reruns, or implemented
+/// and not landed. Each was read in the feed hours late on 2026-11-12 (#185, #182).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Waiting {
+    pub id: i64,
+    pub title: String,
+    pub state: ra_roadmap::model::TaskState,
+    /// The first line of why, from the feed or the card's notes.
+    pub reason: String,
+}
+
+/// How many feed lines a status reads back for the reasons of the waiting cards.
+const FEED_ROWS: usize = 2000;
+
+/// The width of a waiting card's reason in `rc status`.
+const REASON_WIDTH: usize = 100;
+
+impl Waiting {
+    /// The reason in a word or two, for the status line: `reviewer ×5`, `check ×2`, `landing`,
+    /// `idle`, `refused`, else the reason clipped.
+    #[must_use]
+    pub fn short(&self) -> String {
+        let times = |after: &str| {
+            let (_, rest) = self.reason.split_once(after)?;
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            (!digits.is_empty()).then_some(digits)
+        };
+        if let Some(n) = times("the reviewer sent it back ") {
+            format!("reviewer ×{n}")
+        } else if let Some(n) = times("its check failed ") {
+            format!("check ×{n}")
+        } else if self.reason.starts_with("not landed") {
+            String::from("landing")
+        } else if self.reason.starts_with("two runs changed nothing") {
+            String::from("idle")
+        } else if self.reason.starts_with("refused:") {
+            String::from("refused")
+        } else {
+            clip(&self.reason, 24)
+        }
+    }
+
+    /// The line `rc status` prints under its project: the card, its reason, its re-queue.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!("  waits #{} {} · {} · {}", self.id, clip(&self.title, 40), clip(&self.reason, REASON_WIDTH), self.requeue())
+    }
+
+    /// The command that puts the card back on the queue.
+    #[must_use]
+    pub fn requeue(&self) -> String {
+        format!("rc set {} defined", self.id)
+    }
+}
+
+/// The cards of `nodes` that wait on the person, with their reasons read from the feed at `root`.
+#[must_use]
+pub fn waiting(root: &Path, nodes: &[ra_roadmap::model::Node]) -> Vec<Waiting> {
+    waiting_of(nodes, &crate::pair::recent(root, FEED_ROWS))
+}
+
+/// The cards of `nodes` that wait on the person, by their stored state: the blocked ones, the
+/// ones that need revision, and the implemented ones whose last landing word on `feed` is `not
+/// landed`. The reason is the card's latest word on the feed or its notes' first line; a blocked
+/// card's notes come first, where a park or the person put the reason.
+#[must_use]
+pub fn waiting_of(nodes: &[ra_roadmap::model::Node], feed: &[String]) -> Vec<Waiting> {
+    use ra_roadmap::model::TaskState;
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let id = node.id;
+            let noted = node.notes.as_deref().and_then(|n| n.lines().map(str::trim).find(|l| !l.is_empty())).map(str::to_owned);
+            let fed = feed_reason(feed, id);
+            let reason = match node.state {
+                TaskState::Blocked => noted.or(fed),
+                TaskState::NeedsRevision => fed.or(noted),
+                TaskState::Implemented => {
+                    let not_landed = format!("#{id} not landed");
+                    let (landed, start) = (format!("landed #{id} "), format!("start #{id} "));
+                    let last = feed.iter().rev().find(|l| l.starts_with(&not_landed) || l.starts_with(&landed) || l.starts_with(&start))?;
+                    if !last.starts_with(&not_landed) {
+                        return None;
+                    }
+                    fed.or(noted)
+                }
+                _ => return None,
+            };
+            let reason = reason.unwrap_or_else(|| node.state.to_string());
+            Some(Waiting { id, title: node.title.clone(), state: node.state, reason })
+        })
+        .collect()
+}
+
+/// The latest word on the feed of why card `id` waits: the `why` of a `waits`/`rerun` line, the
+/// reason of a `parked` line, or a `not landed` line from its `not landed`.
+fn feed_reason(feed: &[String], id: i64) -> Option<String> {
+    let (waits, rerun, parked, landing) =
+        (format!("waits #{id} "), format!("rerun #{id} "), format!("parked #{id}: "), format!("#{id} not landed"));
+    feed.iter().rev().find_map(|line| {
+        if line.starts_with(&waits) || line.starts_with(&rerun) {
+            line.split(" · ").nth(1).map(|why| why.trim().to_owned())
+        } else if let Some(reason) = line.strip_prefix(&parked) {
+            Some(reason.trim().to_owned())
+        } else if line.starts_with(&landing) {
+            line.strip_prefix(&format!("#{id} ")).map(|rest| rest.trim().to_owned())
+        } else {
+            None
+        }
+    })
 }
 
 /// What the paired feed has open in a project.
@@ -391,14 +507,26 @@ pub fn status_with(root: &Path, alive: impl Fn(u32) -> bool, spends: &[ra_usage:
         Some((text, _)) => Run::Live(text),
         None => Run::Idle,
     };
-    let ready = std::fs::read_to_string(root.join("rhipper.md")).ok().and_then(|text| {
-        let nodes = ra_roadmap::markdown::parse(&text).ok()?;
-        Some(ra_roadmap::tree::effective_states(&nodes).values().filter(|s| **s == ra_roadmap::model::TaskState::Ready).count())
-    });
+    let nodes = std::fs::read_to_string(root.join("rhipper.md")).ok().and_then(|text| ra_roadmap::markdown::parse(&text).ok());
+    let ready = nodes
+        .as_ref()
+        .map(|nodes| ra_roadmap::tree::effective_states(nodes).values().filter(|s| **s == ra_roadmap::model::TaskState::Ready).count());
+    let feed = crate::pair::recent(root, FEED_ROWS);
+    let waiting = nodes.as_deref().map(|nodes| waiting_of(nodes, &feed)).unwrap_or_default();
     let (calls_today, spend_today) = spend_on(spends, today);
     let path = std::fs::canonicalize(root)
         .map_or_else(|_| root.display().to_string(), |p| p.display().to_string().trim_start_matches(r"\\?\").to_owned());
-    Status { name: project_name(root), path, run, last: crate::pair::last_end(root), ready, calls_today, spend_today }
+    Status {
+        name: project_name(root),
+        path,
+        run,
+        last: crate::pair::last_end(root),
+        ready,
+        calls_today,
+        spend_today,
+        waiting,
+        stopped: crate::pair::stop_of(&feed),
+    }
 }
 
 /// The calls and the dollars of the ledger rows written on `today` (`YYYY-MM-DD`, UTC, as the
@@ -432,7 +560,22 @@ impl Status {
         };
         // the end line's head says the card and how it ended; its tail is the cost, which `today` has
         let last = self.last.as_deref().map_or("—", |last| last.split_once(" · ").map_or(last, |(head, _)| head));
-        format!("{:<20} {run:<RUN_WIDTH$} {ready:>5} {today:>16}  {last}", clip(&self.name, 20))
+        let line = format!("{:<20} {run:<RUN_WIDTH$} {ready:>5} {today:>16}  {last}", clip(&self.name, 20));
+        match self.waits() {
+            Some(waits) => format!("{line} · {waits}"),
+            None => line,
+        }
+    }
+
+    /// The waiting cards in a few words, `waits 2 (#185 reviewer ×5, #182 landing)`; none while
+    /// no card waits.
+    #[must_use]
+    pub fn waits(&self) -> Option<String> {
+        if self.waiting.is_empty() {
+            return None;
+        }
+        let each: Vec<String> = self.waiting.iter().map(|w| format!("#{} {}", w.id, w.short())).collect();
+        Some(format!("waits {} ({})", self.waiting.len(), each.join(", ")))
     }
 
     /// The header the lines go under.

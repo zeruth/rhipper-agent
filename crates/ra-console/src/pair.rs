@@ -60,6 +60,21 @@ pub fn last_end(root: &Path) -> Option<String> {
     recent(root, 50).into_iter().rev().find_map(|line| line.strip_prefix("end ").map(str::trim).map(str::to_owned))
 }
 
+/// Why the walk last stopped, from the feed's latest walk end (`walk ran … · stopped: <why>`):
+/// the run that failed, the card that needs revision; none when the last walk ended with no card
+/// ready, or no walk has ended. The person read these in the log, hours late (pair.log:57, 219).
+#[must_use]
+pub fn last_stop(root: &Path) -> Option<String> {
+    stop_of(&recent(root, 500))
+}
+
+/// [`last_stop`] of feed lines already read, oldest first, as [`recent`] gives them.
+#[must_use]
+pub fn stop_of(lines: &[String]) -> Option<String> {
+    let end = lines.iter().rev().find(|line| line.starts_with("walk ran "))?;
+    end.split_once("stopped: ").map(|(_, why)| why.trim().to_owned())
+}
+
 /// The run the feed has open: the latest `start` event with no `end` (or `re-queued`, or the
 /// older `run orphaned`) after it, without its word, and the pid its marker carries last; none
 /// while nothing runs. A start without a pid is from before the marker carried one, and its
