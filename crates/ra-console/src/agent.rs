@@ -935,6 +935,14 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
         {
             lines.extend(review_after_run(store, id, worker).await);
         }
+        // a run sent back that changed nothing and says why is idle: the next run starts fresh,
+        // and a second in a row parks the card (#185 went round seven times on its resumed
+        // session, 26k to 93k tokens a turn, every run refused the same command)
+        if let Ok((lines, _, _)) = &mut outcome
+            && let Some(line) = settle_idle(store, &root, id).await
+        {
+            lines.push(line);
+        }
         let Ok(node) = store.read(id).await else { break };
         if outcome.is_err() || !node.is_absolute() || node.state != TaskState::NeedsRevision {
             break;
@@ -3500,11 +3508,23 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // the topic changes). The session is dropped only when it is stale: then the brief and the
     // handoffs carry it, and the run says so first
     let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node) } else { None };
+    // a run after an idle one starts fresh, as `--clear-session` would: the session that changed
+    // nothing is only resumed to change nothing again at a heavier turn. Its prompt is the last
+    // report and the review, not the transcript
+    let idle = last_run(&task).and_then(idle_of).map(str::to_owned);
+    let rerun = rerun.map(|block| match last_run(&task) {
+        Some(last) if idle.is_some() => format!("{block}\nThe last run changed nothing; its report:\n{}\n", last.report.trim()),
+        _ => block,
+    });
+    if idle.is_some() && node.session.is_some() {
+        store.set_session(id, None, unix_now()).await?;
+    }
     // a rerun after a rejection or a failed check resumes only a lean session: the verdict and
     // the handoff carry what it needs, and a session already heavy paid its whole weight every
     // turn of every rerun (runelite #23 resumed at 132k tokens a turn, $7.39 for eleven turns;
     // #28 at 144k, $3.91 for four), where a fresh one cost a few tens of cents
     let resumed = match resume_of(&node, unix_now()) {
+        Ok(Some(_)) if idle.is_some() => Err(format!("the last run changed nothing ({})", idle.as_deref().unwrap_or_default())),
         // an absolute card keeps its session whatever its weight: its work is one run
         Ok(Some(_)) if rerun.is_some() && !node.is_absolute() && last_largest_turn(&task).is_some_and(|t| t > RERUN_RESUME_LIMIT) => {
             Err(format!(
@@ -5792,6 +5812,87 @@ fn resume_of(node: &Node, now: u64) -> Result<Option<String>, String> {
         return Err("the session is older than a day".to_owned());
     }
     Ok(Some(session.to_owned()))
+}
+
+/// The mark of an idle run on its handoff's check line, last on the line: ` · idle: <reason>`.
+/// The line is kept in the file, so the next run of the card starts fresh and a second idle run
+/// parks it.
+const IDLE_MARK: &str = " · idle: ";
+
+/// The last run's handoff of a task, past the notes other cards left on it.
+fn last_run(task: &ra_context::TaskContext) -> Option<&ra_context::Handoff> {
+    task.handoffs.iter().rev().find(|h| !h.outcome.starts_with("note from"))
+}
+
+/// Why the run of a handoff was idle, as its check line carries it; `None` for a run that was not.
+fn idle_of(handoff: &ra_context::Handoff) -> Option<&str> {
+    handoff.check.split_once(IDLE_MARK).map(|(_, reason)| reason.trim())
+}
+
+/// Why the run of `last` was idle: it changed no file, and its report (or the notes it left)
+/// names a refused command, or it drew the verdict the run of `previous` drew. `None` for a run
+/// that changed a file or says nothing of why it did not.
+fn idle_reason(last: &ra_context::Handoff, previous: Option<&ra_context::Handoff>, notes: &str) -> Option<String> {
+    if !last.changed.is_empty() {
+        return None;
+    }
+    if let Some(line) = refused_line(&last.report).or_else(|| refused_line(notes)) {
+        return Some(line);
+    }
+    let verdict = last.verdict.as_deref()?;
+    (previous.and_then(|p| p.verdict.as_deref()) == Some(verdict)).then(|| format!("the same verdict again: {}", verdict.trim()))
+}
+
+/// The first `refused:` line of a report, with the line under it when the label stands alone,
+/// clipped to 200 characters; `None` when the report names no refusal.
+fn refused_line(report: &str) -> Option<String> {
+    let bare = |line: &str| line.trim().trim_start_matches(['-', '*', '#', '>', '`', ' ']).to_owned();
+    let mut lines = report.lines().map(bare);
+    let rest = lines.find_map(|line| line.strip_prefix("refused:").map(|rest| rest.trim_start_matches(['*', ' ']).trim().to_owned()))?;
+    // a label alone, `refused:` or **refused:**, names its refusal on the line under it
+    let alone = rest.trim_matches(['`', '*']).is_empty();
+    let what = if alone { lines.find(|line| !line.is_empty()).unwrap_or_default() } else { rest };
+    let line = format!("refused: {what}");
+    Some(line.trim_end().chars().take(200).collect())
+}
+
+/// Settles a run of card `id` that its check or its reviewer sent back: one that changed nothing
+/// and says why ([`idle_reason`]) is marked idle on its handoff, and when the run before it was
+/// idle too the card is blocked, the first run's reason at the top of its notes, and the feed
+/// says so ([`crate::pair::parked`]). The line for the run, `None` for a run that was not idle.
+async fn settle_idle(store: &Store, root: &Path, id: i64) -> Option<String> {
+    let node = store.read(id).await.ok()?;
+    if node.state != TaskState::NeedsRevision {
+        return None;
+    }
+    let mut task = ra_context::TaskContext::open(root, id);
+    let runs: Vec<usize> = task.handoffs.iter().enumerate().filter(|(_, h)| !h.outcome.starts_with("note from")).map(|(i, _)| i).collect();
+    let (&at, before) = runs.split_last()?;
+    let previous = before.last().map(|&i| &task.handoffs[i]);
+    let reason = idle_reason(&task.handoffs[at], previous, node.notes.as_deref().unwrap_or_default())?;
+    // the first idle run's reason names the card's trouble; the second only repeats it
+    let first = previous.and_then(idle_of).map(str::to_owned);
+    let last = &mut task.handoffs[at];
+    if idle_of(last).is_none() {
+        last.check = format!("{}{IDLE_MARK}{reason}", last.check.trim());
+        if let Err(e) = task.save(root) {
+            tracing::warn!("the idle run of #{id} was not marked on its handoff: {e:#}");
+        }
+    }
+    let Some(first) = first else {
+        return Some(format!("  idle: #{id} changed nothing ({reason}); its next run starts a fresh session"));
+    };
+    let notes = node.notes.as_deref().map_or_else(|| first.clone(), |notes| format!("{first}\n\n{notes}"));
+    if let Err(e) = store.set_notes(id, &notes).await {
+        tracing::warn!("the reason #{id} is parked was not noted: {e:#}");
+    }
+    if let Err(e) = store.set_state_by(id, TaskState::Blocked, Source::Run).await {
+        tracing::warn!("#{id} could not be parked: {e:#}");
+        return None;
+    }
+    let text = crate::pair::parked(root, id, &first);
+    tracing::warn!("{text}");
+    Some(format!("  {text}; a person sets it defined again"))
 }
 
 /// The turns a session spends reading in, a few past the harness's own reading-in allowance:

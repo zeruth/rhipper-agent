@@ -931,6 +931,79 @@ async fn a_placeholder_report_is_asked_again_on_its_session_and_a_real_one_is_no
     assert_eq!(harness.requests.lock().len(), 5);
 }
 
+/// A card whose check fails with a new error each time and a harness whose runs change no file
+/// and each report a refused command, on sessions `s-1`, `s-2`, …; the store and the harness.
+async fn idle_card(dir: &std::path::Path, runs: usize) -> (Store, std::sync::Arc<CappedHarness>, Worker) {
+    let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    run("/edit 2 acceptance `cargo test -q` passes", &store, &worker()).await.unwrap();
+    // a new error each time: the same one twice holds the card on its fingerprint instead
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let script: ra_tools::Script = std::sync::Arc::new(move |_: &str| {
+        let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok((1, format!("error[E{n:04}]: the build did not start\n")))
+    });
+    let answers = (1..=runs)
+        .rev()
+        .map(|n| {
+            let mut answer = says(
+                "Nothing changed in `src/lib.rs`: the check could not run.\nrefused: `rc hold -- cargo test -q`: rc is not recognized",
+                vec![],
+            );
+            answer.session_id = Some(format!("s-{n}"));
+            Ok(answer)
+        })
+        .collect();
+    let harness = CappedHarness::new(answers);
+    let runner = Worker::new("claude-opus-5-5").with_provider(harness.clone()).with_script(script);
+    (store, harness, runner)
+}
+
+#[tokio::test]
+async fn an_idle_rerun_starts_a_fresh_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, harness, runner) = idle_card(dir.path(), 2).await;
+    run("/run 2", &store, &runner).await.unwrap();
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
+    assert_eq!(node.session.as_deref(), Some("s-1"));
+    let task = ra_context::TaskContext::open(dir.path(), 2);
+    assert!(
+        task.handoffs[0].check.ends_with(" · idle: refused: `rc hold -- cargo test -q`: rc is not recognized"),
+        "{}",
+        task.handoffs[0].check
+    );
+
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    let requests = harness.requests.lock();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].resume, None, "{out:?}");
+    // the prompt carries the last report, not the transcript
+    let prompt = &requests[1].messages.last().unwrap().content;
+    let report = prompt.split_once("The last run changed nothing; its report:\n").map(|(_, report)| report).unwrap_or_default();
+    assert!(report.contains("refused: `rc hold -- cargo test -q`: rc is not recognized"), "{prompt}");
+    assert!(out.iter().any(|l| l.contains("fresh start: the last run changed nothing")), "{out:?}");
+}
+
+#[tokio::test]
+async fn a_second_run_that_changed_nothing_parks_the_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, harness, runner) = idle_card(dir.path(), 3).await;
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    // the walk reran the card once, parked it, and went on: the third answer is never asked
+    assert_eq!(harness.requests.lock().len(), 2, "{out:?}");
+    assert!(out.iter().any(|l| l.contains("parked #2: two runs changed nothing: refused:")), "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 2 card(s) · no card is ready");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Blocked);
+    let notes = node.notes.unwrap_or_default();
+    assert!(notes.starts_with("refused: `rc hold -- cargo test -q`: rc is not recognized\n\n"), "{notes}");
+    let feed = std::fs::read_to_string(dir.path().join(crate::pair::PAIR_FILE)).unwrap();
+    assert_eq!(feed.lines().filter(|l| l.contains("parked #")).count(), 1, "{feed}");
+    let (shown, _) = run("/show 2", &store, &worker()).await.unwrap();
+    assert!(shown[0].contains("[blocked]"), "{shown:?}");
+}
+
 #[test]
 fn a_report_is_a_placeholder_when_it_names_no_file_and_says_nothing_beyond_the_check() {
     assert!(crate::agent::is_empty_handoff(""));
