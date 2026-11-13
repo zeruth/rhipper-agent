@@ -1704,29 +1704,50 @@ async fn dry_system(store: &Store, id: i64) -> String {
 }
 
 #[tokio::test]
-async fn a_look_back_naming_a_check_retires_once_the_config_or_the_card_changed_and_a_plain_one_rides_a_week() {
+async fn a_retro_line_older_than_seven_days_is_retired() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let (hour, week) = (now - 3600, now - crate::retro::RIDES_FOR - 60);
+    let log = format!(
+        "{hour}\t2\t0\tthe card named no files; a files line would have saved the search\n\
+         {week}\t2\t1\tthe outline of agent.rs is long\n"
+    );
+    std::fs::create_dir_all(dir.path().join("var")).unwrap();
+    std::fs::write(dir.path().join(crate::retro::RETRO_FILE), log).unwrap();
+    let system = dry_system(&store, 2).await;
+    assert!(system.contains("the card named no files"), "{system}");
+    assert!(!system.contains("outline of agent.rs"), "a week-old note does not ride: {system}");
+    // the line stays in the log for the person to read
+    assert!(std::fs::read_to_string(dir.path().join(crate::retro::RETRO_FILE)).unwrap().contains("outline of agent.rs"));
+}
+
+#[tokio::test]
+async fn a_retro_line_about_a_changed_check_is_retired() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let print = crate::retro::acceptance_print(None);
-    let (hour, week) = (now - 3600, now - crate::retro::RIDES_FOR - 60);
+    let hour = now - 3600;
     let log = format!(
         "{hour}\t2\t0\t`cargo test --workspace` relinks rc.exe; run it with --exclude rc\t{print}\n\
          {hour}\t2\t0\tthe card named no files; a files line would have saved the search\n\
-         {week}\t2\t0\tthe outline of agent.rs is long\n\
+         {hour}\t2\t0\tthe [worker] route sent a cheap model\n\
          {hour}\t2\t0\tthe acceptance's `cargo test -p ra-tools` was typed by hand\t{print}\n"
     );
     std::fs::create_dir_all(dir.path().join("var")).unwrap();
     std::fs::write(dir.path().join(crate::retro::RETRO_FILE), log).unwrap();
     let system = dry_system(&store, 2).await;
     assert!(system.contains("`cargo test --workspace` relinks") && system.contains("was typed by hand"), "{system}");
-    assert!(!system.contains("outline of agent.rs"), "a week-old note does not ride: {system}");
+    assert!(system.contains("[worker] route"), "{system}");
     // the project's check is configured after the note was written: the note naming a command
     // retires, the plain observation rides on
     std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\ncheck = \"cargo test -p ra-console\"\n").unwrap();
     let system = dry_system(&store, 2).await;
     assert!(!system.contains("cargo test --workspace") && !system.contains("was typed by hand"), "{system}");
+    assert!(!system.contains("[worker] route"), "{system}");
     assert!(system.contains("the card named no files"), "{system}");
     // a note written after the config change, against the card's acceptance, retires once the
     // acceptance changes
@@ -1739,7 +1760,7 @@ async fn a_look_back_naming_a_check_retires_once_the_config_or_the_card_changed_
 }
 
 #[test]
-fn rc_note_retire_drops_one_line_and_its_shared_copy_and_says_which() {
+fn rc_note_retire_marks_one_line() {
     let dir = tempfile::tempdir().unwrap();
     let shared = dir.path().join("hub").join("notes.log");
     let notes = crate::retro::parse("## Faster next time\n- [machine] sed is refused\n- the card named no files\n");
@@ -1753,7 +1774,16 @@ fn rc_note_retire_drops_one_line_and_its_shared_copy_and_says_which() {
     assert_eq!(crate::retro::retire_with(dir.path(), &shared, 1).unwrap(), "[machine] sed is refused");
     let left = crate::retro::recent(dir.path(), 10);
     assert_eq!(left.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), ["the card named no files"]);
-    assert_eq!(std::fs::read_to_string(&shared).unwrap(), "");
+    assert!(!crate::retro::machine_lines_with(dir.path(), &shared).contains("sed is refused"));
+    // the lines stay, marked, and keep their numbers
+    let log = std::fs::read_to_string(dir.path().join(crate::retro::RETRO_FILE)).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(lines[0].starts_with("retired\t") && lines[0].ends_with("sed is refused"), "{log}");
+    assert!(lines[1].ends_with("the card named no files"), "{log}");
+    assert!(std::fs::read_to_string(&shared).unwrap().starts_with("retired\t"));
+    assert_eq!(crate::retro::numbered(dir.path(), 10).iter().map(|(line, _)| *line).collect::<Vec<_>>(), [2]);
+    let err = crate::retro::retire_with(dir.path(), &shared, 1).unwrap_err().to_string();
+    assert!(err.contains("no note on line 1"), "a retired line is not retired twice: {err}");
     let err = crate::retro::retire_with(dir.path(), &shared, 5).unwrap_err().to_string();
     assert!(err.contains("no note on line 5"), "{err}");
 }

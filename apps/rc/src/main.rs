@@ -345,7 +345,7 @@ enum Command {
     Note {
         /// The note, one line; without one, the latest notes with the line numbers `--retire` takes.
         text: Vec<String>,
-        /// Drops the note on that line of var/retro.log, and its shared copy when it was a machine note.
+        /// Retires the note on that line of var/retro.log, and its shared copy when it was a machine note: the line stays, marked, and rides into no run.
         #[arg(long, value_name = "N")]
         retire: Option<usize>,
     },
@@ -777,14 +777,14 @@ async fn run_main() -> anyhow::Result<()> {
         Command::Note { text, retire: Some(line) } => {
             anyhow::ensure!(text.is_empty(), "--retire takes a line number, not a note");
             let retired = ra_console::retro::retire(Path::new("."), line)?;
-            println!("retired {}:{line}: {retired}", ra_console::retro::RETRO_FILE);
+            println!("retired: {retired}");
             Ok(())
         }
         Command::Note { text, retire: None } if text.is_empty() => {
             for (line, note) in ra_console::retro::numbered(Path::new("."), ra_console::retro::EVIDENCE_LINES) {
                 println!("{line:>5}  {}{}", if note.machine { "[machine] " } else { "" }, note.text);
             }
-            println!("rc note --retire <n> drops the note on line n");
+            println!("rc note --retire <n> retires the note on line n");
             Ok(())
         }
         Command::Note { text, retire: None } => {

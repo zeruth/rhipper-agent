@@ -319,7 +319,8 @@ pub fn shared_recent(root: &Path, shared: &Path, limit: usize) -> Vec<(String, N
 }
 
 /// The lines of a log, oldest first, each with its line number (from 1) and its second column
-/// (the node of a project's log, the project of the shared one).
+/// (the node of a project's log, the project of the shared one). A [`RETIRED`] line keeps its
+/// number but is no note.
 fn parse_log(path: &Path) -> Vec<(usize, String, Note)> {
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
     text.lines()
@@ -422,7 +423,7 @@ pub fn acceptance_print(acceptance: Option<&str>) -> String {
 #[must_use]
 pub fn names_a_command(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    text.contains('`') || ["cargo ", "check", ".toml", " = ", " --"].iter().any(|word| lower.contains(word))
+    text.contains('`') || ["cargo ", "check", ".toml", " = ", " --", "[worker]", "[role]", "[plan]"].iter().any(|word| lower.contains(word))
 }
 
 /// Whether a note written at `when` is past [`RIDES_FOR`] at `now`.
@@ -465,8 +466,12 @@ pub fn numbered(root: &Path, limit: usize) -> Vec<(usize, Note)> {
     lines
 }
 
-/// Drops line `n` of the project's log by hand, and its copy in the shared store when it was a
-/// machine note; the line's text, its tag back on.
+/// The first column of a line retired by hand: the line stays in its log, so a `[machine]`
+/// lesson is not lost, but no longer parses as a note and so rides into no run.
+pub const RETIRED: &str = "retired";
+
+/// Retires line `n` of the project's log by hand, and its copy in the shared store when it was
+/// a machine note; the line's text, its tag back on.
 ///
 /// # Errors
 /// When the log has no such line or cannot be written.
@@ -483,20 +488,25 @@ pub fn retire_with(root: &Path, shared: &Path, n: usize) -> anyhow::Result<Strin
     let Some((_, _, note)) = parse_log(&path).into_iter().find(|(line, _, _)| *line == n) else {
         anyhow::bail!("{RETRO_FILE} has no note on line {n}");
     };
-    drop_lines(&path, |index, _| index + 1 == n)?;
+    mark_lines(&path, |index, _| index + 1 == n)?;
     if note.machine {
         let copy = format!("{}\t{}\t{}\t{}", note.when, project_name(root), kind_of(&note), note.text);
-        if let Err(e) = drop_lines(shared, |_, line| line == copy) {
+        if let Err(e) = mark_lines(shared, |_, line| line == copy) {
             tracing::warn!("the shared copy of the note was not retired: {e:#}");
         }
     }
     Ok(tagged(&note))
 }
 
-/// Rewrites `path` without the lines `gone` picks, by their index from 0 and their text.
-fn drop_lines(path: &Path, gone: impl Fn(usize, &str) -> bool) -> anyhow::Result<()> {
+/// Rewrites `path` with the lines `gone` picks, by their index from 0 and their text, marked
+/// [`RETIRED`].
+fn mark_lines(path: &Path, gone: impl Fn(usize, &str) -> bool) -> anyhow::Result<()> {
     let Ok(text) = std::fs::read_to_string(path) else { return Ok(()) };
-    let kept: String = text.lines().enumerate().filter(|(index, line)| !gone(*index, line)).map(|(_, line)| format!("{line}\n")).collect();
+    let kept: String = text
+        .lines()
+        .enumerate()
+        .map(|(index, line)| if gone(index, line) { format!("{RETIRED}\t{line}\n") } else { format!("{line}\n") })
+        .collect();
     std::fs::write(path, kept)?;
     Ok(())
 }
