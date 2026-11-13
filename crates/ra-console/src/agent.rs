@@ -3236,6 +3236,8 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
         store.set_state_by(id, TaskState::Accepted, Source::Run).await?;
     }
     lines.extend(clean_after(&root, id, has_branch).await);
+    // one more landed card toward the next look-back pass
+    crate::lookback::count_landing(&root);
     let line = format!("landed #{id} {} · {}", node.title, lines.join(" · "));
     crate::pair::event(&root, &line);
     Ok(lines)
@@ -3254,6 +3256,9 @@ pub(crate) fn accepted_by_review(root: &Path, id: i64) -> bool {
         .and_then(|last| last.verdict.as_deref())
         .is_some_and(|verdict| verdict.starts_with("accepted"))
 }
+
+/// The flight's id for a look-back pass: no card is numbered 0.
+const LOOKBACK_SEAT: i64 = 0;
 
 /// The runs in a row a parallel walk gives a card that each end sent back for revision before
 /// it parks the card until the next walk.
@@ -3680,6 +3685,12 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id);
                 flight.push((id, Box::pin(async move { investigate(store, id, &reader).await }.instrument(span)), Seat::Investigate));
             }
+        }
+        // every ten landed cards a look-back pass reads the look-backs and the gotchas and plans
+        // what they call for, beside the runs on a seat of its own (no card is numbered 0)
+        if stopped.is_none() && crate::lookback::due(&root) && !flight.iter().any(|(id, _, _)| *id == LOOKBACK_SEAT) {
+            let planner = worker.clone();
+            flight.push((LOOKBACK_SEAT, Box::pin(async move { crate::lookback::pass(store, &planner).await }), Seat::Investigate));
         }
         if flight.is_empty() {
             if starved && stopped.is_none() {

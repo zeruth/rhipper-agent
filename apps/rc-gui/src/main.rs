@@ -1617,6 +1617,8 @@ struct Workspace {
     /// priority order) and when it was read; read again once a second.
     allocation: (Option<String>, u32, Option<usize>),
     allocation_at: Option<Instant>,
+    /// The cards landed toward the next look-back pass, and whether one is running now.
+    lookback: (u32, bool),
     /// The cards that wait on the person, read with the allocation.
     waiting: Vec<ra_console::hub::Waiting>,
     /// The cards landed today and their cost, read with the allocation.
@@ -1837,6 +1839,7 @@ impl Workspace {
             job: None,
             allocation: (None, 1, None),
             allocation_at: None,
+            lookback: (0, false),
             waiting: Vec::new(),
             landed: (0, None),
             job_tx,
@@ -4251,6 +4254,7 @@ impl Workspace {
             );
             self.waiting = ra_console::hub::waiting(&self.root, &nodes);
             self.landed = ra_console::allocation::landed(&self.root);
+            self.lookback = (ra_console::lookback::landed_since(&self.root), ra_console::lookback::running(&self.root));
             self.allocation_at = Some(Instant::now());
         }
         let waiting = self.waiting.clone();
@@ -4337,6 +4341,17 @@ impl Workspace {
                     let landed_shown = format!("landed {}", ra_console::hub::landed_text(landed));
                     ui.label(RichText::new(landed_shown).small().color(theme::dim()))
                         .on_hover_text("the cards accepted today and their cost over every run, from the ledger");
+                    // the look-back pass: landed cards toward the next, lit while one runs
+                    let (since, reading) = self.lookback;
+                    let every = ra_console::lookback::EVERY;
+                    if reading {
+                        cards::badge(ui, "look-back running", theme::warn_text())
+                    } else {
+                        cards::badge(ui, &format!("look-back {}/{every}", since.min(every)), if since >= every { theme::online() } else { theme::dim() })
+                    }
+                    .on_hover_text(format!(
+                        "every {every} landed cards the walk reads this project's look-backs and gotchas, plans the cards they call for, and archives the logs"
+                    ));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let button = egui::Button::new(RichText::new("open ›").color(theme::text()))

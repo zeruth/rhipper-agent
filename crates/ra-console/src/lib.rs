@@ -10,6 +10,7 @@ pub mod hub;
 pub mod install;
 pub mod instance;
 pub mod logs;
+pub mod lookback;
 pub mod mcp;
 pub mod pair;
 pub mod plan;
