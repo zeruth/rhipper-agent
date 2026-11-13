@@ -316,7 +316,7 @@ impl Worker {
         if !self.routed {
             return Ok(self.clone());
         }
-        let choice = crate::router::Router::load(root)?.choose(node, crate::router::IMPLEMENTER, &self.model);
+        let choice = crate::router::Router::load(root)?.choose(node, crate::router::IMPLEMENTER, &self.model, rejections(root, node.id));
         let mut worker = self.clone();
         worker.model = resolve(&choice.model);
         worker.effort = self.effort.or(choice.effort);
@@ -1193,7 +1193,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; review a task");
     let root = workspace_of(store);
     // the reviewer is a role of its own: the card's assignee is its implementer, not its judge
-    let model = match crate::router::Router::load(&root)?.pick(&node, crate::router::REVIEWER) {
+    let model = match crate::router::Router::load(&root)?.pick(&node, crate::router::REVIEWER, rejections(&root, id)) {
         Some((_, rule)) => resolve(&rule.model),
         None => worker.model.clone(),
     };
@@ -1458,7 +1458,7 @@ pub async fn plan(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Pla
         node.kind
     );
     let root = workspace_of(store);
-    let model = match crate::router::Router::load(&root)?.pick(&node, crate::router::PLANNER) {
+    let model = match crate::router::Router::load(&root)?.pick(&node, crate::router::PLANNER, rejections(&root, node.id)) {
         Some((_, rule)) => resolve(&rule.model),
         None => worker.model.clone(),
     };
@@ -2265,6 +2265,17 @@ fn rejected_by_review(root: &Path, id: i64) -> bool {
         .last()
         .and_then(|last| last.verdict.as_deref())
         .is_some_and(|verdict| verdict.starts_with("needs revision"))
+}
+
+/// The times the reviewer sent card `id` back, counted over its handoffs as
+/// [`rejected_by_review`] reads the last: what a route rule's `rejections` is held against.
+#[must_use]
+pub fn rejections(root: &Path, id: i64) -> usize {
+    ra_context::TaskContext::open(root, id)
+        .handoffs
+        .iter()
+        .filter(|handoff| handoff.verdict.as_deref().is_some_and(|verdict| verdict.starts_with("needs revision")))
+        .count()
 }
 
 /// The file a `stop` leaves for a walk, which reads it between runs.
@@ -3210,7 +3221,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             let (waiting, bare): (Vec<Node>, Vec<Node>) = bare.into_iter().partition(|n| investigating.contains(&n.id));
             let mut taken = std::collections::HashSet::new();
             for node in briefed.iter().chain(&bare).chain(&waiting) {
-                let kind = Pool::kind_of(&router.choose(node, crate::router::IMPLEMENTER, &worker.model).model);
+                let kind = Pool::kind_of(&router.choose(node, crate::router::IMPLEMENTER, &worker.model, rejections(&root, node.id)).model);
                 let held = flight.iter().filter(|(_, _, s)| *s == Seat::Build(kind)).count();
                 let Some(slot) = Pool::take(&root, kind, held, width, others, router.worker.borrow()) else {
                     starved = starved || held == 0;
@@ -4353,6 +4364,14 @@ fn bare_context(task: &ra_context::TaskContext, rerun: Option<&str>, project: &s
 pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
     let node = store.read(id).await?;
     anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; run a task");
+    let route = if worker.routed {
+        let root = workspace_of(store);
+        let router = crate::router::Router::load(&root)?;
+        let choice = router.choose(&node, crate::router::IMPLEMENTER, &worker.model, rejections(&root, id));
+        Some(format!("  route {} {}", resolve(&choice.model), router.reason(&node, &choice)))
+    } else {
+        None
+    };
     let worker = &worker.for_card(&workspace_of(store), &node)?;
     // a dry run calls no model, so it needs no key: without one (CI has none) the route alone
     // says whether the run is a harness, and the harness's command line is left out
@@ -4402,6 +4421,7 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             checks.describe()
         ),
     ];
+    lines.extend(route);
     // what the pre hook makes of a check when the worker runs it itself: the command as it
     // runs, with its tail, shown before a run does it
     if let Ok(catalogue) = Catalogue::load(&root.join(GOTCHAS_FILE)) {

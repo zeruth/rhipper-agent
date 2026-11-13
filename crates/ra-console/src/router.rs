@@ -1,6 +1,7 @@
 //! The router: the model of a card when neither the card nor the command names one. The rules
 //! are the `[[route]]` tables of `rhipper.toml` beside the roadmap, read in order; the first that
-//! fits the card's complexity, its kind and the role asked for names the model and, when it says
+//! fits the card's complexity, its kind, its files, its title, its rejections and the role asked
+//! for names the model and, when it says
 //! so, the effort. A card's own model wins over every rule; no file, or no rule that fits, is the
 //! default model.
 
@@ -51,11 +52,29 @@ impl fmt::Display for Span {
 }
 
 /// One `[[route]]` table: what it is for, and the model and effort it names. A field left out
-/// fits every card.
+/// fits every card; every field named must hold.
+///
+/// ```toml
+/// [[route]]
+/// complexity = [1, 2]
+/// files = ["apps/**", "!crates/**"]   # a card file under apps/, and none under crates/
+/// words = ["gotcha", "docs"]          # one of them in the title, lower-cased
+/// rejections = 1                      # once the reviewer sent the card back this often
+/// model = "claude-sonnet-5-5"
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Rule {
     pub complexity: Option<Span>,
     pub kind: Option<NodeKind>,
+    /// Globs on the card's `files:`: one of them matches a file of the card, and none of the
+    /// ones led by `!` does. `*` stays in a directory, `**` crosses them.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Words of which one is in the card's title, lower-cased.
+    #[serde(default)]
+    pub words: Vec<String>,
+    /// The times the reviewer sent the card back before the rule fits it.
+    pub rejections: Option<usize>,
     #[serde(default = "implementer")]
     pub role: String,
     pub model: String,
@@ -67,13 +86,87 @@ fn implementer() -> String {
 }
 
 impl Rule {
-    /// Whether the rule is for `node` run in `role`.
+    /// Whether the rule is for `node` run in `role`, sent back `rejections` times so far.
     #[must_use]
-    pub fn fits(&self, node: &Node, role: &str) -> bool {
+    pub fn fits(&self, node: &Node, role: &str, rejections: usize) -> bool {
         self.role.eq_ignore_ascii_case(role)
             && self.complexity.is_none_or(|span| span.holds(node.complexity))
             && self.kind.is_none_or(|kind| kind == node.kind)
+            && self.files_hold(node)
+            && (self.words.is_empty() || self.word_in(node).is_some())
+            && self.rejections.is_none_or(|least| rejections >= least)
     }
+
+    /// Whether the card's files are what `files` asks for.
+    fn files_hold(&self, node: &Node) -> bool {
+        let (excluded, wanted): (Vec<&str>, Vec<&str>) = self.files.iter().map(String::as_str).partition(|glob| glob.starts_with('!'));
+        let touches = |glob: &str| node.files.iter().any(|file| glob_matches(glob, file));
+        (wanted.is_empty() || self.file_glob(node).is_some()) && !excluded.iter().any(|glob| touches(&glob[1..]))
+    }
+
+    /// The first wanted glob a file of the card matches.
+    fn file_glob(&self, node: &Node) -> Option<&str> {
+        self.files
+            .iter()
+            .map(String::as_str)
+            .filter(|glob| !glob.starts_with('!'))
+            .find(|glob| node.files.iter().any(|file| glob_matches(glob, file)))
+    }
+
+    /// The first word of the rule in the card's title.
+    fn word_in(&self, node: &Node) -> Option<&str> {
+        let title = node.title.to_lowercase();
+        self.words.iter().map(String::as_str).find(|word| title.contains(&word.to_lowercase()))
+    }
+
+    /// The conditions of the rule that a card it fits met, the most telling first: `files
+    /// apps/rc-gui/**`, `words gotcha`, `rejections 1`, then the span and the kind; `every card`
+    /// for a rule that names none.
+    #[must_use]
+    pub fn matched(&self, node: &Node) -> String {
+        let mut terms = Vec::new();
+        if !self.files.is_empty() {
+            terms.push(format!("files {}", self.file_glob(node).map_or_else(|| self.files.join(", "), str::to_owned)));
+        }
+        if let Some(word) = self.word_in(node) {
+            terms.push(format!("words {word}"));
+        }
+        if let Some(least) = self.rejections {
+            terms.push(format!("rejections {least}"));
+        }
+        if let Some(span) = self.complexity {
+            terms.push(span.to_string());
+        }
+        if let Some(kind) = self.kind {
+            terms.push(kind.to_string());
+        }
+        if terms.is_empty() { "every card".to_owned() } else { terms.join(" · ") }
+    }
+}
+
+/// Whether `path` matches `glob`: `**` is any run of characters, `*` any run without a `/`, `?`
+/// one character; a backslash in either reads as `/`, and a trailing `/**` takes the directory.
+fn glob_matches(glob: &str, path: &str) -> bool {
+    fn walk(glob: &[u8], path: &[u8]) -> bool {
+        match glob {
+            [] => path.is_empty(),
+            // `**/` is no directory or any run of them
+            [b'*', b'*', b'/', rest @ ..] => {
+                walk(rest, path) || path.iter().enumerate().any(|(at, c)| *c == b'/' && walk(rest, &path[at + 1..]))
+            }
+            [b'*', b'*', rest @ ..] => (0..=path.len()).any(|at| walk(rest, &path[at..])),
+            [b'*', rest @ ..] => {
+                let end = path.iter().position(|c| *c == b'/').unwrap_or(path.len());
+                (0..=end).any(|at| walk(rest, &path[at..]))
+            }
+            [b'?', rest @ ..] => path.first().is_some_and(|c| *c != b'/') && walk(rest, &path[1..]),
+            [c, rest @ ..] => path.first() == Some(c) && walk(rest, &path[1..]),
+        }
+    }
+    let glob = glob.trim().replace('\\', "/");
+    let path = path.trim().replace('\\', "/");
+    let path = path.trim_start_matches("./");
+    walk(glob.trim_start_matches("./").as_bytes(), path.as_bytes()) || glob.strip_suffix("/**").is_some_and(|dir| dir == path)
 }
 
 impl fmt::Display for Rule {
@@ -84,6 +177,15 @@ impl fmt::Display for Rule {
         }
         if let Some(kind) = self.kind {
             terms.push(kind.to_string());
+        }
+        if !self.files.is_empty() {
+            terms.push(format!("files {}", self.files.join(", ")));
+        }
+        if !self.words.is_empty() {
+            terms.push(format!("words {}", self.words.join(", ")));
+        }
+        if let Some(least) = self.rejections {
+            terms.push(format!("rejections {least}"));
         }
         terms.push(self.role.clone());
         write!(f, "{} → {}", terms.join(" · "), self.model)?;
@@ -396,22 +498,40 @@ impl Router {
         Self::parse(&text).with_context(|| format!("in {}", path.display()))
     }
 
-    /// The first rule for `node` in `role`, with its place counted from one.
+    /// The first rule for `node` in `role`, sent back `rejections` times so far, with its place
+    /// counted from one.
     #[must_use]
-    pub fn pick(&self, node: &Node, role: &str) -> Option<(usize, &Rule)> {
-        self.rules.iter().enumerate().find(|(_, rule)| rule.fits(node, role)).map(|(index, rule)| (index + 1, rule))
+    pub fn pick(&self, node: &Node, role: &str, rejections: usize) -> Option<(usize, &Rule)> {
+        self.rules.iter().enumerate().find(|(_, rule)| rule.fits(node, role, rejections)).map(|(index, rule)| (index + 1, rule))
     }
 
     /// The model of `node` run in `role`: the card's own first, else the first rule that fits,
     /// else `default`.
     #[must_use]
-    pub fn choose(&self, node: &Node, role: &str, default: &str) -> Choice {
+    pub fn choose(&self, node: &Node, role: &str, default: &str, rejections: usize) -> Choice {
         if let Some(own) = &node.assignee {
             return Choice { model: own.model.clone(), effort: None, why: Why::Card };
         }
-        match self.pick(node, role) {
+        match self.pick(node, role, rejections) {
             Some((position, hit)) => Choice { model: hit.model.clone(), effort: hit.effort, why: Why::Rule(position) },
             None => Choice { model: default.to_owned(), effort: None, why: Why::Default },
+        }
+    }
+
+    /// Why `choice` fell where it did for `node`, as the route line says it: `by rule 2: files
+    /// apps/rc-gui/**`, `by the card's own model`, or the default with the reason no rule named one.
+    #[must_use]
+    pub fn reason(&self, node: &Node, choice: &Choice) -> String {
+        match choice.why {
+            Why::Card => "by the card's own model".to_owned(),
+            Why::Rule(place) => self
+                .rules
+                .get(place - 1)
+                .map_or_else(|| format!("by rule {place}"), |rule| format!("by rule {place}: {}", rule.matched(node))),
+            Why::Default if self.rules.is_empty() => format!("by default: no {ROUTES_FILE} beside the roadmap"),
+            Why::Default => {
+                format!("by default: none of the {} rules of {ROUTES_FILE} fits c{} {}", self.rules.len(), node.complexity, node.kind)
+            }
         }
     }
 }

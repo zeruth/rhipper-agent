@@ -70,13 +70,13 @@ fn the_check_is_the_suite_without_one_or_as_a_cargo_test_over_no_package() {
 fn two_rules_pick_a_local_model_for_c1_and_the_default_for_c3() {
     let router = Router::parse(RULES).unwrap();
     assert_eq!(router.rules.len(), 2);
-    let low = router.choose(&card(1), IMPLEMENTER, "claude-fable-5-1");
+    let low = router.choose(&card(1), IMPLEMENTER, "claude-fable-5-1", 0);
     assert_eq!(low, Choice { model: "local/qwen3".into(), effort: Some(Effort::Low), why: Why::Rule(1) });
-    let mid = router.choose(&card(3), IMPLEMENTER, "claude-fable-5-1");
+    let mid = router.choose(&card(3), IMPLEMENTER, "claude-fable-5-1", 0);
     assert_eq!(mid, Choice { model: "claude-fable-5-1".into(), effort: None, why: Why::Default });
     // the second rule is for tasks of c5 only; a reviewer gets no rule at all
-    assert_eq!(router.pick(&card(5), IMPLEMENTER).map(|(place, _)| place), Some(2));
-    assert_eq!(router.pick(&card(1), "reviewer"), None);
+    assert_eq!(router.pick(&card(5), IMPLEMENTER, 0).map(|(place, _)| place), Some(2));
+    assert_eq!(router.pick(&card(1), "reviewer", 0), None);
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn a_cards_own_model_wins_over_the_rules() {
     let router = Router::parse(RULES).unwrap();
     let mut node = card(1);
     node.assignee = Some(ra_roadmap::model::Assignment { model: "z-ai/glm-5.3-flash".into(), role: IMPLEMENTER.into() });
-    let choice = router.choose(&node, IMPLEMENTER, "claude-fable-5-1");
+    let choice = router.choose(&node, IMPLEMENTER, "claude-fable-5-1", 0);
     assert_eq!(choice, Choice { model: "z-ai/glm-5.3-flash".into(), effort: None, why: Why::Card });
 }
 
@@ -95,6 +95,77 @@ fn no_file_means_no_rules_and_a_bad_file_is_named() {
     std::fs::write(dir.path().join(ROUTES_FILE), "[[route]]\ncomplexity = 1\n").unwrap();
     let error = format!("{:#}", Router::load(dir.path()).unwrap_err());
     assert!(error.contains(ROUTES_FILE) && error.contains("model"), "{error}");
+}
+
+/// A c1 task titled `title` with `files`.
+fn card_of(title: &str, files: &[&str]) -> Node {
+    let mut node = card(1);
+    title.clone_into(&mut node.title);
+    node.files = files.iter().map(|f| (*f).to_owned()).collect();
+    node
+}
+
+#[test]
+fn a_rule_with_files_fits_only_a_card_touching_them() {
+    let router = Router::parse(
+        "[[route]]\nfiles = [\"apps/rc-gui/**\", \"crates/ra-roadmap/**\"]\nmodel = \"claude-sonnet-5-5\"\n\n\
+         [[route]]\ncomplexity = [1, 2]\nfiles = [\"!crates/**\"]\nmodel = \"claude-haiku-4-5\"\n",
+    )
+    .unwrap();
+    let gui = card_of("T", &["apps/rc-gui/src/main.rs", "crates/ra-console/src/ui.rs"]);
+    assert_eq!(router.pick(&gui, IMPLEMENTER, 0).map(|(place, _)| place), Some(1));
+    assert_eq!(router.rules[0].matched(&gui), "files apps/rc-gui/**");
+    assert!(router.rules[0].fits(&card_of("T", &["crates\\ra-roadmap\\src\\store.rs"]), IMPLEMENTER, 0), "a backslash reads as /");
+    assert!(!router.rules[0].fits(&card_of("T", &["apps/rc/src/main.rs"]), IMPLEMENTER, 0));
+    assert!(!router.rules[0].fits(&card_of("T", &[]), IMPLEMENTER, 0), "a card with no files touches none");
+    // a `!` glob fits a card with no file under it, and none with one
+    assert!(router.rules[1].fits(&card_of("T", &["rhipper.toml", "tools/x.py"]), IMPLEMENTER, 0));
+    assert!(!router.rules[1].fits(&card_of("T", &["rhipper.toml", "crates/ra-usage/src/lib.rs"]), IMPLEMENTER, 0));
+    assert!(glob_matches("crates/*/src/**/*.rs", "crates/ra-tools/src/lib.rs"));
+    assert!(!glob_matches("crates/*.rs", "crates/ra-tools/lib.rs"), "`*` stays in its directory");
+}
+
+#[test]
+fn a_rule_with_words_fits_on_the_title() {
+    let router = Router::parse("[[route]]\nwords = [\"gotcha\", \"Docs\"]\nmodel = \"claude-sonnet-5-5\"\n").unwrap();
+    let rule = &router.rules[0];
+    let gotcha = card_of("A Gotcha for the refused sed", &[]);
+    assert!(rule.fits(&gotcha, IMPLEMENTER, 0));
+    assert_eq!(rule.matched(&gotcha), "words gotcha");
+    assert!(rule.fits(&card_of("The docs of the router", &[]), IMPLEMENTER, 0), "the words are lower-cased too");
+    assert!(!rule.fits(&card_of("The router reads the files", &[]), IMPLEMENTER, 0));
+    assert_eq!(rule.to_string(), "words gotcha, Docs · implementer → claude-sonnet-5-5");
+}
+
+#[test]
+fn a_rule_with_rejections_fits_after_the_first_rejection() {
+    let router = Router::parse("[[route]]\nrejections = 1\nmodel = \"claude-opus-5-5\"\n").unwrap();
+    let node = card(3);
+    assert_eq!(router.choose(&node, IMPLEMENTER, "claude-fable-5-1", 0).why, Why::Default);
+    let stepped = router.choose(&node, IMPLEMENTER, "claude-fable-5-1", 1);
+    assert_eq!((stepped.model.as_str(), &stepped.why), ("claude-opus-5-5", &Why::Rule(1)));
+    assert_eq!(router.reason(&node, &stepped), "by rule 1: rejections 1");
+    // the count is the reviewer's verdicts that sent the card back, not the failed checks
+    let dir = tempfile::tempdir().unwrap();
+    let handoff = |verdict: Option<&str>| ra_context::Handoff {
+        when: 1,
+        model: "claude-fable-5-1".into(),
+        outcome: "implemented".into(),
+        check: "`cargo test` passed".into(),
+        verdict: verdict.map(str::to_owned),
+        changed: Vec::new(),
+        report: String::new(),
+        warnings: Vec::new(),
+        read: Vec::new(),
+    };
+    let mut context = ra_context::TaskContext::open(dir.path(), node.id);
+    context.record(handoff(None));
+    context.save(dir.path()).unwrap();
+    assert_eq!(crate::agent::rejections(dir.path(), node.id), 0);
+    context.record(handoff(Some("needs revision (substantive) · 2 point(s) by claude-opus-5-5")));
+    context.record(handoff(Some("accepted by claude-opus-5-5")));
+    context.save(dir.path()).unwrap();
+    assert_eq!(crate::agent::rejections(dir.path(), node.id), 1);
 }
 
 #[test]
