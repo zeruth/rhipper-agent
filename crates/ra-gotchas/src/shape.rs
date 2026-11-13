@@ -163,7 +163,7 @@ const GIT_FORM: &str = "the git state is the person's: only the read-only git co
 const GIT_C_FORM: &str = "git runs in the workspace already: drop the `-C <dir>`";
 const REDIRECT_FORM: &str =
     "write a file with Write and change one with Edit, not a `>` redirect (`> /dev/null`, `2>$null` and `2>&1` pass)";
-const STDIN_FORM: &str = "write the script to a file with Write and run `python file.py`, or a one-line `python -c`";
+const STDIN_FORM: &str = "write the script to a file with Write and name it in the report: the hook refuses a runtime";
 
 /// The permission rules of the table, Bash's first, as the harness's `--allowedTools` takes them.
 #[must_use]
