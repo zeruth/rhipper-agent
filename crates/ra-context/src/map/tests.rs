@@ -133,6 +133,57 @@ fn render_quotes_what_fits_the_room_highest_score_first() {
     assert!(rendered.contains("src/c.rs 15-24  fn low()"), "{rendered}");
 }
 
+const RECIPE_TESTS: &str = "use super::*;\n\n#[test]\nfn a_parse_reads_lines() {\n    assert!(true);\n}\n\n#[test]\nfn the_ledger_totals_its_calls() {\n    let total = 3;\n    assert_eq!(total, 3);\n}\n\nfn helper_of_the_ledger() {}\n";
+
+fn recipe_of(card: &str, tests: &str) -> String {
+    let (read, _) = files_of(&[("crates/x/src/map.rs", "pub fn map() {}\n"), ("crates/x/src/map/tests.rs", tests)]);
+    let sources = ["crates/x/src/map.rs".to_owned(), "crates/x/src/map/tests.rs".to_owned(), "crates/y/src/tests.rs".to_owned()];
+    test_recipe(read, &["+crates/x/src/map.rs".to_owned()], &Ask { card, sources: &sources, ..Ask::default() })
+}
+
+#[test]
+fn test_recipe_names_the_tests_file_and_its_last_test_when_no_test_matches() {
+    let recipe = recipe_of("check with `cargo test -p x -q test_recipe`", RECIPE_TESTS);
+    assert!(
+        recipe.contains(
+            "test: `test_recipe`: no test matches yet; add it to crates/x/src/map/tests.rs, where its last test `the_ledger_totals_its_calls` ends at line 12\n"
+        ),
+        "{recipe}"
+    );
+    assert!(recipe.contains("test: the tests beside crates/x/src/map.rs are crates/x/src/map/tests.rs;"), "{recipe}");
+
+    let (read, _) = files_of(&[("crates/x/src/map.rs", "pub fn map() {}\n")]);
+    let fresh = test_recipe(read, &["crates/x/src/map.rs".to_owned()], &Ask { card: "`cargo test -p x test_recipe`", ..Ask::default() });
+    assert!(fresh.contains("where it has no test yet"), "{fresh}");
+    assert!(fresh.contains("test: crates/x/src/map/tests.rs is not there yet;"), "{fresh}");
+}
+
+#[test]
+fn test_recipe_gives_the_range_of_the_test_the_filter_matches() {
+    let tests = format!("{RECIPE_TESTS}\n#[tokio::test]\nasync fn test_recipe_finds_it() {{\n    assert!(true);\n}}\n");
+    let recipe = recipe_of("`cargo test -p x -q test_recipe`", &tests);
+    assert!(recipe.contains("test: `test_recipe` matches `test_recipe_finds_it` at crates/x/src/map/tests.rs 16-19\n"), "{recipe}");
+    assert!(!recipe.contains("no test matches"), "{recipe}");
+}
+
+#[test]
+fn test_recipe_quotes_the_test_sharing_the_card_words() {
+    let recipe = recipe_of("The ledger totals what a run costs", RECIPE_TESTS);
+    assert!(
+        recipe.contains("test: nearest the card's words, `the_ledger_totals_its_calls` at crates/x/src/map/tests.rs 8-12\n"),
+        "{recipe}"
+    );
+    assert!(recipe.contains("   9  fn the_ledger_totals_its_calls() {\n  10      let total = 3;\n"), "{recipe}");
+    assert!(recipe.ends_with("  12  }\n"), "{recipe}");
+    assert!(!recipe.contains("a_parse_reads_lines"), "{recipe}");
+
+    let body: String = (0..45).map(|i| format!("    let line_{i} = {i};\n")).collect();
+    let long = format!("#[test]\nfn the_ledger_totals_its_calls() {{\n{body}}}\n");
+    let recipe = recipe_of("The ledger totals what a run costs", &long);
+    assert!(recipe.contains("`the_ledger_totals_its_calls` at crates/x/src/map/tests.rs 1-48\n"), "{recipe}");
+    assert!(!recipe.contains("let line_0"), "{recipe}");
+}
+
 #[test]
 fn map_ranks_nothing_in_a_file_and_prints_its_one_line() {
     let (read, files) =

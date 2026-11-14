@@ -6769,7 +6769,8 @@ pub async fn context_preview(store: &Store, id: i64) -> anyhow::Result<String> {
 
 /// The map of the card's files and of those its last session `read` as the prompt carries it:
 /// the items its title, objective, acceptance and `points` point at, read from the tree the
-/// worker acts in, and where in its tracked sources a name the card's files do not define is.
+/// worker acts in, where in its tracked sources a name the card's files do not define is, and
+/// where the card's test goes.
 fn map_of_card(
     root: &Path,
     node: &Node,
@@ -6790,7 +6791,9 @@ fn map_of_card(
         }
     }
     let text = |file: &str| std::fs::read_to_string(root.join(file)).ok();
-    ra_context::map::map_of(text, &files, &ask, changed, ra_context::MAP_ROOM).render(text, ra_context::QUOTE_ROOM)
+    let mut map = ra_context::map::map_of(text, &files, &ask, changed, ra_context::MAP_ROOM).render(text, ra_context::QUOTE_ROOM);
+    map.push_str(&ra_context::map::test_recipe(text, &files, &ask));
+    map
 }
 
 /// The lines the last run of a card in revision changed, from `git diff -U0` over the files

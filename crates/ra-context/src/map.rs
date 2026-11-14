@@ -442,5 +442,127 @@ fn name_parts(name: &str) -> Vec<String> {
     parts.into_iter().filter(|p| p.len() > 2).map(|p| stem(&p)).collect()
 }
 
+/// The longest test the recipe quotes whole, in lines; a longer one keeps its range alone.
+const RECIPE_QUOTE: usize = 40;
+
+/// A test of a tests file: its file, its inclusive range without the blank lines after it, and
+/// the name of its function.
+struct Test {
+    file: String,
+    start: usize,
+    end: usize,
+    name: String,
+}
+
+/// Where the card's test goes, so a worker need not page a long tests file for its fixtures:
+/// for each filter of the card's `cargo test`, the test that holds it or that none does yet;
+/// the tests file beside the card's first file and its last test; and the test whose name
+/// shares the card's rarest words, quoted when it is under [`RECIPE_QUOTE`] lines. Its lines
+/// open on `test: `; empty for a card with no files.
+#[must_use]
+pub fn test_recipe(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask) -> String {
+    let Some(beside) = files.first().and_then(|f| tests_beside(f)) else { return String::new() };
+    let crates: Vec<&str> = files.iter().filter_map(|f| crate_of(f)).collect();
+    let mut test_files = vec![beside.clone()];
+    for file in files.iter().chain(ask.sources).map(|f| f.trim_start_matches('+').replace('\\', "/")) {
+        let ours = crate_of(&file).is_some_and(|c| crates.contains(&c));
+        if ours && is_tests(&file) && !test_files.contains(&file) {
+            test_files.push(file);
+        }
+    }
+    let mut texts: HashMap<String, String> = HashMap::new();
+    let mut found: Vec<Test> = Vec::new();
+    for file in &test_files {
+        let Some(text) = read(file) else { continue };
+        found.extend(tests_of(file, &text));
+        texts.insert(file.clone(), text);
+    }
+
+    let mut out = String::new();
+    let last = found.iter().rfind(|t| t.file == beside);
+    let after = last.map_or_else(|| "it has no test yet".to_owned(), |t| format!("its last test `{}` ends at line {}", t.name, t.end));
+    for filter in filters_of(ask.card) {
+        let _ = match found.iter().find(|t| t.name.contains(filter.as_str())) {
+            Some(t) => writeln!(out, "test: `{filter}` matches `{}` at {} {}-{}", t.name, t.file, t.start, t.end),
+            None => writeln!(out, "test: `{filter}`: no test matches yet; add it to {beside}, where {after}"),
+        };
+    }
+    if texts.contains_key(&beside) {
+        let _ = writeln!(out, "test: the tests beside {} are {beside}; {after}", files[0].trim_start_matches('+'));
+    } else {
+        let _ = writeln!(out, "test: {beside} is not there yet; create it and declare `mod tests;` at the end of its parent");
+    }
+
+    // how many tests' names hold each word, so a word every test holds weighs little
+    let words = words_of(ask.card);
+    let mut spread: HashMap<String, usize> = HashMap::new();
+    for t in &found {
+        for part in name_parts(&t.name).into_iter().collect::<HashSet<_>>() {
+            *spread.entry(part).or_default() += 1;
+        }
+    }
+    let nearest = found
+        .iter()
+        .map(|t| {
+            let shared: HashSet<String> = name_parts(&t.name).into_iter().filter(|p| words.contains(p)).collect();
+            (shared.iter().map(|p| RARE / spread.get(p).copied().unwrap_or(1).max(1)).sum::<usize>(), t)
+        })
+        .filter(|(score, _)| *score > 0)
+        .reduce(|best, next| if next.0 > best.0 { next } else { best });
+    if let Some((_, t)) = nearest {
+        let _ = writeln!(out, "test: nearest the card's words, `{}` at {} {}-{}", t.name, t.file, t.start, t.end);
+        if t.end + 1 - t.start < RECIPE_QUOTE
+            && let Some(text) = texts.get(&t.file)
+        {
+            for (i, line) in text.lines().enumerate().take(t.end).skip(t.start - 1) {
+                let _ = writeln!(out, "{:>4}  {line}", i + 1);
+            }
+        }
+    }
+    out
+}
+
+/// The tests file beside `file` as the project lays them out: `src/tests.rs` beside a `lib.rs`,
+/// `main.rs` or `mod.rs`, `src/map/tests.rs` beside `src/map.rs`, and a tests file itself.
+fn tests_beside(file: &str) -> Option<String> {
+    let file = file.trim_start_matches('+').replace('\\', "/");
+    if is_tests(&file) {
+        return Some(file);
+    }
+    let path = file.strip_suffix(".rs")?;
+    let (dir, stem) = path.rsplit_once('/').unwrap_or(("", path));
+    let parent = if ["lib", "main", "mod"].contains(&stem) { dir } else { path };
+    Some(if parent.is_empty() { "tests.rs".to_owned() } else { format!("{parent}/tests.rs") })
+}
+
+/// Whether a file holds tests: a `tests.rs` or a file under a `tests` directory.
+fn is_tests(file: &str) -> bool {
+    Path::new(file).extension().is_some_and(|e| e == "rs")
+        && (file == "tests.rs" || file.ends_with("/tests.rs") || file.starts_with("tests/") || file.contains("/tests/"))
+}
+
+/// The directory of the crate a file belongs to, the part before its `src/` or `tests/`.
+fn crate_of(file: &str) -> Option<&str> {
+    let file = file.trim_start_matches('+');
+    ["/src/", "/tests/"].iter().filter_map(|dir| file.find(dir)).min().map(|at| &file[..at])
+}
+
+/// The tests of a file: its functions whose attributes hold a `test`, `#[test]` or
+/// `#[tokio::test]`, each without the blank lines after it.
+fn tests_of(file: &str, text: &str) -> Vec<Test> {
+    let lines: Vec<&str> = text.lines().collect();
+    items(Path::new(file), text)
+        .into_iter()
+        .filter_map(|(start, end, item)| {
+            let name = item_name(&item).filter(|_| item.contains("fn "))?;
+            let head = lines.get(start - 1..end.min(lines.len()))?;
+            let attributes = head.iter().map(|l| l.trim_start()).take_while(|l| l.starts_with("#[") || l.starts_with("///"));
+            attributes.filter(|l| l.starts_with("#[")).find(|l| l.contains("test"))?;
+            let end = (start..=end.min(lines.len())).rev().find(|&n| !lines[n - 1].trim().is_empty()).unwrap_or(start);
+            Some(Test { file: file.to_owned(), start, end, name: name.to_owned() })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;
