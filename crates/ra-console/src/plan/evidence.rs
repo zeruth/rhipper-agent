@@ -119,11 +119,28 @@ pub fn reruns_from(nodes: &[Node], runs_of: impl Fn(i64) -> Vec<Handoff>) -> Vec
 #[must_use]
 pub fn rerun_line(node: &Node, runs: &[Handoff]) -> Line {
     let outcomes: Vec<&str> = runs.iter().map(|run| run.outcome.as_str()).collect();
-    let verdict = runs.last().and_then(|run| run.verdict.as_deref()).unwrap_or("no verdict yet");
+    let last = runs.last();
+    let verdict = match last.and_then(|run| run.verdict.as_deref()) {
+        Some(verdict) => verdict.to_owned(),
+        None => match last.and_then(|run| last_reason(&run.report)) {
+            Some(reason) => format!("no verdict yet, last reason: {reason}"),
+            None => "no verdict yet".to_owned(),
+        },
+    };
     Line {
         source: format!("context #{}", node.id),
         text: format!("card #{} {} ran {} times ({}), last verdict: {verdict}", node.id, node.title, runs.len(), outcomes.join(", ")),
     }
+}
+
+/// The first 120 characters of the reason a report gives under its `## Blocked` heading: the
+/// rest of the heading's line, else the first line under it.
+fn last_reason(report: &str) -> Option<String> {
+    let mut lines = report.lines().map(str::trim);
+    let heading = lines.find(|line| line.strip_prefix("## Blocked").is_some_and(|rest| !rest.starts_with(char::is_alphanumeric)))?;
+    let own = heading.trim_start_matches("## Blocked").trim_start_matches([':', ' ', '-', '—', '·']).trim();
+    let reason = if own.is_empty() { lines.find(|line| !line.is_empty())? } else { own };
+    Some(reason.chars().take(120).collect())
 }
 
 /// The hub's lines: the digest of every other project, its headline as one line, by name.
