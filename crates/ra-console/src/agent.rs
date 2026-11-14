@@ -2794,6 +2794,7 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         // sent back as ready, and without this the one-at-a-time walk took the same card again;
         // a card whose prerequisites are missing waits too, named
         let mut picked = None;
+        lines.extend(say_review_waits(&root, &roadmap.nodes, &std::collections::HashSet::new(), &mut held));
         if retried.is_none() {
             for node in ready_cards(&roadmap.nodes, &roadmap.gambits, tight).into_iter().filter(|n| !parked.contains(&n.id)) {
                 match prerequisites_missing(&root, node).await {
@@ -3310,14 +3311,18 @@ fn batch_ready<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Opt
 }
 
 /// Every card a batch may run, in the order [`batch_ready`] would pick them: by score, or by
-/// complexity with `tight`, the smallest first.
-fn ready_cards<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Vec<&'a Node> {
+/// complexity with `tight`, the smallest first. A card whose run ended `implemented` is never
+/// among them: it waits on its review ([`say_review_waits`]), and only a `needs revision`
+/// verdict or a `failed` outcome puts it back.
+#[must_use]
+pub fn ready_cards<'a>(nodes: &'a [Node], gambits: &'a [Gambit], tight: bool) -> Vec<&'a Node> {
     let met = |dep: &i64| nodes.iter().any(|d| d.id == *dep && d.state == TaskState::Accepted);
     // a card sent back for revision is ready again at once: its verdict is in its notes and the
     // rerun resumes its session; only what it waits on holds it (the person, 2026-11-12: "all
-    // needs revision cards should go right back into queue unless depends on changes")
+    // needs revision cards should go right back into queue unless depends on changes"); a
+    // failed run is parked for the rest of its walk and tried again by the next
     let candidates = nodes.iter().filter(|n| {
-        matches!(n.state, TaskState::Defined | TaskState::InProgress | TaskState::NeedsRevision)
+        matches!(n.state, TaskState::Defined | TaskState::InProgress | TaskState::NeedsRevision | TaskState::Failed)
             && matches!(n.kind, NodeKind::Task | NodeKind::Subtask)
             && n.depends_on.iter().all(met)
     });
@@ -3405,7 +3410,12 @@ async fn tool_runs(dir: &Path, tool: &str) -> bool {
 
 /// Tells once a walk, and again when the reason changes, that card `node` waits on `why`: a
 /// progress line the window shows and an event on the feed. The line, when it is news.
-fn say_held(root: &Path, node: &Node, why: &str, said: &mut std::collections::HashMap<i64, String>) -> Option<String> {
+fn say_held<S: std::hash::BuildHasher>(
+    root: &Path,
+    node: &Node,
+    why: &str,
+    said: &mut std::collections::HashMap<i64, String, S>,
+) -> Option<String> {
     if said.get(&node.id).is_some_and(|w| w == why) {
         return None;
     }
@@ -3414,6 +3424,28 @@ fn say_held(root: &Path, node: &Node, why: &str, said: &mut std::collections::Ha
     tracing::info!(target: crate::trace::PROGRESS, "{text}");
     crate::pair::event(root, &text);
     Some(text)
+}
+
+/// The reason [`say_review_waits`] gives a card whose run ended `implemented`.
+pub const WAITS_ON_REVIEW: &str = "waits on review";
+
+/// Tells once a walk that each card whose run ended `implemented` and has no verdict yet waits
+/// on its review, the lines that were news. The queue never takes such a card
+/// ([`ready_cards`] and [`tree::next_ready`] pass it over); only its verdict, `needs revision`,
+/// or a `failed` outcome the person sets back to defined, puts it on the queue again. A card in
+/// `skip` is one whose review is in flight and is not told.
+pub fn say_review_waits<S: std::hash::BuildHasher, T: std::hash::BuildHasher>(
+    root: &Path,
+    nodes: &[Node],
+    skip: &std::collections::HashSet<i64, S>,
+    said: &mut std::collections::HashMap<i64, String, T>,
+) -> Vec<String> {
+    nodes
+        .iter()
+        .filter(|n| n.state == TaskState::Implemented && matches!(n.kind, NodeKind::Task | NodeKind::Subtask))
+        .filter(|n| !skip.contains(&n.id))
+        .filter_map(|n| say_held(root, n, WAITS_ON_REVIEW, said))
+        .collect()
 }
 
 /// Why the acceptance command `command` cannot run in the project at `root`, or `None` when it
@@ -5122,6 +5154,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             let in_flight: std::collections::HashSet<i64> = flight.iter().map(|(id, _, _)| *id).collect();
             let others = other_walks(&root);
             let mut ready: Vec<Node> = Vec::new();
+            lines.extend(say_review_waits(&root, &roadmap.nodes, &in_flight, &mut held));
             for node in ready_cards(&roadmap.nodes, &roadmap.gambits, plan_tight(&root))
                 .into_iter()
                 .filter(|n| !in_flight.contains(&n.id) && !parked.contains(&n.id))
