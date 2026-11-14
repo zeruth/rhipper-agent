@@ -643,6 +643,10 @@ impl Gauges {
 /// How many runs the token graphs span: the last 60 across the open projects.
 const RUNS_SHOWN: usize = 60;
 
+/// What a projected walk order was computed from: the roadmap's stamp, its size, the gambits'
+/// count and whether the plan was tight.
+type WalkKey = (Option<SystemTime>, usize, usize, bool);
+
 /// One token gauge as the row draws it: the badge's text and the graph's samples, 0 to 1,
 /// the oldest first.
 #[derive(Default, Debug, PartialEq)]
@@ -1645,6 +1649,11 @@ struct Workspace {
     /// The plan's windows as the harness last reported them, and when they were last read.
     limits: ra_providers::limits::Limits,
     limits_read: Instant,
+    /// The projected walk order and what it was computed from: the roadmap's stamp, its size,
+    /// the gambits' count and whether the plan was tight. The projection ranks the ready cards
+    /// once a pick, hundreds of times on a large roadmap; computed every frame for every
+    /// project it held the window's thread at a full core and the UI lagged.
+    walk_cache: Option<(WalkKey, Vec<i64>)>,
     /// The share of the week past which a claude-* run is steered, from the project's
     /// `rhipper.toml`; the week's pill shows it.
     threshold: f64,
@@ -1810,6 +1819,7 @@ impl Workspace {
             code: None,
             limits: ra_providers::limits::Limits::load(&root.join(ra_providers::claude_code::LIMITS_FILE)),
             limits_read: Instant::now(),
+            walk_cache: None,
             threshold: ra_console::agent::plan_threshold(&root),
             local: ra_providers::openrouter::LocalProbe::default(),
             local_probed: None,
@@ -2226,6 +2236,18 @@ impl Workspace {
                 self.select(toast.card);
             }
         }
+    }
+
+    /// The walk's projected order of the cards ([`ra_console::agent::walk_order`]), computed
+    /// again only when the roadmap, the gambits or the plan's tightness moved.
+    fn walk_order(&mut self) -> Vec<i64> {
+        let tight = ra_console::agent::limits_tight(&self.limits);
+        let key = (self.roadmap_seen, self.roadmap.len(), self.gambits.len(), tight);
+        if self.walk_cache.as_ref().is_none_or(|(at, _)| *at != key) {
+            let order = ra_console::agent::walk_order(&self.roadmap, &self.gambits, tight);
+            self.walk_cache = Some((key, order));
+        }
+        self.walk_cache.as_ref().map(|(_, order)| order.clone()).unwrap_or_default()
     }
 
     /// Picks a card; the model field of the card view and the ledger's calls follow. An unsaved
@@ -2852,6 +2874,7 @@ impl Workspace {
         }
         let mut out = Walked::default();
         let view = self.view;
+        let order = if view == RoadmapView::Walk { self.walk_order() } else { Vec::new() };
         let scroll = egui::ScrollArea::vertical().id_salt("roadmap").auto_shrink([false, false]).show(ui, |ui| {
             ui.set_width(ui.available_width());
             match view {
@@ -2863,7 +2886,6 @@ impl Workspace {
                 RoadmapView::Walk => {
                     // the projected order: the cards as a walk would take them, numbered,
                     // the filters and the search applying as in the tree
-                    let order = ra_console::agent::walk_order(&nodes, &self.gambits, ra_console::agent::limits_tight(&self.limits));
                     if order.is_empty() {
                         ui.label(RichText::new("no card is ready to walk").color(theme::dim()).italics());
                     }
@@ -4214,7 +4236,7 @@ impl Workspace {
 
     fn dashboard_card(&mut self, ui: &mut egui::Ui, lane: Color32, page: f32, budget: f32) -> bool {
         let nodes = self.roadmap.clone();
-        let order = ra_console::agent::walk_order(&nodes, &self.gambits, ra_console::agent::limits_tight(&self.limits));
+        let order = self.walk_order();
         let live = self.sink.live_run();
         // the card the live run is on: its id leads the run's title
         let running: Option<i64> = live.and_then(|id| {
