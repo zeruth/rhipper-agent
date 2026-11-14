@@ -15,7 +15,7 @@ use std::path::Path;
 use ra_context::{Handoff, TaskContext};
 use ra_gotchas::journal::{self, Summary};
 use ra_roadmap::model::Node;
-use ra_usage::{CardCost, LAST_DAY, UsageStore};
+use ra_usage::{Call, CardCost, LAST_DAY, UsageStore};
 
 use crate::hub::{self, Digest};
 
@@ -38,10 +38,47 @@ impl std::fmt::Display for Line {
 
 /// The ledger's lines: the costliest cards of the last day, the costliest first.
 ///
+/// Each line ends with the card's runs, as the ledger and the handoffs under `root` have them.
+///
 /// # Errors
 /// When the ledger cannot be read.
-pub async fn ledger(store: &UsageStore) -> anyhow::Result<Vec<Line>> {
-    Ok(store.costliest_cards(LAST_DAY, LEDGER_CARDS).await?.iter().map(ledger_line).collect())
+pub async fn ledger(store: &UsageStore, root: &Path) -> anyhow::Result<Vec<Line>> {
+    let mut lines = Vec::new();
+    for card in store.costliest_cards(LAST_DAY, LEDGER_CARDS).await? {
+        let calls = store.calls_of(Some(card.node)).await?;
+        let handoffs = TaskContext::open(root, card.node).handoffs;
+        lines.push(ledger_line_by_run(&card, &calls, &handoffs));
+    }
+    Ok(lines)
+}
+
+/// [`ledger_line`] with one entry per run after the totals: `r3 22t 51k needs-revision`, the
+/// run's turns, its tokens a turn and how it ended. It tells a card that is one long run from
+/// one that is many short reruns. `calls` are the card's ledger rows, the latest first; the
+/// runs are the worker's own calls, matched in order to `handoffs`.
+#[must_use]
+pub fn ledger_line_by_run(card: &CardCost, calls: &[Call], handoffs: &[Handoff]) -> Line {
+    let mut line = ledger_line(card);
+    let runs: Vec<String> = calls
+        .iter()
+        .rev()
+        .filter(|call| call.role.is_none())
+        .enumerate()
+        .map(|(i, call)| {
+            let tokens = (call.prompt_tokens + call.completion_tokens).checked_div(call.turns).unwrap_or(0);
+            let outcome = handoffs.get(i).map_or("unfinished", |h| h.outcome.split(" (").next().unwrap_or_default());
+            format!("r{} {}t {} {}", i + 1, call.turns, tokens_short(tokens), outcome.replace(' ', "-"))
+        })
+        .collect();
+    if !runs.is_empty() {
+        line.text = format!("{}; runs: {}", line.text, runs.join(", "));
+    }
+    line
+}
+
+/// A token count as the run entries show it: whole under a thousand, else in thousands.
+fn tokens_short(tokens: u64) -> String {
+    if tokens < 1000 { tokens.to_string() } else { format!("{}k", (tokens + 500) / 1000) }
 }
 
 /// The line of one card's cost: the card, what it cost, its turns and its average tokens a turn.

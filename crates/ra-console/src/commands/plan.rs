@@ -50,7 +50,7 @@ pub async fn gather(store: &Store, root: &Path, worker: &Worker) -> anyhow::Resu
     let nodes = store.all().await?;
     let mut lines = Vec::new();
     if let Some(ledger) = worker.ledger() {
-        lines.extend(evidence::ledger(ledger).await?);
+        lines.extend(evidence::ledger(ledger, root).await?);
     }
     lines.extend(evidence::reruns(root, &nodes));
     lines.extend(retro::evidence(root));

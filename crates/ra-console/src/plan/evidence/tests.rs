@@ -169,12 +169,13 @@ async fn the_ledger_lines_name_the_card_its_cost_and_its_average_a_turn() {
     store.record(&entry(12, 8, 4_000, Some(0.4))).await.unwrap();
     store.record(&entry(12, 2, 1_000, Some(0.1))).await.unwrap();
     store.record(&entry(13, 1, 300, None)).await.unwrap();
-    let lines = ledger(&store).await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let lines = ledger(&store, root.path()).await.unwrap();
     assert_eq!(
         lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
         [
-            "[usage.db #12] card #12 cost $0.50 in the last day over 2 runs and 10 turn(s), 500 tokens a turn on average",
-            "[usage.db #13] card #13 cost an unreported amount in the last day over 1 run and 1 turn(s), 300 tokens a turn on average",
+            "[usage.db #12] card #12 cost $0.50 in the last day over 2 runs and 10 turn(s), 500 tokens a turn on average; runs: r1 8t 500 unfinished, r2 2t 500 unfinished",
+            "[usage.db #13] card #13 cost an unreported amount in the last day over 1 run and 1 turn(s), 300 tokens a turn on average; runs: r1 1t 300 unfinished",
         ]
     );
 }
