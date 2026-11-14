@@ -22,6 +22,14 @@ fn request(workspace: Option<PathBuf>) -> CompletionRequest {
 }
 
 #[test]
+fn fable_context_cap_doubled() {
+    assert_eq!(context_cap("claude-fable-1", Some(160_000)), Some(320_000));
+    assert_eq!(context_cap("Fable", Some(100)), Some(200));
+    assert_eq!(context_cap("claude-sonnet-5-5", Some(160_000)), Some(160_000));
+    assert_eq!(context_cap("claude-fable-1", None), None);
+}
+
+#[test]
 fn shell_timeout_is_raised_to_ten_minutes_unless_the_project_sets_it() {
     let value =
         |env: &[(String, std::ffi::OsString)], key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.to_string_lossy().into_owned());

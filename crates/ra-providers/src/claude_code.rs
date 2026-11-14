@@ -463,10 +463,10 @@ impl ClaudeCode {
         // the tokens of each assistant turn, as the events show them
         let mut turns = TurnTally::default();
         // the project's context cap, and the size of the turn that crossed it once one did;
-        // a Fable run has none whatever the project sets: its window is the point of it
-        let fable = request.model.to_ascii_lowercase().contains("fable");
+        // a Fable run's is twice the project's: its window is the point of it, but not without end
+        let cap = context_cap(&request.model, request.max_context);
         let resumed = request.resume.as_deref().is_some_and(|s| !s.trim().is_empty());
-        let mut watch = ContextWatch::new(request.max_context.filter(|_| !fable)).resumed(resumed);
+        let mut watch = ContextWatch::new(cap).resumed(resumed);
         let mut crossed: Option<u64> = None;
         // which tool each call id belongs to, so only a shell's output is read for gotchas
         let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -575,7 +575,7 @@ impl ClaudeCode {
                 completion.turn_usage = turns.into_turns();
                 completion.reads = reads;
             })
-        } else if let Some((size, cap)) = crossed.zip(request.max_context) {
+        } else if let Some((size, cap)) = crossed.zip(cap) {
             let mut completion = turns.completion(&request.model);
             completion.gotchas = gotchas;
             completion.reads = reads;
@@ -801,6 +801,12 @@ impl TurnTally {
 /// run on what the next one would read again (runelite #15 at turn 7, rhipper-asm #134's
 /// resumed rerun at turn 1).
 pub const READING_IN_TURNS: usize = 12;
+
+/// The context cap a run ends at: the project's, doubled for a Fable run, none without one.
+fn context_cap(model: &str, max_context: Option<u64>) -> Option<u64> {
+    let fable = model.to_ascii_lowercase().contains("fable");
+    max_context.map(|cap| if fable { cap.saturating_mul(2) } else { cap })
+}
 
 /// The turns of a resumed run the cap leaves alone: enough to read its verdict and answer it,
 /// not the twelve of a fresh read-in. A resumed session already past the cap paid twelve turns
