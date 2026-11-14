@@ -2835,8 +2835,25 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         match run_picked(store, id, &runner, tight && retried.is_none()).await {
             Ok(run_lines) => lines.extend(run_lines),
             Err(error) => {
-                done(&mut lines, format!("ran {ran} card(s) · stopped: the run of #{id} failed: {error:#}")).await;
-                return Ok(lines);
+                // the plan's own limit is the one failure that ends the week's work: the walk
+                // waits out the reset and takes the card up again; any other failure (a steer, a
+                // route, a model error) is the card's, set aside while the walk goes on (both
+                // walks died on one card's steer, 2026-11-14)
+                if plan_spent(&root) {
+                    let line = format!("the run of #{id} failed on the plan's limit: {error:#}; the walk waits for the reset");
+                    // the tests never wait out a week
+                    if cfg!(test) {
+                        done(&mut lines, format!("ran {ran} card(s) · stopped: {line}")).await;
+                        return Ok(lines);
+                    }
+                    lines.push(line.clone());
+                    wait_for_week(&root, 1.0, &line).await;
+                    again = None;
+                    continue;
+                }
+                lines.push(set_aside(&root, id, &error));
+                parked.insert(id);
+                continue;
             }
         }
         ran += 1;
@@ -2910,6 +2927,21 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             }
         }
     }
+}
+
+/// Whether the plan's week, as the latest reading on the machine has it, is used up: the plan's
+/// own limit, the one that ends a walk's week rather than one card's run.
+fn plan_spent(root: &Path) -> bool {
+    plan_week(&plan_readings(root), 1.0, unix_now()).is_some()
+}
+
+/// Sets card `id` aside for this walk after its run failed with `error`: the reason on the
+/// progress channel and the paired feed, and the line for the walk's output.
+fn set_aside(root: &Path, id: i64, error: &anyhow::Error) -> String {
+    let text = format!("set aside #{id}: its run failed: {}; the walk goes on with the next ready card", first_line(&format!("{error:#}")));
+    tracing::warn!(target: crate::trace::PROGRESS, "{text}");
+    crate::pair::event(root, &text);
+    text
 }
 
 /// How many runs in a row a walk gives one card before it stops: a card the project's turn cap
@@ -5244,10 +5276,10 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // failure (the content filter on one card, runelite #56) is that card's: it waits
                 // for a person and the other runners go on (the walk stopped starting cards on
                 // it and runelite ran one card of four, 2026-11-12)
+                // a steer past a ladder mark names the week too, and is one card's (2026-11-14)
                 let text = format!("{error:#}");
-                let full_stop = ["unreachable", "limit", "week", "logged in", "authentication"]
-                    .iter()
-                    .any(|word| text.to_ascii_lowercase().contains(word));
+                let full_stop = plan_spent(&root)
+                    || ["unreachable", "logged in", "authentication"].iter().any(|word| text.to_ascii_lowercase().contains(word));
                 if full_stop {
                     stopped.get_or_insert(format!("stopped: the run of #{id} failed: {text}"));
                 } else {

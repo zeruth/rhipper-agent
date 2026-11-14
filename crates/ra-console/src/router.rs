@@ -460,11 +460,11 @@ impl RoleConfig {
 
 /// The `[plan]` table: how the week is spent by a run on a `claude-*` model, unless `--force`.
 /// The ladder's marks move the small cards off the Claude route first and hold the big ones
-/// last; without a ladder the default one stands, its last rung on `threshold`.
+/// last; without a ladder no mark stands and the week is spent to the plan's own limit.
 ///
 /// ```toml
 /// [plan]
-/// threshold = 0.95    # the share of the week of the default ladder's hold; 0.9 when left out
+/// threshold = 0.95    # the share of the week `plan_threshold` reports; 0.9 when left out
 /// ladder = [
 ///     { at = 0.5, span = "1-2", to = "local" },
 ///     { at = 0.75, span = "1-3", to = "claude-haiku-4-5" },
@@ -536,19 +536,11 @@ impl PlanConfig {
         self.threshold.filter(|t| (0.0..=1.0).contains(t)).unwrap_or(ra_providers::limits::DEFAULT_THRESHOLD)
     }
 
-    /// The ladder's marks: the table's, else c1–2 to the local server at half the week, c1–3 to
-    /// Haiku at three quarters and every card but a priority one held at the threshold.
+    /// The ladder's marks: the table's, else none, so the whole week is spent and the plan's own
+    /// rate limits are what end it.
     #[must_use]
     pub fn marks(&self) -> Vec<Mark> {
-        if let Some(ladder) = &self.ladder {
-            return ladder.clone();
-        }
-        let mark = |at: f64, span: Span, to: &str, except_priority: Option<u8>| Mark { at, span, to: to.to_owned(), except_priority };
-        vec![
-            mark(ra_providers::limits::LOCAL_MARK, Span::Between(1, 2), TO_LOCAL, None),
-            mark(ra_providers::limits::CHEAP_MARK, Span::Between(1, 3), "claude-haiku-4-5", None),
-            mark(self.threshold(), Span::Between(1, 5), TO_HOLD, Some(1)),
-        ]
+        self.ladder.clone().unwrap_or_default()
     }
 
     /// The rung `node` stands on with the week at `week`, 0 to 1, and its place counted from one:

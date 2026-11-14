@@ -2319,6 +2319,7 @@ async fn a_claude_run_past_the_weeks_threshold_is_refused_with_the_room_and_the_
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     week_at(dir.path(), 0.95);
+    std::fs::write(dir.path().join("rhipper.toml"), LADDER).unwrap();
     let script = Scripted::new(vec![says("did it", vec![])]);
     // a claude-* pick past 90%: held before any token goes, naming the room and the reset
     let runner = Worker::new("claude-sonnet-5-5").with_provider(script.clone());
@@ -2330,21 +2331,26 @@ async fn a_claude_run_past_the_weeks_threshold_is_refused_with_the_room_and_the_
     let node = store.read(2).await.unwrap();
     // another route is not the plan's
     assert!(Worker::new("z-ai/glm-5.3-flash").steered_by_plan(dir.path(), &node).await.is_ok());
-    // the project's own threshold stands above the week: the c3 stands on the Haiku rung
-    std::fs::write(dir.path().join("rhipper.toml"), "[plan]\nthreshold = 0.97\n").unwrap();
-    assert_eq!(crate::agent::plan_threshold(dir.path()), 0.97);
+    // the project's hold stands above the week: the c3 stands on the Haiku rung
+    std::fs::write(dir.path().join("rhipper.toml"), LADDER.replace("at = 0.9,", "at = 0.97,")).unwrap();
     assert_eq!(runner.steered_by_plan(dir.path(), &node).await.unwrap().model, "claude-haiku-4-5");
     // forced, the run goes ahead on the badge model
-    std::fs::remove_file(dir.path().join("rhipper.toml")).unwrap();
+    std::fs::write(dir.path().join("rhipper.toml"), LADDER).unwrap();
     assert!(runner.steered_by_plan(dir.path(), &node).await.is_err());
     assert_eq!(runner.clone().with_force(true).steered_by_plan(dir.path(), &node).await.unwrap().model, "claude-sonnet-5-5");
 }
 
-/// A card of `complexity` and `priority` in a fresh project whose week is at `week`.
+/// The ladder the steering tests write: c1–2 to the local server at half the week, c1–3 to Haiku
+/// at three quarters and every card but a priority one held at 90%.
+const LADDER: &str = "[plan]\nladder = [\n  { at = 0.5, span = \"1-2\", to = \"local\" },\n  { at = 0.75, span = \"1-3\", to = \"claude-haiku-4-5\" },\n  { at = 0.9, span = \"1-5\", to = \"hold\", except_priority = 1 },\n]\n";
+
+/// A card of `complexity` and `priority` in a fresh project whose week is at `week`, on
+/// [`LADDER`].
 async fn card_in_week(dir: &std::path::Path, week: f64, complexity: u8, priority: Option<u8>) -> ra_roadmap::model::Node {
     let store = Store::open(&dir.join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     week_at(dir, week);
+    std::fs::write(dir.join("rhipper.toml"), LADDER).unwrap();
     let mut node = store.read(2).await.unwrap();
     node.complexity = complexity;
     node.priority = priority;
@@ -2392,21 +2398,40 @@ async fn a_priority_one_card_runs_past_the_hold_mark() {
 }
 
 #[test]
-fn without_a_ladder_the_old_threshold_is_the_last_rung() {
+fn without_a_ladder_no_mark_stands_and_the_week_is_spent() {
     use crate::router::{Mark, Router, Span, TO_HOLD};
-    let written = Router::parse(
-        "[plan]\nladder = [\n  { at = 0.5, span = \"1-2\", to = \"local\" },\n  { at = 0.75, span = \"1-3\", to = \"claude-haiku-4-5\" },\n  { at = 0.9, span = \"1-5\", to = \"hold\", except_priority = 1 },\n]\n",
-    )
-    .unwrap();
-    let default = Router::default().plan.marks();
-    assert_eq!(default, written.plan.marks());
-    let last =
-        Mark { at: ra_providers::limits::DEFAULT_THRESHOLD, span: Span::Between(1, 5), to: TO_HOLD.to_owned(), except_priority: Some(1) };
-    assert_eq!(default.last(), Some(&last));
-    // the project's threshold moves the last rung, and only it
-    let moved = Router::parse("[plan]\nthreshold = 0.97\n").unwrap().plan.marks();
-    assert_eq!(moved.last().map(|mark| mark.at), Some(0.97));
-    assert_eq!(moved[..2], default[..2]);
+    assert!(Router::default().plan.marks().is_empty());
+    assert!(Router::parse("[plan]\nthreshold = 0.97\n").unwrap().plan.marks().is_empty());
+    let written = Router::parse(LADDER).unwrap().plan.marks();
+    let last = Mark { at: 0.9, span: Span::Between(1, 5), to: TO_HOLD.to_owned(), except_priority: Some(1) };
+    assert_eq!(written.len(), 3);
+    assert_eq!(written.last(), Some(&last));
+}
+
+#[tokio::test]
+async fn walk_goes_on_past_a_failed_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = three_cards(dir.path(), true).await;
+    // #2 A is a c2 the ladder sends to a local server no test has up; #3 B and #4 C are c4s
+    store.set_complexity(2, 2).await.unwrap();
+    store.set_complexity(3, 4).await.unwrap();
+    store.set_complexity(4, 4).await.unwrap();
+    week_at(dir.path(), 0.55);
+    std::fs::write(dir.path().join("rhipper.toml"), LADDER).unwrap();
+    let passing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let script = Scripted::new(accepted_runs(&["did B", "did C"]));
+    let runner = Worker::new("claude-sonnet-5-5").with_provider(script.clone()).with_script(passing);
+    let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
+    let aside = out.iter().find(|l| l.starts_with("set aside #2: its run failed: ")).unwrap_or_else(|| panic!("{out:?}"));
+    assert!(aside.contains("no local route is up"), "{aside}");
+    let ran = implemented(&out);
+    assert_eq!(ran.len(), 2, "{out:?}");
+    assert!(ran[0].starts_with("✓ #3 B implemented"), "{out:?}");
+    assert!(ran[1].starts_with("✓ #4 C implemented"), "{out:?}");
+    assert_eq!(out.last().unwrap(), "ran 2 card(s) · no card is ready");
+    // the reason is on the feed, and the card is still the person's to take up
+    assert!(crate::pair::recent(dir.path(), 50).iter().any(|l| l.starts_with("set aside #2")));
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Defined);
 }
 
 #[tokio::test]
