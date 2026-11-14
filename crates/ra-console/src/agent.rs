@@ -7681,8 +7681,71 @@ fn machine_notes(workspace: &Path, project: &str, card: (i64, Option<&str>)) -> 
     };
     // what the earlier runs said themselves, in debug mode, rides along
     let retro = crate::retro::machine_lines_for(workspace, Some(card));
+    let mut checks = check_commands(card.1);
+    if let Some(check) = crate::router::Router::load(workspace).ok().and_then(|router| router.worker.check().map(str::to_owned)) {
+        checks.push(check);
+    }
+    let retro = machine_notes_keep(&retro, workspace, &checks);
     let notes = [gotchas, retro].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     ra_context::dedupe_notes(&notes, project)
+}
+
+/// The heading of the block of what other projects learned, in [`crate::retro::machine_lines_for`].
+const ELSEWHERE: &str = "What runs in other projects";
+
+/// `notes` with the other projects' lines cut to those that name something this project has: a
+/// line naming a path or a command keeps when a path exists under `root` or the command's program
+/// is one of `checks`'; a line naming neither is a general lesson and keeps. A line whose words
+/// another kept line holds, bar one, is a repeat and goes. This project's own lines are left.
+fn machine_notes_keep(notes: &str, root: &Path, checks: &[String]) -> String {
+    let programs: Vec<&str> = checks.iter().filter_map(|check| check.split_whitespace().next()).collect();
+    let words = |line: &str| -> std::collections::BTreeSet<String> {
+        let text = line.split_once(") ").map_or(line, |(_, rest)| rest);
+        text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect()
+    };
+    let mut kept_words: Vec<std::collections::BTreeSet<String>> = Vec::new();
+    let mut blocks: Vec<String> = Vec::new();
+    for block in notes.split("\n\n") {
+        if !block.starts_with(ELSEWHERE) {
+            blocks.push(block.to_owned());
+            continue;
+        }
+        let mut lines: Vec<&str> = Vec::new();
+        for line in block.lines() {
+            let Some(text) = line.strip_prefix("- ") else {
+                lines.push(line);
+                continue;
+            };
+            let mut named = false;
+            let mut here = false;
+            for span in text.split('`').skip(1).step_by(2).map(str::trim) {
+                if is_command(span) {
+                    named = true;
+                    here |= span.split_whitespace().next().is_some_and(|program| programs.contains(&program));
+                }
+            }
+            for word in text.split(|c: char| c.is_whitespace() || matches!(c, '`' | '(' | ')' | ',' | ';' | '\'' | '"')) {
+                let path = word.trim_end_matches(['.', ':']);
+                if path.contains('/') && !path.contains("://") && path.len() > 1 {
+                    named = true;
+                    here |= root.join(path.trim_start_matches("./")).exists();
+                }
+            }
+            if named && !here {
+                continue;
+            }
+            let set = words(text);
+            if set.len() >= 4 && kept_words.iter().any(|kept| set.difference(kept).count() <= 1) {
+                continue;
+            }
+            kept_words.push(set);
+            lines.push(line);
+        }
+        if lines.len() > 1 {
+            blocks.push(lines.join("\n"));
+        }
+    }
+    blocks.into_iter().filter(|b| !b.is_empty()).collect::<Vec<_>>().join("\n\n")
 }
 
 /// What one worker session came to: the final answer, the usage summed over its turns, and how

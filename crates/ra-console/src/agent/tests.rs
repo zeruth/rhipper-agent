@@ -207,6 +207,23 @@ fn the_files_read_again_are_named_most_first_and_three_at_most() {
     assert_eq!(reread(&[]), None);
 }
 
+#[test]
+fn machine_notes_keep_what_names_something_here_and_say_a_repeat_once() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("crates/ra-console/src")).unwrap();
+    let notes = format!(
+        "{ELSEWHERE} on this machine learned about it:\n\
+- (runelite) the jdk lives in `third-party/jdk8u/bin` and must be on the path\n\
+- (asm) a first `cargo build` compile runs past the foreground limit here\n\
+- (asm) a first `cargo build` compile runs past the foreground limit there\n\
+- (asm) `crates/ra-console/src` holds the loop"
+    );
+    let kept = machine_notes_keep(&notes, dir.path(), &["cargo test -p x".to_owned()]);
+    assert!(!kept.contains("jdk8u"), "{kept}");
+    assert_eq!(kept.matches("compile runs past").count(), 1, "{kept}");
+    assert!(kept.contains("crates/ra-console/src"), "{kept}");
+}
+
 /// A `cargo test` output with two failures among many passing tests, longer than the tail, the
 /// failures farther from the end than the tail reaches.
 fn sample_output() -> String {
