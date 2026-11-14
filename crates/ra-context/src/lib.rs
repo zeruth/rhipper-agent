@@ -671,6 +671,9 @@ const FAILURES_KEPT: usize = 40;
 /// How many error lines one failure keeps under its name.
 const FAILURE_LINES: usize = 12;
 
+/// How many of a test's printed lines before its panic a failure keeps.
+const BEFORE_PANIC_LINES: usize = 20;
+
 /// The failures of a failed check's output, read by their structure rather than by where they
 /// fall in it: every failing test of a cargo or a gradle run, each with the lines after its
 /// `panicked at` or under its gradle name, then every compiler `error`, each with the lines up
@@ -701,15 +704,24 @@ pub fn failures_of(output: &str) -> Vec<String> {
             // the test's own output: what it printed from its panic on
             let mut detail = Vec::new();
             let mut panicked = false;
+            let mut context = 0;
             let mut next = at + 1;
             while next < lines.len() && !is_cargo_section_end(lines[next]) {
                 let text = lines[next].trim_end();
+                if !panicked && detail.is_empty() && (text.contains("panicked at") || text.trim_start().starts_with("error")) {
+                    // what the test printed just before its panic: a crash report names the
+                    // cause there
+                    let from = (at + 1..next).filter(|&i| !lines[i].trim().is_empty()).collect::<Vec<_>>();
+                    let keep = from.len().saturating_sub(BEFORE_PANIC_LINES);
+                    detail.extend(from[keep..].iter().map(|&i| lines[i].trim_end().to_owned()));
+                    context = detail.len();
+                }
                 panicked |= text.contains("panicked at") || text.trim_start().starts_with("error");
                 // the panic's message ends at its first blank line; what follows is not its
-                let ended = panicked && text.trim().is_empty() && !detail.is_empty();
+                let ended = panicked && text.trim().is_empty() && detail.len() > context;
                 if ended {
                     panicked = false;
-                } else if panicked && !text.starts_with("note: run with") && detail.len() < FAILURE_LINES {
+                } else if panicked && !text.starts_with("note: run with") && detail.len() < context + FAILURE_LINES {
                     detail.push(text.to_owned());
                 }
                 next += 1;

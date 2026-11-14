@@ -417,7 +417,7 @@ fn the_failures_of_a_check_are_every_failing_test_and_error_with_its_lines_and_r
     assert_eq!(
         failures,
         [
-            "a::two\nthread 'a::two' panicked at src/a.rs:4:5:\nassertion `left == right` failed\n  left: 1\n right: 2",
+            "a::two\nsome print\nthread 'a::two' panicked at src/a.rs:4:5:\nassertion `left == right` failed\n  left: 1\n right: 2",
             "a::three\nthread 'a::three' panicked at src/a.rs:9:5:\nno greeting"
         ]
     );
