@@ -135,6 +135,11 @@ pub async fn tree_of(root: &Path, base: &str, branch: Option<&str>, since: Optio
     ra_context::Tree { tip, branch: branch.map(str::to_owned), commits, since, build, merge_base }
 }
 
+/// The commit `root`'s tree is at, abbreviated as a handoff's head has it; `None` when git cannot say.
+pub async fn tip_now(root: &Path) -> Option<String> {
+    git(root, &["rev-parse", "--short=12", "HEAD"]).await
+}
+
 /// One git command in `dir`, its stdout trimmed; `None` when it does not run or fails.
 async fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = tokio::process::Command::new("git").args(args).current_dir(dir).output().await.ok()?;

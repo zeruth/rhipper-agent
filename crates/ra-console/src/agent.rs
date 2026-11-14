@@ -1037,6 +1037,15 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     if let Some(lines) = skipped_in_base(store, &root, &node, worker).await? {
         return Ok(lines);
     }
+    // a card already reported implemented, its tree and notes as that run left them, goes to the
+    // reviewer and not to another worker
+    if worker.script.is_none() && reported_implemented(store, id).await? {
+        let mut lines = vec![format!("  #{id} was reported implemented and nothing changed since: no worker started")];
+        if ra_context::TaskContext::open(&root, id).handoffs.last().is_some_and(|h| h.verdict.is_none()) {
+            lines.extend(review_after_run(store, id, worker).await);
+        }
+        return Ok(lines);
+    }
     // then the plan's week: a claude-* pick past the threshold falls to the local route or is
     // refused here, before the start marker
     let worker = &worker.for_card(&root, &node)?.steered_by_plan(&root, &node).await?;
@@ -7098,6 +7107,27 @@ async fn held_by_preflight(store: &Store, root: &Path, node: &Node, worker: &Wor
     tracing::warn!("{text}");
     crate::pair::event(root, &text);
     Ok(Some(vec![format!("  {text}")]))
+}
+
+/// Whether the card's last run ended `implemented` and nothing happened since: the card is
+/// implemented or in review, the run's handoff is the card's last (a note or a send-back would be
+/// a later one), and the tree is at the commit that handoff's head names. Another worker run
+/// would only redo it; the review is what the card waits for.
+///
+/// # Errors
+/// When the card cannot be read.
+pub async fn reported_implemented(store: &Store, id: i64) -> anyhow::Result<bool> {
+    let node = store.read(id).await?;
+    if !matches!(node.state, TaskState::Implemented | TaskState::Review) {
+        return Ok(false);
+    }
+    let root = workspace_of(store);
+    let task = ra_context::TaskContext::open(&root, id);
+    let Some(last) = task.handoffs.last().filter(|h| h.outcome == "implemented") else { return Ok(false) };
+    let Some(tip) = ra_context::tip_of(last) else { return Ok(false) };
+    let worktree = root.join(WORKTREES_DIR).join(id.to_string());
+    let acting = if worktree.join(".git").exists() { worktree } else { root };
+    Ok(crate::review::tip_now(&acting).await.as_deref() == Some(tip))
 }
 
 /// Whether the work of `id` is already in the base: the card lists `+` files, every one exists in
