@@ -1115,12 +1115,9 @@ fn path_with(own: Option<PathBuf>, tools: &[PathBuf], path: &std::ffi::OsStr) ->
 }
 
 /// The target directory for a run in one of the project's worktrees
-/// (`<root>/var/worktrees/<id>`): `<root>/target/wt-<id>`, the worktree's own under the
-/// project's target, so a build of one card never reads another's artifacts (two worktrees
-/// editing one crate shared a target and each compiled against the other's copy, #176 and
-/// #181), while the project's target stays the one place the builds live. The orchestrator's
-/// check of the card builds in the same one, so its artifacts are warm and it never queues
-/// behind the project's target. `None` for a workspace that is not a worktree.
+/// (`<root>/var/worktrees/<id>`): the main checkout's own target, so the binaries already built
+/// there can be run from the worktree and its first compile is incremental. The orchestrator's
+/// check of the card builds in the same one. `None` for a workspace that is not a worktree.
 #[must_use]
 pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
     let worktree = || -> Option<(PathBuf, String)> {
@@ -1135,7 +1132,7 @@ pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
         Some((var.parent()?.to_path_buf(), workspace.file_name()?.to_string_lossy().into_owned()))
     };
     match worktree() {
-        Some((root, card)) => std::path::absolute(project_target(&root).join(format!("wt-{card}"))).ok(),
+        Some((root, _)) => std::path::absolute(project_target(&root)).ok(),
         // the project's own tree builds in its own target, on the scratch drive when there is one
         None => scratch().map(|_| project_target(workspace)),
     }
@@ -1204,7 +1201,8 @@ pub fn scratch_env(workspace: &Path) -> Vec<(String, PathBuf)> {
 /// The temp directory of a run in a workspace, absolute and outside its git repository (the
 /// scratch root's `tmp`, else the system temp), one per project and card; none for a chat
 /// completion, which runs nothing.
-fn run_temp(request: &CompletionRequest) -> Option<PathBuf> {
+#[must_use]
+pub fn run_temp(request: &CompletionRequest) -> Option<PathBuf> {
     let workspace = std::path::absolute(request.workspace.as_deref()?).ok()?;
     let (root, card) = project_of(&workspace);
     let name = root.file_name().map_or_else(|| "project".into(), |n| n.to_string_lossy().into_owned());

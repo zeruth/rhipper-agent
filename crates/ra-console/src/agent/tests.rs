@@ -175,7 +175,7 @@ fn the_turn_sizes_lead_with_the_average_and_name_the_largest_when_shown() {
         cap: None,
         capped: None,
         reads: Vec::new(),
-        biggest: None,
+        biggest: Vec::new(),
         read_in: 12_500,
         whole_reads: 9,
     };
@@ -1000,7 +1000,7 @@ fn the_read_roots_of_a_project_and_its_temp_reach_the_harness() {
     let harness = harness_of(&project, &worker, var);
     let line = harness.command_line(&request).unwrap();
     let at = line.iter().position(|a| a == "--add-dir").expect("the read roots are added directories");
-    let temp = worktree.join("var").join("tmp");
+    let temp = ra_providers::claude_code::run_temp(&request).unwrap();
     let shown = |p: &PathBuf| p.display().to_string();
     assert_eq!(line[at + 1..at + 6], [&jdk8u, &registry, &gradle, &java, &temp].map(shown));
     let env = harness.environment(&request);

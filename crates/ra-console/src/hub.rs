@@ -997,8 +997,7 @@ fn worktree_card(root: &Path) -> Option<String> {
         .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
 }
 
-/// The cargo target a build in `root` writes: a worktree's own under the project's
-/// (`target/wt-<id>`), else the target of the cargo workspace `root` is in; `None` where no
+/// The cargo target a build in `root` writes: a worktree's is the project's, else the target of the cargo workspace `root` is in; `None` where no
 /// `Cargo.toml` is, since a gradle build has none.
 #[must_use]
 pub fn build_target(root: &Path) -> Option<PathBuf> {
@@ -1006,7 +1005,7 @@ pub fn build_target(root: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(match worktree_card(root) {
-        Some(card) => project_root_of(root).join("target").join(format!("wt-{card}")),
+        Some(_) => cargo_target(&project_root_of(root)),
         None => cargo_target(root),
     })
 }

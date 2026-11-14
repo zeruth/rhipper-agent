@@ -182,17 +182,23 @@ pub const HEAVY: &str = "[heavy]";
 /// of 2026-11-12 (83k a turn): at 40k, under their median of 55k, nearly every run was noted.
 pub const TURN_CEILING: u64 = 90_000;
 
-/// Keeps `[heavy] #id N tokens/turn over the ceiling of C; biggest tool result: … (M chars)`
-/// under the card when a run's mean turn passes [`TURN_CEILING`], naming the tool call whose
-/// answer was the largest, so the next walk reads which read or command to make smaller; the
-/// line as written. `biggest` is `None` when the harness ran the tools out of sight.
+/// How many tool results a `[heavy]` line names.
+pub const HEAVY_NAMED: usize = 3;
+
+/// Keeps `[heavy] #id N tokens/turn over the ceiling of C; largest tool results: a (M chars), …`
+/// under the card when a run's mean turn passes [`TURN_CEILING`], naming the [`HEAVY_NAMED`]
+/// tool calls whose answers were the largest, tool and target with size, files read whole
+/// included, so the next walk reads which read or command to make smaller; the line as written.
+/// `largest` is empty when the harness ran the tools out of sight.
 ///
 /// # Errors
 /// When the file cannot be written.
-pub fn record_heavy(root: &Path, node: i64, per_turn: u64, biggest: Option<(&str, usize)>) -> anyhow::Result<String> {
-    let result = match biggest {
-        Some((call, chars)) => format!("biggest tool result: {call} ({chars} chars)"),
-        None => "the tool results were the harness's, out of sight".to_owned(),
+pub fn record_heavy(root: &Path, node: i64, per_turn: u64, largest: &[(String, usize)]) -> anyhow::Result<String> {
+    let result = if largest.is_empty() {
+        "the tool results were the harness's, out of sight".to_owned()
+    } else {
+        let named: Vec<String> = largest.iter().take(HEAVY_NAMED).map(|(call, chars)| format!("{call} ({chars} chars)")).collect();
+        format!("largest tool results: {}", named.join(", "))
     };
     let text = format!("{HEAVY} #{node} {per_turn} tokens/turn over the ceiling of {TURN_CEILING}; {result}");
     record(root, Some(node), &[Note { when: 0, node: Some(node), machine: false, pair: false, text: text.clone(), against: None }])?;

@@ -13,6 +13,7 @@ mod fonts;
 mod input;
 mod markdown;
 mod metrics;
+mod phase;
 mod report;
 mod since;
 #[cfg(test)]
@@ -1621,6 +1622,8 @@ struct Workspace {
     browsing: Option<usize>,
     /// How far into the activity file the log has read.
     activity_offset: u64,
+    /// The pair feed's latest run of each card, which dates a run card past a restart.
+    feed: phase::Feed,
     /// The slow call in flight, named for the status row.
     job: Option<String>,
     job_tx: mpsc::UnboundedSender<()>,
@@ -1787,6 +1790,7 @@ impl Workspace {
             browsing: None,
             // a run going when the tab opens is re-attached from its start, so it shows live
             activity_offset: ra_console::ui::attach_offset(&root.join(ra_console::ui::ACTIVITY_FILE)),
+            feed: phase::Feed::default(),
             job: None,
             allocation: (None, 1, None),
             allocation_at: None,
@@ -2095,6 +2099,7 @@ impl Workspace {
             self.start_walk(parallel);
         }
         ra_console::ui::tail_activity_at(&self.root.join(ra_console::ui::ACTIVITY_FILE), &mut self.activity_offset, &self.sink);
+        self.feed.follow(&self.root);
         self.raise_toasts();
         let modified = self.store.modified();
         if modified != self.roadmap_seen {
@@ -4134,7 +4139,7 @@ impl Workspace {
             .show(root, |ui| {
                 ui.label(RichText::new("CONSOLE").small().strong().color(theme::dim()));
                 egui::ScrollArea::vertical().id_salt("console").auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                    console::draw(ui, &self.sink, self.show_debug);
+                    console::draw(ui, &self.sink, self.show_debug, &self.feed);
                 });
             });
         self.console_height = band.response.rect.height();
@@ -4483,7 +4488,7 @@ impl Workspace {
                     ui.allocate_ui_with_layout(egui::vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
                         ui.set_width(right);
                         ui.set_max_width(right);
-                        if !console::draw_latest_run(ui, &self.sink, room, right, implementer.as_deref()) {
+                        if !console::draw_latest_run(ui, &self.sink, room, right, implementer.as_deref(), &self.feed) {
                             ui.label(RichText::new("no run in this session yet").color(theme::dim()).italics());
                         }
                     });

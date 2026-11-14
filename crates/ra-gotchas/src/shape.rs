@@ -502,11 +502,24 @@ fn split(command: &str, shell: Shell) -> Option<Vec<Part>> {
 /// judges by: what runs, the shapes a command may take, and what to use instead of a refusal.
 #[must_use]
 pub fn block() -> String {
+    block_for(on_path("rg"))
+}
+
+/// Whether `program` is an executable in a directory of the shell's PATH.
+fn on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else { return false };
+    std::env::split_paths(&path).any(|dir| [program.to_owned(), format!("{program}.exe")].iter().any(|name| dir.join(name).is_file()))
+}
+
+/// [`block`] for a shell that does (`rg`) or does not have ripgrep on its PATH: without it the
+/// list leaves `rg` out and names what searches in its place.
+#[must_use]
+pub fn block_for(rg: bool) -> String {
     let names = |shell: Shell| {
         let mut seen: Vec<&str> = Vec::new();
         for rule in shell.allowed() {
             let name = rule.trim_end_matches('*').trim_end();
-            if !seen.contains(&name) {
+            if (rg || name != "rg") && !seen.contains(&name) {
                 seen.push(name);
             }
         }
@@ -521,6 +534,9 @@ pub fn block() -> String {
         "- a `$( )` or backtick substitution, a `( )` or `{ }` block, a heredoc and a `<` redirect are not judged by the hook, and the allowlist usually refuses them".to_owned(),
         "- refused, with what to use instead:".to_owned(),
     ];
+    if !rg {
+        lines.insert(3, "- `rg` is not on this shell's PATH: search with the Grep tool or `grep`".to_owned());
+    }
     for (names, form) in REFUSED {
         lines.push(format!("  - {}: {form}", names.join(", ")));
     }

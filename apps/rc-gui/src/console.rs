@@ -9,6 +9,7 @@ use egui::{
 };
 use ra_console::logs::{Kind, Line, Run, Sink};
 
+use crate::phase::{self, Feed, Live};
 use crate::theme;
 
 /// The most characters a bubble shows of a line before it clips, with the rest on hover.
@@ -27,8 +28,8 @@ const SEGMENTS: u8 = 48;
 const LAPS_PER_SECOND: f32 = 0.22;
 
 /// Draws the log into `ui`, oldest first; the caller wraps it in a scroll area that sticks to
-/// the bottom. `show_debug` lets the trace lines through.
-pub(crate) fn draw(ui: &mut Ui, sink: &Sink, show_debug: bool) {
+/// the bottom. `show_debug` lets the trace lines through; `feed` dates the runs.
+pub(crate) fn draw(ui: &mut Ui, sink: &Sink, show_debug: bool, feed: &Feed) {
     let lines: Vec<Line> = sink.with_lines(<[Line]>::to_vec);
     // a live run's card keeps the bottom of the log until its result is in: whatever arrives
     // while it works goes above it, and it settles into its place when it ends
@@ -43,13 +44,13 @@ pub(crate) fn draw(ui: &mut Ui, sink: &Sink, show_debug: bool) {
                 live.push((index, line, id, run));
                 continue;
             }
-            Some((id, run)) if line.kind == Kind::Run => run_card(ui, sink, id, &line.text, &run, index, None, None),
+            Some((id, run)) if line.kind == Kind::Run => run_card(ui, sink, id, &line.text, &run, index, None, None, feed),
             _ => bubble(ui, line, index),
         }
         ui.add_space(6.0);
     }
     for (index, line, id, run) in live {
-        run_card(ui, sink, id, &line.text, &run, index, None, None);
+        run_card(ui, sink, id, &line.text, &run, index, None, None, feed);
         ui.add_space(6.0);
     }
 }
@@ -80,7 +81,7 @@ pub(crate) fn grid_columns(n: usize) -> usize {
     n.clamp(1, 2)
 }
 
-pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32, project_model: Option<&str>) -> bool {
+pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32, project_model: Option<&str>, feed: &Feed) -> bool {
     let runs: Vec<(usize, u64, String)> = sink.with_lines(|lines| {
         lines.iter().enumerate().filter(|(_, l)| l.kind == Kind::Run).filter_map(|(i, l)| l.run.map(|id| (i, id, l.text.clone()))).collect()
     });
@@ -131,7 +132,7 @@ pub(crate) fn draw_latest_run(ui: &mut Ui, sink: &Sink, room: f32, column: f32, 
                     ui.set_clip_rect(across.intersect(ui.clip_rect()));
                     ui.set_width(width);
                     ui.set_max_width(width);
-                    run_card(ui, sink, *id, title, &run, *index, Some(height), project_model);
+                    run_card(ui, sink, *id, title, &run, *index, Some(height), project_model, feed);
                 });
             }
         });
@@ -233,7 +234,17 @@ fn clipped(ui: &mut Ui, raw: &str, limit: usize, font: &FontId, color: Color32) 
 /// wheel over the card sizes the card, not the log; a click on the header folds the card to
 /// that one line, and a finished card folds itself after a minute.
 #[allow(clippy::too_many_arguments)]
-fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: usize, room: Option<f32>, project_model: Option<&str>) {
+fn run_card(
+    ui: &mut Ui,
+    sink: &Sink,
+    id: u64,
+    title: &str,
+    run: &Run,
+    index: usize,
+    room: Option<f32>,
+    project_model: Option<&str>,
+    feed: &Feed,
+) {
     let lane = theme::lane(1 + index % 9);
     // the animation runs on the window's clock, not the run's: every live card on the
     // dashboard breathes and its light laps in step, instead of each on its own start time
@@ -260,7 +271,7 @@ fn run_card(ui: &mut Ui, sink: &Sink, id: u64, title: &str, run: &Run, index: us
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let folded = run.folded();
-            if run_title(ui, sink, id, title, run, lane, folded, project_model).clicked() {
+            if run_title(ui, sink, id, title, run, lane, folded, project_model, feed).clicked() {
                 sink.toggle_fold(id);
             }
             if folded {
@@ -309,16 +320,27 @@ fn failed(run: &Run) -> bool {
     run.outcome.as_deref().is_some_and(|o| o.starts_with('✗'))
 }
 
-/// A duration as the card's clock shows it.
-fn clock(d: Duration) -> String {
-    let s = d.as_secs();
-    if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) } else { format!("{s}s") }
+/// A live run as its card reads it: the start, number and cause from the feed when it has the
+/// card, the window's own sight of the run otherwise.
+fn live_of<'a>(run: &'a Run, title: &str, feed: &Feed, now: u64) -> Live<'a> {
+    let seen = now.saturating_sub(run.started.elapsed().as_secs());
+    // the feed's start is earlier than the window's sight of it unless it is another run's
+    let begun = feed.of_title(title).filter(|b| b.started <= seen);
+    Live {
+        started: begun.map_or(seen, |b| b.started),
+        stepped: now.saturating_sub(run.touched.elapsed().as_secs()),
+        number: begun.map_or(1, |b| b.number),
+        cause: begun.and_then(|b| b.cause.clone()),
+        steps: &run.steps,
+    }
 }
 
 /// The title row of a run card: the task and the model as badges, the way the status bar wears
-/// them; the clock and the step count while the run is live, the outcome and how long it took
-/// when it ends; and the two buttons that size the card, which a folded card does without.
-/// The row answers a click, which folds or unfolds the card.
+/// them; while the run is live, its number and the cause of the run before when it is a rerun,
+/// the clock from its start, the step count and a warning when it has gone quiet, over a strip
+/// of the share of its time each phase took; the outcome and how long it took when it ends; and
+/// the two buttons that size the card, which a folded card does without. The row answers a
+/// click, which folds or unfolds the card.
 #[allow(clippy::too_many_arguments)]
 fn run_title(
     ui: &mut Ui,
@@ -329,13 +351,17 @@ fn run_title(
     lane: Color32,
     folded: bool,
     project_model: Option<&str>,
+    feed: &Feed,
 ) -> Response {
-    let status = match (&run.outcome, run.took) {
-        (Some(outcome), Some(took)) => format!("{outcome} · {}", clock(took)),
-        (Some(outcome), None) => outcome.clone(),
-        (None, _) => format!("{} · {} steps", clock(run.started.elapsed()), run.steps.len()),
+    let now = phase::unix_now();
+    let live = run.live().then(|| live_of(run, title, feed, now));
+    let status = match (&run.outcome, run.took, &live) {
+        (Some(outcome), Some(took), _) => format!("{outcome} · {}", phase::clock(took.as_secs())),
+        (Some(outcome), None, _) => outcome.clone(),
+        (None, _, Some(live)) => phase::status(live, now),
+        (None, _, None) => String::new(),
     };
-    let status_color = if failed(run) {
+    let status_color = if failed(run) || live.as_ref().is_some_and(|l| phase::quiet(l, now).is_some()) {
         theme::error_text()
     } else if run.live() {
         theme::warn_text()
@@ -397,6 +423,16 @@ fn run_title(
             }
         });
     });
+    // the strip along the foot of the row, painted over it so the card's rows keep their room
+    if let Some(live) = &live {
+        let foot = row.response.rect;
+        let mut left = foot.left();
+        for (phase, share) in phase::strip(live, now) {
+            let right = left + foot.width() * share;
+            ui.painter().rect_filled(Rect::from_min_max(pos2(left, foot.bottom() - 2.0), pos2(right, foot.bottom())), 1.0, phase.color());
+            left = right;
+        }
+    }
     // the row is sensed after its buttons, so a click on one of them is theirs, not the fold's
     row.response.interact(Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand)
 }

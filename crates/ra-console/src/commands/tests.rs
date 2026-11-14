@@ -565,7 +565,7 @@ async fn a_run_whose_mean_turn_passes_the_ceiling_is_noted_heavy_with_its_bigges
     let heavy = Worker::new("z-ai/glm-5.3-flash").with_provider(provider);
     let (out, _) = run("/run 2", &store, &heavy).await.unwrap();
     let heavy = out.iter().find(|l| l.contains("[heavy]")).unwrap_or_else(|| panic!("{out:?}"));
-    let expected = format!("[heavy] #2 100000 tokens/turn over the ceiling of {ceiling}; biggest tool result: read_file big.txt (");
+    let expected = format!("[heavy] #2 100000 tokens/turn over the ceiling of {ceiling}; largest tool results: read_file big.txt (");
     assert!(heavy.starts_with(&format!("  ⚠ {expected}")), "{heavy}");
     // the line is kept under the card for the next walk, and left out of the next worker's prompt
     let notes = crate::retro::recent(dir.path(), 5);
@@ -2978,7 +2978,7 @@ async fn a_reviewer_that_accepts_moves_the_card_to_accepted_and_the_verdict_lead
     assert_eq!(node.notes.as_deref(), Some("review by z-ai/glm-5.3-flash: accepted"));
     use crate::agent::{Verdict, verdict_of};
     assert_eq!(verdict_of("needs revision\n* a\n* b"), Verdict::NeedsRevision(vec!["a".into(), "b".into()]));
-    assert_eq!(verdict_of("the diff misses the test"), Verdict::NeedsRevision(vec!["the diff misses the test".into()]));
+    assert_eq!(verdict_of("the diff misses the test"), Verdict::Malformed);
     assert_eq!(verdict_of("I read the diff.\nIt is fine.\naccepted"), Verdict::Accepted);
     assert_eq!(verdict_of("needs_revision\n- ✓ tests pass\n- lint ok\n- docs passes"), Verdict::Accepted);
     assert_eq!(
@@ -3012,6 +3012,78 @@ async fn reviewed_with_kinds(answer: &str) -> (Vec<String>, Store, tempfile::Tem
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(answer, vec![])]));
     let (out, _) = run("/review 2", &store, &runner).await.unwrap();
     (out, store, dir)
+}
+
+/// An implemented card reviewed by a reviewer that gives `answers` in turn: the lines, the store
+/// and the answers it was not asked for.
+async fn reviewed_with_answers(answers: &[&str]) -> (Vec<String>, Store, std::sync::Arc<Scripted>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    let reviewer = Scripted::new(answers.iter().map(|text| says(text, vec![])).collect());
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(reviewer.clone());
+    let (out, _) = run("/review 2", &store, &runner).await.unwrap();
+    (out, store, reviewer, dir)
+}
+
+#[tokio::test]
+async fn a_malformed_verdict_is_asked_again_and_the_second_answer_is_the_verdict() {
+    let essay = "I read the diff carefully.\nThe change looks reasonable overall.\nThere is much to say about the design.";
+    let (out, store, _, _dir) = reviewed_with_answers(&[essay, "accepted"]).await;
+    assert!(out[0].starts_with("✓ #2 Probe accepted"), "{out:?}");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Accepted);
+    assert!(node.notes.as_deref().unwrap_or_default().contains("asked again"), "{:?}", node.notes);
+}
+
+#[tokio::test]
+async fn a_malformed_verdict_asked_again_sends_the_card_back_on_the_second_answers_points_alone() {
+    let essay = "I read the diff carefully.\nThe change looks reasonable overall.";
+    let (_, store, _, _dir) = reviewed_with_answers(&[essay, "needs_revision\n- the test is missing"]).await;
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
+    let notes = node.notes.unwrap_or_default();
+    assert!(notes.lines().next().unwrap_or_default().ends_with("asked again: the first answer was off the form"), "{notes}");
+    assert!(notes.contains("- the test is missing") && !notes.contains("reasonable overall"), "{notes}");
+}
+
+#[tokio::test]
+async fn a_second_malformed_verdict_leaves_the_card_implemented_without_points() {
+    let essay = "I read the diff carefully.\nThe change looks reasonable overall.\nThere is much to say about the design.";
+    let (out, store, _, _dir) = reviewed_with_answers(&[essay, essay]).await;
+    assert!(out[0].contains("no verdict"), "{out:?}");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented);
+    assert!(node.notes.as_deref().unwrap_or_default().is_empty(), "{:?}", node.notes);
+}
+
+#[tokio::test]
+async fn a_malformed_verdict_whose_second_ask_fails_puts_the_card_back_for_the_next_review() {
+    let essay = "I read the diff carefully.\nThe change looks reasonable overall.";
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
+    // the script runs out on the second ask: the provider errs, and the review with it
+    let reviewer = Scripted::new(vec![says(essay, vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(reviewer.clone());
+    assert!(run("/review 2", &store, &runner).await.is_err());
+    assert_eq!(reviewer.seen.lock().len(), 2);
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented);
+    assert!(node.notes.as_deref().unwrap_or_default().is_empty(), "{:?}", node.notes);
+    // the card is not stuck in review: the next reviewer takes it up and its verdict lands
+    let again = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("accepted", vec![])]));
+    let (out, _) = run("/review 2", &store, &again).await.unwrap();
+    assert!(out[0].starts_with("✓ #2 Probe accepted"), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Accepted);
+}
+
+#[test]
+fn a_malformed_verdict_is_an_answer_whose_first_line_is_neither_word() {
+    use crate::agent::{Verdict, verdict_of};
+    assert_eq!(verdict_of("Here is my analysis.\n1. the design\n2. the tests"), Verdict::Malformed);
 }
 
 #[tokio::test]
@@ -4875,9 +4947,12 @@ async fn the_effort_follows_the_card_and_the_flag_overrides_it() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task T parent 1", &store, &worker()).await.unwrap();
+    // the check is scripted: a real `cargo test` in a temp directory under a cargo workspace
+    // ran that workspace's whole suite, three times
+    let passing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
     // a fresh card runs at medium
     let script = Scripted::new(vec![says("done", vec![])]);
-    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone()))).with_script(passing.clone());
     run("/run 2", &store, &runner).await.unwrap();
     assert_eq!(script.seen.lock()[0].effort.as_deref(), Some("medium"));
     // `effort` sets the card, and the file carries it
@@ -4885,13 +4960,14 @@ async fn the_effort_follows_the_card_and_the_flag_overrides_it() {
     assert!(out[0].contains("high"), "{out:?}");
     assert_eq!(store.read(2).await.unwrap().effort, ra_roadmap::model::Effort::High);
     let script = Scripted::new(vec![says("done", vec![])]);
-    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone()))).with_script(passing.clone());
     run("/run 2", &store, &runner).await.unwrap();
     assert_eq!(script.seen.lock()[0].effort.as_deref(), Some("high"));
     // --effort overrides the card for one run
     let script = Scripted::new(vec![says("done", vec![])]);
     let runner = Worker::new("claude-opus-5-5")
         .with_provider(std::sync::Arc::new(Harness(script.clone())))
+        .with_script(passing)
         .with_effort(Some(ra_roadmap::model::Effort::Low));
     run("/run 2", &store, &runner).await.unwrap();
     assert_eq!(script.seen.lock()[0].effort.as_deref(), Some("low"));

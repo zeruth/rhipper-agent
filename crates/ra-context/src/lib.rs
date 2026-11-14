@@ -610,6 +610,10 @@ pub fn changed_lines(diff: &str) -> ChangedLines {
 }
 
 /// What one run of a task left behind, for the next run to start from.
+///
+/// It holds no turns or cost: those live in the usage ledger (`ra_usage::Call`), one row a
+/// call, and a reader joins them to a handoff by its `when`, as the window's RUNS card does.
+/// Keeping them in one place leaves the ledger the only account of what a run cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handoff {
     /// When the run ended, as seconds since the Unix epoch.

@@ -1160,11 +1160,13 @@ pub enum Verdict {
     Accepted,
     /// The points the reviewer listed, one per entry, without their bullets.
     NeedsRevision(Vec<String>),
+    /// An answer whose first line is neither word: no verdict, and no points.
+    Malformed,
 }
 
-/// The verdict of a reviewer's answer: `accepted` on the first line is acceptance; anything
-/// else is a revision, with the lines after a `needs_revision` first line as its points, or
-/// every line when the first is not the word.
+/// The verdict of a reviewer's answer: `accepted` on the first line is acceptance; a
+/// `needs_revision` first line is a revision, with the lines after it as its points; a first
+/// line that is neither word is [`Verdict::Malformed`].
 #[must_use]
 pub fn verdict_of(answer: &str) -> Verdict {
     let mut lines = answer.lines().map(str::trim).filter(|line| !line.is_empty());
@@ -1189,16 +1191,15 @@ pub fn verdict_of(answer: &str) -> Verdict {
     if rest.last().is_some_and(|last| word_of(last).starts_with("accepted")) {
         return Verdict::Accepted;
     }
-    let points: Vec<String> = if word.starts_with("needs_revision") {
-        // Every point a tick is an acceptance; a mixed list keeps only the failing ones.
-        let failing: Vec<String> = rest.iter().filter(|line| !is_tick(line)).map(|line| point(line)).collect();
-        if failing.is_empty() && !rest.is_empty() {
-            return Verdict::Accepted;
-        }
-        failing
-    } else {
-        std::iter::once(first).chain(rest).map(point).collect()
-    };
+    if !word.starts_with("needs_revision") {
+        // prose is no list of points: the worker would be sent to settle an essay
+        return Verdict::Malformed;
+    }
+    // Every point a tick is an acceptance; a mixed list keeps only the failing ones.
+    let points: Vec<String> = rest.iter().filter(|line| !is_tick(line)).map(|line| point(line)).collect();
+    if points.is_empty() && !rest.is_empty() {
+        return Verdict::Accepted;
+    }
     Verdict::NeedsRevision(if points.is_empty() { vec!["the reviewer gave no points".to_owned()] } else { points })
 }
 
@@ -1519,6 +1520,12 @@ async fn review_to(store: &Store, id: i64, worker: &Worker, accepted: TaskState)
     Ok(lines)
 }
 
+/// The characters of an off-form answer the second ask quotes back.
+const MALFORMED_CLIP: usize = 1500;
+
+/// What the notes of a card say when its verdict came from the second ask.
+const REASKED: &str = "asked again: the first answer was off the form";
+
 /// The turns a review gets: enough to read the card's diff and the files it names.
 pub(crate) const REVIEW_TURNS: u32 = 4;
 
@@ -1576,14 +1583,58 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
         }
     };
     worker.record_as(&model, Some("reviewer"), Some(id), &answer.usage, answer.turns).await;
-    let (verdict, left) = split_points(store, &node, verdict_of(&answer.text)).await;
+    let mut answer = answer;
+    let mut verdict = verdict_of(&answer.text);
+    let reasked = verdict == Verdict::Malformed;
+    if reasked {
+        // an answer off the form is asked again once, with the form alone
+        let clip: String = answer.text.chars().take(MALFORMED_CLIP).collect();
+        let again = CompletionRequest {
+            messages: vec![
+                Message::system(REVIEW_INSTRUCTION),
+                Message::user(format!(
+                    "Your answer to the review of this card was not in the form:\n{clip}\n\nGive its verdict again, in the form alone: `accepted` or `needs_revision` on the first line, the points after `needs_revision`, one per line."
+                )),
+            ],
+            ..ask(1)
+        };
+        match provider.complete(again).await {
+            Ok(second) => {
+                worker.record_as(&model, Some("reviewer"), Some(id), &second.usage, second.turns).await;
+                answer = second;
+                verdict = verdict_of(&answer.text);
+            }
+            Err(error) => {
+                store.set_state_by(id, before, Source::Run).await?;
+                return Err(map_error(error));
+            }
+        }
+        if verdict == Verdict::Malformed {
+            // no verdict: the card stays as it was for the next walk's reviewer
+            store.set_state_by(id, before, Source::Run).await?;
+            let line = format!(
+                "· #{id} {} no verdict: the review by {} was off the form twice; the card stays {before:?} for the next review",
+                node.title,
+                short(&model)
+            );
+            return Ok((vec![line], None));
+        }
+    }
+    let (verdict, left) = split_points(store, &node, verdict).await;
     // the points' fingerprint rides the handoff's verdict, so a run that changed nothing and drew
     // the same points again is held on that round, not run a third time
     let print = match &verdict {
         Verdict::NeedsRevision(points) => format!("{}{}", ra_context::POINTS_MARK, points_fingerprint(points)),
-        Verdict::Accepted => String::new(),
+        Verdict::Accepted | Verdict::Malformed => String::new(),
     };
     let Judged { state, mut head, said, trivial } = judged(&verdict, id, &model, &root, accepted);
+    // the notes say the verdict came from the second ask; the first answer's usage is booked above
+    if reasked {
+        head = match head.split_once('\n') {
+            Some((first, points)) => format!("{first} · {REASKED}\n{points}"),
+            None => format!("{head} · {REASKED}"),
+        };
+    }
     // the points that left the card follow the rerun's, past the block the rerun reads
     if !left.is_empty() {
         head = format!("{head}\n{}", left.join("\n"));
@@ -1647,6 +1698,7 @@ struct Judged {
 /// The [`Judged`] of `verdict` by `model`; `accepted` is where an acceptance leaves the card.
 /// A rejection whose points only the person can settle goes on the feed as well.
 fn judged(verdict: &Verdict, id: i64, model: &str, root: &Path, accepted: TaskState) -> Judged {
+    // a malformed verdict never gets here: `judge` leaves the card as it was
     let Verdict::NeedsRevision(points) = verdict else {
         return Judged { state: accepted, head: format!("review by {model}: accepted"), said: "accepted".to_owned(), trivial: None };
     };
@@ -5625,8 +5677,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                     turn_usage: answer.turn_usage,
                     cap: caps.limit(),
                     capped: None,
+                    biggest: read_sizes(workspace_dir.as_deref(), &answer.reads),
                     reads: answer.reads,
-                    biggest: None,
                     read_in: answer.read_in,
                     whole_reads: answer.whole_reads,
                 })
@@ -5647,8 +5699,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                         turn_usage: answer.turn_usage,
                         cap: Some(restart),
                         capped: Some(Capped::Turns(restart)),
+                        biggest: read_sizes(workspace_dir.as_deref(), &answer.reads),
                         reads: answer.reads,
-                        biggest: None,
                         read_in: answer.read_in,
                         whole_reads: answer.whole_reads,
                     }),
@@ -5668,8 +5720,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                     turn_usage: answer.turn_usage,
                     cap: caps.limit(),
                     capped: Some(Capped::Context { cap, size }),
+                    biggest: read_sizes(workspace_dir.as_deref(), &answer.reads),
                     reads: answer.reads,
-                    biggest: None,
                     read_in: answer.read_in,
                     whole_reads: answer.whole_reads,
                 })
@@ -6093,8 +6145,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // next walk to make that read or command smaller
     let per_turn = average_turn(&session);
     if per_turn > crate::retro::TURN_CEILING {
-        let biggest = session.biggest.as_ref().map(|(call, chars)| (call.as_str(), *chars));
-        match crate::retro::record_heavy(&root, id, per_turn, biggest) {
+        match crate::retro::record_heavy(&root, id, per_turn, &session.biggest) {
             Ok(text) => lines.push(format!("  ⚠ {text}")),
             Err(e) => tracing::warn!("the weight of #{id} was not noted: {e:#}"),
         }
@@ -7252,14 +7303,9 @@ async fn main_failures(worker: &Worker, root: &Path, command: &str, tests: &[Str
         .ok()?
         .with_timeout(timeout)
         .with_env(own_target.iter().map(|t| ("CARGO_TARGET_DIR".to_owned(), t.display().to_string())));
-    // the build slot is the card's check's, still held: a second one from the same run could
-    // wait the whole of [`HOLD_WAIT`] on a full machine
-    let _target = if command.trim_start().starts_with("cargo") {
-        let target = own_target.unwrap_or_else(|| crate::hub::cargo_target(root));
-        guard_target(root, &path, &target, timeout).await.ok()?
-    } else {
-        None
-    };
+    // the build slot and the target lock are the card's check's, still held: the base worktree
+    // builds in the same target as the card's, and the hub's lock taken again in this process
+    // waited out the check's whole timeout (every red-main test hung for twenty minutes)
     let (passed, output) = toolbox.check_args(&rerun).await.ok()?;
     let gradle = !words[0].to_lowercase().contains("cargo");
     let failing: Vec<String> =
@@ -7623,9 +7669,10 @@ struct Session {
     capped: Option<Capped>,
     /// The files the run read, one entry per read, relative to the workspace.
     reads: Vec<String>,
-    /// The tool call whose answer was the largest and its size in characters, when the loop
-    /// ran the tools itself: a harness keeps its tool results out of sight.
-    biggest: Option<(String, usize)>,
+    /// The tool calls whose answers were the largest, biggest first, with their sizes in
+    /// characters, when the loop ran the tools itself: a harness keeps its tool results out of
+    /// sight.
+    biggest: Vec<(String, usize)>,
     /// The read-in: the input tokens of the turns through the first edit, as
     /// [`ra_providers::Completion::read_in`] has it.
     read_in: u64,
@@ -7842,7 +7889,7 @@ async fn tool_loop(
     let mut calls = 0usize;
     let mut turn = 0u32;
     let mut reads: Vec<String> = Vec::new();
-    let mut biggest: Option<(String, usize)> = None;
+    let mut biggest: Vec<(String, usize)> = Vec::new();
     // the prompt tokens before the first write, and the files read with no window
     let mut read_in = 0u64;
     let mut edited = false;
@@ -7945,13 +7992,31 @@ async fn tool_loop(
             let result = toolbox.execute(call).await;
             // the largest answer is what a heavy run is noted by
             let chars = result.chars().count();
-            if biggest.as_ref().is_none_or(|(_, most)| chars > *most) {
-                biggest = Some((call_summary(call), chars));
-            }
+            biggest.push((call_summary(call), chars));
+            biggest.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+            biggest.truncate(crate::retro::HEAVY_NAMED);
             messages.push(Message::tool(&call.id, result));
             calls += 1;
         }
     }
+}
+
+/// The largest files a harness run read, as `read_file path` with their sizes, biggest first:
+/// the harness keeps its tool results out of sight, but a file it read whole is as heavy as the
+/// file is. Files gone from the workspace are left out.
+fn read_sizes(workspace: Option<&Path>, reads: &[String]) -> Vec<(String, usize)> {
+    let Some(workspace) = workspace else { return Vec::new() };
+    let files: std::collections::BTreeSet<&String> = reads.iter().collect();
+    let mut sizes: Vec<(String, usize)> = files
+        .into_iter()
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(workspace.join(path)).ok()?;
+            Some((format!("read_file {path}"), text.chars().count()))
+        })
+        .collect();
+    sizes.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    sizes.truncate(crate::retro::HEAVY_NAMED);
+    sizes
 }
 
 /// One ledger row of a completion's usage, under `model` and `role`, with the read-in of a run.
