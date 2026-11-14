@@ -1628,6 +1628,32 @@ async fn a_walk_with_nothing_ready_plans_the_next_milestone_when_a_gambit_says_s
 }
 
 #[tokio::test]
+async fn plan_next_passes_over_a_milestone_whose_wait_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    // #2 is planned already and its card #3 is open; #4 and #5 are the two unplanned milestones
+    for line in [
+        "/add milestone Earlier parent 1",
+        "/add task Open work parent 2",
+        "/add milestone First parent 1",
+        "/add milestone Second parent 1",
+    ] {
+        run(line, &store, &worker()).await.unwrap();
+    }
+    // the first unplanned milestone waits on the open #3, so the second is the one planned
+    store.depend_on(4, 3).await.unwrap();
+    let nodes = store.all().await.unwrap();
+    assert_eq!(super::run::next_unplanned(&nodes).map(|n| n.id), Some(5));
+    // the feed hears once which milestone waits on which
+    assert_eq!(super::run::passed_over(&nodes, 5), vec!["passed over #4 First: it waits on #3, which is not accepted"]);
+    assert!(super::run::passed_over(&nodes, 5).is_empty());
+    // once the wait is accepted the first milestone is next again
+    store.set_state(3, TaskState::Accepted).await.unwrap();
+    let nodes = store.all().await.unwrap();
+    assert_eq!(super::run::next_unplanned(&nodes).map(|n| n.id), Some(4));
+}
+
+#[tokio::test]
 async fn a_parallel_walk_plans_the_next_milestone_when_nothing_is_ready_and_starts_its_card() {
     let dir = tempfile::tempdir().unwrap();
     let store = empty_milestone(dir.path()).await;
