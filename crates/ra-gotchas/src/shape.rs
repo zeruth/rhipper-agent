@@ -206,6 +206,14 @@ struct Part {
 /// (the project's `[worker] allow`) does, pass; the first refused part denies the whole.
 #[must_use]
 pub fn judge(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool) -> Shape {
+    let target = std::env::var_os("CARGO_TARGET_DIR").filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
+    judge_in(command, shell, workspace, own, target.as_deref())
+}
+
+/// [`judge`] with the card's own `target` named: listing it and running a program under it pass,
+/// while any other directory outside the workspace stays the harness's to judge.
+#[must_use]
+pub fn judge_in(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool, target: Option<&Path>) -> Shape {
     let Some(parts) = split(command, shell) else { return Shape::Unknown };
     if parts.is_empty() {
         return Shape::Unknown;
@@ -214,7 +222,7 @@ pub fn judge(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -
     // the PowerShell variables the command sets itself, to a value judged where it is set
     let mut assigned: Vec<String> = Vec::new();
     for part in &parts {
-        match judge_part(part, shell, workspace, own, &mut assigned) {
+        match judge_part(part, shell, workspace, own, target, &mut assigned) {
             Shape::Allowed => {}
             Shape::Denied(form) => return Shape::Denied(format!("`{}` is refused here: {form}", part.words.join(" "))),
             Shape::Unknown => all = false,
@@ -223,7 +231,16 @@ pub fn judge(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -
     if all { Shape::Allowed } else { Shape::Unknown }
 }
 
-fn judge_part(part: &Part, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool, assigned: &mut Vec<String>) -> Shape {
+fn judge_part(
+    part: &Part,
+    shell: Shell,
+    workspace: &Path,
+    own: &dyn Fn(&str) -> bool,
+    target: Option<&Path>,
+    assigned: &mut Vec<String>,
+) -> Shape {
+    let in_target = |w: &str| target.is_some_and(|t| in_target(w, t));
+    let away = |w: &str| outside(w, workspace) && !in_target(w);
     if part.writes {
         return Shape::Denied(REDIRECT_FORM.to_owned());
     }
@@ -245,7 +262,7 @@ fn judge_part(part: &Part, shell: Shell, workspace: &Path, own: &dyn Fn(&str) ->
             _ if first.contains('=') => std::iter::once(value).chain(rest.iter().copied()).collect(),
             _ => return Shape::Unknown,
         };
-        if part.call || values.iter().any(|w| outside(w, workspace) || !known(w, shell, assigned)) {
+        if part.call || values.iter().any(|w| away(w) || !known(w, shell, assigned)) {
             return Shape::Unknown;
         }
         assigned.push(name.to_lowercase());
@@ -261,11 +278,15 @@ fn judge_part(part: &Part, shell: Shell, workspace: &Path, own: &dyn Fn(&str) ->
     }
     // a print script is no path, and its `$` is the last line, not a variable
     if let Some(files) = sed_prints(name, rest) {
-        let fine = files.iter().all(|w| !outside(w, workspace) && known(w, shell, assigned));
+        let fine = files.iter().all(|w| !away(w) && known(w, shell, assigned));
         return if fine { Shape::Allowed } else { Shape::Unknown };
     }
-    if words.iter().any(|w| outside(w, workspace) || !known(w, shell, assigned)) {
+    if words.iter().any(|w| away(w) || !known(w, shell, assigned)) {
         return Shape::Unknown;
+    }
+    // the program is the card's own build output
+    if in_target(first) && !part.call {
+        return Shape::Allowed;
     }
     let line = std::iter::once(name).chain(rest.iter().copied()).collect::<Vec<_>>().join(" ");
     if own(&line) {
@@ -448,6 +469,14 @@ fn outside(word: &str, workspace: &Path) -> bool {
         None => seen,
     };
     !(seen == root || seen.starts_with(&format!("{root}/")))
+}
+
+/// Whether a word names an absolute path at or under `target`, the card's own cargo target.
+fn in_target(word: &str, target: &Path) -> bool {
+    let path = word.split_once('=').map_or(word, |(_, value)| value).replace('\\', "/");
+    let bytes = path.as_bytes();
+    let absolute = path.starts_with('/') || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
+    absolute && path != "/dev/null" && !outside(word, target)
 }
 
 /// The simple commands of `command`, or `None` for a shape it does not read: a subshell, a
