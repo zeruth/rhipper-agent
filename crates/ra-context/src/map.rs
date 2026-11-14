@@ -28,12 +28,20 @@ const STOPWORDS: &[&str] = &[
     "only", "also", "each", "every", "per", "pass", "passes", "where", "their",
 ];
 
-/// What a card asks, as the map reads it: its text (title, objective and acceptance) and the
-/// points a review or a failed check left on it.
+/// How many items of one name outside the card's files the map points at.
+const OUTSIDE_EACH: usize = 3;
+
+/// The extensions of a tracked file the map looks in for a name the card's files lack.
+const SOURCES: [&str; 8] = ["rs", "py", "ps1", "js", "ts", "go", "kt", "java"];
+
+/// What a card asks, as the map reads it: its text (title, objective and acceptance), the
+/// points a review or a failed check left on it, and the project's sources, where a name the
+/// card's files do not define is looked for.
 #[derive(Debug, Clone, Default)]
 pub struct Ask<'a> {
     pub card: &'a str,
     pub points: &'a [String],
+    pub sources: &'a [String],
 }
 
 /// One item the map points at: its file, its inclusive 1-based range, the item as the outline
@@ -56,12 +64,14 @@ impl Pointer {
     }
 }
 
-/// The map of a card's files: the items pointed at, in file order, and one line a file for
-/// what is not shown.
+/// The map of a card's files: the items pointed at, in file order with those found outside the
+/// card's files after them, one line a file for what is not shown, and the names the card puts
+/// in backticks that nothing in the project defines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Map {
     pub pointers: Vec<Pointer>,
     pub rest: Vec<String>,
+    pub unresolved: Vec<String>,
 }
 
 impl Map {
@@ -72,8 +82,31 @@ impl Map {
         for line in self.pointers.iter().map(Pointer::line).chain(self.rest.iter().cloned()) {
             let _ = writeln!(out, "{line}");
         }
+        for name in &self.unresolved {
+            let _ = writeln!(out, "nothing defines: {name}; treat it as new");
+        }
         out
     }
+}
+
+/// The source files git tracks in `workspace`, as `git ls-files` lists them: where the map
+/// looks for a name the card's files do not define. None outside a git repository.
+#[must_use]
+pub fn tracked_sources(workspace: &Path) -> Vec<String> {
+    let listed = std::process::Command::new("git")
+        .args(["ls-files"])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    listed
+        .lines()
+        .map(|line| line.trim().trim_matches('"'))
+        .filter(|path| Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCES.contains(&e)))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A file as the map reads it: its text and its items with the lines each owns.
@@ -90,7 +123,7 @@ pub fn tokens(text: &str) -> usize {
 /// tokens kept, a tie going to the earlier item.
 #[must_use]
 pub fn map_of(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask, changed: &ChangedLines, room: usize) -> Map {
-    let read: Vec<Option<Read>> = files
+    let entries: Vec<Option<Read>> = files
         .iter()
         .map(|file| {
             read(file).map(|text| {
@@ -109,7 +142,7 @@ pub fn map_of(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask
     // how many items' names hold each word, across every file, so a word most items hold weighs little
     let mut spread: HashMap<String, usize> = HashMap::new();
     let mut named_names: HashSet<String> = HashSet::new();
-    for (file, (_, items)) in files.iter().zip(&read).filter_map(|(f, r)| r.as_ref().map(|r| (f, r))) {
+    for (file, (_, items)) in files.iter().zip(&entries).filter_map(|(f, r)| r.as_ref().map(|r| (f, r))) {
         for (start, end, item) in items {
             for part in name_parts(name_of(item)).into_iter().collect::<HashSet<_>>() {
                 *spread.entry(part).or_default() += 1;
@@ -123,7 +156,7 @@ pub fn map_of(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask
     }
 
     let mut candidates: Vec<(usize, Pointer)> = Vec::new();
-    for (index, (file, entry)) in files.iter().zip(&read).enumerate() {
+    for (index, (file, entry)) in files.iter().zip(&entries).enumerate() {
         let Some((text, items)) = entry else { continue };
         let lines: Vec<&str> = text.lines().collect();
         let marks = changed.get(file).map_or(&[][..], Vec::as_slice);
@@ -166,6 +199,8 @@ pub fn map_of(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask
         }
     }
 
+    let unresolved = look_outside(&read, files, &entries, ask, &mut candidates);
+
     candidates.sort_by(|(a, p), (b, q)| q.score.cmp(&p.score).then(a.cmp(b)).then(p.start.cmp(&q.start)));
     let mut used = 0;
     let mut kept: Vec<(usize, Pointer)> = Vec::new();
@@ -179,7 +214,7 @@ pub fn map_of(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask
     kept.sort_by_key(|(index, pointer)| (*index, pointer.start));
 
     let mut rest = Vec::new();
-    for (index, (file, entry)) in files.iter().zip(&read).enumerate() {
+    for (index, (file, entry)) in files.iter().zip(&entries).enumerate() {
         let Some((text, items)) = entry else {
             rest.push(format!("{file} (not in the workspace yet)"));
             continue;
@@ -192,7 +227,62 @@ pub fn map_of(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask
             rest.push(format!("{file} ({lines} lines): {} more items not shown", items.len() - shown));
         }
     }
-    Map { pointers: kept.into_iter().map(|(_, pointer)| pointer).collect(), rest }
+    Map { pointers: kept.into_iter().map(|(_, pointer)| pointer).collect(), rest, unresolved }
+}
+
+/// The names of the card no item of its files declares, each looked for in the project's
+/// sources: an item found there joins `candidates` as named by the card, and a name found
+/// nowhere is returned, in the card's order.
+fn look_outside(
+    read: &impl Fn(&str) -> Option<String>,
+    files: &[String],
+    entries: &[Option<Read>],
+    ask: &Ask,
+    candidates: &mut Vec<(usize, Pointer)>,
+) -> Vec<String> {
+    let defined: HashSet<&str> =
+        entries.iter().flatten().flat_map(|(_, items)| items.iter().filter_map(|(_, _, item)| item_name(item))).collect();
+    let missing: Vec<(String, Vec<String>)> =
+        code_names(ask.card).into_iter().filter(|(_, segments)| !segments.iter().any(|s| defined.contains(s.as_str()))).collect();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    let wanted: HashSet<&str> = missing.iter().flat_map(|(_, segments)| segments.iter().map(String::as_str)).collect();
+    let own: HashSet<String> = files.iter().map(|f| f.replace('\\', "/")).collect();
+    let mut found: HashMap<String, usize> = HashMap::new();
+    for (offset, source) in ask.sources.iter().enumerate() {
+        if own.contains(&source.replace('\\', "/")) {
+            continue;
+        }
+        let Some(text) = read(source) else { continue };
+        for (start, end, item) in items(Path::new(source), &text) {
+            let Some(name) = item_name(&item).filter(|n| wanted.contains(n)) else { continue };
+            let seen = found.entry(name.to_owned()).or_default();
+            if *seen < OUTSIDE_EACH {
+                *seen += 1;
+                let why = "named by the card, outside its files".to_owned();
+                candidates.push((files.len() + offset, Pointer { file: source.clone(), start, end, item, why, score: NAMED }));
+            }
+        }
+    }
+    missing.into_iter().filter(|(_, segments)| !segments.iter().any(|s| found.contains_key(s))).map(|(name, _)| name).collect()
+}
+
+/// The names a card puts in backticks as code, each with the segments of its path, in the
+/// card's order: `map_of`, `Map::unresolved` or `render()`, not a command, a path or a file.
+fn code_names(card: &str) -> Vec<(String, Vec<String>)> {
+    let mut names: Vec<(String, Vec<String>)> = Vec::new();
+    for span in card.split('`').skip(1).step_by(2) {
+        let name = span.trim().trim_start_matches(['&', '*']).trim_end_matches("()").trim_end_matches('!');
+        let segments: Vec<String> = name.split("::").map(str::to_owned).collect();
+        let code = segments
+            .iter()
+            .all(|s| s.len() > 2 && !s.starts_with(|c: char| c.is_ascii_digit()) && s.chars().all(|c| c.is_alphanumeric() || c == '_'));
+        if code && !names.iter().any(|(known, _)| known == name) {
+            names.push((name.to_owned(), segments));
+        }
+    }
+    names
 }
 
 /// The name an item declares, or the item itself for one that declares none, a heading say.

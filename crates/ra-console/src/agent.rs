@@ -6755,11 +6755,13 @@ pub async fn context_preview(store: &Store, id: i64) -> anyhow::Result<String> {
 }
 
 /// The map of the card's files as the prompt carries it: the items its title, objective and
-/// acceptance point at, read from the tree the worker acts in.
+/// acceptance point at, read from the tree the worker acts in, and where in its tracked sources
+/// a name the card's files do not define is.
 fn map_of_card(root: &Path, node: &Node, files: &[String], changed: &ra_context::ChangedLines, points: &[String]) -> String {
     let card =
         format!("{}\n{}\n{}", node.title, node.objective.as_deref().unwrap_or_default(), node.acceptance.as_deref().unwrap_or_default());
-    let ask = ra_context::map::Ask { card: &card, points };
+    let sources = ra_context::map::tracked_sources(root);
+    let ask = ra_context::map::Ask { card: &card, points, sources: &sources };
     let read = |file: &str| std::fs::read_to_string(root.join(file)).ok();
     ra_context::map::map_of(read, files, &ask, changed, ra_context::MAP_ROOM).render()
 }

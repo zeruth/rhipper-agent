@@ -13,7 +13,7 @@ const ABC: &str = "fn first() {}\nfn second() {}\nfn third() {}\n";
 #[test]
 fn map_ranks_a_named_item_above_an_early_one() {
     let (read, files) = files_of(&[("src/a.rs", ABC)]);
-    let ask = Ask { card: "the first fn and `third`", points: &[] };
+    let ask = Ask { card: "the first fn and `third`", points: &[], sources: &[] };
     let all = map_of(&read, &files, &ask, &ChangedLines::new(), 10_000);
     let third = all.pointers.iter().find(|p| p.item == "fn third()").expect("third is pointed at");
     assert_eq!(third.score, 100);
@@ -29,7 +29,7 @@ fn map_ranks_a_named_item_above_an_early_one() {
 fn map_ranks_a_changed_item_and_keeps_it() {
     let (read, files) = files_of(&[("src/a.rs", ABC)]);
     let changed: ChangedLines = HashMap::from([("src/a.rs".to_owned(), vec![(2, 2)])]);
-    let map = map_of(&read, &files, &Ask { card: "nothing in here", points: &[] }, &changed, 10_000);
+    let map = map_of(&read, &files, &Ask { card: "nothing in here", points: &[], sources: &[] }, &changed, 10_000);
     assert_eq!(map.pointers.len(), 1);
     assert_eq!(map.pointers[0].item, "fn second()");
     assert_eq!(map.pointers[0].score, 80);
@@ -40,7 +40,7 @@ fn map_ranks_a_changed_item_and_keeps_it() {
 fn map_ranks_a_common_word_under_a_rare_one() {
     let text = "fn parse_head() {}\nfn parse_line() {}\nfn parse_tail() {}\nfn ledger_total() {}\n";
     let (read, files) = files_of(&[("src/a.rs", text)]);
-    let map = map_of(&read, &files, &Ask { card: "parse the ledger", points: &[] }, &ChangedLines::new(), 10_000);
+    let map = map_of(&read, &files, &Ask { card: "parse the ledger", points: &[], sources: &[] }, &ChangedLines::new(), 10_000);
     let score = |item: &str| map.pointers.iter().find(|p| p.item == item).map_or(0, |p| p.score);
     assert!(score("fn parse_head()") > 0);
     assert!(score("fn parse_head()") < score("fn ledger_total()"), "{map:?}");
@@ -54,7 +54,7 @@ fn map_ranks_within_the_room_across_two_files() {
     let card: String = (0..10).map(|i| format!("`a_step_{i}` `b_step_{i}` ")).collect();
     let (read, files) = files_of(&[("src/a.rs", &a), ("src/b.rs", &b)]);
     let room = 40;
-    let map = map_of(&read, &files, &Ask { card: &card, points: &[] }, &ChangedLines::new(), room);
+    let map = map_of(&read, &files, &Ask { card: &card, points: &[], sources: &[] }, &ChangedLines::new(), room);
     assert!(!map.pointers.is_empty());
     assert!(map.pointers.len() < 20);
     assert!(map.pointers.iter().map(|p| tokens(&p.line())).sum::<usize>() <= room);
@@ -65,10 +65,35 @@ fn map_ranks_within_the_room_across_two_files() {
 }
 
 #[test]
+fn map_finds_outside_the_card_files_a_name_they_do_not_define() {
+    let texts: HashMap<&str, &str> = HashMap::from([
+        ("crates/x/src/lib.rs", "fn alpha() {}\n"),
+        ("apps/rc/src/main.rs", "fn main() {}\n\nfn handle_note(line: &str) {}\n"),
+    ]);
+    let read = |file: &str| texts.get(file).map(|t| (*t).to_owned());
+    let files = ["crates/x/src/lib.rs".to_owned()];
+    let sources = ["apps/rc/src/main.rs".to_owned(), "crates/x/src/lib.rs".to_owned(), "gone.rs".to_owned()];
+    let card = "fix `alpha`, wire `handle_note()` to `Ledger::brand_new`; check with `cargo test -p x` in `apps/rc/`";
+    let map = map_of(read, &files, &Ask { card, points: &[], sources: &sources }, &ChangedLines::new(), 10_000);
+    let outside: Vec<&Pointer> = map.pointers.iter().filter(|p| p.file == "apps/rc/src/main.rs").collect();
+    assert_eq!(outside.len(), 1, "{map:?}");
+    assert_eq!((outside[0].item.as_str(), outside[0].start, outside[0].end), ("fn handle_note(line: &str)", 3, 3));
+    assert_eq!(outside[0].score, 100);
+    assert_eq!(map.pointers.iter().filter(|p| p.item == "fn alpha()").count(), 1, "{map:?}");
+    assert_eq!(map.unresolved, ["Ledger::brand_new"]);
+    let rendered = map.render();
+    assert!(
+        rendered.contains("apps/rc/src/main.rs 3-3  fn handle_note(line: &str)  · named by the card, outside its files\n"),
+        "{rendered}"
+    );
+    assert!(rendered.ends_with("nothing defines: Ledger::brand_new; treat it as new\n"), "{rendered}");
+}
+
+#[test]
 fn map_ranks_nothing_in_a_file_and_prints_its_one_line() {
     let (read, files) =
         files_of(&[("src/a.rs", "fn alpha() {}\nfn beta() {}\n"), ("src/b.rs", "fn zeta() {}\nfn eta() {}\nfn theta() {}\n")]);
-    let map = map_of(&read, &files, &Ask { card: "fix `alpha`", points: &[] }, &ChangedLines::new(), 10_000);
+    let map = map_of(&read, &files, &Ask { card: "fix `alpha`", points: &[], sources: &[] }, &ChangedLines::new(), 10_000);
     let rendered = map.render();
     assert!(rendered.contains("src/a.rs 1-1  fn alpha()  · named by the card\n"), "{rendered}");
     assert!(rendered.contains("src/a.rs (2 lines): 1 more items not shown\n"), "{rendered}");
