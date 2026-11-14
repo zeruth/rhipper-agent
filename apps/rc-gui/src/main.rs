@@ -647,6 +647,13 @@ const RUNS_SHOWN: usize = 60;
 /// count and whether the plan was tight.
 type WalkKey = (Option<SystemTime>, usize, usize, bool);
 
+/// A file's modification time and length, `None` when it cannot be read.
+type Stamp = Option<(Option<SystemTime>, u64)>;
+
+/// What a project's allocation and feed counts were read from: the feed's stamp, the table's,
+/// the roadmap's and whether a run was live.
+type AllocationKey = (Stamp, Stamp, Option<SystemTime>, bool);
+
 /// One token gauge as the row draws it: the badge's text and the graph's samples, 0 to 1,
 /// the oldest first.
 #[derive(Default, Debug, PartialEq)]
@@ -1569,6 +1576,10 @@ struct Workspace {
     /// priority order) and when it was read; read again once a second.
     allocation: (Option<String>, u32, Option<usize>),
     allocation_at: Option<Instant>,
+    /// When the stamps of what the allocation is read from were last looked at, and what they
+    /// were: the reads run again only when one moved.
+    allocation_looked: Option<Instant>,
+    allocation_key: Option<AllocationKey>,
     /// The cards landed toward the next look-back pass, and whether one is running now.
     lookback: (u32, bool),
     /// What changed since the person last looked, read with the allocation.
@@ -1803,6 +1814,8 @@ impl Workspace {
             job: None,
             allocation: (None, 1, None),
             allocation_at: None,
+            allocation_looked: None,
+            allocation_key: None,
             lookback: (0, false),
             since: since::Since::default(),
             waiting: Vec::new(),
@@ -4249,8 +4262,24 @@ impl Workspace {
             .unwrap_or_else(|| self.root.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
         let dir = self.root.display().to_string();
         let job = self.job.clone();
-        // the project's allocation, read once a second: the header's controls change it
-        if self.allocation_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+        // the project's allocation and its feed's counts, looked at once a second but read only
+        // when the feed, the table or the roadmap moved (or half a minute passed): each read is
+        // the whole feed three times and the table twice, and a pass every second for every
+        // project skipped the window once a second (the person, 2026-11-14)
+        let looked = self.allocation_at.is_none() || self.allocation_looked.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+        let key = looked.then(|| {
+            self.allocation_looked = Some(Instant::now());
+            let stamp = |path: PathBuf| std::fs::metadata(path).ok().map(|m| (m.modified().ok(), m.len()));
+            (
+                stamp(self.root.join("var").join("pair.log")),
+                stamp(self.root.join(ra_console::router::ROUTES_FILE)),
+                self.roadmap_seen,
+                live.is_some(),
+            )
+        });
+        let stale = self.allocation_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+        if let Some(key) = key.filter(|key| stale || self.allocation_key.as_ref() != Some(key)) {
+            self.allocation_key = Some(key);
             self.allocation = (
                 ra_console::allocation::model(&self.root),
                 ra_console::allocation::runners(&self.root),
