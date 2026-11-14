@@ -79,6 +79,14 @@ message = "a path outside the worktree is not readable: the worktree's own targe
 remedy = { kind = "hint" }
 
 [[gotcha]]
+# `llvm-objdump -s --start-address=…` dumps the whole section: the address flags only bound `-d`
+id = "objdump-s-address"
+where = "command"
+pattern = '\bllvm-objdump\b(.*\s(-[A-Za-z]*s[A-Za-z]*|--full-contents)\b.*--(start|stop)-address|.*--(start|stop)-address.*\s(-[A-Za-z]*s[A-Za-z]*|--full-contents)\b)'
+message = "--start-address and --stop-address are ignored for -s (--full-contents), which dumps the whole section: grep the hex dump by its address column instead, as in llvm-objdump -s file | grep -A2 \"^ 10066b90\""
+remedy = { kind = "hint" }
+
+[[gotcha]]
 # the other heavy work a worker starts, on the same slots as the builds (the person, 2026-11-12:
 # "catch more of the cpu time stuff in them like giant greps, script runs"): a script run (a .py,
 # a .ps1, a node script), a JVM, a recursive search, and the WSL toolchains. Held, it waits its
