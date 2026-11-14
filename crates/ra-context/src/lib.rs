@@ -161,6 +161,9 @@ pub fn dedupe_notes(notes: &str, known: &str) -> String {
 /// The tokens the map of a card's files takes in its prompt.
 pub const MAP_ROOM: usize = 1_500;
 
+/// The tokens of quoted item text the map carries under its rows.
+pub const QUOTE_ROOM: usize = 6_000;
+
 /// How many items the outline or the item ranges a whole-file read gets back name before
 /// they count the rest.
 const READ_OUTLINE_ROOM: usize = 60;

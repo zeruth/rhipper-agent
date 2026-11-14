@@ -75,15 +75,38 @@ pub struct Map {
 }
 
 impl Map {
-    /// The map as the prompt carries it.
+    /// The map as the prompt carries it, with the numbered text of the pointed-at items under
+    /// its rows, read through `read`: the highest score first, inside `quote` tokens, and an
+    /// item that does not fit keeps its row alone.
     #[must_use]
-    pub fn render(&self) -> String {
+    pub fn render(&self, read: impl Fn(&str) -> Option<String>, quote: usize) -> String {
         let mut out = String::new();
         for line in self.pointers.iter().map(Pointer::line).chain(self.rest.iter().cloned()) {
             let _ = writeln!(out, "{line}");
         }
         for name in &self.unresolved {
             let _ = writeln!(out, "nothing defines: {name}; treat it as new");
+        }
+        let mut order: Vec<&Pointer> = self.pointers.iter().collect();
+        order.sort_by_key(|p| std::cmp::Reverse(p.score));
+        let mut left = quote;
+        let mut bodies: HashMap<(&str, usize), String> = HashMap::new();
+        for p in order {
+            let Some(text) = read(&p.file) else { continue };
+            let mut body = format!("{} {}-{}:\n", p.file, p.start, p.end);
+            for (i, line) in text.lines().enumerate().take(p.end).skip(p.start.saturating_sub(1)) {
+                let _ = writeln!(body, "{:>4}  {line}", i + 1);
+            }
+            let cost = tokens(&body);
+            if cost <= left {
+                left -= cost;
+                bodies.insert((p.file.as_str(), p.start), body);
+            }
+        }
+        for p in &self.pointers {
+            if let Some(body) = bodies.get(&(p.file.as_str(), p.start)) {
+                out.push_str(body);
+            }
         }
         out
     }

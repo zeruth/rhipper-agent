@@ -81,7 +81,7 @@ fn map_finds_outside_the_card_files_a_name_they_do_not_define() {
     assert_eq!(outside[0].score, 100);
     assert_eq!(map.pointers.iter().filter(|p| p.item == "fn alpha()").count(), 1, "{map:?}");
     assert_eq!(map.unresolved, ["Ledger::brand_new"]);
-    let rendered = map.render();
+    let rendered = map.render(&read, 0);
     assert!(
         rendered.contains("apps/rc/src/main.rs 3-3  fn handle_note(line: &str)  · named by the card, outside its files\n"),
         "{rendered}"
@@ -89,12 +89,56 @@ fn map_finds_outside_the_card_files_a_name_they_do_not_define() {
     assert!(rendered.ends_with("nothing defines: Ledger::brand_new; treat it as new\n"), "{rendered}");
 }
 
+fn function_of(name: &str, lines: usize) -> String {
+    let body: String = (0..lines - 2).map(|i| format!("    let value_{i} = {i};\n")).collect();
+    format!("fn {name}() {{\n{body}}}\n")
+}
+
+#[test]
+fn render_quotes_what_fits_the_room_highest_score_first() {
+    let twenty = function_of("twenty", 20);
+    let (read, files) = files_of(&[("src/a.rs", &twenty)]);
+    let ask = Ask { card: "change `twenty`", points: &[], sources: &[] };
+    let map = map_of(&read, &files, &ask, &ChangedLines::new(), 10_000);
+    let rendered = map.render(&read, 6_000);
+    assert!(rendered.contains("src/a.rs 1-20  fn twenty()  · named by the card\n"), "{rendered}");
+    assert!(rendered.contains("   1  fn twenty() {\n   2      let value_0 = 0;\n"), "{rendered}");
+    assert!(rendered.contains("  20  }\n"), "{rendered}");
+
+    let long = function_of("long", 400);
+    let (read, files) = files_of(&[("src/b.rs", &long)]);
+    let ask = Ask { card: "change `long`", points: &[], sources: &[] };
+    let map = map_of(&read, &files, &ask, &ChangedLines::new(), 10_000);
+    let rendered = map.render(&read, 100);
+    assert!(rendered.contains("src/b.rs 1-400  fn long()"), "{rendered}");
+    assert!(!rendered.contains("let value_0"), "{rendered}");
+
+    let two = format!("{}{}", function_of("high", 14), function_of("low", 10));
+    let (read, files) = files_of(&[("src/c.rs", &two)]);
+    let changed: ChangedLines = HashMap::from([("src/c.rs".to_owned(), vec![(20, 20)])]);
+    let ask = Ask { card: "change `high`", points: &[], sources: &[] };
+    let map = map_of(&read, &files, &ask, &changed, 10_000);
+    let [high, low] = [&map.pointers[0], &map.pointers[1]];
+    assert!(high.item.contains("high") && low.item.contains("low") && high.score > low.score, "{map:?}");
+    // The higher-scored body is the dearer: the smallest room that holds it holds the cheaper
+    // one alone too, but not both, so only the order decides which is quoted.
+    let high_line = "   2      let value_0 = 0;\n";
+    let low_line = "  16      let value_0 = 0;\n";
+    let room = (0..6_000).find(|&q| map.render(&read, q).contains(high_line)).expect("some room quotes high");
+    let low_alone = Map { pointers: vec![low.clone()], ..Map::default() };
+    assert!(low_alone.render(&read, room).contains(low_line), "the room holds the cheaper body alone");
+    let rendered = map.render(&read, room);
+    assert!(rendered.contains(high_line), "{rendered}");
+    assert!(!rendered.contains(low_line), "{rendered}");
+    assert!(rendered.contains("src/c.rs 15-24  fn low()"), "{rendered}");
+}
+
 #[test]
 fn map_ranks_nothing_in_a_file_and_prints_its_one_line() {
     let (read, files) =
         files_of(&[("src/a.rs", "fn alpha() {}\nfn beta() {}\n"), ("src/b.rs", "fn zeta() {}\nfn eta() {}\nfn theta() {}\n")]);
     let map = map_of(&read, &files, &Ask { card: "fix `alpha`", points: &[], sources: &[] }, &ChangedLines::new(), 10_000);
-    let rendered = map.render();
+    let rendered = map.render(&read, 0);
     assert!(rendered.contains("src/a.rs 1-1  fn alpha()  · named by the card\n"), "{rendered}");
     assert!(rendered.contains("src/a.rs (2 lines): 1 more items not shown\n"), "{rendered}");
     assert!(rendered.contains("src/b.rs (3 lines): 3 items, none the card points at\n"), "{rendered}");

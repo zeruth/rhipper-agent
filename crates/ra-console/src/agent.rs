@@ -6767,7 +6767,7 @@ fn map_of_card(root: &Path, node: &Node, files: &[String], changed: &ra_context:
     let sources = ra_context::map::tracked_sources(root);
     let ask = ra_context::map::Ask { card: &card, points, sources: &sources };
     let read = |file: &str| std::fs::read_to_string(root.join(file)).ok();
-    ra_context::map::map_of(read, files, &ask, changed, ra_context::MAP_ROOM).render()
+    ra_context::map::map_of(read, files, &ask, changed, ra_context::MAP_ROOM).render(read, ra_context::QUOTE_ROOM)
 }
 
 /// The lines the last run of a card in revision changed, from `git diff -U0` over the files

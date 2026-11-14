@@ -198,7 +198,8 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
     task.brief = "Task #7: a thing\nObjective: do it\n".to_owned();
     let ask = map::Ask { card: "Task #7: change `one`", points: &[], sources: &[] };
     let read = |file: &str| std::fs::read_to_string(root.join(file)).ok();
-    task.outlines = map::map_of(read, &["src/lib.rs".to_owned(), "src/missing.rs".to_owned()], &ask, &ChangedLines::new(), 1_500).render();
+    task.outlines =
+        map::map_of(&read, &["src/lib.rs".to_owned(), "src/missing.rs".to_owned()], &ask, &ChangedLines::new(), 1_500).render(&read, 0);
     assert!(task.outlines.contains("src/lib.rs 1-1  pub fn one()  · named by the card\n"), "{}", task.outlines);
     assert!(task.outlines.contains("src/missing.rs (not in the workspace yet)"), "{}", task.outlines);
     // the first prompt carries no handoff
