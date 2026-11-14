@@ -18,6 +18,12 @@ const COUNT_FILE: &str = "var/lookback.count";
 /// Present while a pass runs: the window lights its pill, and a second walk does not start one.
 const RUNNING_FILE: &str = "var/lookback.running";
 
+/// The last failed pass: its unix time and the landed count it failed at.
+const FAILED_FILE: &str = "var/lookback.failed";
+
+/// How long a failed pass waits when no more cards land.
+const BACKOFF_SECS: u64 = 3600;
+
 /// The logs a pass reads and then archives.
 const LOGS: [&str; 2] = ["var/retro.log", "var/gotchas.log"];
 
@@ -40,10 +46,26 @@ pub fn running(root: &Path) -> bool {
     std::fs::read_to_string(root.join(RUNNING_FILE)).ok().and_then(|t| t.trim().parse::<u32>().ok()).is_some_and(crate::hub::pid_alive)
 }
 
-/// Whether a pass is due: [`EVERY`] cards landed and none running.
+/// Whether a pass is due: [`EVERY`] cards landed and none running; after a failed pass, [`EVERY`]
+/// more cards than it failed at, or [`BACKOFF_SECS`] later.
 #[must_use]
 pub fn due(root: &Path) -> bool {
-    landed_since(root) >= EVERY && !running(root)
+    if landed_since(root) < EVERY || running(root) {
+        return false;
+    }
+    let Some((at, landed)) = failure(root) else { return true };
+    landed_since(root) >= landed + EVERY || now().saturating_sub(at) >= BACKOFF_SECS
+}
+
+fn now() -> u64 {
+    crate::clock::unix_now()
+}
+
+/// The unix time and the landed count of the last failed pass, while it holds.
+fn failure(root: &Path) -> Option<(u64, u32)> {
+    let text = std::fs::read_to_string(root.join(FAILED_FILE)).ok()?;
+    let (at, landed) = text.trim().split_once(' ')?;
+    Some((at.parse().ok()?, landed.parse().ok()?))
 }
 
 /// The look-back pass: plans the cards the evidence calls for, archives the logs it read under
@@ -59,7 +81,15 @@ pub async fn pass(store: &ra_roadmap::store::Store, worker: &crate::agent::Worke
     let landed = landed_since(&root);
     let planned = crate::commands::plan::plan(store, worker, None, false).await;
     let _ = std::fs::remove_file(&marker);
-    let lines = planned?;
+    let lines = match planned {
+        Ok(lines) => lines,
+        Err(error) => {
+            let _ = std::fs::write(root.join(FAILED_FILE), format!("{} {landed}", now()));
+            crate::pair::event(&root, &format!("look-back pass failed; the next try waits for {EVERY} more landed cards or an hour"));
+            return Err(error);
+        }
+    };
+    let _ = std::fs::remove_file(root.join(FAILED_FILE));
     let archived = archive(&root);
     let _ = std::fs::write(root.join(COUNT_FILE), "0");
     let head = lines.first().cloned().unwrap_or_else(|| "nothing new to plan".to_owned());
@@ -72,7 +102,7 @@ pub async fn pass(store: &ra_roadmap::store::Store, worker: &crate::agent::Worke
 
 /// Moves the logs a pass read to `var/archive/<unix time>/`; says what it moved.
 fn archive(root: &Path) -> String {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let now = now();
     let dir: PathBuf = root.join("var").join("archive").join(now.to_string());
     let mut moved = Vec::new();
     for log in LOGS {
@@ -106,6 +136,24 @@ mod tests {
         assert!(due(dir.path()));
         std::fs::write(dir.path().join(RUNNING_FILE), std::process::id().to_string()).unwrap();
         assert!(!due(dir.path()), "a pass running holds the next");
+    }
+
+    #[test]
+    fn lookback_backs_off_after_a_failed_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("var")).unwrap();
+        for _ in 0..EVERY {
+            count_landing(dir.path());
+        }
+        std::fs::write(dir.path().join(FAILED_FILE), format!("{} {EVERY}", now())).unwrap();
+        assert!(!due(dir.path()), "a failed pass is not retried at once");
+        for _ in 0..EVERY {
+            count_landing(dir.path());
+        }
+        assert!(due(dir.path()), "EVERY more cards end the backoff");
+        std::fs::write(dir.path().join(COUNT_FILE), EVERY.to_string()).unwrap();
+        std::fs::write(dir.path().join(FAILED_FILE), format!("{} {EVERY}", now() - BACKOFF_SECS)).unwrap();
+        assert!(due(dir.path()), "an hour ends the backoff");
     }
 
     #[test]

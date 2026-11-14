@@ -18,6 +18,9 @@ use super::home::Owner;
 use super::prompt::{self, MAX_CARDS, MIN_CARDS};
 use crate::agent::{self, Worker};
 
+/// The turns the evidence planner may take: it needs one, a harness route needs a few.
+const PLAN_TURNS: u32 = 6;
+
 /// One card that stands: the item the store imports, the evidence numbers it cites and what it
 /// says it saves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +115,9 @@ pub async fn propose(
             workspace: None,
             budget_usd: None,
             resume: None,
-            max_turns: Some(1),
+            // a harness route spends a turn or two beyond the answer (a Fable planner ran out of
+            // one after 2, asm 2026-11-14): the cap is a ceiling, not the plan's length
+            max_turns: Some(PLAN_TURNS),
             max_context: None,
             effort: Some(ra_roadmap::model::Effort::default().to_string()),
             read_only: false,
