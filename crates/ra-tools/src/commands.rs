@@ -169,6 +169,20 @@ fn verdict(mut text: String) -> (bool, String) {
     (true, text)
 }
 
+/// The `--test` target a check's `command` named when its output shows no test ran (`running 0
+/// tests` for every target, or `0 tests matched`): the target is not in the tree the check ran
+/// on, which is a wait for main and not a failure of the card.
+#[must_use]
+pub fn missing_test_target(command: &str, text: &str) -> Option<String> {
+    let none_ran = text.trim_end().ends_with(NO_TEST_RAN) || text.contains("0 tests matched");
+    if !none_ran {
+        return None;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let at = words.iter().position(|w| *w == "--test")?;
+    words.get(at + 1).map(|name| (*name).to_owned())
+}
+
 /// How long a check's pipes are read after its command has exited: what a process it left
 /// behind writes later is not the check's.
 const PIPE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);

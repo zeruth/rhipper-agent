@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use commands::clip;
-pub use commands::words;
+pub use commands::{missing_test_target, words};
 
 mod commands;
 pub mod cpu;

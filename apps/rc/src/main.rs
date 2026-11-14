@@ -1752,7 +1752,12 @@ async fn check_card(card: i64) -> anyhow::Result<()> {
             Err(e) => (false, format!("{e:#}\n")),
         };
         kept.extend(["$ ", command.as_str(), "\n", output.as_str(), "\n"]);
-        println!("{} {command}", if ok { "passed" } else { "failed" });
+        let missing = if ok { None } else { ra_tools::missing_test_target(&command, &output) };
+        if let Some(target) = &missing {
+            println!("waits on main: test target {target} not in the worktree · {command}");
+        } else {
+            println!("{} {command}", if ok { "passed" } else { "failed" });
+        }
         if !ok {
             passed = false;
             break;

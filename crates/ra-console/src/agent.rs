@@ -6028,6 +6028,16 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         let base = base_failures(worker, &root, &failed.command, timeout).await;
         failed.failures = ra_context::marked_on_base(&failed.failures, &base);
     }
+    // a test target the worktree lacks ran no test: the card that lists it is built on a main
+    // that does not have it yet, so it waits for main's next commit and is no send-back
+    let missing = checks.iter().find(|run| !run.passed).and_then(|run| ra_tools::missing_test_target(&run.command, &run.text));
+    if worker.branch.is_some()
+        && red_main.is_none()
+        && missing.is_some()
+        && let Ok(sha) = git(&root, &["rev-parse", "HEAD"]).await
+    {
+        red_main = Some(BaseRun { sha, failing: Vec::new() });
+    }
     let status_after = git_status(&acting).await;
     // the card's own set: on a tree other hands share, a dirty file joins it only when the run
     // wrote to it and the report or an earlier handoff names it (#157 lost a named file, #185
@@ -6122,7 +6132,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         .map(str::to_owned);
     // a card whose failed tests fail on main too waits for main's next commit: neither a rerun
     // nor a block for a person
-    let red = red_main.as_ref().map(|base| format!("main fails {} at {}", base.failing.join(", "), short_sha(&base.sha)));
+    let red = red_main.as_ref().map(|base| match &missing {
+        Some(target) if base.failing.is_empty() => format!("test target {target} not in the worktree"),
+        _ => format!("main fails {} at {}", base.failing.join(", "), short_sha(&base.sha)),
+    });
     let held = if red.is_some() { None } else { held_reason(&session.text, &changed, failed, print.as_deref(), last_print.as_deref()) };
     // the lint of what the run changed, once the check passed: the orchestrator finds the
     // warnings so the worker spends no turns on them. A lint that cannot run is a line, not a
