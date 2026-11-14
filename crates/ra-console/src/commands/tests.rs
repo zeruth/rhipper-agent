@@ -3084,6 +3084,35 @@ async fn a_second_malformed_verdict_leaves_the_card_implemented_without_points()
 }
 
 #[tokio::test]
+async fn a_second_malformed_verdict_after_a_run_holds_the_card_in_review_and_the_walk_asks_one_rung_up() {
+    let essay = "I read the diff carefully.\nThe change looks reasonable overall.\nThere is much to say about the design.";
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task T parent 1", &store, &worker()).await.unwrap();
+    let passing: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    // the worker's report, then the reviewer's two essays
+    let script = Scripted::new(vec![says("done: the tree already holds the work", vec![]), says(essay, vec![]), says(essay, vec![])]);
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone()))).with_script(passing.clone());
+    let (out, _) = run("/run 2", &store, &runner).await.unwrap();
+    assert_eq!(script.seen.lock().len(), 3, "{out:?}");
+    assert!(out.iter().any(|l| l.contains("no verdict")), "{out:?}");
+    // implemented after a run is the state the walk lands: a card without a verdict waits instead
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, ra_roadmap::model::TaskState::Review, "{out:?}");
+    assert!(!node.notes.as_deref().unwrap_or_default().contains("reasonable overall"), "{:?}", node.notes);
+    let feed = crate::pair::recent(dir.path(), 50);
+    assert!(feed.iter().any(|l| l.contains("#2") && l.contains("no verdict")), "{feed:?}");
+    // the walk's next pass asks the review again, one rung above the reviewer that wrote essays
+    let reviewer = Scripted::new(vec![says("accepted", vec![])]);
+    let walker = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(reviewer.clone()))).with_script(passing);
+    let walked = crate::agent::run_all(&store, &walker, false).await.unwrap();
+    let models: Vec<String> = reviewer.seen.lock().iter().map(|request| request.model.clone()).collect();
+    assert_eq!(models, ["claude-opus-5-5"], "{walked:?}");
+    assert!(walked.iter().any(|l| l.contains("#2 T accepted by")), "{walked:?}");
+    assert_ne!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Review, "{walked:?}");
+}
+
+#[tokio::test]
 async fn a_malformed_verdict_whose_second_ask_fails_puts_the_card_back_for_the_next_review() {
     let essay = "I read the diff carefully.\nThe change looks reasonable overall.";
     let dir = tempfile::tempdir().unwrap();

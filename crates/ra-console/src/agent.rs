@@ -1541,7 +1541,13 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     let root = workspace_of(store);
     // the reviewer is a role of its own: the card's assignee is its implementer, not its judge,
     // and a model judging its own work sent #185 back seven times on the same points
-    let (model, by) = crate::router::Router::load(&root)?.reviewer(&node, &worker.model, rejections(&root, id));
+    let router = crate::router::Router::load(&root)?;
+    let (mut model, mut by) = router.reviewer(&node, &worker.model, rejections(&root, id));
+    // a card held for a reviewer that wrote off the form twice is judged one rung above it
+    if let Some(failed) = held_without_verdict(&root, id) {
+        model = rung_above(&router.ladder, &failed);
+        by = format!("one rung above {}, whose review was off the form", short(&failed));
+    }
     let provider = worker.provider_for(&model)?;
     // the diff is read where the run acted: a card run in its worktree left nothing in the
     // project's tree, and the reviewer judged an empty diff (#173, the first parallel walk)
@@ -1610,10 +1616,23 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
             }
         }
         if verdict == Verdict::Malformed {
-            // no verdict: the card stays as it was for the next walk's reviewer
-            store.set_state_by(id, before, Source::Run).await?;
+            // no verdict: the card stays as it was for the next reviewer; after a run, where
+            // implemented is the accepting state the walk lands, it waits in review instead, so
+            // no card lands without a verdict
+            let held = if accepted == TaskState::Implemented { TaskState::Review } else { before };
+            // the mark on the handoff names the reviewer, so the walk's next pass asks the
+            // review again of the model one rung up ([`review_held`])
+            let mut task = ra_context::TaskContext::open(&root, id);
+            if let Some(last) = task.handoffs.last_mut() {
+                last.verdict = Some(format!("{NO_VERDICT} {model}"));
+                if let Err(e) = task.save(&root) {
+                    tracing::warn!("the no-verdict mark of #{id} was not saved on its handoff: {e:#}");
+                }
+            }
+            store.set_state_by(id, held, Source::Run).await?;
+            let next = if held == TaskState::Review { "the walk's next pass asks it again one rung up" } else { "for the next review" };
             let line = format!(
-                "· #{id} {} no verdict: the review by {} was off the form twice; the card stays {before:?} for the next review",
+                "· #{id} {} no verdict: the review by {} was off the form twice; the card stays {held:?}, {next}",
                 node.title,
                 short(&model)
             );
@@ -2740,6 +2759,8 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
     // the planned cards done a day ago are read back first: the day since them against the
     // day before, so the plan's claims are judged before the walk spends the next day
     lines.extend(crate::commands::plan::read_back(store, &root, worker).await);
+    // the cards a review off the form held are judged again before any card runs
+    lines.extend(review_held(store, worker).await);
     loop {
         // the cards that wait on a red main are ready again once main moves
         lines.extend(requeue_red_main(store, &root).await);
@@ -2999,6 +3020,49 @@ pub fn rejections(root: &Path, id: i64) -> usize {
         .iter()
         .filter(|handoff| handoff.verdict.as_deref().is_some_and(|verdict| verdict.starts_with("needs revision")))
         .count()
+}
+
+/// The mark a review off the form twice leaves on the last handoff's verdict, before the
+/// reviewer's model.
+const NO_VERDICT: &str = "no verdict by";
+
+/// The reviewer whose answers on card `id` were off the form twice, when its last handoff
+/// carries [`NO_VERDICT`].
+fn held_without_verdict(root: &Path, id: i64) -> Option<String> {
+    let task = ra_context::TaskContext::open(root, id);
+    let verdict = task.handoffs.last()?.verdict.as_deref()?;
+    verdict.strip_prefix(NO_VERDICT).map(|model| model.trim().to_owned()).filter(|model| !model.is_empty())
+}
+
+/// The model one rung above `model` on `ladder`: `model` itself at the top or off the ladder.
+fn rung_above(ladder: &crate::router::Ladder, model: &str) -> String {
+    let own = resolve(model);
+    ladder.models.iter().position(|rung| resolve(rung) == own).and_then(|at| ladder.models.get(at + 1)).map_or(own, |above| resolve(above))
+}
+
+/// The walk's pass over the cards held in review for want of a verdict ([`NO_VERDICT`]): each
+/// is reviewed again, one rung above the reviewer that wrote off the form, and one it accepts
+/// lands, so a held card never waits on a person. The lines of the reviews and the landings.
+async fn review_held(store: &Store, worker: &Worker) -> Vec<String> {
+    let root = workspace_of(store);
+    let Ok(nodes) = store.all().await else { return Vec::new() };
+    let mut lines = Vec::new();
+    for node in nodes {
+        if node.state != TaskState::Review || held_without_verdict(&root, node.id).is_none() {
+            continue;
+        }
+        let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id = node.id);
+        let id = node.id;
+        async {
+            lines.extend(review_after_run(store, id, worker).await);
+            if store.read(id).await.is_ok_and(|n| n.state == TaskState::Implemented) {
+                lines.extend(land_or_say(store, id, worker).await);
+            }
+        }
+        .instrument(span)
+        .await;
+    }
+    lines
 }
 
 /// The file a `stop` leaves for a walk, which reads it between runs.
@@ -4983,6 +5047,8 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     // the planned cards done a day ago are read back first: the day since them against the
     // day before, so the plan's claims are judged before the walk spends the next day
     lines.extend(crate::commands::plan::read_back(store, &root, worker).await);
+    // the cards a review off the form held are judged again, and landed when accepted
+    lines.extend(review_held(store, worker).await);
     // the cards the reviewer accepted that a walk stopped before they landed: landed first, so
     // a restart never strands accepted work (runelite #21 and #35, 2026-11-12)
     for node in store.all().await? {
