@@ -1033,6 +1033,10 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     if let Some(lines) = held_by_preflight(store, &root, &node, worker).await? {
         return Ok(lines);
     }
+    // a card whose files and passing check are already in the base needs no worker
+    if let Some(lines) = skipped_in_base(store, &root, &node, worker).await? {
+        return Ok(lines);
+    }
     // then the plan's week: a claude-* pick past the threshold falls to the local route or is
     // refused here, before the start marker
     let worker = &worker.for_card(&root, &node)?.steered_by_plan(&root, &node).await?;
@@ -7092,6 +7096,57 @@ async fn held_by_preflight(store: &Store, root: &Path, node: &Node, worker: &Wor
     store.set_state_by(node.id, TaskState::Blocked, Source::Run).await?;
     let text = format!("#{} blocked: `{command}` is rejected before any build: {error}; a person fixes the acceptance", node.id);
     tracing::warn!("{text}");
+    crate::pair::event(root, &text);
+    Ok(Some(vec![format!("  {text}")]))
+}
+
+/// Whether the work of `id` is already in the base: the card lists `+` files, every one exists in
+/// the project, and every command of its acceptance passes there. Card #666 ran four times with
+/// its file on main; a card with no `+` file or no named command is never in the base.
+///
+/// # Errors
+/// When the card or the roadmap cannot be read.
+pub async fn in_base(store: &Store, id: i64) -> anyhow::Result<bool> {
+    let root = workspace_of(store);
+    let node = store.read(id).await?;
+    let nodes = store.all().await?;
+    let files = ra_roadmap::tree::files_of(&nodes, &node).0;
+    Ok(is_in_base(&root, &node, files, ra_tools::Toolbox::new(&root)).await)
+}
+
+/// [`in_base`] over a node, its files and a toolbox already at hand.
+async fn is_in_base(root: &Path, node: &Node, files: &[String], toolbox: anyhow::Result<ra_tools::Toolbox>) -> bool {
+    let created: Vec<&str> = files.iter().filter_map(|f| f.trim().strip_prefix('+')).map(str::trim).collect();
+    let commands = named_checks(node.acceptance.as_deref());
+    if created.is_empty() || commands.is_empty() || !created.iter().all(|f| root.join(f).exists()) {
+        return false;
+    }
+    let Ok(toolbox) = toolbox else { return false };
+    let toolbox = toolbox.with_timeout(checks_of(root, node).timeout);
+    let _slot = hold_build(root, root).await;
+    for command in &commands {
+        let Ok(words) = ra_tools::words(command) else { return false };
+        if !matches!(toolbox.check_args(&words).await, Ok((true, _))) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Marks a card whose work is already in the base accepted and starts no worker; `None` sends
+/// the card on. A scripted worker goes on, as the preflight's does.
+async fn skipped_in_base(store: &Store, root: &Path, node: &Node, worker: &Worker) -> anyhow::Result<Option<Vec<String>>> {
+    if worker.script.is_some() {
+        return Ok(None);
+    }
+    let nodes = store.all().await?;
+    let files = ra_roadmap::tree::files_of(&nodes, node).0;
+    if !is_in_base(root, node, files, worker.toolbox(root)).await {
+        return Ok(None);
+    }
+    store.set_state_by(node.id, TaskState::Accepted, Source::Run).await?;
+    let text = format!("#{} already in base: its `+` files exist and its acceptance passes; no worker started", node.id);
+    tracing::info!(target: crate::trace::PROGRESS, "{text}");
     crate::pair::event(root, &text);
     Ok(Some(vec![format!("  {text}")]))
 }
