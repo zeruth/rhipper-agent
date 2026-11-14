@@ -727,6 +727,7 @@ fn a_handoff_head_names_the_tip_the_branch_s_commits_what_happened_and_what_is_o
         commits: vec!["c2 Checkpoint: run 2".to_owned(), "c1 Checkpoint: run 1".to_owned()],
         since: Some("merged: Merge branch 'main'".to_owned()),
         build: Some(build_line(Path::new("t"), false)),
+        merge_base: None,
     };
     let head = tree.head(&["cargo test -p x".to_owned()]);
     assert_eq!(

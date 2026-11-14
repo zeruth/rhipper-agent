@@ -1428,7 +1428,7 @@ pub fn changed_between(before: &str, after: &str) -> Vec<String> {
 pub const TREE_PREFIX: &str = "tree: at ";
 
 /// The prefixes of the lines the orchestrator writes at the head of a handoff's report.
-const HEAD_PREFIXES: [&str; 4] = [TREE_PREFIX, "since the last run: ", "build: ", "open: "];
+const HEAD_PREFIXES: [&str; 5] = [TREE_PREFIX, "since the last run: ", "build: ", "diff: ", "open: "];
 
 /// How many of the branch's commits the head names.
 const COMMITS_SHOWN: usize = 5;
@@ -1451,6 +1451,10 @@ pub struct Tree {
     /// Whether the worktree has a build, as [`build_line`] words it: a worker looked for one
     /// outside the worktree (`ls ../../target/debug/ras.exe`) when its own had none.
     pub build: Option<String>,
+    /// The full SHA the card's branch forked from the project's, which the head prints in a
+    /// literal `git diff <sha> HEAD --stat`: a worker's own `$(git merge-base ..)` is refused
+    /// and `git diff main HEAD` shows main's changes when the local ref is behind.
+    pub merge_base: Option<String>,
 }
 
 /// The handoff's word on a worktree's cargo `target`: its build to run from when `built`, else
@@ -1493,6 +1497,9 @@ impl Tree {
         }
         if let Some(build) = &self.build {
             let _ = writeln!(text, "build: {build}");
+        }
+        if let Some(sha) = &self.merge_base {
+            let _ = writeln!(text, "diff: the card's change is `git diff {sha} HEAD --stat`");
         }
         if !open.is_empty() {
             let items: Vec<String> = open.iter().map(|item| format!("`{item}`")).collect();

@@ -127,7 +127,12 @@ pub async fn tree_of(root: &Path, base: &str, branch: Option<&str>, since: Optio
         let built = target.join("debug").is_dir();
         ra_context::build_line(&target, built)
     });
-    ra_context::Tree { tip, branch: branch.map(str::to_owned), commits, since, build }
+    // the base is a literal SHA in the head, so a worker copies it instead of a substitution
+    let merge_base = match branch {
+        Some(_) if base != "HEAD" => git(root, &["rev-parse", base]).await,
+        _ => None,
+    };
+    ra_context::Tree { tip, branch: branch.map(str::to_owned), commits, since, build, merge_base }
 }
 
 /// One git command in `dir`, its stdout trimmed; `None` when it does not run or fails.
