@@ -2034,6 +2034,35 @@ async fn a_named_landing_conflict_goes_to_a_conflict_pass_whose_prompt_is_the_hu
 }
 
 #[tokio::test]
+async fn rerere_resolves_the_same_conflict_met_a_second_time_with_no_provider_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = project_with_a_card_branch(dir.path()).await;
+    std::fs::write(dir.path().join("made.txt"), "by the project\n").unwrap();
+    git_ok(dir.path(), &["add", "made.txt"]);
+    git_ok(dir.path(), &["commit", "-q", "-m", "the project's own"]);
+    let resolve = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"made.txt","content":"by the project\nby the worker\n"}"#.into(),
+    };
+    let script = Scripted::new(vec![says("", vec![resolve]), says("kept both sides of made.txt", vec![])]);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let first = crate::agent::resolve_landing(&store, 2, &runner).await.unwrap();
+    assert_eq!(first, "conflict pass by glm-5.3-flash resolved made.txt");
+    assert_eq!(script.seen.lock().len(), 2);
+    // the card's branch goes back to before the merge, and the same hunks meet again
+    let tree = dir.path().join("var").join("worktrees").join("2");
+    git_ok(&tree, &["reset", "-q", "--hard", "HEAD^1"]);
+    let nothing = Scripted::new(vec![]);
+    let again = Worker::new("z-ai/glm-5.3-flash").with_provider(nothing.clone());
+    let second = crate::agent::resolve_landing(&store, 2, &again).await.unwrap();
+    assert!(second.contains("merged into card/2 clean"), "{second}");
+    assert!(nothing.seen.lock().is_empty(), "a model was asked");
+    let text = std::fs::read_to_string(tree.join("made.txt")).unwrap().replace("\r\n", "\n");
+    assert_eq!(text, "by the project\nby the worker\n");
+}
+
+#[tokio::test]
 async fn a_merge_git_refused_naming_no_path_never_reaches_a_conflict_pass_or_the_worker() {
     let dir = tempfile::tempdir().unwrap();
     let store = project_with_a_card_branch(dir.path()).await;

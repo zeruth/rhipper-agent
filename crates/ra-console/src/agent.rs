@@ -3933,6 +3933,13 @@ async fn merge_in(path: &Path, main: &str, behind: &str, base: Option<String>) -
         Ok(_) => CatchUp::Merged(behind.to_owned(), base),
         Err(e) => {
             let conflicts = git(path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
+            // rerere resolved and staged every file: the merge only waits for its commit
+            if conflicts.trim().is_empty()
+                && git(path, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await.is_ok()
+                && git(path, &["commit", "-q", "--no-edit"]).await.is_ok()
+            {
+                return CatchUp::Merged(behind.to_owned(), base);
+            }
             if conflicts.trim().is_empty() {
                 let _ = git(path, &["merge", "--abort"]).await;
                 CatchUp::Refused(format!("{e:#}"))
@@ -3996,6 +4003,7 @@ fn quote_git(text: &str) -> String {
 /// would put the markers on the branch.
 async fn catch_up(root: &Path, path: &Path, node: &Node) -> Option<(String, CatchUp)> {
     let main = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.ok()?;
+    enable_rerere(root).await;
     let open = unresolved(path).await;
     if !open.is_empty() {
         return Some((main, CatchUp::Conflicts(open.len())));
@@ -4024,6 +4032,15 @@ async fn catch_up(root: &Path, path: &Path, node: &Node) -> Option<(String, Catc
         outcome = merge_in(path, &main, behind.trim(), base).await;
     }
     Some((main, outcome))
+}
+
+/// Turns git's rerere on in the project's config, which its worktrees share: a conflict the
+/// conflict pass resolved once is resolved by git when it meets the same hunks again (#211 and
+/// #216 each met one three times, and a model resolved it afresh each time).
+async fn enable_rerere(root: &Path) {
+    for key in ["rerere.enabled", "rerere.autoupdate"] {
+        let _ = git(root, &["config", key, "true"]).await;
+    }
 }
 
 /// The unmerged files of a tree that still hold a conflict marker: a merge the worker has not
@@ -4488,6 +4505,8 @@ async fn conflict_pass(root: &Path, tree: &Path, node: &Node, worker: &Worker) -
     if !left.is_empty() {
         return Err(format!("markers left in {}", left.join(", ")));
     }
+    // the resolution is recorded before the commit, for the next time the hunks meet
+    let _ = git(tree, &["rerere"]).await;
     git(tree, &["add", "-A"]).await.map_err(said)?;
     git(tree, &["commit", "-q", "--no-edit"]).await.map_err(said)?;
     let line = format!("conflict pass by {} resolved {}", short(&model), files.join(", "));
@@ -4498,7 +4517,7 @@ async fn conflict_pass(root: &Path, tree: &Path, node: &Node, worker: &Worker) -
 /// The conflict pass for a landing that conflicted: the project's branch merged into the card's
 /// worktree (made again from the branch when it is gone), and the pass on what that left. `Ok`
 /// with the line of the pass or of a clean merge, after which the landing is tried once more.
-async fn resolve_landing(store: &Store, id: i64, worker: &Worker) -> Result<String, String> {
+pub(crate) async fn resolve_landing(store: &Store, id: i64, worker: &Worker) -> Result<String, String> {
     let root = workspace_of(store);
     let said = |e: anyhow::Error| first_line(&format!("{e:#}"));
     let node = store.read(id).await.map_err(said)?;
