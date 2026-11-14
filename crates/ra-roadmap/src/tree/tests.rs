@@ -108,6 +108,31 @@ fn ready_blocked_and_plain_defined_are_told_apart() {
 }
 
 #[test]
+fn waits_above_hold_the_card_below() {
+    // #2 is open; milestone #3 waits on it, section #4 sits under #3, card #5 under #4
+    let mut open = node(2, None);
+    open.kind = NodeKind::Milestone;
+    open.state = TaskState::InProgress;
+    let mut milestone = node(3, None);
+    milestone.kind = NodeKind::Milestone;
+    milestone.depends_on = vec![2];
+    let mut section = node(4, Some(3));
+    section.kind = NodeKind::Section;
+    let card = node(5, Some(4));
+    let mut nodes = vec![open, milestone, section, card];
+    assert_eq!(effective_state(&nodes, &nodes[3]), TaskState::Defined);
+    assert_eq!(holder_of(&nodes, &nodes[3]).map(|n| n.id), Some(3));
+    assert!(next_ready(&nodes, &[]).is_none());
+    nodes[0].state = TaskState::Accepted;
+    assert_eq!(effective_state(&nodes, &nodes[3]), TaskState::Ready);
+    assert!(holder_of(&nodes, &nodes[3]).is_none());
+    assert_eq!(next_ready(&nodes, &[]).map(|n| n.id), Some(5));
+    // a wait above that can never be met blocks the card
+    nodes[0].state = TaskState::Failed;
+    assert_eq!(effective_state(&nodes, &nodes[3]), TaskState::Blocked);
+}
+
+#[test]
 fn next_names_the_first_ready_card() {
     let mut root = node(1, None);
     root.kind = NodeKind::Section;

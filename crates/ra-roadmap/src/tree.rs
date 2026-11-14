@@ -81,11 +81,20 @@ pub fn files_of<'a>(nodes: &'a [Node], node: &'a Node) -> (&'a [String], Option<
 /// The state a card stands in once its waits-on are read, computed and never written: a defined
 /// task or subtask is ready when every node it waits on is accepted (a card waiting on nothing is
 /// ready), blocked when one of them failed, was cancelled or is gone, and stays defined while one
-/// is still open. Any other state, and any node above a task, is the stored one.
+/// is still open. The waits of every node above the card count as its own. Any other state, and
+/// any node above a task, is the stored one.
 #[must_use]
 pub fn effective_state(nodes: &[Node], node: &Node) -> TaskState {
     let by_id: HashMap<i64, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
     effective_in(&by_id, node)
+}
+
+/// The node that holds a defined card: the card itself when its own wait is open, or the node above
+/// it whose wait is. `None` when nothing holds it.
+#[must_use]
+pub fn holder_of<'a>(nodes: &'a [Node], node: &'a Node) -> Option<&'a Node> {
+    let by_id: HashMap<i64, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
+    hold_in(&by_id, node).map(|(holder, _)| holder)
 }
 
 /// The effective state of every node, by id.
@@ -348,16 +357,36 @@ fn effective_in(by_id: &HashMap<i64, &Node>, node: &Node) -> TaskState {
     if node.state != TaskState::Defined || !is_card(node) {
         return node.state;
     }
-    let mut ready = true;
-    for dep in &node.depends_on {
-        match by_id.get(dep).map(|n| n.state) {
-            Some(TaskState::Accepted) => {}
-            // a dependency that will never be accepted, or that left the roadmap, holds the card
-            Some(TaskState::Failed | TaskState::Cancelled) | None => return TaskState::Blocked,
-            Some(_) => ready = false,
-        }
+    match hold_in(by_id, node) {
+        Some((_, state)) => state,
+        None => TaskState::Ready,
     }
-    if ready { TaskState::Ready } else { TaskState::Defined }
+}
+
+/// The node whose wait holds a card: the card itself or the nearest node above it that waits on
+/// something not yet accepted. A wait that can never be met outranks one still open.
+fn hold_in<'a>(by_id: &HashMap<i64, &'a Node>, node: &'a Node) -> Option<(&'a Node, TaskState)> {
+    let mut open = None;
+    let mut current = Some(node);
+    let mut steps = 0;
+    while let Some(n) = current {
+        for dep in &n.depends_on {
+            match by_id.get(dep).map(|d| d.state) {
+                Some(TaskState::Accepted) => {}
+                // a dependency that will never be accepted, or that left the roadmap, holds the card
+                Some(TaskState::Failed | TaskState::Cancelled) | None => {
+                    return Some((n, TaskState::Blocked));
+                }
+                Some(_) => {
+                    open.get_or_insert((n, TaskState::Defined));
+                }
+            }
+        }
+        steps += 1;
+        // a parent loop must not hang the walk
+        current = if steps > by_id.len() { None } else { n.parent.and_then(|id| by_id.get(&id).copied()) };
+    }
+    open
 }
 
 fn files_in<'a>(by_id: &HashMap<i64, &'a Node>, node: &'a Node) -> (&'a [String], Option<&'a Node>) {
