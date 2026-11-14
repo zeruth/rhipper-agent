@@ -859,6 +859,43 @@ async fn the_outline_of_the_worktree_is_what_prepare_sends_and_not_the_roots() {
     assert!(outline.contains("lib.rs (5 lines): 1 more items not shown") && !outline.contains("(3 lines)"), "{outline}");
 }
 
+#[test]
+fn rerun_quotes_the_item_its_failure_names_and_lists_the_others_it_read_as_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // five functions of thirty lines each, all of which the last session read
+    let names = ["north", "south", "east", "west", "centre"];
+    let text: String = names
+        .iter()
+        .map(|name| format!("pub fn {name}() {{\n{}}}\n", (0..28).map(|i| format!("    let _ = {i};\n")).collect::<String>()))
+        .collect();
+    std::fs::write(root.join("lib.rs"), &text).unwrap();
+    let last = ra_context::Handoff {
+        when: 1,
+        model: "m".into(),
+        outcome: "failed".into(),
+        check: "`cargo test` failed".into(),
+        verdict: None,
+        changed: vec![],
+        report: "done".into(),
+        warnings: vec![],
+        read: vec!["lib.rs:1-150".into()],
+        failures: vec!["tests::west\nthread 'tests::west' panicked at lib.rs:100:5:\nassertion failed".into()],
+    };
+    let points = rerun_points(None, Some(&last));
+    let map = map_of_card(root, &card(), &["lib.rs".to_owned()], &ra_context::ChangedLines::new(), &points, &last.read);
+    assert!(map.contains("lib.rs 91-120  pub fn west()  · named by a point\n"), "{map}");
+    for (at, name) in [(1, "north"), (31, "south"), (61, "east"), (121, "centre")] {
+        let row = format!("lib.rs {at}-{}  pub fn {name}()  · read by the last session\n", at + 29);
+        assert!(map.contains(&row), "{row} in {map}");
+        assert!(!map.contains(&format!("{at:>4}  pub fn {name}() {{")), "{name} is quoted: {map}");
+    }
+    assert!(map.contains("  91  pub fn west() {\n") && map.contains(" 120  }\n"), "{map}");
+    // what the regions gave the same read set: at least every line of it, numbered
+    let regions: String = text.lines().enumerate().map(|(i, line)| format!("{:>6}  {line}\n", i + 1)).collect();
+    assert!(map.len() * 3 < regions.len(), "{} against {}", map.len(), regions.len());
+}
+
 #[tokio::test]
 async fn prompt_carries_the_map() {
     let dir = tempfile::tempdir().unwrap();

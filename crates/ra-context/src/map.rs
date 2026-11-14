@@ -1,18 +1,21 @@
 //! The map of a card's work: the items of the card's files ranked against what the card says,
 //! so the prompt points at the few a worker needs rather than the first sixty in file order.
-//! An item the card names comes first, then what the last run changed or a point names, the
-//! test the check runs, an item whose name holds a rare word of the card, and a caller of a
-//! named item; the best that fit the room, in file order, and one line a file for the rest.
+//! An item the card names comes first, then what a point names and what the last run changed,
+//! the test the check runs, an item whose name holds a rare word of the card, a caller of a
+//! named item, and what the last session read; the best that fit the room, in file order, and
+//! one line a file for the rest.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 
-use crate::{ChangedLines, clip, item_name, items};
+use crate::{ChangedLines, clip, item_name, items, read_entry};
 
 /// An item the card names, in backticks or by a `file:line` that falls in it.
 const NAMED: usize = 100;
-/// An item the last run changed, or one a point names.
+/// An item a point names: a review's, a failure's or a warning's.
+const POINTED: usize = 90;
+/// An item the last run changed.
 const CHANGED: usize = 80;
 /// A test whose name holds the filter of the card's `cargo test`.
 const FILTER: usize = 70;
@@ -20,6 +23,11 @@ const FILTER: usize = 70;
 const RARE: usize = 40;
 /// An item that calls one the card names.
 const CALLER: usize = 30;
+/// An item the last session read: a row, never quoted, so a rerun opens on what its points
+/// name and not on everything the last session looked at.
+const READ: usize = 20;
+/// Why an item only read is pointed at.
+const READ_WHY: &str = "read by the last session";
 
 /// Words too common in a card's prose to point at anything.
 const STOPWORDS: &[&str] = &[
@@ -35,17 +43,19 @@ const OUTSIDE_EACH: usize = 3;
 const SOURCES: [&str; 8] = ["rs", "py", "ps1", "js", "ts", "go", "kt", "java"];
 
 /// What a card asks, as the map reads it: its text (title, objective and acceptance), the
-/// points a review or a failed check left on it, and the project's sources, where a name the
-/// card's files do not define is looked for.
+/// points a review, a failed check or a lint left on it, the read set of its last session as
+/// [`crate::read_set`] has it, and the project's sources, where a name the card's files do not
+/// define is looked for.
 #[derive(Debug, Clone, Default)]
 pub struct Ask<'a> {
     pub card: &'a str,
     pub points: &'a [String],
+    pub read: &'a [String],
     pub sources: &'a [String],
 }
 
 /// One item the map points at: its file, its inclusive 1-based range, the item as the outline
-/// shows it, why it is pointed at and how much that weighs.
+/// shows it, why it is pointed at and how much that weighs, and whether its text may be quoted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pointer {
     pub file: String,
@@ -54,6 +64,7 @@ pub struct Pointer {
     pub item: String,
     pub why: String,
     pub score: usize,
+    pub quote: bool,
 }
 
 impl Pointer {
@@ -77,7 +88,7 @@ pub struct Map {
 impl Map {
     /// The map as the prompt carries it, with the numbered text of the pointed-at items under
     /// its rows, read through `read`: the highest score first, inside `quote` tokens, and an
-    /// item that does not fit keeps its row alone.
+    /// item that does not fit, or was only read by the last session, keeps its row alone.
     #[must_use]
     pub fn render(&self, read: impl Fn(&str) -> Option<String>, quote: usize) -> String {
         let mut out = String::new();
@@ -87,7 +98,7 @@ impl Map {
         for name in &self.unresolved {
             let _ = writeln!(out, "nothing defines: {name}; treat it as new");
         }
-        let mut order: Vec<&Pointer> = self.pointers.iter().collect();
+        let mut order: Vec<&Pointer> = self.pointers.iter().filter(|p| p.quote).collect();
         order.sort_by_key(|p| std::cmp::Reverse(p.score));
         let mut left = quote;
         let mut bodies: HashMap<(&str, usize), String> = HashMap::new();
@@ -157,7 +168,7 @@ pub fn map_of(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask
         .collect();
     let named = backticked(ask.card);
     let card_refs = refs_of(ask.card);
-    let pointed: HashSet<String> = ask.points.iter().flat_map(|p| backticked(p)).collect();
+    let pointed: HashSet<String> = ask.points.iter().flat_map(|p| backticked(p).into_iter().chain(failed_name(p))).collect();
     let point_refs: Vec<(String, usize)> = ask.points.iter().flat_map(|p| refs_of(p)).collect();
     let filters = filters_of(ask.card);
     let words = words_of(ask.card);
@@ -194,7 +205,10 @@ pub fn map_of(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask
                 reasons.push((CHANGED, "changed by the last run".to_owned()));
             }
             if name.is_some_and(|n| pointed.contains(n)) || refers(&point_refs, file, start, end) {
-                reasons.push((CHANGED, "named by a point".to_owned()));
+                reasons.push((POINTED, "named by a point".to_owned()));
+            }
+            if was_read(ask.read, file, start, end) {
+                reasons.push((READ, READ_WHY.to_owned()));
             }
             if let Some(n) = name.filter(|_| item.contains("fn "))
                 && let Some(filter) = filters.iter().find(|f| n.contains(f.as_str()))
@@ -217,7 +231,8 @@ pub fn map_of(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask
             }
             // the strongest reason, the first given on a tie
             if let Some((score, why)) = reasons.into_iter().reduce(|best, next| if next.0 > best.0 { next } else { best }) {
-                candidates.push((index, Pointer { file: file.clone(), start, end, item: item.clone(), why, score }));
+                let quote = why != READ_WHY;
+                candidates.push((index, Pointer { file: file.clone(), start, end, item: item.clone(), why, score, quote }));
             }
         }
     }
@@ -284,7 +299,8 @@ fn look_outside(
             if *seen < OUTSIDE_EACH {
                 *seen += 1;
                 let why = "named by the card, outside its files".to_owned();
-                candidates.push((files.len() + offset, Pointer { file: source.clone(), start, end, item, why, score: NAMED }));
+                let pointer = Pointer { file: source.clone(), start, end, item, why, score: NAMED, quote: true };
+                candidates.push((files.len() + offset, pointer));
             }
         }
     }
@@ -327,7 +343,13 @@ fn backticked(text: &str) -> HashSet<String> {
 fn refs_of(text: &str) -> Vec<(String, usize)> {
     text.split(|c: char| c.is_whitespace() || "`(),;".contains(c))
         .filter_map(|token| {
-            let (path, line) = token.trim_end_matches(['.', ':']).rsplit_once(':')?;
+            let (mut path, mut line) = token.trim_end_matches(['.', ':']).rsplit_once(':')?;
+            // a `file:line:column`, as a panic, a compiler error or a lint gives it
+            if let Some((file, row)) = path.rsplit_once(':')
+                && row.parse::<usize>().is_ok()
+            {
+                (path, line) = (file, row);
+            }
             let line = line.parse().ok()?;
             path.contains('.').then(|| (path.replace('\\', "/"), line))
         })
@@ -338,6 +360,24 @@ fn refs_of(text: &str) -> Vec<(String, usize)> {
 fn refers(refs: &[(String, usize)], file: &str, start: usize, end: usize) -> bool {
     let file = file.replace('\\', "/");
     refs.iter().any(|(path, line)| file.ends_with(path.as_str()) && (start..=end).contains(line))
+}
+
+/// The function a failure names, the last segment of the test path its first line is
+/// (`third` of `tests::third`); `None` for a point whose first line is prose.
+fn failed_name(point: &str) -> Option<String> {
+    let first = point.lines().next()?.trim();
+    let name = first.rsplit("::").next()?;
+    let path = !first.contains(char::is_whitespace) && first.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':');
+    (path && name.len() > 1).then(|| name.to_owned())
+}
+
+/// Whether the last session read any line of the item at `start..=end` of `file`.
+fn was_read(read: &[String], file: &str, start: usize, end: usize) -> bool {
+    let file = file.replace('\\', "/");
+    read.iter().any(|entry| {
+        let (path, range) = read_entry(entry);
+        path.replace('\\', "/") == file && range.is_none_or(|(from, to)| from <= end && to >= start)
+    })
 }
 
 /// The filters of the `cargo test` commands a card puts in backticks: the first word after

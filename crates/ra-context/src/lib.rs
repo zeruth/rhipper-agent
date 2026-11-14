@@ -630,8 +630,9 @@ pub struct Handoff {
     /// the lint was clean or did not run. Kept apart from the report so the clip never eats them.
     pub warnings: Vec<String>,
     /// The read set of a session that ended on its cap or a failed check, as [`read_set`] has
-    /// it: `path` for a file read whole, `path:<from>-<to>` for a region. The next session opens
-    /// on those regions instead of reading them in again; empty for any other run.
+    /// it: `path` for a file read whole, `path:<from>-<to>` for a region. The next session's map
+    /// lists the items in them as rows, quoting only what its points name or the run changed;
+    /// empty for any other run.
     pub read: Vec<String>,
     /// The failures of the run's failed check as [`failures_of`] reads them from the whole
     /// output, each its name line and its error lines; empty when the check passed. Kept apart
@@ -845,9 +846,6 @@ pub struct TaskContext {
     /// a reject; `None` for a fresh card. The notes are in the roadmap, which the worker does not
     /// read, so the prompt quotes them.
     pub review: Option<String>,
-    /// The regions the last session read, as [`regions`] renders them, built afresh each run;
-    /// the prompt opens with them. Not kept in the file: they are the files' current lines.
-    pub regions: String,
     /// The output of the last run's checks, clipped to its tail ([`TaskContext::set_check_output`]):
     /// the reviewer reads it, so a point never asks for what the check already shows. Kept in
     /// the file before the handoffs; empty until a run checked the card.
@@ -862,18 +860,6 @@ const CHECK_OUTPUT_ROOM: usize = 4000;
 
 /// The indent of the check output's lines in the file, so no line of it reads as a heading.
 const CHECK_OUTPUT_INDENT: &str = "    ";
-
-/// The heading under which the last session's regions open the prompt.
-pub const REGIONS_HEADING: &str = "## Read by the last session";
-
-/// How many lines one region shows before it is clipped to an item boundary.
-const REGION_LINES: usize = 200;
-
-/// How many lines the regions show in all; the regions past it are named by their outline.
-const REGIONS_ROOM: usize = 800;
-
-/// How many items a clipped region names of the lines it leaves out.
-const LEFT_OUT_SHOWN: usize = 8;
 
 /// One entry of a read set: the path and the lines read of it, `None` for the whole file. A
 /// path with a colon of its own (`D:/x.rs`) keeps it; only a `:<from>-<to>` tail is a range.
@@ -929,69 +915,6 @@ pub fn read_set(reads: &[String]) -> Vec<String> {
     set
 }
 
-/// The regions of a read set as the next session reads them: per region its path and lines, the
-/// outline of the items in it, and the lines themselves, numbered. A region over
-/// [`REGION_LINES`] lines is clipped at the last item boundary the outline knows inside that
-/// room, and the items it leaves out are named with their ranges; past [`REGIONS_ROOM`] lines
-/// in all a region is named by its outline alone. A file no longer there is passed over.
-#[must_use]
-pub fn regions(workspace: &Path, read: &[String]) -> String {
-    let mut out = String::new();
-    let mut room = REGIONS_ROOM;
-    for entry in read {
-        let (file, range) = read_entry(entry);
-        let path = if Path::new(file).is_absolute() { PathBuf::from(file) } else { workspace.join(file) };
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let lines: Vec<&str> = text.lines().collect();
-        let (from, to) = range.unwrap_or((1, lines.len()));
-        let (from, to) = (from.max(1), to.min(lines.len()));
-        if from > to {
-            continue;
-        }
-        let items = items(Path::new(file), &text);
-        let shown_to = clip_region(&items, from, to, REGION_LINES.min(room));
-        let _ = writeln!(out, "{file} lines {from}-{to} (of {})", lines.len());
-        for (start, end, item) in items.iter().filter(|(start, end, _)| *start <= to && *end >= from) {
-            let _ = writeln!(out, "  {start:>5}-{end:<5} {}", clip(item, 110));
-        }
-        if let Some(shown_to) = shown_to {
-            for (number, line) in lines.iter().enumerate().take(shown_to).skip(from - 1) {
-                let _ = writeln!(out, "{:>6}  {line}", number + 1);
-            }
-            room -= shown_to + 1 - from;
-            if shown_to < to {
-                let left: Vec<String> = items
-                    .iter()
-                    .filter(|(start, end, _)| *start <= to && *end > shown_to)
-                    .take(LEFT_OUT_SHOWN)
-                    .map(|(start, end, item)| format!("{} {start}-{end}", item_name(item).unwrap_or(item)))
-                    .collect();
-                let _ = write!(out, "     … lines {}-{to} left out", shown_to + 1);
-                if !left.is_empty() {
-                    let _ = write!(out, "; read them by range: {}", left.join(", "));
-                }
-                out.push('\n');
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
-
-/// The last line a region of `from..=to` shows in `room` lines: the whole region when it fits,
-/// else the end of the last item that ends inside the room, else the room's last line; `None`
-/// when there is no room left.
-fn clip_region(items: &[(usize, usize, String)], from: usize, to: usize, room: usize) -> Option<usize> {
-    if room == 0 {
-        return None;
-    }
-    let last = from + room - 1;
-    if to <= last {
-        return Some(to);
-    }
-    Some(items.iter().map(|(_, end, _)| *end).filter(|end| (from..=last).contains(end)).max().unwrap_or(last))
-}
-
 /// The heading of the review in the file and the prompt.
 pub const REVIEW_HEADING: &str = "## Review";
 
@@ -1025,15 +948,7 @@ impl TaskContext {
         let check_output = section_of(&text, CHECK_OUTPUT_HEADING)
             .map(|output| output.lines().map(|line| line.strip_prefix(CHECK_OUTPUT_INDENT).unwrap_or(line)).collect::<Vec<_>>().join("\n"))
             .unwrap_or_default();
-        Self {
-            id,
-            brief: String::new(),
-            outlines: String::new(),
-            handoffs: parse_handoffs(&text),
-            review,
-            regions: String::new(),
-            check_output,
-        }
+        Self { id, brief: String::new(), outlines: String::new(), handoffs: parse_handoffs(&text), review, check_output }
     }
 
     /// Keeps the output of a run's checks, clipped to its last [`CHECK_OUTPUT_ROOM`] characters.
@@ -1048,19 +963,10 @@ impl TaskContext {
         };
     }
 
-    /// The text a run sends the worker: the regions the last session read, when it left any,
-    /// then the brief, the outlines, and the last handoffs.
+    /// The text a run sends the worker: the brief, the outlines, and the last handoffs.
     #[must_use]
     pub fn prompt(&self) -> String {
-        let mut text = String::new();
-        if !self.regions.is_empty() {
-            let _ = write!(
-                text,
-                "{REGIONS_HEADING}\nThe last session of this task read these regions; they are the files' current lines, so read only what they leave out.\n\n{}\n",
-                self.regions.trim_end()
-            );
-        }
-        text.push_str(&self.brief);
+        let mut text = self.brief.clone();
         if !self.outlines.is_empty() {
             text.push_str("\nFiles: read the regions the outline points at, not whole files.\n");
             text.push_str(&self.outlines);

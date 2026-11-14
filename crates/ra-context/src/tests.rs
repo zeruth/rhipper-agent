@@ -196,7 +196,7 @@ fn a_task_file_keeps_its_handoffs_across_runs_and_the_prompt_shows_the_last_ones
     let mut task = TaskContext::open(root, 7);
     assert!(task.handoffs.is_empty());
     task.brief = "Task #7: a thing\nObjective: do it\n".to_owned();
-    let ask = map::Ask { card: "Task #7: change `one`", points: &[], sources: &[] };
+    let ask = map::Ask { card: "Task #7: change `one`", ..map::Ask::default() };
     let read = |file: &str| std::fs::read_to_string(root.join(file)).ok();
     task.outlines =
         map::map_of(&read, &["src/lib.rs".to_owned(), "src/missing.rs".to_owned()], &ask, &ChangedLines::new(), 1_500).render(&read, 0);
@@ -470,7 +470,7 @@ fn a_read_set_merges_each_file_s_ranges_and_a_whole_read_stands_for_the_file() {
 }
 
 #[test]
-fn the_handoff_names_the_read_set_and_the_next_prompt_opens_with_its_regions_clipped_to_items() {
+fn the_handoff_names_the_read_set_and_the_next_map_lists_its_items_without_quoting_them() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -496,27 +496,17 @@ fn the_handoff_names_the_read_set_and_the_next_prompt_opens_with_its_regions_cli
     task.save(root).unwrap();
     let text = std::fs::read_to_string(TaskContext::path(root, 11)).unwrap();
     assert!(text.contains("read: src/big.rs:1-300 src/small.rs src/gone.rs:1-9\n"), "{text}");
-    let mut again = TaskContext::open(root, 11);
+    let again = TaskContext::open(root, 11);
     assert_eq!(again.handoffs[0].read, ["src/big.rs:1-300", "src/small.rs", "src/gone.rs:1-9"]);
     assert_eq!(again.handoffs[0].report, "half way");
-    again.brief = "Task #11: a thing\n".to_owned();
-    again.regions = regions(root, &again.handoffs[0].read);
-    let prompt = again.prompt();
-    assert!(prompt.starts_with(REGIONS_HEADING), "{prompt}");
-    assert!(prompt.find(REGIONS_HEADING).unwrap() < prompt.find("Task #11").unwrap());
-    // the outline of the region, then its lines up to the end of f1, then what is left out
-    assert!(
-        prompt.contains("src/big.rs lines 1-300 (of 300)\n      1-100   fn f0()\n    101-200   fn f1()\n    201-300   fn f2()\n"),
-        "{prompt}"
-    );
-    assert!(prompt.contains("     1  fn f0() {\n"), "{prompt}");
-    assert!(prompt.contains("   200  }\n     … lines 201-300 left out; read them by range: f2 201-300\n"), "{prompt}");
-    assert!(!prompt.contains("   201  fn f2"), "{prompt}");
-    assert!(prompt.contains("src/small.rs lines 1-2 (of 2)\n") && prompt.contains("     2  pub fn two() {}\n"), "{prompt}");
-    // a file no longer there is passed over; only the handoff still names it
-    assert!(!again.regions.contains("gone.rs"), "{}", again.regions);
-    // a run with no read set opens on its brief
-    assert!(TaskContext::open(root, 12).prompt().is_empty());
+    // the map of the next run lists what was read as rows and quotes none of it
+    let files: Vec<String> = ["src/big.rs", "src/small.rs"].map(str::to_owned).into();
+    let read = |file: &str| std::fs::read_to_string(root.join(file)).ok();
+    let ask = map::Ask { card: "Task #11: a thing", read: &again.handoffs[0].read, ..map::Ask::default() };
+    let rendered = map::map_of(&read, &files, &ask, &ChangedLines::new(), 1_500).render(&read, 6_000);
+    assert!(rendered.contains("src/big.rs 201-300  fn f2()  · read by the last session\n"), "{rendered}");
+    assert!(rendered.contains("src/small.rs 2-2  pub fn two()  · read by the last session\n"), "{rendered}");
+    assert!(!rendered.contains("let _ = 0;"), "{rendered}");
 }
 
 #[test]

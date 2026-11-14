@@ -777,7 +777,7 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
         task.handoffs[0].report
     );
     assert!(task.handoffs[0].report.ends_with("editing the store"), "{}", task.handoffs[0].report);
-    // the handoff names the read set, and the fresh session's prompt opens with its regions
+    // the handoff names the read set, and the fresh session's map lists its items as rows
     assert_eq!(task.handoffs[0].read, ["src/lib.rs:1-2", "Cargo.toml"]);
     let text = std::fs::read_to_string(ra_context::TaskContext::path(dir.path(), 2)).unwrap();
     assert!(text.contains("read: src/lib.rs:1-2 Cargo.toml\n"), "{text}");
@@ -789,10 +789,9 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
     assert!(harness.requests.lock().last().unwrap().resume.is_none());
     // the second request is the fresh session's; a review may follow it
     let opened = harness.requests.lock()[1].messages.last().unwrap().content.clone();
-    assert!(opened.starts_with(ra_context::REGIONS_HEADING), "{opened}");
-    assert!(opened.contains("src/lib.rs lines 1-2 (of 2)\n") && opened.contains("     1  #[test]\n"), "{opened}");
-    assert!(opened.contains("Cargo.toml lines 1-6 (of 6)\n      1-5     [package]\n      6-6     [workspace]\n"), "{opened}");
-    assert!(opened.find("Cargo.toml lines").unwrap() < opened.find("Task #2").unwrap(), "{opened}");
+    assert!(opened.contains("Cargo.toml 1-5  [package]  · read by the last session\n"), "{opened}");
+    assert!(opened.contains("Cargo.toml 6-6  [workspace]  · read by the last session\n"), "{opened}");
+    assert!(!opened.contains("   6  [workspace]"), "what was only read is not quoted: {opened}");
     // the cap fell at turn 5, while the session was still reading in: the fresh session reads
     // the same files, so it runs without the cap rather than hit it again (runelite #15)
     assert_eq!(harness.requests.lock().last().unwrap().max_context, None, "no cap after a cap hit reading in");

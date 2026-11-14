@@ -5934,8 +5934,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         if let Some(branch) = &worker.branch {
             last.check = format!("{} · branch {branch}", last.check);
         }
-        // the regions this session read, which the fresh one opens on instead of reading them
-        // in again (#103's three sessions each began with the same twenty turns of reading)
+        // the regions this session read, which the fresh one's map lists instead of their being
+        // read in again (#103's three sessions each began with the same twenty turns of reading)
         last.read = ra_context::read_set(&session.reads);
         task.record(last);
         save_context(store, &root, &task).await;
@@ -6397,20 +6397,18 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // the commands of the acceptance the worker may not run, or that outlive its turn, are
     // named under the card, so the session spends no turn on a refusal or a wait
     task.brief = format!("{}{}", brief.text, orchestrated_line(&checks_of(&root, node)));
-    // the outline is read from the tree the worker acts in, as its regions are, so a rerun in a
+    // the outline is read from the tree the worker acts in, as its quotes are, so a rerun in a
     // worktree gets the line numbers the file has there
     let acts_in = workspace.as_deref().unwrap_or(&root);
     let changed = last_change(acts_in, node, &task).await;
     // a card sent back by its reviewer carries the verdict's points in its context: the notes
     // that hold them are in the roadmap, which the worker does not read
     task.review = if is_rerun(node, worker) { ra_context::review_of(node.notes.as_deref().unwrap_or_default()) } else { None };
-    let points = review_points(task.review.as_deref());
-    task.outlines = map_of_card(acts_in, node, &brief.files, &changed, &points);
-    // the regions the last session read open this one, read from the tree it acts in, so the
-    // worker reads the ranges it still needs and not the same files again
-    if let Some(last) = task.handoffs.last().filter(|last| !last.read.is_empty()) {
-        task.regions = ra_context::regions(acts_in, &last.read);
-    }
+    // the map of a rerun quotes what its failures, warnings and points name and lists what the
+    // last session read as rows, so the worker opens on the few items the rerun is about
+    let points = rerun_points(task.review.as_deref(), task.handoffs.last());
+    let read = task.handoffs.last().map_or(&[][..], |last| last.read.as_slice());
+    task.outlines = map_of_card(acts_in, node, &brief.files, &changed, &points, read);
     let project =
         if draft { ra_context::Project::ensure(&root).unwrap_or_default() } else { ra_context::Project::load(&root).unwrap_or_default() };
     // the context rides cut to the card's crates (whole on rhipper-asm it is 12k tokens a run);
@@ -6762,21 +6760,37 @@ pub async fn context_preview(store: &Store, id: i64) -> anyhow::Result<String> {
     // the points of a review rank the map in `prepare`, so the preview ranks it by them too;
     // a fix pass is the one rerun it cannot tell, having no worker
     task.review = if sent_back(&node) { ra_context::review_of(node.notes.as_deref().unwrap_or_default()) } else { None };
-    let points = review_points(task.review.as_deref());
-    task.outlines = map_of_card(&root, &node, &brief.files, &last_change(&root, &node, &task).await, &points);
+    let points = rerun_points(task.review.as_deref(), task.handoffs.last());
+    let changed = last_change(&root, &node, &task).await;
+    let read = task.handoffs.last().map_or(&[][..], |last| last.read.as_slice());
+    task.outlines = map_of_card(&root, &node, &brief.files, &changed, &points, read);
     Ok(task.prompt())
 }
 
-/// The map of the card's files as the prompt carries it: the items its title, objective and
-/// acceptance point at, read from the tree the worker acts in, and where in its tracked sources
-/// a name the card's files do not define is.
-fn map_of_card(root: &Path, node: &Node, files: &[String], changed: &ra_context::ChangedLines, points: &[String]) -> String {
+/// The map of the card's files and of those its last session `read` as the prompt carries it:
+/// the items its title, objective, acceptance and `points` point at, read from the tree the
+/// worker acts in, and where in its tracked sources a name the card's files do not define is.
+fn map_of_card(
+    root: &Path,
+    node: &Node,
+    files: &[String],
+    changed: &ra_context::ChangedLines,
+    points: &[String],
+    read: &[String],
+) -> String {
     let card =
         format!("{}\n{}\n{}", node.title, node.objective.as_deref().unwrap_or_default(), node.acceptance.as_deref().unwrap_or_default());
     let sources = ra_context::map::tracked_sources(root);
-    let ask = ra_context::map::Ask { card: &card, points, sources: &sources };
-    let read = |file: &str| std::fs::read_to_string(root.join(file)).ok();
-    ra_context::map::map_of(read, files, &ask, changed, ra_context::MAP_ROOM).render(read, ra_context::QUOTE_ROOM)
+    let ask = ra_context::map::Ask { card: &card, points, read, sources: &sources };
+    let mut files = files.to_vec();
+    for entry in read {
+        let (path, _) = ra_context::read_entry(entry);
+        if !files.iter().any(|f| f.replace('\\', "/") == path.replace('\\', "/")) {
+            files.push(path.to_owned());
+        }
+    }
+    let text = |file: &str| std::fs::read_to_string(root.join(file)).ok();
+    ra_context::map::map_of(text, &files, &ask, changed, ra_context::MAP_ROOM).render(text, ra_context::QUOTE_ROOM)
 }
 
 /// The lines the last run of a card in revision changed, from `git diff -U0` over the files
@@ -9005,9 +9019,11 @@ fn sent_back(node: &Node) -> bool {
             .is_some_and(|review| review.lines().next().is_some_and(|first| first.contains("needs revision")))
 }
 
-/// The review's points a rerun carries: they rank the map's items as the review names them.
-fn review_points(review: Option<&str>) -> Vec<String> {
-    review.iter().flat_map(|r| r.lines().map(str::to_owned)).collect()
+/// The points a rerun carries: the failures and the warnings its last run left and the lines
+/// of the review; they rank the map's items as they name them, and the quote holds those.
+fn rerun_points(review: Option<&str>, last: Option<&ra_context::Handoff>) -> Vec<String> {
+    let left = last.into_iter().flat_map(|last| last.failures.iter().chain(&last.warnings).cloned());
+    left.chain(review.iter().flat_map(|r| r.lines().map(str::to_owned))).collect()
 }
 
 /// How many lines of the failing check a rerun reads: the failures lead the block, so what is
