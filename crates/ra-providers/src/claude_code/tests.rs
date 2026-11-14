@@ -121,6 +121,11 @@ fn a_chat_request_runs_with_no_tools_and_one_turn() {
     assert!(args.windows(2).any(|w| w == ["--tools", ""]), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--max-turns", "1"]), "{args:?}");
     assert!(!args.contains(&"--permission-mode".to_owned()), "{args:?}");
+    // a review names its turns, and a chat request keeps them
+    let mut review = request(None);
+    review.max_turns = Some(4);
+    let args = ClaudeCode::new().args(&review);
+    assert!(args.windows(2).any(|w| w == ["--max-turns", "4"]), "{args:?}");
 }
 
 #[test]

@@ -388,8 +388,10 @@ impl ClaudeCode {
                 args.extend(["--settings".to_owned(), hook_settings(rc)]);
             }
         } else {
-            // a chat completion: no tools, one turn
-            args.extend(["--tools".to_owned(), String::new(), "--max-turns".to_owned(), "1".to_owned()]);
+            // a chat completion: no tools, one turn unless the request names its own (a review
+            // asks 4 then 12; a hard 1 left it no verdict once the harness spent a second turn)
+            let turns = request.max_turns.unwrap_or(1).to_string();
+            args.extend(["--tools".to_owned(), String::new(), "--max-turns".to_owned(), turns]);
         }
         if request.workspace.is_some() {
             // the reads a run needs outside its worktree (a gitignored source tree, the cargo
