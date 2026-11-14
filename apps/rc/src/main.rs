@@ -1638,6 +1638,54 @@ fn wrong_crate_paths(nodes: &[ra_roadmap::model::Node], root: &Path) -> Vec<Stri
     faults
 }
 
+/// A fault for each `--test <name>` a card not yet done names in its acceptance while no
+/// `tests/<name>.rs` is in the tree or in the card's own `files:`. The fault names the open card
+/// whose files list that test, so the card creates it or waits on that card.
+fn missing_test_targets(nodes: &[ra_roadmap::model::Node], root: &Path) -> Vec<String> {
+    let in_tree = |file: &str| {
+        root.join("tests").join(file).exists()
+            || ["crates", "apps"].into_iter().any(|parent| {
+                std::fs::read_dir(root.join(parent))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|member| member.path().join("tests").join(file).exists())
+            })
+    };
+    let lists = |node: &ra_roadmap::model::Node, file: &str| {
+        node.files.iter().any(|f| f.trim_start_matches(ra_roadmap::tree::NEW_MARK).ends_with(&format!("tests/{file}")))
+    };
+    let mut faults = Vec::new();
+    for node in nodes.iter().filter(|n| !matches!(n.state, TaskState::Accepted | TaskState::Cancelled)) {
+        let Some(acceptance) = node.acceptance.as_deref() else { continue };
+        let mut seen: Vec<&str> = Vec::new();
+        for span in acceptance.split('`').skip(1).step_by(2) {
+            let mut words = span.split_whitespace();
+            while let Some(word) = words.next() {
+                let Some(name) = word.strip_prefix("--test=").or_else(|| (word == "--test").then(|| words.next()).flatten()) else {
+                    continue;
+                };
+                let file = format!("{name}.rs");
+                if seen.contains(&name) || in_tree(&file) || lists(node, &file) {
+                    continue;
+                }
+                seen.push(name);
+                let owner = nodes
+                    .iter()
+                    .find(|o| o.id != node.id && !matches!(o.state, TaskState::Accepted | TaskState::Cancelled) && lists(o, &file));
+                faults.push(match owner {
+                    Some(o) => format!(
+                        "#{}: --test {name} has no tests/{file} in the tree; #{} lists it: wait on #{} or create it here",
+                        node.id, o.id, o.id
+                    ),
+                    None => format!("#{}: --test {name} has no tests/{file} in the tree or in the card's files", node.id),
+                });
+            }
+        }
+    }
+    faults
+}
+
 /// Prints every fault the lint finds, and every named path missing from the project's tree,
 /// and exits 1 when there is one, so a script or a hook can gate on a clean roadmap.
 async fn check() -> anyhow::Result<()> {
@@ -1649,6 +1697,7 @@ async fn check() -> anyhow::Result<()> {
     faults.extend(tree::missing_files(&nodes, |file| root.join(file).exists()));
     faults.extend(wrong_crate_paths(&nodes, root));
     faults.extend(unknown_rc_faults(&nodes));
+    faults.extend(missing_test_targets(&nodes, root));
     // a check that cannot run fails every run of its card for a reason no worker can fix
     faults.extend(ra_console::agent::unrunnable_checks(&ra_console::agent::workspace_of(&store), &nodes).await);
     // a command the tool rejects is a fault of the card's text, found before a walk holds it
