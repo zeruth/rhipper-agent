@@ -41,6 +41,10 @@ const SDK_VARS: [&str; 10] = [
 /// `--version` costs the walk that much once a day, not more.
 const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// The line a prompt carries when the card uses WSL: the one form that reaches a distribution's
+/// tool, before the first WSL call finds out the quoted one is refused.
+const WSL_FORM: &str = "Call WSL as `wsl -d <distro> -- <tool> <args>`, one program per command: a quoted `bash -lc \"a; b\"` script loses its quotes (the second command runs on Windows) and is refused.";
+
 /// The longest a version line keeps, for the prompt's sake.
 const VERSION_WIDTH: usize = 90;
 
@@ -170,9 +174,10 @@ impl Manifest {
         } else {
             ""
         };
+        let wsl_form = if lines.iter().any(|l| l.starts_with("wsl ")) { format!("\n{WSL_FORM}") } else { String::new() };
         let lines: Vec<String> = lines.iter().map(|l| format!("- {l}")).collect();
         format!(
-            "The tools the card names, from the machine's manifest of {} (each found one's directory is on your PATH{shell}):\n{}",
+            "The tools the card names, from the machine's manifest of {} (each found one's directory is on your PATH{shell}):\n{}{wsl_form}",
             self.day,
             lines.join("\n")
         )
