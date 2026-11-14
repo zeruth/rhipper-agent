@@ -65,6 +65,8 @@ async fn review_scope_handoff_head_says_the_tree_was_merged_since() {
     assert!(head.starts_with(&format!("tree: at {}", tree.tip)), "{head}");
     assert!(head.contains("on card/7 · 3 commit(s) on the branch since its base"), "{head}");
     assert!(head.contains("\nsince the last run: merged: "), "{head}");
+    // a card's branch has a word on its build, so the next run looks for no binary elsewhere
+    assert!(head.contains("\nbuild: the worktree"), "{head}");
     assert!(head.ends_with("open: `cargo test -p x`\n"), "{head}");
     // where the run left it, nothing happened since
     let now = git_ok(root, &["rev-parse", "--short=12", "HEAD"]);

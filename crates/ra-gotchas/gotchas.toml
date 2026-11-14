@@ -70,6 +70,15 @@ message = "the shells here run cargo, the read-only git commands and the read-on
 remedy = { kind = "hint" }
 
 [[gotcha]]
+# a worker looking for a build the worktree has not made (`ls ../../target/debug/ras.exe`) or for a
+# system file (`ls C:/Windows/SysWOW64/…`): the hook reads the worktree and nothing around it
+id = "ls-outside-worktree"
+where = "command"
+pattern = '^\s*(ls|dir|Get-ChildItem|gci)\b[^|;&\n]*([\s"]\.\.[\\/]|[A-Za-z]:[\\/](Windows|Program Files)|\s/(mnt|usr|etc|bin)/)'
+message = "a path outside the worktree is not readable: the worktree's own target/ is the only build to look in, and system paths (C:/Windows, ../..) are not readable; the handoff's build: line says whether the worktree has a build, and when it has none, build it with cargo -p <crate> instead of looking for one elsewhere"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 # the other heavy work a worker starts, on the same slots as the builds (the person, 2026-11-12:
 # "catch more of the cpu time stuff in them like giant greps, script runs"): a script run (a .py,
 # a .ps1, a node script), a JVM, a recursive search, and the WSL toolchains. Held, it waits its

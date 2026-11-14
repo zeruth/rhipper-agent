@@ -1428,7 +1428,7 @@ pub fn changed_between(before: &str, after: &str) -> Vec<String> {
 pub const TREE_PREFIX: &str = "tree: at ";
 
 /// The prefixes of the lines the orchestrator writes at the head of a handoff's report.
-const HEAD_PREFIXES: [&str; 3] = [TREE_PREFIX, "since the last run: ", "open: "];
+const HEAD_PREFIXES: [&str; 4] = [TREE_PREFIX, "since the last run: ", "build: ", "open: "];
 
 /// How many of the branch's commits the head names.
 const COMMITS_SHOWN: usize = 5;
@@ -1448,6 +1448,20 @@ pub struct Tree {
     /// What happened to the tree between the last run's end and this run's start, as
     /// [`since_line`] words it.
     pub since: Option<String>,
+    /// Whether the worktree has a build, as [`build_line`] words it: a worker looked for one
+    /// outside the worktree (`ls ../../target/debug/ras.exe`) when its own had none.
+    pub build: Option<String>,
+}
+
+/// The handoff's word on a worktree's cargo `target`: its build to run from when `built`, else
+/// that there is none and how to make one, so the next run looks nowhere else for a binary.
+#[must_use]
+pub fn build_line(target: &Path, built: bool) -> String {
+    if built {
+        format!("the worktree's build is in {}; run its binaries from there", target.display())
+    } else {
+        format!("the worktree has no build yet in {}; build with `cargo build -p <crate>` before looking for a binary", target.display())
+    }
 }
 
 impl Tree {
@@ -1476,6 +1490,9 @@ impl Tree {
         text.push('\n');
         if let Some(since) = &self.since {
             let _ = writeln!(text, "since the last run: {since}");
+        }
+        if let Some(build) = &self.build {
+            let _ = writeln!(text, "build: {build}");
         }
         if !open.is_empty() {
             let items: Vec<String> = open.iter().map(|item| format!("`{item}`")).collect();

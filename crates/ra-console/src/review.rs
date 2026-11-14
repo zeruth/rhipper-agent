@@ -120,7 +120,14 @@ pub async fn tree_of(root: &Path, base: &str, branch: Option<&str>, since: Optio
         }
         _ => Vec::new(),
     };
-    ra_context::Tree { tip, branch: branch.map(str::to_owned), commits, since }
+    // a card's worktree builds where its run's `CARGO_TARGET_DIR` points; the project's own tree
+    // needs no word on it
+    let build = branch.map(|_| {
+        let target = ra_providers::claude_code::shared_target(root).unwrap_or_else(|| root.join("target"));
+        let built = target.join("debug").is_dir();
+        ra_context::build_line(&target, built)
+    });
+    ra_context::Tree { tip, branch: branch.map(str::to_owned), commits, since, build }
 }
 
 /// One git command in `dir`, its stdout trimmed; `None` when it does not run or fails.

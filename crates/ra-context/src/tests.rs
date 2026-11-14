@@ -726,11 +726,12 @@ fn a_handoff_head_names_the_tip_the_branch_s_commits_what_happened_and_what_is_o
         branch: Some("card/7".to_owned()),
         commits: vec!["c2 Checkpoint: run 2".to_owned(), "c1 Checkpoint: run 1".to_owned()],
         since: Some("merged: Merge branch 'main'".to_owned()),
+        build: Some(build_line(Path::new("t"), false)),
     };
     let head = tree.head(&["cargo test -p x".to_owned()]);
     assert_eq!(
         head,
-        "tree: at abc123 on card/7 · 2 commit(s) on the branch since its base: c2 Checkpoint: run 2; c1 Checkpoint: run 1\nsince the last run: merged: Merge branch 'main'\nopen: `cargo test -p x`\n"
+        "tree: at abc123 on card/7 · 2 commit(s) on the branch since its base: c2 Checkpoint: run 2; c1 Checkpoint: run 1\nsince the last run: merged: Merge branch 'main'\nbuild: the worktree has no build yet in t; build with `cargo build -p <crate>` before looking for a binary\nopen: `cargo test -p x`\n"
     );
     // the head rides the report through the file, and the next run reads its tip back
     let report = format!("{head}the worker's words\nmore");
