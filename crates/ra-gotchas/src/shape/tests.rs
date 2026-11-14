@@ -134,5 +134,5 @@ fn the_rules_and_the_prompt_block_come_from_the_one_table() {
     assert!(block.starts_with("Allowed shell shapes"), "{block}");
     assert!(block.contains("Bash runs: cargo, rustfmt, git status"), "{block}");
     assert!(block.contains("sed, awk, perl: change a file with Edit"), "{block}");
-    assert!(block.contains("`a && b`"), "{block}");
+    assert!(block.contains("one command per call"), "{block}");
 }
