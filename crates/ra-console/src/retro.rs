@@ -224,6 +224,10 @@ pub async fn landed(root: &Path, card: &ra_roadmap::model::Node, ledger: &ra_usa
     if !matches!(card.state, TaskState::Implemented | TaskState::Accepted) || saving_read(root, card.id) {
         return Vec::new();
     }
+    let claim = card.saving.clone().or_else(|| card.objective.as_deref().and_then(claim_in));
+    if let Some(event) = claim.as_deref().and_then(event_of) {
+        return landed_by_event(root, card, ledger, event, claim.as_deref().unwrap_or_default()).await;
+    }
     let (Ok(own), Ok(others)) = (ledger.card_cost(card.id).await, ledger.recent_cards(mark, MEDIAN_OF + 1).await) else {
         return Vec::new();
     };
@@ -237,7 +241,7 @@ pub async fn landed(root: &Path, card: &ra_roadmap::model::Node, ledger: &ra_usa
     let held = per_turn < median;
     let across = card.evidence.as_deref().is_some_and(|e| e.contains("notes.log"));
     let cost = own.totals.cost_usd.map(|c| format!(", ${c:.2}")).unwrap_or_default();
-    let claimed = match card.saving.clone().or_else(|| card.objective.as_deref().and_then(claim_in)) {
+    let claimed = match claim {
         Some(saving) => format!("claimed \"{saving}\""),
         None => format!("claimed by estimate of {} tokens/turn", crate::agent::estimate_of(card).a_turn()),
     };
@@ -248,6 +252,88 @@ pub async fn landed(root: &Path, card: &ra_roadmap::model::Node, ledger: &ra_usa
         own.totals.turns
     );
     let note = Note { when: 0, node: Some(card.id), machine: held && across, pair: false, text: text.clone(), against: None };
+    match record(root, Some(card.id), &[note]) {
+        Ok(()) => vec![text],
+        Err(e) => {
+            tracing::warn!("the saving of #{} was not recorded: {e:#}", card.id);
+            Vec::new()
+        }
+    }
+}
+
+/// An event a claim counts in its own unit instead of in turns or tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// A command the harness refused.
+    Refusal,
+    /// A run of the card after the first.
+    Rerun,
+    /// An `rc wait` call.
+    Wait,
+}
+
+impl Event {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Refusal => "refused commands",
+            Self::Rerun => "reruns",
+            Self::Wait => "rc wait calls",
+        }
+    }
+}
+
+/// The event a claim names, `None` for one in turns or tokens (or in no unit), which the walk
+/// compares to the median.
+#[must_use]
+pub fn event_of(claim: &str) -> Option<Event> {
+    let claim = claim.to_lowercase();
+    if claim.contains("rc wait") {
+        Some(Event::Wait)
+    } else if claim.contains("refus") {
+        Some(Event::Refusal)
+    } else if claim.contains("rerun") || claim.contains("re-run") {
+        Some(Event::Rerun)
+    } else {
+        None
+    }
+}
+
+/// How often `event` happened in the card's run: the refusals and `rc wait` calls the gotcha
+/// journal holds under the card, the runs of the card after its first.
+#[must_use]
+pub fn count_of(event: Event, root: &Path, node: i64, runs: u64) -> u64 {
+    if event == Event::Rerun {
+        return runs.saturating_sub(1);
+    }
+    let journal = std::fs::read_to_string(root.join("var/gotchas.log")).unwrap_or_default();
+    let mine = journal.lines().filter_map(|line| {
+        let mut cols = line.split('\t');
+        let (_, who, _, place, excerpt) = (cols.next()?, cols.next()?, cols.next()?, cols.next()?, cols.next()?);
+        (who == node.to_string() && place == "Command").then_some(excerpt)
+    });
+    let waits = |excerpt: &&str| excerpt.trim_start().starts_with("rc wait");
+    mine.filter(|e| (event == Event::Wait) == waits(e)).count() as u64
+}
+
+/// The verdict on a claim in events: held when the run had none of the event the claim saves.
+async fn landed_by_event(
+    root: &Path,
+    card: &ra_roadmap::model::Node,
+    ledger: &ra_usage::UsageStore,
+    event: Event,
+    claim: &str,
+) -> Vec<String> {
+    let Ok(own) = ledger.card_cost(card.id).await else {
+        return Vec::new();
+    };
+    let count = count_of(event, root, card.id, own.totals.runs);
+    let text = format!(
+        "{SAVING} #{} {}: {count} {} in the run; claimed \"{claim}\"",
+        card.id,
+        if count == 0 { "held" } else { "missed" },
+        event.name()
+    );
+    let note = Note { when: 0, node: Some(card.id), machine: false, pair: false, text: text.clone(), against: None };
     match record(root, Some(card.id), &[note]) {
         Ok(()) => vec![text],
         Err(e) => {

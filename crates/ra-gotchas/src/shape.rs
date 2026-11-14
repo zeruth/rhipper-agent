@@ -11,6 +11,9 @@
 //! a refusal has to ([`block`]).
 
 use std::path::Path;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 /// The shell of the tool a command came through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +122,10 @@ const POWERSHELL: &[&str] = &[
 
 /// The programs refused in either shell, each group with the form to use instead.
 const REFUSED: &[(&[&str], &str)] = &[
-    (&["sed", "awk", "perl"], "change a file with Edit and read one with Read (a pattern with Grep), not sed or awk"),
+    (
+        &["sed", "awk", "perl"],
+        "change a file with Edit and read one with Read (a pattern with Grep), not sed or awk; only a print-only `sed -n '1,20p' file` runs",
+    ),
     (
         &["cd", "pushd", "Set-Location", "Push-Location"],
         "the shell starts in the workspace: name the paths relative to it instead of changing directory",
@@ -253,6 +259,11 @@ fn judge_part(part: &Part, shell: Shell, workspace: &Path, own: &dyn Fn(&str) ->
     if let Some(form) = refusal(name, rest) {
         return Shape::Denied(form.to_owned());
     }
+    // a print script is no path, and its `$` is the last line, not a variable
+    if let Some(files) = sed_prints(name, rest) {
+        let fine = files.iter().all(|w| !outside(w, workspace) && known(w, shell, assigned));
+        return if fine { Shape::Allowed } else { Shape::Unknown };
+    }
     if words.iter().any(|w| outside(w, workspace) || !known(w, shell, assigned)) {
         return Shape::Unknown;
     }
@@ -282,6 +293,9 @@ fn judge_move(args: &[&str], shell: Shell, workspace: &Path, assigned: &[String]
 
 /// The form to use instead of a refused program, when `name` with `rest` is one.
 fn refusal(name: &str, rest: &[&str]) -> Option<&'static str> {
+    if sed_prints(name, rest).is_some() {
+        return None;
+    }
     if let Some(form) = REFUSED.iter().find(|(names, _)| names.iter().any(|n| n.eq_ignore_ascii_case(name))).map(|(_, form)| *form) {
         return Some(form);
     }
@@ -302,6 +316,41 @@ fn refusal(name: &str, rest: &[&str]) -> Option<&'static str> {
     }
     let python = ["python", "python3", "py"].iter().any(|p| p.eq_ignore_ascii_case(name));
     (python && (rest.is_empty() || rest.first() == Some(&"-"))).then_some(STDIN_FORM)
+}
+
+/// One print command of a `sed -n` script: an optional line number, `$` or `/pattern/` address
+/// or range of them, then `p`.
+static SED_PRINT: LazyLock<Regex> = LazyLock::new(|| {
+    let address = r"(\d+|\$|/([^/\\]|\\.)*/)";
+    Regex::new(&format!(r"^({address}(,{address})?)?p$")).expect("the sed print pattern parses")
+});
+
+/// The files of a `sed` that only prints, `sed -n '1,20p' f`: `-n` and one script of print
+/// commands, so it neither writes a file (`-i`, `w`) nor runs one (`e`); `None` for any other
+/// `sed`. A `$` the shell would read as a variable (`$p`) is no print script: its value is unseen.
+fn sed_prints<'a, 'b>(name: &str, rest: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    if !name.eq_ignore_ascii_case("sed") {
+        return None;
+    }
+    let at = rest.iter().position(|w| !w.starts_with('-'))?;
+    let (flags, script, files) = (&rest[..at], rest[at], &rest[at + 1..]);
+    let short = |f: &str| f.len() > 1 && !f.starts_with("--") && f[1..].chars().all(|c| matches!(c, 'n' | 'E' | 'r' | 's'));
+    let quiet = |f: &str| matches!(f, "--quiet" | "--silent") || (short(f) && f.contains('n'));
+    let flags_read = flags.iter().all(|f| quiet(f) || short(f) || *f == "--regexp-extended");
+    let variable =
+        script.match_indices('$').any(|(at, _)| script[at + 1..].starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '_' | '{')));
+    let prints = !script.is_empty() && script.split(';').all(|command| SED_PRINT.is_match(command.trim()));
+    (flags_read && flags.iter().any(|f| quiet(f)) && !variable && prints && !files.iter().any(|f| f.starts_with('-'))).then_some(files)
+}
+
+/// Whether `command` starts with a `sed` that only prints, as [`sed_prints`] judges it: the
+/// shell-outside-allowlist gotcha stands aside for it.
+#[must_use]
+pub fn is_sed_print(command: &str) -> bool {
+    let Some(parts) = split(command, Shell::Bash) else { return false };
+    let Some(first) = parts.first() else { return false };
+    let words: Vec<&str> = first.words.iter().map(String::as_str).skip_while(|w| is_assignment(w)).collect();
+    words.split_first().is_some_and(|(&name, rest)| !first.writes && sed_prints(program(name), rest).is_some())
 }
 
 /// Whether the arguments of a git command (after `git`) read a card's worktree from outside it:

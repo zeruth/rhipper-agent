@@ -26,8 +26,14 @@ fn a_pipe_with_a_redirect_passes_when_its_parts_do_and_a_write_is_sent_to_write(
     assert_eq!(bash("cargo build 2>/dev/null | grep error | head -5"), Shape::Allowed);
     assert_eq!(powershell("cargo test -p x 2>&1 | Select-Object -Last 40"), Shape::Allowed);
     assert_eq!(powershell("cargo clippy 2>$null"), Shape::Allowed);
-    let shape = bash("cargo test 2>&1 | sed -n 1,20p");
-    assert!(denied_with(&shape, "sed -n 1,20p", "Read"), "{shape:?}");
+    let shape = bash("cargo test 2>&1 | sed s/a/b/");
+    assert!(denied_with(&shape, "sed s/a/b/", "Read"), "{shape:?}");
+    // a sed that only prints reads; one that writes or runs a file is refused
+    assert_eq!(bash("cargo test 2>&1 | sed -n 1,20p"), Shape::Allowed);
+    assert_eq!(bash("sed -n '/fn main/,/^}/p' src/lib.rs"), Shape::Allowed);
+    for writes in ["sed -n -i 1p x.rs", "sed -n '1w out' x.rs", "sed -n '1e ls' x.rs", "p='1w x'; sed -n \"$p\" x.rs"] {
+        assert!(matches!(bash(writes), Shape::Denied(_)), "{writes}");
+    }
     let shape = bash("cargo test > out.txt");
     assert!(denied_with(&shape, "cargo test", "Write"), "{shape:?}");
     // a `>` inside quotes is text, not a redirect

@@ -402,6 +402,10 @@ impl Answer {
     #[must_use]
     pub fn of(verdict: Verdict, shape: shape::Shape) -> Self {
         match (verdict, shape) {
+            // the chain hint says only that the chain was refused; the shape names the part
+            (Verdict::Deny { id, .. }, shape::Shape::Denied(reason)) if id == PIPED_OR_CHAINED => {
+                Self::Deny { id: String::from("shell-shape"), reason }
+            }
             (Verdict::Deny { id, reason }, _) => Self::Deny { id, reason },
             (_, shape::Shape::Denied(reason)) => Self::Deny { id: String::from("shell-shape"), reason },
             (Verdict::Pass, shape::Shape::Allowed) => Self::Allow,
@@ -566,7 +570,12 @@ impl Catalogue {
                 continue;
             }
             match &gotcha.remedy {
-                Remedy::Hint if gotcha.id == ALLOWLIST_HINT && (conditions.allowed || shape::is_worktree_read(&current)) => continue,
+                Remedy::Hint
+                    if gotcha.id == ALLOWLIST_HINT
+                        && (conditions.allowed || shape::is_worktree_read(&current) || shape::is_sed_print(&current)) =>
+                {
+                    continue;
+                }
                 Remedy::Hint if gotcha.id == WSL_SCRIPT && conditions.allowed => continue,
                 // a catalogue from before `git merge-base` was read as a read ends its git
                 // writes at a `\b`, which `merge-base` passes: a match running into a hyphen
