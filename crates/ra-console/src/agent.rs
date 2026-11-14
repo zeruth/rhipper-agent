@@ -7009,11 +7009,46 @@ fn dry_words(command: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+/// Whether a cargo `command` names, by `-p`/`--package` or `--test`, a package or test file that
+/// the card's `+` entries in `files` create: the base tree cannot have it, so the dry run would
+/// reject what the card is there to make (asm #180).
+fn names_created(command: &str, files: &[String]) -> bool {
+    let Ok(words) = ra_tools::words(command) else { return false };
+    if words.first().map(String::as_str) != Some("cargo") {
+        return false;
+    }
+    let created: Vec<&str> = files.iter().filter_map(|f| f.trim().strip_prefix('+')).map(|f| f.trim().trim_end_matches('/')).collect();
+    let stop = words.iter().position(|w| w == "--").unwrap_or(words.len());
+    let mut args = words[..stop].iter();
+    while let Some(word) = args.next() {
+        let (flag, inline) = match word.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (word.as_str(), None),
+        };
+        if !matches!(flag, "-p" | "--package" | "--test") {
+            continue;
+        }
+        let Some(value) = inline.or_else(|| args.next().map(String::as_str)) else { break };
+        let hit = if flag == "--test" {
+            created.iter().any(|f| f.rsplit_once("/tests/").is_some_and(|(_, name)| name.strip_suffix(".rs") == Some(value)))
+        } else {
+            created.iter().any(|f| f.strip_suffix("/Cargo.toml").is_some_and(|dir| dir.rsplit('/').next() == Some(value)))
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
 /// The first command of `commands` the tool rejects before building, with its first error
 /// line. A command that fails for another reason, or whose program cannot start, is the run's
 /// to find.
-async fn rejected_command(toolbox: &ra_tools::Toolbox, commands: &[String]) -> Option<(String, String)> {
+async fn rejected_command(toolbox: &ra_tools::Toolbox, commands: &[String], files: &[String]) -> Option<(String, String)> {
     for command in commands {
+        if names_created(command, files) {
+            continue;
+        }
         let Some(words) = dry_words(command) else { continue };
         if let Ok((false, output)) = toolbox.check_args(&words).await
             && is_setup_failure(&output)
@@ -7033,7 +7068,9 @@ async fn held_by_preflight(store: &Store, root: &Path, node: &Node, worker: &Wor
         return Ok(None);
     }
     // a toolbox that cannot be made is the run's to report
-    let Some((command, error)) = preflight(root, node, worker.toolbox(root)).await else { return Ok(None) };
+    let nodes = store.all().await?;
+    let files = ra_roadmap::tree::files_of(&nodes, node).0;
+    let Some((command, error)) = preflight(root, node, files, worker.toolbox(root)).await else { return Ok(None) };
     store.set_state_by(node.id, TaskState::Blocked, Source::Run).await?;
     let text = format!("#{} blocked: `{command}` is rejected before any build: {error}; a person fixes the acceptance", node.id);
     tracing::warn!("{text}");
@@ -7055,7 +7092,8 @@ pub async fn preflight_faults(store: &Store) -> anyhow::Result<Vec<String>> {
         .filter(|node| matches!(node.state, TaskState::Defined | TaskState::Ready | TaskState::NeedsRevision));
     let mut faults = Vec::new();
     for node in open {
-        if let Some((command, error)) = preflight(&root, node, ra_tools::Toolbox::new(&root)).await {
+        let files = ra_roadmap::tree::files_of(&nodes, node).0;
+        if let Some((command, error)) = preflight(&root, node, files, ra_tools::Toolbox::new(&root)).await {
             faults.push(format!("#{}: `{command}` is rejected before any build: {error}", node.id));
         }
     }
@@ -7065,14 +7103,14 @@ pub async fn preflight_faults(store: &Store) -> anyhow::Result<Vec<String>> {
 /// The acceptance command of `node` the tool rejects on a dry run in `toolbox`, under the
 /// project's timeout and on a worker slot, with its first error line; `None` when the acceptance
 /// names no command or the toolbox could not be made.
-async fn preflight(root: &Path, node: &Node, toolbox: anyhow::Result<ra_tools::Toolbox>) -> Option<(String, String)> {
+async fn preflight(root: &Path, node: &Node, files: &[String], toolbox: anyhow::Result<ra_tools::Toolbox>) -> Option<(String, String)> {
     let commands = named_checks(node.acceptance.as_deref());
     if commands.is_empty() {
         return None;
     }
     let toolbox = toolbox.ok()?.with_timeout(checks_of(root, node).timeout);
     let _slot = hold_build(root, root).await;
-    rejected_command(&toolbox, &commands).await
+    rejected_command(&toolbox, &commands, files).await
 }
 
 /// The programs a worker's shell runs a check through by itself; any other is the

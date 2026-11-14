@@ -4,6 +4,21 @@
 use super::*;
 
 #[test]
+fn preflight_skips_created_package() {
+    let files = vec![
+        "+crates/ra-asm-verify/Cargo.toml".to_owned(),
+        "+crates/ra-asm-verify/tests/format.rs".to_owned(),
+        "crates/x/src/lib.rs".to_owned(),
+    ];
+    assert!(names_created("cargo test -q -p ra-asm-verify --test format", &files));
+    assert!(names_created("cargo test --package=ra-asm-verify", &files));
+    assert!(names_created("cargo test -p ra-console --test format", &files));
+    assert!(!names_created("cargo test -p ra-console --test other", &files));
+    assert!(!names_created("cargo test -p ra-asm-verify", &["crates/ra-asm-verify/Cargo.toml".to_owned()]));
+    assert!(!names_created("python -p ra-asm-verify", &files));
+}
+
+#[test]
 fn a_stale_marker_stop_for_another_walk_stops_nothing_and_one_for_this_walk_stops_it() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("var")).unwrap();
