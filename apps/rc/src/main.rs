@@ -1744,9 +1744,21 @@ async fn check_card(card: i64) -> anyhow::Result<()> {
     std::fs::create_dir_all(&temp)?;
     let temp = temp.to_string_lossy().into_owned();
     let toolbox = ra_tools::Toolbox::new(&here)?.with_env([("TEMP".to_owned(), temp.clone()), ("TMP".to_owned(), temp)]);
+    let commands = ra_console::agent::check_commands(node.acceptance.as_deref());
+    // a merge from main since the last check leaves the card's crates stale: they rebuild
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .or_else(|| ra_providers::claude_code::shared_target(&here))
+        .unwrap_or_else(|| here.join("target"));
+    let rebuild = ra_providers::rebuild::rebuild_after_merge(&here, &target, &commands).ok();
+    if let Some(rebuild) = &rebuild
+        && !rebuild.cleaned.is_empty()
+    {
+        println!("main was merged since the last check: {} rebuild", rebuild.cleaned.join(", "));
+    }
     let mut kept = String::new();
     let mut passed = true;
-    for command in ra_console::agent::check_commands(node.acceptance.as_deref()) {
+    for command in commands {
         let (ok, output) = match toolbox.check_acceptance(&command).await {
             Ok(done) => done,
             Err(e) => (false, format!("{e:#}\n")),
@@ -1762,6 +1774,10 @@ async fn check_card(card: i64) -> anyhow::Result<()> {
             passed = false;
             break;
         }
+    }
+    // only a check that ran marks the merge seen: cargo has rebuilt what the merge made stale
+    if let Some(rebuild) = rebuild {
+        rebuild.seen()?;
     }
     std::fs::write(&log, kept)?;
     println!("{}", log.display());

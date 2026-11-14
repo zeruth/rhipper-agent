@@ -10,6 +10,7 @@ pub mod claude_code;
 pub mod limits;
 pub mod local;
 pub mod openrouter;
+pub mod rebuild;
 pub mod route;
 
 #[cfg(test)]

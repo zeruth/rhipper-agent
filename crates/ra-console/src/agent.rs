@@ -1365,6 +1365,71 @@ const FIX_INSTRUCTION: &str = "A reviewer sent this card back for the points bel
 /// What the fix pass of a lint-only failure is told, ahead of the warnings and the card.
 const LINT_FIX_INSTRUCTION: &str = "The lint of this card's run left the warnings below in the lines it changed; the checks passed. Fix exactly those lines in the files the warnings name, run the card's checks, and report in a few lines what you changed; change nothing else, and do not take the card up afresh.";
 
+/// What the handoff and the end line say of a lint-only pass's session.
+const LINT_PASS_FRESH: &str = "lint pass: fresh";
+
+/// Whether `worker` is the fix pass of a lint-only failure ([`lint_fix`]).
+fn is_lint_pass(worker: &Worker) -> bool {
+    worker.fix.as_deref().is_some_and(|fix| fix.starts_with(LINT_FIX_INSTRUCTION))
+}
+
+/// The lines a lint pass quotes on either side of a warning's line.
+const LINT_AROUND: usize = 3;
+
+/// The warnings a lint pass quotes the lines of; the rest it names alone.
+const LINT_QUOTED: usize = 20;
+
+/// The prompt of a lint-only pass: `fix`, the instruction and the warnings, then the lines
+/// around each warning's place in `acting`, numbered, so the pass reads those lines and not the
+/// card's history (asm #237 resumed 199k tokens a turn for five warnings).
+fn lint_prompt(acting: &Path, fix: &str) -> String {
+    let mut prompt = fix.to_owned();
+    let mut quoted: Vec<(String, usize)> = Vec::new();
+    for (file, line) in fix.lines().filter_map(warning_at) {
+        if quoted.len() >= LINT_QUOTED || quoted.iter().any(|(f, l)| *f == file && *l == line) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(acting.join(&file)) else { continue };
+        let from = line.saturating_sub(LINT_AROUND).max(1);
+        let lines =
+            text.lines().enumerate().skip(from - 1).take(line + LINT_AROUND + 1 - from).fold(String::new(), |mut out, (at, text)| {
+                let _ = writeln!(out, "{:>6}  {text}", at + 1);
+                out
+            });
+        if lines.is_empty() {
+            continue;
+        }
+        if quoted.is_empty() {
+            prompt.push_str("\n\nThe lines around each warning, as the tree has them now:\n");
+        }
+        let _ = write!(prompt, "\n{file}:{line}\n{lines}");
+        quoted.push((file, line));
+    }
+    prompt
+}
+
+/// The file and line a line of a warning points at: rustc's ` --> src/a.rs:3:9` or the short
+/// format's `src/a.rs:3:9: warning: …`; `None` for any other line.
+fn warning_at(line: &str) -> Option<(String, usize)> {
+    let line = line.trim_start();
+    let at = match line.strip_prefix("--> ") {
+        Some(at) => at.trim(),
+        None => line.split_once(": warning").map(|(at, _)| at)?,
+    };
+    let (rest, last) = at.rsplit_once(':')?;
+    let last: usize = last.trim().parse().ok()?;
+    // a column after the line, or the line alone
+    let (file, row) = rest.rsplit_once(':').and_then(|(file, row)| row.parse().ok().map(|row| (file, row))).unwrap_or((rest, last));
+    (!file.is_empty() && row > 0).then(|| (file.replace('\\', "/"), row))
+}
+
+/// The cheapest rung of `ladder` on the route of `model`: a lint pass needs no stronger model,
+/// and stays on the route the card was given. `None` when no rung is on that route.
+fn cheapest_on_route(ladder: &crate::router::Ladder, model: &str) -> Option<String> {
+    let route = Route::of(&resolve(model));
+    ladder.models.iter().map(|rung| resolve(rung)).find(|rung| Route::of(rung) == route)
+}
+
 /// The outcome a review leaves on the handoff of a trivially rejected run; a second one on the
 /// same card halts the fix passes.
 const TRIVIAL_TAG: &str = "needs revision (trivial)";
@@ -1383,7 +1448,8 @@ async fn fix_model(root: &Path) -> Option<String> {
 }
 
 /// The fix pass of a run whose checks passed and whose lint alone failed: the warning lines of
-/// its handoff are the task, on the cheap model, and the pass runs the checks and the lint
+/// its handoff are the task, on the cheapest rung of the card's route ([`cheapest_on_route`],
+/// else the `fix` role), in a fresh session ([`lint_prompt`]), and the pass runs the checks and the lint
 /// again, so a clean lint leaves the card implemented for the reviewer and a second red one
 /// leaves it needs revision as the first did. The pass's lines join `lines`: after the run's
 /// when the lint stayed red, and before them, with `lint fixed on <model>` on the run line,
@@ -1396,7 +1462,15 @@ async fn lint_fix(store: &Store, id: i64, worker: &Worker, roles: &Roles, lines:
     if warnings.is_empty() {
         return;
     }
-    let Some(model) = fix_model(&root).await else {
+    // the cheapest rung of the card's route first; a `fix = ""` keeps the pass off
+    let router = crate::router::Router::load(&root).ok();
+    let off = router.as_ref().and_then(|router| router.role.fix.as_deref()).is_some_and(|fix| fix.trim().is_empty());
+    let cheapest = router.as_ref().filter(|_| !off).and_then(|router| cheapest_on_route(&router.ladder, &worker.model));
+    let model = match cheapest {
+        Some(model) => Some(model),
+        None => fix_model(&root).await,
+    };
+    let Some(model) = model else {
         lines.push("  the fix role is off: the lint warnings wait for the person".to_owned());
         return;
     };
@@ -5669,12 +5743,20 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let Prepared { workspace, root, mut task, project, budget, caps, effort } = prepare(store, &node, worker, true).await?;
     // a fix pass reads its points first, the verdict's or the lint's: they are the task, the
     // card is the setting
+    let lint_pass = is_lint_pass(worker);
     if let Some(fix) = &worker.fix {
         task.brief = format!("{fix}\n\n{}", task.brief);
     }
     let workspace_dir = workspace.clone();
     // where the changes land: the worktree when the run has one, else the project
     let acting = workspace_dir.clone().unwrap_or_else(|| root.clone());
+    // a lint-only pass needs the warnings and the lines around them, not the card's context
+    // (asm #237: 14 turns at 199k a turn on the resumed session for five warnings)
+    if lint_pass {
+        task.brief = lint_prompt(&acting, worker.fix.as_deref().unwrap_or_default());
+        task.outlines.clear();
+        task.review = None;
+    }
     // a merge of the project's branch that left conflicts in the tree is the run's first job
     if let Some(block) = conflicts_block(&acting).await {
         task.brief = format!("{block}\n{}", task.brief);
@@ -5691,7 +5773,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         Some(tip) => crate::review::since_last(&acting, tip).await,
         None => None,
     };
-    if let Some(since) = &since {
+    if let Some(since) = &since
+        && !lint_pass
+    {
         task.brief = format!("The tree changed since the last run of this card: {since}\n\n{}", task.brief);
     }
     // what is dirty before the run, so the handoff names only what the run changed
@@ -5705,7 +5789,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // --resume unless the topic changes), but a rerun of a card that is not absolute starts
     // fresh on the rerun block ([`rerun_resume`]); a stale session is dropped too, and the run
     // says so first
-    let rerun = if is_rerun(&node, worker) { rerun_block(&task, &node, &acting, &root) } else { None };
+    let rerun = if is_rerun(&node, worker) && !lint_pass { rerun_block(&task, &node, &acting, &root) } else { None };
     // the environment this run has, read against by the next one's rerun block
     save_stamp(&root, id);
     // a run after an idle one starts fresh, as `--clear-session` would: the session that changed
@@ -5722,6 +5806,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // an idle run is the reason a session is not resumed, ahead of the rerun's own fresh start
     // (#210): it names what went wrong, which "a rerun starts a fresh session" does not
     let resumed = match rerun_resume(&node, rerun.is_some(), unix_now()) {
+        _ if lint_pass => Err(LINT_PASS_FRESH.to_owned()),
         Ok(Some(_)) | Err(_) if idle.is_some() && node.session.is_some() => {
             Err(format!("the last run changed nothing ({})", idle.as_deref().unwrap_or_default()))
         }
@@ -5737,6 +5822,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             None,
             rerun.as_ref().map(|_| "  fresh start: no session to resume; a rerun carries the verdict and the failing check".to_owned()),
         ),
+        Err(reason) if lint_pass => (None, Some(format!("  {reason}; the warnings and the lines around them are the prompt"))),
         Err(reason) if rerun.is_some() => {
             (None, Some(format!("  fresh start: {reason}; the rerun carries the last report, the review points and the failures")))
         }
@@ -5747,20 +5833,19 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     }
     // whether the report was asked for a second time, for the end line
     let mut asked_twice = false;
+    // the handoffs' reports are the history a lint pass does without; the task keeps them for
+    // the handoff this run records
+    let shown = lint_pass.then(|| ra_context::TaskContext { handoffs: Vec::new(), ..task.clone() });
+    let shown = shown.as_ref().unwrap_or(&task);
     let session = if provider.has_own_tools() {
         // a harness acts in the workspace by itself: one call carries the whole task, and the
         // harness holds it to the budget; its hooks learn the card from the environment
         begin_run(&acting, id);
-        if let (Some(fix), Some(session)) = (&worker.fix, &resume)
-            && fix.starts_with(LINT_FIX_INSTRUCTION)
-        {
-            reset_builds(&acting, session);
-        }
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
                 messages: harness_messages(
-                    &task,
+                    shown,
                     node.acceptance.as_deref(),
                     rerun.as_deref(),
                     &project,
@@ -5889,7 +5974,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             Err(error) => Err(map_error(error)),
         }
     } else {
-        let context = bare_context(&task, rerun.as_deref(), &project, worker.debug);
+        let context = bare_context(shown, rerun.as_deref(), &project, worker.debug);
         tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref(), budget, caps).await
     };
     // the head of the handoff is the orchestrator's, not the worker's: where the tree is, the
@@ -5908,8 +5993,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         // the tree's head comes first, then the ladder's move, so the next run and the person
         // see where the tree is and why this model
         report: format!(
-            "{}{}",
+            "{}{}{}",
             tree.head(open),
+            if lint_pass { format!("{LINT_PASS_FRESH}.\n") } else { String::new() },
             worker.step.as_ref().map_or_else(|| report.to_owned(), |step| format!("Route: {step}.\n{report}"))
         ),
         warnings: Vec::new(),
@@ -6292,7 +6378,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     };
     let mut lines = vec![
         format!(
-            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · {} · {sizes} · {} · {verdict}{}",
+            "{} #{} {} {} on {} · turns {turns}, {} tool call(s) · {} · {sizes} · {} · {verdict}{}{}",
             if passed { "✓" } else { "✗" },
             id,
             node.title,
@@ -6301,7 +6387,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             session.calls,
             tokens_line(&session),
             cost_text(&session.usage),
-            if asked_twice { " · report asked twice" } else { "" }
+            if asked_twice { " · report asked twice" } else { "" },
+            if lint_pass { format!(" · {LINT_PASS_FRESH}") } else { String::new() }
         ),
         check_line,
     ];
@@ -6477,7 +6564,10 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
         // no context cap on a run whose last session hit it while still reading in: the fresh
         // session reads the same files and hits it again, and the card never gets past them
         // (runelite #15: AffineTransform and Arc2D from the JDK, 161k at turn 7)
-        context: router.as_ref().and_then(|router| router.worker.context()).filter(|_| !capped_reading_in(&task) && !absolute),
+        context: router
+            .as_ref()
+            .and_then(|router| router.worker.context())
+            .filter(|_| is_lint_pass(worker) || !capped_reading_in(&task) && !absolute),
     };
     let effort = worker.effort.unwrap_or(node.effort);
     Ok(Prepared { workspace, root, task, project, budget, caps, effort })

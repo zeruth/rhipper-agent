@@ -359,6 +359,96 @@ fn a_session_within_the_day_is_resumed_and_an_older_one_is_not() {
 }
 
 #[test]
+fn lint_pass_is_fresh_for_the_fix_of_a_lint_alone() {
+    let lint = Worker { fix: Some(format!("{LINT_FIX_INSTRUCTION}\nwarning: x")), ..Worker::new("claude-haiku-4-5") };
+    assert!(is_lint_pass(&lint));
+    assert!(!is_lint_pass(&Worker { fix: Some(FIX_INSTRUCTION.to_owned()), ..lint.clone() }));
+    assert!(!is_lint_pass(&Worker { fix: None, ..lint }));
+    assert_eq!(LINT_PASS_FRESH, "lint pass: fresh");
+}
+
+#[test]
+fn lint_pass_is_fresh_on_the_cheapest_rung_of_the_cards_route() {
+    let ladder = crate::router::Ladder::default();
+    assert_eq!(cheapest_on_route(&ladder, "opus").as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(cheapest_on_route(&ladder, "claude-sonnet-5-5").as_deref(), Some("claude-haiku-4-5"));
+    // a route the ladder has no rung on leaves the pass to the fix role
+    assert_eq!(cheapest_on_route(&ladder, "z-ai/glm-5.3-flash"), None);
+    let mixed = crate::router::Ladder { models: vec!["haiku".into(), "z-ai/glm-5.3-flash".into(), "z-ai/glm-6".into()], ..ladder };
+    assert_eq!(cheapest_on_route(&mixed, "z-ai/glm-6").as_deref(), Some("z-ai/glm-5.3-flash"));
+}
+
+#[test]
+fn lint_pass_is_fresh_and_quotes_the_lines_around_each_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let text: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(dir.path().join("src/a.rs"), text).unwrap();
+    let fix = format!(
+        "{LINT_FIX_INSTRUCTION}\nwarning: unused variable\n --> src/a.rs:10:5\n\nsrc/a.rs:2:1: warning: doc\n\nwarning: elsewhere\n --> src/gone.rs:1:1"
+    );
+    let prompt = lint_prompt(dir.path(), &fix);
+    assert!(prompt.starts_with(&fix), "{prompt}");
+    assert!(prompt.contains("\nsrc/a.rs:10\n     7  line 7\n"), "{prompt}");
+    assert!(prompt.contains("    13  line 13\n") && !prompt.contains("  line 14\n"), "{prompt}");
+    assert!(prompt.contains("\nsrc/a.rs:2\n     1  line 1\n") && prompt.contains("     5  line 5\n"), "{prompt}");
+    assert!(!prompt.contains("src/gone.rs:1\n"), "a file not in the tree is named alone: {prompt}");
+    assert_eq!(warning_at("warning: unused"), None);
+    assert_eq!(warning_at("  --> crates\\x\\src\\b.rs:7:3"), Some(("crates/x/src/b.rs".to_owned(), 7)));
+}
+
+/// A provider that acts in the workspace by itself, as Claude Code does, over a script.
+struct Harnessed(Arc<crate::commands::tests::Scripted>);
+
+impl ra_providers::ModelProvider for Harnessed {
+    fn complete(&self, request: CompletionRequest) -> ra_providers::CompletionFuture<'_> {
+        self.0.complete(request)
+    }
+
+    fn has_own_tools(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn lint_pass_is_fresh_on_a_card_with_a_live_session_and_says_so() {
+    use crate::commands::tests::{Scripted, says};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/extra.rs"), "pub fn extra() {\n    let x = 1;\n}\n").unwrap();
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\ncontext = 120000\n").unwrap();
+    let store = ra_roadmap::store::Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    let files = ["src/extra.rs".to_owned()];
+    let card = ra_roadmap::store::Card { files: &files, objective: Some("A goal of many words."), ..ra_roadmap::store::Card::new() };
+    let id = store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, "Probe", &card).await.unwrap();
+    let node = store.read(id).await.unwrap();
+    // a session of the last run, young enough to be resumed by any other run
+    store.set_session(id, Some(("s-1", &card_fingerprint(&node))), unix_now()).await.unwrap();
+    let node = store.read(id).await.unwrap();
+    let script: ra_tools::Script = Arc::new(|_: &str| Ok((0, "ok\n".to_owned())));
+    let model = Scripted::new((0..3).map(|_| says("dropped the unused x in src/extra.rs", vec![])).collect());
+    let fix = format!("{LINT_FIX_INSTRUCTION}\nwarning: unused variable: `x`\n --> src/extra.rs:2:9");
+    let worker = Worker {
+        fix: Some(fix),
+        ..Worker::new("claude-haiku-4-5").with_provider(Arc::new(Harnessed(model.clone()))).with_script(script).with_debug(false)
+    };
+    let roles = worker.roles(dir.path()).await;
+    let (lines, _, _) = run_task(&store, node, &worker, &roles).await.unwrap();
+    let seen = model.seen.lock();
+    let request = &seen[0];
+    assert_eq!(request.resume, None, "a lint pass never resumes the card's session");
+    assert_eq!(request.max_context, Some(120_000), "a lint pass has the context cap of a fresh run");
+    let prompt: String = request.messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
+    assert!(prompt.contains(" --> src/extra.rs:2:9"), "{prompt}");
+    assert!(prompt.contains("     2      let x = 1;\n"), "{prompt}");
+    assert!(!prompt.contains("A goal of many words."), "the card's brief stays out: {prompt}");
+    assert!(lines[0].contains(" · lint pass: fresh"), "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("  lint pass: fresh; ")), "{lines:?}");
+    let handoff = ra_context::TaskContext::open(dir.path(), id).handoffs.pop().unwrap();
+    assert!(handoff.report.contains("lint pass: fresh.\n"), "{}", handoff.report);
+}
+
+#[test]
 fn a_rerun_of_a_card_not_absolute_drops_its_session_and_an_absolute_one_keeps_it() {
     let now = 1_800_000_000;
     let node = with_session(60, now);
