@@ -65,7 +65,7 @@ remedy = { kind = "hint" }
 # hook's shape table (`ra_gotchas::shape`), which names the form to use instead of each refusal
 id = "shell-outside-allowlist"
 where = "command"
-pattern = '^\s*(cd|Set-Location|Start-Process|powershell(\.exe)?|pwsh|cmd(\.exe)?|sh|bash|python|pip|npm|node|sed|awk|perl)\b|^\s*git\s+-C\b'
+pattern = '^\s*(cd|Set-Location|Start-Process|powershell(\.exe)?|pwsh|cmd(\.exe)?|sh|bash|pip|npm|node|sed|awk|perl)\b|^\s*git\s+-C\b'
 message = "the shells here run cargo, the read-only git commands and the read-only listing and reading commands, from the workspace directory; read files with Read, change them with Edit (never sed), search with Grep and Glob, start from the files on the card, and pipe a long output through tail"
 remedy = { kind = "hint" }
 
@@ -85,6 +85,22 @@ id = "process-substitution"
 where = "command"
 pattern = '<\('
 message = "a `<(...)` process substitution is refused whole: write the tool's output once to a file under `var/`, then use Grep or Read on that file instead of re-running the dump through pipes"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+# `sed -n '1,20p' file`: a worker pages a file through sed and the hook refuses it
+id = "sed-n"
+where = "command"
+pattern = '(^|[;&|]\s*)sed\s+-n\b'
+message = "sed is refused: read a range of a file with the Read tool and its offset and limit arguments (offset is the first line, limit the line count), and search with the Grep tool"
+remedy = { kind = "hint" }
+
+[[gotcha]]
+# `python x.py` or `python -c`: no runtime runs under the hook; WSL has python3 for a script
+id = "python"
+where = "command"
+pattern = '(^|[;&|]\s*)(&\s*)?python3?(\.exe)?\b'
+message = "python is refused here: write the script to a file with the Write tool and run it in WSL with `wsl -- bash -l <script>.sh`, calling python3 inside the .sh"
 remedy = { kind = "hint" }
 
 [[gotcha]]
