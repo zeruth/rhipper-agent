@@ -5,6 +5,7 @@
 //! A tool never fails the run: whatever goes wrong comes back as text the model reads and acts
 //! on, the way a person reads an error.
 
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,10 @@ pub mod cpu;
 
 /// The most matches a search reports.
 const MAX_HITS: usize = 200;
+/// The characters a whole-file read may carry; a larger file answers with its outline instead.
+const READ_CEILING: usize = 12_000;
+/// The most lines an outline lists.
+const MAX_OUTLINE: usize = 150;
 /// The directories a search and a listing skip.
 const SKIPPED_DIRS: [&str; 4] = [".git", "target", "node_modules", "var"];
 
@@ -166,7 +171,7 @@ impl Toolbox {
         match call.name.as_str() {
             "read_file" => {
                 let a: ReadArgs = parse(args)?;
-                self.read_file(&a.path, a.offset.unwrap_or(1), a.limit.unwrap_or(400))
+                self.read_file(&a.path, a.offset, a.limit)
             }
             "write_file" => {
                 let a: WriteArgs = parse(args)?;
@@ -214,10 +219,14 @@ impl Toolbox {
         path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().replace('\\', "/")
     }
 
-    fn read_file(&self, rel: &str, offset: usize, limit: usize) -> anyhow::Result<String> {
+    fn read_file(&self, rel: &str, offset: Option<usize>, limit: Option<usize>) -> anyhow::Result<String> {
         let path = self.resolve(rel)?;
         let text = std::fs::read_to_string(&path).with_context(|| format!("cannot read {rel}"))?;
         let total = text.lines().count();
+        if offset.is_none() && limit.is_none() && text.chars().count() > READ_CEILING {
+            return Ok(outline(rel, &text, total));
+        }
+        let (offset, limit) = (offset.unwrap_or(1), limit.unwrap_or(400));
         let start = offset.max(1);
         let mut out = String::new();
         for (number, line) in text.lines().enumerate().skip(start - 1).take(limit.max(1)) {
@@ -422,6 +431,32 @@ pub fn warnings_within(output: &str, ranges: &[(String, u32, u32)]) -> Vec<Strin
             })
         })
         .collect()
+}
+
+/// The outline of a file too large to read whole: its headings, section tables, top-level keys
+/// and top-level items with their line numbers, and the way to ask for a range.
+fn outline(rel: &str, text: &str, total: usize) -> String {
+    const ITEMS: [&str; 10] = ["fn ", "pub ", "struct ", "enum ", "impl", "mod ", "trait ", "use ", "class ", "def "];
+    let is_top = |line: &str| {
+        let first = line.chars().next().unwrap_or(' ');
+        let named = first.is_alphabetic() || first == '_' || first == '"';
+        let key = line.split_once(['=', ':']).is_some_and(|(k, _)| !k.trim_end().contains(' '));
+        first == '#' || first == '[' || (named && (ITEMS.iter().any(|i| line.starts_with(i)) || key))
+    };
+    let heads: Vec<(usize, &str)> = text.lines().enumerate().filter(|(_, l)| is_top(l)).collect();
+    let mut out = format!("{rel} is {total} lines, {} characters: too large to read whole. Its outline:\n", text.chars().count());
+    for (number, line) in heads.iter().take(MAX_OUTLINE) {
+        let line: String = line.chars().take(100).collect();
+        let _ = writeln!(out, "{:>5}│{line}", number + 1);
+    }
+    if heads.len() > MAX_OUTLINE {
+        let _ = writeln!(out, "… {} more outline lines", heads.len() - MAX_OUTLINE);
+    }
+    let _ = writeln!(
+        out,
+        "Ask for a range: read_file with offset (a 1-based line) and limit, for example offset 1, limit 200 of the {total} lines."
+    );
+    out
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(args: serde_json::Value) -> anyhow::Result<T> {
