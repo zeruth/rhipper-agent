@@ -849,13 +849,36 @@ async fn the_outline_of_the_worktree_is_what_prepare_sends_and_not_the_roots() {
     std::fs::write(tree.join("lib.rs"), "pub fn moved() {}\n\npub struct S {\n    a: u8,\n}\n").unwrap();
     let store = ra_roadmap::store::Store::open(&root.join("rhipper.md"), "Rhipper").await.unwrap();
     let files = ["lib.rs".to_owned()];
-    let card = ra_roadmap::store::Card { files: &files, ..ra_roadmap::store::Card::new() };
+    let card = ra_roadmap::store::Card { files: &files, objective: Some("Rename `moved`."), ..ra_roadmap::store::Card::new() };
     let id = store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, "T", &card).await.unwrap();
     let node = store.read(id).await.unwrap();
     let worker = Worker::new("z-ai/glm-5.3-flash").with_worktree(tree, "card/2");
     let prepared = prepare(&store, &node, &worker, false).await.unwrap();
     let outline = prepared.task.outlines;
-    assert!(outline.contains("pub fn moved()") && outline.contains("lib.rs (5 lines)"), "{outline}");
+    assert!(outline.contains("lib.rs 1-2  pub fn moved()  · named by the card"), "{outline}");
+    assert!(outline.contains("lib.rs (5 lines): 1 more items not shown") && !outline.contains("(3 lines)"), "{outline}");
+}
+
+#[tokio::test]
+async fn prompt_carries_the_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut text = String::new();
+    for i in 0..100 {
+        text.push_str(&format!("pub fn item_{i:03}() {{}}\n\n"));
+    }
+    text.push_str("pub fn the_target() {}\n");
+    std::fs::write(root.join("big.rs"), text).unwrap();
+    let store = ra_roadmap::store::Store::open(&root.join("rhipper.md"), "Rhipper").await.unwrap();
+    let files = ["big.rs".to_owned()];
+    let card = ra_roadmap::store::Card { files: &files, objective: Some("Change `the_target`."), ..ra_roadmap::store::Card::new() };
+    let id = store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, "T", &card).await.unwrap();
+    let node = store.read(id).await.unwrap();
+    let prepared = prepare(&store, &node, &Worker::new("z-ai/glm-5.3-flash"), false).await.unwrap();
+    let prompt = prepared.task.prompt();
+    assert!(prompt.contains("big.rs 201-201  pub fn the_target()  · named by the card"), "{prompt}");
+    assert!(!prompt.contains("item_000"), "{prompt}");
+    assert!(prompt.contains("big.rs (201 lines): 100 more items not shown"), "{prompt}");
 }
 
 #[tokio::test]

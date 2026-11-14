@@ -6387,10 +6387,12 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // the outline is read from the tree the worker acts in, as its regions are, so a rerun in a
     // worktree gets the line numbers the file has there
     let acts_in = workspace.as_deref().unwrap_or(&root);
-    task.outlines = ra_context::outline_files(acts_in, &brief.files, &last_change(acts_in, node, &task).await);
+    let changed = last_change(acts_in, node, &task).await;
     // a card sent back by its reviewer carries the verdict's points in its context: the notes
     // that hold them are in the roadmap, which the worker does not read
     task.review = if is_rerun(node, worker) { ra_context::review_of(node.notes.as_deref().unwrap_or_default()) } else { None };
+    let points = review_points(task.review.as_deref());
+    task.outlines = map_of_card(acts_in, node, &brief.files, &changed, &points);
     // the regions the last session read open this one, read from the tree it acts in, so the
     // worker reads the ranges it still needs and not the same files again
     if let Some(last) = task.handoffs.last().filter(|last| !last.read.is_empty()) {
@@ -6744,8 +6746,22 @@ pub async fn context_preview(store: &Store, id: i64) -> anyhow::Result<String> {
     let mut task = ra_context::TaskContext::open(&root, id);
     let brief = context_of(store, &node).await?;
     task.brief = brief.text;
-    task.outlines = ra_context::outline_files(&root, &brief.files, &last_change(&root, &node, &task).await);
+    // the points of a review rank the map in `prepare`, so the preview ranks it by them too;
+    // a fix pass is the one rerun it cannot tell, having no worker
+    task.review = if sent_back(&node) { ra_context::review_of(node.notes.as_deref().unwrap_or_default()) } else { None };
+    let points = review_points(task.review.as_deref());
+    task.outlines = map_of_card(&root, &node, &brief.files, &last_change(&root, &node, &task).await, &points);
     Ok(task.prompt())
+}
+
+/// The map of the card's files as the prompt carries it: the items its title, objective and
+/// acceptance point at, read from the tree the worker acts in.
+fn map_of_card(root: &Path, node: &Node, files: &[String], changed: &ra_context::ChangedLines, points: &[String]) -> String {
+    let card =
+        format!("{}\n{}\n{}", node.title, node.objective.as_deref().unwrap_or_default(), node.acceptance.as_deref().unwrap_or_default());
+    let ask = ra_context::map::Ask { card: &card, points };
+    let read = |file: &str| std::fs::read_to_string(root.join(file)).ok();
+    ra_context::map::map_of(read, files, &ask, changed, ra_context::MAP_ROOM).render()
 }
 
 /// The lines the last run of a card in revision changed, from `git diff -U0` over the files
@@ -8891,10 +8907,20 @@ fn capped_reading_in(task: &ra_context::TaskContext) -> bool {
 /// `needs revision` review is a rerun whatever its state (rhipper-asm #47: the five points
 /// were in the notes and not in the prompt, and the worker spent its first turns finding them).
 fn is_rerun(node: &Node, worker: &Worker) -> bool {
+    worker.fix.is_some() || sent_back(node)
+}
+
+/// Whether the card itself says it was sent back, whoever runs it: the half of [`is_rerun`]
+/// the context preview can tell without a worker.
+fn sent_back(node: &Node) -> bool {
     node.state == TaskState::NeedsRevision
-        || worker.fix.is_some()
         || ra_context::review_of(node.notes.as_deref().unwrap_or_default())
             .is_some_and(|review| review.lines().next().is_some_and(|first| first.contains("needs revision")))
+}
+
+/// The review's points a rerun carries: they rank the map's items as the review names them.
+fn review_points(review: Option<&str>) -> Vec<String> {
+    review.iter().flat_map(|r| r.lines().map(str::to_owned)).collect()
 }
 
 /// How many lines of the failing check a rerun reads: the failures lead the block, so what is

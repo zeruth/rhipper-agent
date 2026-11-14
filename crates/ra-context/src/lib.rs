@@ -158,8 +158,12 @@ pub fn dedupe_notes(notes: &str, known: &str) -> String {
     blocks.join("\n\n")
 }
 
-/// How many items an outline names before it counts the rest.
-const OUTLINE_ROOM: usize = 60;
+/// The tokens the map of a card's files takes in its prompt.
+pub const MAP_ROOM: usize = 1_500;
+
+/// How many items the outline or the item ranges a whole-file read gets back name before
+/// they count the rest.
+const READ_OUTLINE_ROOM: usize = 60;
 
 /// How many handoffs a prompt carries, newest last; the file keeps [`HANDOFFS_KEPT`].
 const HANDOFFS_SHOWN: usize = 3;
@@ -340,7 +344,7 @@ pub fn outline_marked(path: &Path, text: &str, changed: &[(usize, usize)]) -> St
     let lines: Vec<&str> = text.lines().collect();
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let items = items(path, text);
-    let hidden = items.len().saturating_sub(OUTLINE_ROOM);
+    let hidden = items.len().saturating_sub(READ_OUTLINE_ROOM);
     let mut out = format!("{} ({} lines)", path.display().to_string().replace('\\', "/"), lines.len());
     if extension == "rs"
         && let Some(doc) = lines.iter().find_map(|l| l.strip_prefix("//!").map(str::trim)).filter(|d| !d.is_empty())
@@ -348,7 +352,7 @@ pub fn outline_marked(path: &Path, text: &str, changed: &[(usize, usize)]) -> St
         let _ = write!(out, " — {}", clip(doc, 140));
     }
     out.push('\n');
-    for (start, end, item) in items.iter().take(OUTLINE_ROOM) {
+    for (start, end, item) in items.iter().take(READ_OUTLINE_ROOM) {
         let mark = if changed.iter().any(|&(from, to)| from <= *end && to >= *start) { '*' } else { ' ' };
         let _ = writeln!(out, "{mark} {:>11}  {}", format!("{start}-{end}"), clip(item, 110));
     }
@@ -402,10 +406,13 @@ pub fn items(path: &Path, text: &str) -> Vec<(usize, usize, String)> {
 #[must_use]
 pub fn item_ranges(path: &Path, text: &str) -> Vec<String> {
     let items = items(path, text);
-    let mut ranges: Vec<String> =
-        items.iter().take(OUTLINE_ROOM).map(|(start, end, item)| format!("{} {start}-{end}", item_name(item).unwrap_or(item))).collect();
-    if items.len() > OUTLINE_ROOM {
-        ranges.push(format!("… and {} more", items.len() - OUTLINE_ROOM));
+    let mut ranges: Vec<String> = items
+        .iter()
+        .take(READ_OUTLINE_ROOM)
+        .map(|(start, end, item)| format!("{} {start}-{end}", item_name(item).unwrap_or(item)))
+        .collect();
+    if items.len() > READ_OUTLINE_ROOM {
+        ranges.push(format!("… and {} more", items.len() - READ_OUTLINE_ROOM));
     }
     ranges
 }
@@ -494,22 +501,6 @@ fn rust_item(line: &str) -> Option<String> {
 fn generic_item(line: &str) -> Option<String> {
     const STARTS: [&str; 9] = ["function ", "def ", "class ", "export function ", "export class ", "export const ", "fn ", "func ", "sub "];
     STARTS.iter().any(|s| line.starts_with(s)).then(|| line.trim().trim_end_matches(['{', ':', ' ']).to_owned())
-}
-
-/// The outlines of the files a card names, under one heading, with the lines `changed` names
-/// per file marked; a file that is not there is named as missing, so the card's list shows
-/// its mistake.
-pub fn outline_files(workspace: &Path, files: &[String], changed: &ChangedLines) -> String {
-    let mut out = String::new();
-    for file in files {
-        match std::fs::read_to_string(workspace.join(file)) {
-            Ok(text) => out.push_str(&outline_marked(Path::new(file), &text, changed.get(file).map_or(&[], Vec::as_slice))),
-            Err(_) => {
-                let _ = writeln!(out, "{file} (not in the workspace yet)");
-            }
-        }
-    }
-    out
 }
 
 /// The heading under which the untracked source files ride with the project context.

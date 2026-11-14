@@ -297,7 +297,7 @@ async fn a_task_without_files_takes_its_sections_and_the_preview_outlines_them()
     // the brief says whose files they are, and the outline of the section's file follows
     assert!(preview.contains("Files of the card, where the change lands, from #2 S:\n  src/lib.rs\n"), "{preview}");
     let at = preview.find("Files:").unwrap_or_else(|| panic!("no Files: in {preview}"));
-    assert!(preview[at..].contains("inherited_outline"), "{preview}");
+    assert!(preview[at..].contains("src/lib.rs (3 lines): 1 items"), "{preview}");
     // the lint asks nothing of the card: the section's files stand for it
     let faults = ra_roadmap::tree::lint(&store.all().await.unwrap());
     assert!(!faults.iter().any(|l| l.contains("no files")), "{faults:?}");
@@ -315,7 +315,7 @@ async fn context_prints_the_preview_of_a_card_folded_under_a_header_and_the_proj
     assert!(matches!(outcome, Outcome::Fold), "{outcome:?}");
     assert_eq!(out[0], format!("context #2 · {} lines", out.len() - 1));
     assert!(out.iter().any(|l| l.contains("src/lib.rs (1 lines)")), "{out:?}");
-    assert!(out.iter().any(|l| l.contains("pub fn outlined()")), "{out:?}");
+    assert!(out.iter().any(|l| l.contains("1 items, none the card points at")), "{out:?}");
     // the project context is the file beside the roadmap, and a missing one says so
     let err = run("/context", &store, &worker()).await.unwrap_err();
     assert!(err.to_string().contains(agent::PROJECT_FILE), "{err:#}");
