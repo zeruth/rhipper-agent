@@ -25,8 +25,7 @@ impl Toolbox {
     /// When the command is off the allowlist or cannot start.
     pub async fn check(&self, command: &str) -> anyhow::Result<(bool, String)> {
         let text = self.run(command, true).await?;
-        let passed = text.lines().last() == Some("exit code 0");
-        Ok((passed, text))
+        Ok(verdict(text))
     }
 
     /// Runs a command the person wrote in a card's acceptance, under the same limit and with
@@ -50,8 +49,7 @@ impl Toolbox {
     /// When there are no words or the program cannot start.
     pub async fn check_args(&self, words: &[String]) -> anyhow::Result<(bool, String)> {
         let text = self.run_words(words, &words.join(" "), false).await?;
-        let passed = text.lines().last() == Some("exit code 0");
-        Ok((passed, text))
+        Ok(verdict(text))
     }
 
     pub(crate) async fn run(&self, command: &str, allowlisted: bool) -> anyhow::Result<String> {
@@ -150,6 +148,25 @@ impl Toolbox {
         }
         Ok(text)
     }
+}
+
+/// The line a check ends in when it exited 0 but its test filter ran nothing.
+const NO_TEST_RAN: &str = "the filter matched no test name";
+
+/// Whether a check passed, from its output: it exited 0, and when it is a test run, some test
+/// ran. A filter that matches no name makes cargo print `running 0 tests` for every target and
+/// exit 0, which proves nothing; that output is failed and ends in [`NO_TEST_RAN`].
+fn verdict(mut text: String) -> (bool, String) {
+    if text.lines().last() != Some("exit code 0") {
+        return (false, text);
+    }
+    let counts: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("running ")).filter_map(|l| l.split_whitespace().next()).collect();
+    if !counts.is_empty() && counts.iter().all(|n| *n == "0") {
+        text.push('\n');
+        text.push_str(NO_TEST_RAN);
+        return (false, text);
+    }
+    (true, text)
 }
 
 /// How long a check's pipes are read after its command has exited: what a process it left

@@ -186,6 +186,56 @@ const GIT_WRITES: &str = "git-writes";
 /// The gotcha that names the single-command form for a refused pipeline or `;` chain.
 const PIPED_OR_CHAINED: &str = "piped-or-chained";
 
+/// The gotcha that refuses a chained script quoted to `wsl -- bash -lc` where WSL is not allowed.
+const WSL_SCRIPT: &str = "wsl-quoted-script";
+
+/// [`WSL_SCRIPT`]'s message, for a catalogue from before the entry.
+const WSL_SCRIPT_FORM: &str = "a script quoted to `wsl -- bash -lc` is judged whole, and this project does not allow WSL here: write the script to `var/<name>.sh` with Write and run it by path, `wsl -- bash var/<name>.sh`";
+
+/// What stands for a WSL script while the gotchas read the command around it: one word, which
+/// no pattern matches and a rewrite's word split keeps whole.
+const SCRIPT_MARK: &str = "\u{1}wsl-script\u{1}";
+
+/// The span of the script a `wsl … bash -lc "<script>"` hands WSL, its quotes included: the
+/// shell is `bash` or `sh` by any path, its last flag a short one with `c`. `None` for any
+/// other command, and for a quote that does not close.
+fn wsl_script(command: &str) -> Option<(usize, usize)> {
+    let bytes = command.as_bytes();
+    let mut words: Vec<&str> = Vec::new();
+    let mut at = 0;
+    loop {
+        // the same whitespace as the word's end, or a non-ASCII space makes an empty word forever
+        at = command.len() - command[at..].trim_start().len();
+        match bytes.get(at)? {
+            b'"' | b'\'' => break,
+            _ => {
+                let end = command[at..].find(char::is_whitespace).map_or(command.len(), |n| at + n);
+                words.push(&command[at..end]);
+                at = end;
+            }
+        }
+    }
+    let quote = bytes[at];
+    let mut close = at + 1;
+    loop {
+        match *bytes.get(close)? {
+            c if c == quote => break,
+            b'\\' if quote == b'"' => close += 2,
+            _ => close += 1,
+        }
+    }
+    let name = |word: &str| word.rsplit(['/', '\\']).next().unwrap_or(word).to_ascii_lowercase();
+    let (first, rest) = words.split_first()?;
+    if !matches!(name(first).as_str(), "wsl" | "wsl.exe") || words.iter().any(|w| w.contains([';', '|', '&', '<', '>', '(', ')', '`'])) {
+        return None;
+    }
+    let shell = rest.iter().position(|w| matches!(name(w).as_str(), "bash" | "sh"))?;
+    let flags = &rest[shell + 1..];
+    let last = flags.last()?;
+    let short_c = last.starts_with('-') && !last.starts_with("--") && last.contains('c');
+    (short_c && flags.iter().all(|f| f.starts_with('-'))).then_some((at, close + 1))
+}
+
 /// Whether the shape table allows every part of `command` in either shell.
 fn shaped_allowed(command: &str) -> bool {
     [shape::Shell::Bash, shape::Shell::PowerShell]
@@ -493,6 +543,22 @@ impl Catalogue {
                 },
             };
         }
+        // a script quoted to `wsl -- bash -lc` is one command of WSL's: the gotchas read the
+        // command around it, never the `;` and `|` inside it, and a rewrite keeps it as written
+        if let Some((at, end)) = wsl_script(command) {
+            let script = &command[at..end];
+            if !conditions.allowed && script.contains([';', '|', '&', '\n']) {
+                let reason = self.get(WSL_SCRIPT).map_or(WSL_SCRIPT_FORM, |g| g.message.as_str());
+                return Verdict::Deny { id: WSL_SCRIPT.to_owned(), reason: reason.to_owned() };
+            }
+            let masked = format!("{}{SCRIPT_MARK}{}", &command[..at], &command[end..]);
+            return match self.command(&masked, conditions) {
+                Verdict::Rewrite { id, command, reason } => {
+                    Verdict::Rewrite { id, command: command.replacen(SCRIPT_MARK, script, 1), reason }
+                }
+                other => other,
+            };
+        }
         let mut current = command.to_owned();
         let mut rewritten: Option<(String, Vec<String>)> = None;
         for gotcha in self.entries.iter().filter(|g| g.place == Where::Command) {
@@ -501,6 +567,7 @@ impl Catalogue {
             }
             match &gotcha.remedy {
                 Remedy::Hint if gotcha.id == ALLOWLIST_HINT && (conditions.allowed || shape::is_worktree_read(&current)) => continue,
+                Remedy::Hint if gotcha.id == WSL_SCRIPT && conditions.allowed => continue,
                 // a catalogue from before `git merge-base` was read as a read ends its git
                 // writes at a `\b`, which `merge-base` passes: a match running into a hyphen
                 // is another subcommand

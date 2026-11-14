@@ -50,6 +50,17 @@ message = "the hook cannot check a variable before it runs: drop `$?` (the exit 
 remedy = { kind = "hint" }
 
 [[gotcha]]
+# a script quoted to `wsl -- bash -lc` is WSL's one command, judged whole (`ra_gotchas`'s
+# `wsl_script`), never by the `;` and `|` inside the quotes: a project that allows WSL runs it
+# held, one that does not is refused a chained script with this message. The other gotchas read
+# the command with the script masked, so this pattern only names the command as written
+id = "wsl-quoted-script"
+where = "command"
+pattern = '^\s*wsl(\.exe)?\s.*\b(ba)?sh\s+(-\S+\s+)*-\w*c\w*\s+["\x27][^"\x27]*[;|&\n]'
+message = "a script quoted to `wsl -- bash -lc` is judged whole, and this project does not allow WSL here: write the script to `var/<name>.sh` with Write and run it by path, `wsl -- bash var/<name>.sh`"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 # the first word of a command; the parts after a pipe or a `;`, `&&` or `||` are judged by the
 # hook's shape table (`ra_gotchas::shape`), which names the form to use instead of each refusal
 id = "shell-outside-allowlist"
