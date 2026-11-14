@@ -3418,6 +3418,7 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
     let path = root.join(WORKTREES_DIR).join(id.to_string());
     let branch = worktree_branch(id);
     if path.join(".git").exists() {
+        seed_target(&path).await;
         return Ok((path, branch));
     }
     std::fs::create_dir_all(root.join(WORKTREES_DIR)).with_context(|| format!("cannot create {WORKTREES_DIR}"))?;
@@ -3435,7 +3436,20 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
     if let Ok(router) = crate::router::Router::load(root) {
         carry(root, &path, &router.worker.carry, id);
     }
+    seed_target(&path).await;
     Ok((path, branch))
+}
+
+/// Gives the worktree at `tree` its own cargo target, seeded from the project's when it has
+/// none yet, off the async threads. A seed that fails leaves the first build cold, never wrong.
+async fn seed_target(tree: &Path) {
+    let owned = tree.to_path_buf();
+    match tokio::task::spawn_blocking(move || ra_providers::claude_code::seed_worktree_target(&owned)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(files)) => tracing::info!("the target of {} seeded from the project's: {files} files", tree.display()),
+        Ok(Err(e)) => tracing::warn!("the target of {} was not seeded: {e}", tree.display()),
+        Err(e) => tracing::warn!("the target of {} was not seeded: {e}", tree.display()),
+    }
 }
 
 /// Where the walk runs a card's failed tests on the project's base commit: one detached
@@ -3457,6 +3471,7 @@ async fn base_worktree(root: &Path, sha: &str) -> anyhow::Result<PathBuf> {
     if let Ok(router) = crate::router::Router::load(root) {
         carry_into(root, &path, &router.worker.carry, "the base worktree");
     }
+    seed_target(&path).await;
     Ok(path)
 }
 
@@ -4708,8 +4723,9 @@ async fn clean_after(root: &Path, id: i64, has_branch: bool) -> Vec<String> {
             Err(e) => lines.push(format!("branch kept: {}", first_line(&format!("{e:#}")))),
         }
     }
-    let target = root.join("target").join(format!("wt-{id}"));
-    if target.is_dir() {
+    if let Some(target) = ra_providers::claude_code::shared_target(&path)
+        && target.is_dir()
+    {
         match std::fs::remove_dir_all(&target) {
             Ok(()) => lines.push("target removed".to_owned()),
             Err(e) => lines.push(format!("target kept: {e}")),
@@ -7335,8 +7351,8 @@ async fn main_failures(worker: &Worker, root: &Path, command: &str, tests: &[Str
         .ok()?
         .with_timeout(timeout)
         .with_env(own_target.iter().map(|t| ("CARGO_TARGET_DIR".to_owned(), t.display().to_string())));
-    // the build slot and the target lock are the card's check's, still held: the base worktree
-    // builds in the same target as the card's, and the hub's lock taken again in this process
+    // the build slot is the card's check's, still held, and the base worktree builds in its own
+    // target, `wt-base`, which cargo's own lock guards: the hub's lock taken again in this process
     // waited out the check's whole timeout (every red-main test hung for twenty minutes)
     let (passed, output) = toolbox.check_args(&rerun).await.ok()?;
     let gradle = !words[0].to_lowercase().contains("cargo");

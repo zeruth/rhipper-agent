@@ -251,8 +251,8 @@ impl ClaudeCode {
     pub fn run_env(&self, workspace: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
         let mut env: Vec<(String, std::ffi::OsString)> = self.env.iter().map(|(k, v)| (k.clone(), v.into())).collect();
         let set = |env: &[(String, std::ffi::OsString)], key: &str| env.iter().any(|(k, _)| k.eq_ignore_ascii_case(key));
-        // a run in a worktree builds in the project's target, like the run beside it: one
-        // build directory under one lock, not one per worktree
+        // a run in a worktree builds in the worktree's own target, seeded from the project's:
+        // a target shared between trees linked one tree's crates into the other's check
         if !set(&env, "CARGO_TARGET_DIR")
             && let Some(target) = workspace.and_then(shared_target)
         {
@@ -1121,9 +1121,11 @@ fn path_with(own: Option<PathBuf>, tools: &[PathBuf], path: &std::ffi::OsStr) ->
 }
 
 /// The target directory for a run in one of the project's worktrees
-/// (`<root>/var/worktrees/<id>`): the main checkout's own target, so the binaries already built
-/// there can be run from the worktree and its first compile is incremental. The orchestrator's
-/// check of the card builds in the same one. `None` for a workspace that is not a worktree.
+/// (`<root>/var/worktrees/<id>`): the worktree's own, `wt-<id>` under the project's target, and
+/// the one the orchestrator's check of the card builds in. Never the main checkout's: cargo
+/// judges an artifact fresh by mtimes, not by which tree's sources built it, and two trees in
+/// one target linked each other's crates. [`seed_target`] makes its first build warm. For a
+/// workspace that is not a worktree, the project's own target on the scratch drive, else `None`.
 #[must_use]
 pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
     let worktree = || -> Option<(PathBuf, String)> {
@@ -1138,10 +1140,98 @@ pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
         Some((var.parent()?.to_path_buf(), workspace.file_name()?.to_string_lossy().into_owned()))
     };
     match worktree() {
-        Some((root, _)) => std::path::absolute(project_target(&root)).ok(),
+        Some((root, id)) => std::path::absolute(project_target(&root).join(format!("wt-{id}"))).ok(),
         // the project's own tree builds in its own target, on the scratch drive when there is one
         None => scratch().map(|_| project_target(workspace)),
     }
+}
+
+/// Seeds the cargo target of the worktree at `workspace` from its project's target, when the
+/// worktree has none yet; see [`seed_target`]. The number of files copied, 0 for a workspace
+/// that is not a worktree.
+///
+/// # Errors
+/// When a file cannot be copied.
+pub fn seed_worktree_target(workspace: &Path) -> std::io::Result<usize> {
+    let Some(own) = shared_target(workspace) else { return Ok(0) };
+    let main = std::path::absolute(project_target(&project_of(workspace).0))?;
+    // the project's own tree builds in the project's target, which is no worktree's to seed
+    if own.parent() != Some(main.as_path()) {
+        return Ok(0);
+    }
+    seed_target(&main, &own)
+}
+
+/// Seeds `own`, a new worktree's target, from `main`, the project's: each profile's artifacts
+/// (every directory with cargo's `.cargo-lock`) copied with their modified times, so cargo finds
+/// the dependencies fresh and rebuilds the members, whose checked-out sources are newer than
+/// anything copied. A copy, never a link: a build in either tree rewrites its own files only.
+/// `incremental` is left out, the members rebuild anyway. Nothing is done when `own` exists or
+/// `main` is not there. The number of files copied.
+///
+/// # Errors
+/// When a file cannot be copied; the half-made copy stays under a `.seeding` name, never `own`.
+pub fn seed_target(main: &Path, own: &Path) -> std::io::Result<usize> {
+    if own.exists() || !main.is_dir() {
+        return Ok(0);
+    }
+    let name = own.file_name().ok_or_else(|| std::io::Error::other("a target with no name"))?;
+    let staging = own.with_file_name(format!("{}.seeding", name.to_string_lossy()));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    std::fs::create_dir_all(&staging)?;
+    let mut copied = 0;
+    for entry in std::fs::read_dir(main)? {
+        let entry = entry?;
+        let (from, to) = (entry.path(), staging.join(entry.file_name()));
+        let kind = entry.file_type()?;
+        if kind.is_file() {
+            copy_dated(&from, &to)?;
+            copied += 1;
+        } else if kind.is_dir() && from.join(".cargo-lock").is_file() {
+            // a build in the project's tree holds cargo's lock on the profile: the copy waits for
+            // it, so no half-written artifact is seeded
+            let lock = std::fs::File::open(from.join(".cargo-lock"))?;
+            lock.lock_shared()?;
+            std::fs::create_dir_all(&to)?;
+            for inner in std::fs::read_dir(&from)? {
+                let inner = inner?;
+                if inner.file_name() == "incremental" || inner.file_name() == ".cargo-lock" {
+                    continue;
+                }
+                copied += copy_tree(&inner.path(), &to.join(inner.file_name()))?;
+            }
+        }
+    }
+    std::fs::rename(&staging, own)?;
+    Ok(copied)
+}
+
+/// Copies the file or directory `from` to `to`, each file with its modified time.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<usize> {
+    let kind = std::fs::symlink_metadata(from)?.file_type();
+    if kind.is_file() {
+        copy_dated(from, to)?;
+        return Ok(1);
+    }
+    if !kind.is_dir() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(to)?;
+    let mut copied = 0;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        copied += copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+    }
+    Ok(copied)
+}
+
+/// Copies one file and gives the copy the original's modified time, which cargo's freshness reads.
+fn copy_dated(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::copy(from, to)?;
+    let modified = std::fs::metadata(from)?.modified()?;
+    std::fs::File::options().write(true).open(to)?.set_modified(modified)
 }
 
 /// The machine's scratch root: where the heavy, throwaway output goes (build targets, temp
