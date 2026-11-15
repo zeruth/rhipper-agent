@@ -1393,6 +1393,26 @@ fn rule_prefix(rule: &str) -> Option<String> {
     (!prefix.is_empty()).then(|| prefix.to_owned())
 }
 
+/// What the worker is told when the Edit tool dropped the trailing space of a `new_string`.
+pub const TRAILING_SPACE_NOTE: &str = "the Edit tool drops a trailing space from new_string; end a replacement on a non-space character, and put the space inside old_string and new_string before a following character instead";
+
+/// The key suffix under which `gotchas_of_event` remembers an edit call whose replacement
+/// ended in whitespace.
+const SPACED_MARK: &str = "#ends-in-whitespace";
+
+/// Whether a replacement ends in whitespace the Edit tool would drop.
+#[must_use]
+pub fn ends_in_whitespace(new_string: &str) -> bool {
+    new_string.chars().last().is_some_and(char::is_whitespace)
+}
+
+/// The `edit-missed` message, with the trailing-space note added when the intended
+/// `new_string` ended in whitespace.
+#[must_use]
+pub fn edit_missed_message(message: &str, new_string: &str) -> String {
+    if ends_in_whitespace(new_string) { format!("{message}; {TRAILING_SPACE_NOTE}") } else { message.to_string() }
+}
+
 /// The gotchas one stream event shows: a command about to run that the catalogue would refuse
 /// or rewrite, a shell result with a known error in it, the final answer with a claim in it, and
 /// a command the harness refused that no gotcha names (`unmatched-denied`, for the catalogue
@@ -1427,6 +1447,10 @@ fn gotchas_of_event(
                 }
                 if let (Some(id), Some(name)) = (block.get("id").and_then(Value::as_str), block.get("name").and_then(Value::as_str)) {
                     tools.insert(id.to_owned(), name.to_owned());
+                    let new_string = block.pointer("/input/new_string").and_then(Value::as_str).unwrap_or("");
+                    if ends_in_whitespace(new_string) {
+                        tools.insert(format!("{id}{SPACED_MARK}"), String::new());
+                    }
                 }
                 if !matches!(block.get("name").and_then(Value::as_str), Some("Bash" | "PowerShell")) {
                     continue;
@@ -1460,7 +1484,16 @@ fn gotchas_of_event(
                     }
                     _ => continue,
                 };
-                hits.extend(catalogue.scan(place, &content));
+                let mut found = catalogue.scan(place, &content);
+                // an Edit whose replacement ended in whitespace: the tool dropped it
+                let spaced =
+                    block.get("tool_use_id").and_then(Value::as_str).is_some_and(|id| tools.contains_key(&format!("{id}{SPACED_MARK}")));
+                if spaced {
+                    for hit in found.iter_mut().filter(|hit| hit.id == "edit-missed") {
+                        hit.message = edit_missed_message(&hit.message, " ");
+                    }
+                }
+                hits.extend(found);
             }
         }
         Some("result") => {
