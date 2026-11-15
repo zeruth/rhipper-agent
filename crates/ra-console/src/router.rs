@@ -213,6 +213,7 @@ impl fmt::Display for Rule {
 /// borrow = false                       # no borrowing of the pool's spare Opus slots past `parallel`; true without it
 /// shell = "bash"                       # the one shell a worker gets; both without it
 /// web = true                           # the web tools for builders; investigators have them anyway
+/// slow = ["cargo test -p ras --features oracle"] # suites run on main once a day, a new failure a card
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -299,6 +300,11 @@ pub struct WorkerConfig {
     /// investigator has them regardless. Absent, no.
     #[serde(default)]
     pub web: Option<bool>,
+    /// The project's slow or feature-gated suites, which a landing never runs: once a day the
+    /// walk runs each on main and files a card for a test that passed the day before and fails
+    /// now. Asm's `--features oracle` broke on main hours before a fork found it by chance.
+    #[serde(default)]
+    pub slow: Vec<String>,
 }
 
 impl WorkerConfig {

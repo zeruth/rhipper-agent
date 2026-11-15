@@ -2415,6 +2415,176 @@ async fn probe_the_machine(root: &Path) {
     }
 }
 
+/// The daily runs of a project's slow suites, one line each: the time, the commit of main, the
+/// command and the tests it passed, tab-separated, the names space-separated.
+pub const SLOW_LOG: &str = "var/slow.log";
+
+/// When the slow suites last started, in unix seconds: a run that named no test still counts,
+/// so a broken suite costs one run a day, not one a walk.
+const SLOW_STAMP: &str = "var/slow.stamp";
+
+/// How long after their last start the slow suites are due again.
+const SLOW_EVERY: u64 = 86_400;
+
+/// The flight's id for the slow suites: no card is numbered below 1.
+const SLOW_SEAT: i64 = -1;
+
+/// The failure lines a slow suite's card quotes.
+const SLOW_FAILURE_LINES: usize = 8;
+
+/// Whether the slow suites of the project at `root` are due at `now`: it names some under
+/// `[worker] slow` and they have not started in the last day.
+#[must_use]
+pub fn slow_due(root: &Path, now: u64) -> bool {
+    let named = crate::router::Router::load(root).is_ok_and(|r| r.worker.slow.iter().any(|c| !c.trim().is_empty()));
+    let last = std::fs::read_to_string(root.join(SLOW_STAMP)).ok().and_then(|t| t.trim().parse::<u64>().ok());
+    named && last.is_none_or(|last| now.saturating_sub(last) >= SLOW_EVERY)
+}
+
+/// Runs the project's slow suites on main when they are due at `now` ([`slow_due`]), each on a
+/// worker slot under the check timeout, records what each passed in [`SLOW_LOG`], and files a
+/// priority-1 card under the Look-back milestone for every test that passed in the last run of
+/// its command and fails now. A landing runs the workspace tests only, so these broke on main
+/// unseen (asm's oracle suite, 2026-11-15). One line per suite and per card filed.
+pub async fn slow_suites(store: &Store, worker: &Worker, now: u64) -> Vec<String> {
+    let root = workspace_of(store);
+    if !slow_due(&root, now) {
+        return Vec::new();
+    }
+    let router = crate::router::Router::load(&root).unwrap_or_default();
+    let commands: Vec<String> = router.worker.slow.iter().map(|c| c.trim().to_owned()).filter(|c| !c.is_empty()).collect();
+    let timeout = router.worker.check_timeout();
+    let _ = std::fs::create_dir_all(root.join("var"));
+    let _ = std::fs::write(root.join(SLOW_STAMP), now.to_string());
+    let commit = git(&root, &["rev-parse", "HEAD"]).await.unwrap_or_default();
+    let mut lines = Vec::new();
+    let toolbox = match worker.toolbox(&root) {
+        Ok(toolbox) => toolbox.with_timeout(timeout),
+        Err(e) => return vec![format!("slow suites not run: {e:#}")],
+    };
+    for command in &commands {
+        let output = {
+            let _slot = hold_build(&root, &root).await;
+            let _target = if command.starts_with("cargo") {
+                match guard_target(&root, &root, &crate::hub::cargo_target(&root), timeout).await {
+                    Ok(guard) => guard,
+                    Err(why) => {
+                        lines.push(format!("slow suite `{command}` not run: {why}"));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            match toolbox.check_acceptance(command).await {
+                Ok((_, output)) => output,
+                Err(e) => {
+                    lines.push(format!("slow suite `{command}` could not run: {e:#}"));
+                    continue;
+                }
+            }
+        };
+        let gradle = !command.starts_with("cargo");
+        let passed = passed_test_names(&output);
+        let failed = failed_test_names(&output, gradle);
+        // a suite that named no test did not run: its last record stays the one to compare with
+        if passed.is_empty() && failed.is_empty() {
+            lines.push(format!("slow suite `{command}` named no test: {}", first_error(&output)));
+            continue;
+        }
+        let log = std::fs::read_to_string(root.join(SLOW_LOG)).unwrap_or_default();
+        let before = last_slow_run(&log, command);
+        let mut text = log;
+        let _ = writeln!(text, "{now}\t{commit}\t{command}\t{}", passed.join(" "));
+        let _ = std::fs::write(root.join(SLOW_LOG), text);
+        lines.push(format!("slow suite `{command}`: {} passed, {} failed", passed.len(), failed.len()));
+        let Some((green, was)) = before else { continue };
+        let range = if commit.is_empty() { format!("{green}..HEAD") } else { format!("{green}..{commit}") };
+        let landings: Vec<String> =
+            git(&root, &["log", "--format=%h %s", &range]).await.map(|out| out.lines().map(str::to_owned).collect()).unwrap_or_default();
+        for test in failed.iter().filter(|t| was.contains(t)) {
+            let failure = slow_failure_lines(&output, test);
+            match file_slow_failure(store, command, test, &failure, &landings, (&green, &commit)).await {
+                Ok(id) => {
+                    let line = format!("#{id} filed: `{test}` of the slow suite `{command}` fails on main");
+                    crate::pair::event(&root, &line);
+                    lines.push(line);
+                }
+                Err(e) => lines.push(format!("the card for `{test}` could not be filed: {e:#}")),
+            }
+        }
+    }
+    lines
+}
+
+/// The commit and the passed tests of the last run of `command` in a [`SLOW_LOG`] text.
+fn last_slow_run(log: &str, command: &str) -> Option<(String, Vec<String>)> {
+    log.lines().rev().find_map(|line| {
+        let mut fields = line.splitn(4, '\t');
+        let (_, commit, run, passed) = (fields.next()?, fields.next()?, fields.next()?, fields.next().unwrap_or_default());
+        (run == command).then(|| (commit.to_owned(), passed.split_whitespace().map(str::to_owned).collect()))
+    })
+}
+
+/// The names of the tests a cargo or gradle output marks passed: `test name ... ok`, or gradle's
+/// `Class > method PASSED` as `Class.method`. A `-q` cargo run names none.
+#[must_use]
+pub fn passed_test_names(output: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in output.lines().map(str::trim) {
+        let name = if let Some(rest) = line.strip_prefix("test ") {
+            rest.strip_suffix(" ... ok").map(str::to_owned)
+        } else {
+            line.strip_suffix(" PASSED")
+                .and_then(|head| head.split_once(" > "))
+                .map(|(class, method)| format!("{class}.{}", method.trim_end_matches("()")))
+        };
+        if let Some(name) = name
+            && !name.is_empty()
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The first lines of `test`'s failure in `output`, else the output's first error.
+fn slow_failure_lines(output: &str, test: &str) -> String {
+    let failures = ra_context::failures_of(output);
+    let found = failures.iter().find(|f| f.lines().next().is_some_and(|first| first.contains(test)));
+    match found {
+        Some(failure) => failure.lines().take(SLOW_FAILURE_LINES).collect::<Vec<_>>().join("\n"),
+        None => first_error(output),
+    }
+}
+
+/// Files the card of a slow suite's test that broke between the commits `green` and `red`:
+/// priority 1, under the Look-back milestone, its check the suite filtered to the test.
+async fn file_slow_failure(
+    store: &Store,
+    command: &str,
+    test: &str,
+    failure: &str,
+    landings: &[String],
+    (green, red): (&str, &str),
+) -> anyhow::Result<i64> {
+    let parent = crate::plan::home::ensure_milestone(store).await?;
+    let short = |commit: &str| commit.chars().take(10).collect::<String>();
+    let landed = if landings.is_empty() { "none git could name".to_owned() } else { landings.join("\n") };
+    let objective = format!(
+        "The slow suite `{command}`, run on main once a day, passed {test} at {} and fails it at {}.\n\nThe first failure lines:\n{failure}\n\nThe landings since the last green run:\n{landed}",
+        short(green),
+        short(red)
+    );
+    let check = if command.starts_with("cargo") { format!("{command} {test}") } else { command.to_owned() };
+    let acceptance = format!("`{check}` passes");
+    let card = Card { objective: Some(&objective), acceptance: Some(&acceptance), ..Card::new() };
+    let id = store.insert_card(Some(parent), NodeKind::Task, &format!("{test} fails on main in the slow suite"), &card).await?;
+    store.set_priority(id, Some(1)).await?;
+    Ok(id)
+}
+
 /// Gives `session` a fresh build budget in `tree`, for a rerun whose prompt is a lint fix: the
 /// builds of the run before it were spent on the card's change, and the fix runs the checks.
 pub fn reset_builds(tree: &Path, session: &str) {
@@ -5351,6 +5521,11 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 Seat::Investigate,
             ));
         }
+    }
+    // the slow suites the landings never run, on main once a day, beside the runs on a seat of
+    // their own: they take a worker slot like any check, not a runner
+    if slow_due(&root, unix_now()) {
+        flight.push((SLOW_SEAT, Box::pin(async move { Ok(slow_suites(store, worker, unix_now()).await) }), Seat::Investigate));
     }
     let mut stopped: Option<String> = None;
     // the cards parked past [`RERUNS_A_WALK`] or failed in this walk; the count of the rounds is
