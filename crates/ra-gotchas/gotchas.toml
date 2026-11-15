@@ -70,6 +70,16 @@ message = "the shells here run cargo, the read-only git commands and the read-on
 remedy = { kind = "hint" }
 
 [[gotcha]]
+# a worker listing a run's scratch directory (`ls -la D:/rhipper/tmp/rhipper-asm/run-209`), another
+# project's or one the hook does not allow: the run's files are in the workspace; ahead of
+# `ls-outside-worktree`, which names every other outside path
+id = "outside-workspace"
+where = "command"
+pattern = '^\s*(ls|cat|dir)\b(\s+-\S+)*\s+["\x27]?(/[A-Za-z]|[A-Za-z]:)[\\/]rhipper[\\/]tmp[\\/]'
+message = "that path is outside the workspace and is refused: the run's own files are under `var/` in the workspace (var/<name> for what you wrote, the build's tail for its output); list them with Glob or read them with Read"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 # a worker looking for a build the worktree has not made (`ls ../../target/debug/ras.exe`) or for a
 # system file (`ls C:/Windows/SysWOW64/…`): the hook reads the worktree and nothing around it
 id = "ls-outside-worktree"
