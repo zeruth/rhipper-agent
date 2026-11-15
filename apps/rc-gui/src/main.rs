@@ -4247,6 +4247,7 @@ impl Workspace {
         self.sink.live_run().is_none()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn dashboard_card(&mut self, ui: &mut egui::Ui, lane: Color32, page: f32, budget: f32) -> bool {
         let nodes = self.roadmap.clone();
         let order = self.walk_order();

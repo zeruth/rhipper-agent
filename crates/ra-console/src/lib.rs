@@ -24,6 +24,7 @@ pub mod retro;
 pub mod review;
 pub mod roadmap_pane;
 pub mod roles;
+pub mod route;
 pub mod router;
 pub mod secret;
 pub mod setup;

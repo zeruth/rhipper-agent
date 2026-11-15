@@ -363,6 +363,22 @@ impl Worker {
         Ok(worker)
     }
 
+    /// The same worker on a route that can start: when its model's key is missing the model is
+    /// Claude Code's, and the step says so. A worker already connected keeps its provider.
+    #[must_use]
+    pub fn with_usable_route(&self) -> Self {
+        let mut worker = self.clone();
+        if self.provider.lock().is_some() {
+            return worker;
+        }
+        let chosen = crate::route::choose(&self.model, crate::route::key_present);
+        if let Some(note) = chosen.note() {
+            worker.model = chosen.model;
+            worker.step = Some(worker.step.map_or(note.clone(), |step| format!("{step} · {note}")));
+        }
+        worker
+    }
+
     /// The same worker, already connected to `provider` for its model's route; the tests hand in
     /// a scripted one.
     pub fn with_provider(self, provider: Arc<dyn ModelProvider>) -> Self {
@@ -1048,7 +1064,7 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     }
     // then the plan's week: a claude-* pick past the threshold falls to the local route or is
     // refused here, before the start marker
-    let worker = &worker.for_card(&root, &node)?.steered_by_plan(&root, &node).await?;
+    let worker = &worker.for_card(&root, &node)?.steered_by_plan(&root, &node).await?.with_usable_route();
     let mut pick = worker.step.as_ref().map_or_else(String::new, |step| format!(" · {step}"));
     if tight {
         write!(pick, " · {TIGHT_PICK}").unwrap();
@@ -3601,7 +3617,7 @@ pub async fn unrunnable_checks(root: &Path, nodes: &[Node]) -> Vec<String> {
         for command in named_checks(node.acceptance.as_deref()) {
             // a package or test the card itself creates is not there yet, as the run's own
             // preflight knows (asm #180); agent #256, #291 and #488 were held on it
-            if names_created(&command, &files) {
+            if names_created(&command, files) {
                 continue;
             }
             if let Some(why) = unrunnable(root, &command).await {
@@ -6059,9 +6075,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         changed,
         // the tree's head comes first, then the ladder's move, so the next run and the person
         // see where the tree is and why this model
+        // the route rides in the head with the tree's lines, never ahead of the worker's report:
+        // what reads a report reads how it opens (the context cap's words, the rerun's quote)
         report: format!(
             "{}{}{}",
-            tree.head(open),
+            match tree.head(open) {
+                head if head.is_empty() => head,
+                head => format!("{head}route: {} · {}\n", worker.route().name(), worker.model),
+            },
             if lint_pass { format!("{LINT_PASS_FRESH}.\n") } else { String::new() },
             worker.step.as_ref().map_or_else(|| report.to_owned(), |step| format!("Route: {step}.\n{report}"))
         ),

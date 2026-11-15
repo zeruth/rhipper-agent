@@ -156,6 +156,7 @@ pub fn tokens(text: &str) -> usize {
 /// scored against `ask` and the lines the last run `changed`, the best whose lines fit `room`
 /// tokens kept, a tie going to the earlier item.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn map_of(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask, changed: &ChangedLines, room: usize) -> Map {
     let entries: Vec<Option<Read>> = files
         .iter()

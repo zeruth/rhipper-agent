@@ -1418,7 +1418,7 @@ pub fn changed_between(before: &str, after: &str) -> Vec<String> {
 pub const TREE_PREFIX: &str = "tree: at ";
 
 /// The prefixes of the lines the orchestrator writes at the head of a handoff's report.
-const HEAD_PREFIXES: [&str; 5] = [TREE_PREFIX, "since the last run: ", "build: ", "diff: ", "open: "];
+const HEAD_PREFIXES: [&str; 6] = [TREE_PREFIX, "since the last run: ", "build: ", "diff: ", "open: ", "route: "];
 
 /// How many of the branch's commits the head names.
 const COMMITS_SHOWN: usize = 5;
