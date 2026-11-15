@@ -9179,6 +9179,32 @@ pub fn ran_of(output: &str) -> anyhow::Result<String> {
     Ok(ran.join("\n"))
 }
 
+/// The text a passed check keeps: the last `kept` lines, and ahead of them each test binary's
+/// `test result:` line that ran a test with its `Running` and `running N tests` lines, so a
+/// filtered run's closing `0 passed` blocks do not hide the binary that ran the test.
+fn passed_text(output: &str, kept: usize) -> String {
+    let tail = last_lines(output, kept);
+    let mut ahead: Vec<&str> = Vec::new();
+    let mut pending: Vec<&str> = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("Running ") {
+            pending.clear();
+            pending.push(line);
+        } else if trimmed.starts_with("running ") {
+            pending.push(line);
+        } else if trimmed.starts_with("test result:") {
+            let ran = trimmed.split(" passed").next().and_then(|before| before.rsplit(' ').next()).and_then(|n| n.parse::<u64>().ok());
+            if trimmed.contains(" passed") && ran.is_some_and(|n| n > 0) && !tail.lines().any(|seen| seen == line) {
+                ahead.append(&mut pending);
+                ahead.push(line);
+            }
+            pending.clear();
+        }
+    }
+    if ahead.is_empty() { tail } else { format!("{}\n{tail}", ahead.join("\n")) }
+}
+
 /// Runs the checks of a card in the project directory, in the order written, and stops at the
 /// first failure; each command's verdict goes to the activity log as it comes. Each command is
 /// split into its words once, here, and they reach the program as its arguments. A passed
@@ -9209,7 +9235,7 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                 command: command.clone(),
                 passed: true,
                 exit: output.lines().last().unwrap_or_default().to_owned(),
-                text: last_lines(&output, kept),
+                text: passed_text(&output, kept),
                 failed_tests: 0,
                 failures: Vec::new(),
                 tests: Vec::new(),

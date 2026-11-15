@@ -107,6 +107,21 @@ async fn flaky_rerun_passes_a_test_that_passes_alone_and_names_it() {
 }
 
 #[tokio::test]
+async fn passed_check_keeps_each_binarys_result() {
+    let output = "Running unittests src/lib.rs\nrunning 3 tests\n...\ntest result: ok. 3 passed; 0 failed\n\
+        Running tests/a.rs\nrunning 0 tests\ntest result: ok. 0 passed; 0 failed; 4 filtered out\n\
+        Running tests/b.rs\nrunning 0 tests\ntest result: ok. 0 passed; 0 failed; 5 filtered out\n\
+        Running tests/c.rs\nrunning 0 tests\ntest result: ok. 0 passed; 0 failed; 6 filtered out\nexit code 0";
+    let text = passed_text(output, 5);
+    assert!(text.contains("Running unittests src/lib.rs\nrunning 3 tests\ntest result: ok. 3 passed"), "{text}");
+    assert!(!text.contains("tests/a.rs"), "{text}");
+    assert!(text.ends_with("exit code 0"), "{text}");
+    let (toolbox, _) = scripted_checks(|_, _| (0, "test result: ok. 1 passed".to_owned()));
+    let runs = run_checks(&toolbox, &["cargo test -p x -q".to_owned()], &[]).await;
+    assert!(runs[0].passed && runs[0].text.contains("test result: ok. 1 passed"));
+}
+
+#[tokio::test]
 async fn flaky_rerun_fails_the_card_with_the_second_output_when_the_test_fails_again() {
     let (toolbox, seen) = scripted_checks(|_, call| {
         if call == 1 {
