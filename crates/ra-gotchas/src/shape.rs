@@ -285,6 +285,9 @@ fn judge_part(
     if name == "git" && rest.first() == Some(&"mv") {
         return judge_move(&rest[1..], shell, workspace, assigned);
     }
+    if name == "git" && rest.first() == Some(&"rm") && !rest.contains(&"--cached") {
+        return judge_remove(&rest[1..], shell, workspace, assigned);
+    }
     if let Some(form) = refusal(name, rest) {
         return Shape::Denied(form.to_owned());
     }
@@ -323,6 +326,46 @@ fn judge_move(args: &[&str], shell: Shell, workspace: &Path, assigned: &[String]
     }
     if paths.len() < 2 || args.iter().any(|w| !known(w, shell, assigned)) {
         return Shape::Unknown;
+    }
+    Shape::Allowed
+}
+
+/// Whether `git` run in `workspace` with `args` succeeds.
+fn git_ok(workspace: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `git rm` with `args` (after `rm`): allowed when every path stays inside the workspace and is
+/// tracked there; a forced removal also needs the paths unchanged since the last commit.
+fn judge_remove(args: &[&str], shell: Shell, workspace: &Path, assigned: &[String]) -> Shape {
+    let flag = |w: &str| w.starts_with('-') && w != "--";
+    let known_flag = |w: &str| matches!(w, "-r" | "-f" | "-q" | "-rf" | "-fr" | "--force" | "--quiet");
+    if let Some(path) = args.iter().find(|w| outside(w, workspace)) {
+        return Shape::Denied(format!("`git rm` runs inside the workspace only, and `{path}` leaves it: {GIT_FORM}"));
+    }
+    if args.iter().filter(|w| flag(w)).any(|w| !known_flag(w)) {
+        // a flag that is not a plain remove (`--ignore-unmatch`, `--cached` is handled apart)
+        return Shape::Denied(GIT_FORM.to_owned());
+    }
+    let forced = args.iter().any(|w| matches!(*w, "-f" | "-rf" | "-fr" | "--force"));
+    let paths: Vec<&str> = args.iter().copied().skip_while(|w| *w != "--").skip(1).collect();
+    let paths = if paths.is_empty() { args.iter().copied().filter(|w| !w.starts_with('-')).collect() } else { paths };
+    if paths.is_empty() || args.iter().any(|w| !known(w, shell, assigned)) {
+        return Shape::Unknown;
+    }
+    for path in paths {
+        if !git_ok(workspace, &["ls-files", "--error-unmatch", "--", path]) {
+            return Shape::Denied(format!("`git rm` takes a tracked path, and `{path}` is not tracked here: {GIT_FORM}"));
+        }
+        if forced && !git_ok(workspace, &["diff", "--quiet", "HEAD", "--", path]) {
+            return Shape::Denied(format!("`git rm` of `{path}` is forced over uncommitted changes: {GIT_FORM}"));
+        }
     }
     Shape::Allowed
 }
@@ -674,7 +717,7 @@ pub fn block_with(rg: bool, builds_refused: bool) -> String {
         lines.push(format!("  - {}: {form}", names.join(", ")));
     }
     lines.push(format!(
-        "  - git {} (but `git rm --cached` and `git mv` inside the workspace run) and git -C (but `git -C var/worktrees/<id> status|log|diff|show` runs): {GIT_FORM}",
+        "  - git {} (but `git rm` of tracked paths, `git rm --cached` and `git mv` inside the workspace run) and git -C (but `git -C var/worktrees/<id> status|log|diff|show` runs): {GIT_FORM}",
         GIT_WRITES.join("|")
     ));
     lines.push(format!("  - a `>` redirect to a file: {REDIRECT_FORM}"));
