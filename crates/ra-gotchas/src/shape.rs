@@ -636,6 +636,7 @@ pub fn block_with(rg: bool, builds_refused: bool) -> String {
         format!("- Bash runs: {}", names(Shell::Bash)),
         format!("- PowerShell runs: {}", names(Shell::PowerShell)),
         "- one command per call: no `;`, `&&` or pipe between commands; a call passes when its command does, with a `2>&1`, `> /dev/null` or `2>$null`, a `VAR=value` prefix in Bash, and in PowerShell a `& \"path\\tool.exe\"` call or a `$name = 'value'` assignment".to_owned(),
+        "- a command chained with `;` or `&&`, or one that tests `$?`, is refused whole: send each command in its own call".to_owned(),
         "- paths are the workspace's, relative or absolute; `..` and paths outside it are the harness's to judge".to_owned(),
         "- hash a file with `sha256sum <file>` in Bash, on a path inside the workspace".to_owned(),
         "- a `$( )` or backtick substitution, a `( )` or `{ }` block, a heredoc and a `<` redirect are not judged by the hook, and the allowlist usually refuses them".to_owned(),
