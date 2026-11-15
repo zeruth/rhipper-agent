@@ -21,6 +21,14 @@ fn every_tool_the_prompt_lists_passes_the_hook() {
     }
 }
 
+#[test]
+fn the_prompt_names_sha256sum_as_the_way_to_hash_a_file() {
+    let block = shape::block();
+    let list = block.lines().find_map(|l| l.strip_prefix("- Bash runs: ")).unwrap_or_else(|| panic!("no Bash line in {block}"));
+    assert!(list.split(", ").any(|tool| tool == "sha256sum"), "the Bash list leaves `sha256sum` out: {list}");
+    assert!(block.contains("hash a file with `sha256sum <file>`"), "{block}");
+}
+
 /// The runtime forms a worker reaches for to run a script it wrote.
 const RUNTIME_FORMS: &[&str] =
     &["python file.py", "python -c \"print(1)\"", "python3 file.py", "python3 -c \"print(1)\"", "py file.py", "py -c \"print(1)\""];
