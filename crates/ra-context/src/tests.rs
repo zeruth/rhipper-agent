@@ -753,3 +753,31 @@ fn a_handoff_head_names_the_tip_the_branch_s_commits_what_happened_and_what_is_o
     let own = Tree { tip: "abc".to_owned(), ..Tree::default() };
     assert_eq!(own.head(&[]), "tree: at abc\n");
 }
+
+#[test]
+fn lint_primer_leads_with_the_commonest_lint_and_its_count() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(lint_primer(dir.path()), "");
+    let public = |line: u32| {
+        format!("warning: unreachable `pub` item\n --> src/a.rs:{line}:1\n  |\n  = note: `#[warn(unreachable_pub)]` on by default")
+    };
+    let single = "warning: you seem to be trying to use `match` for destructuring a single pattern\n --> src/a.rs:9:5\n  |\n  = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#single_match";
+    let mut task = TaskContext::open(dir.path(), 5);
+    for (when, warnings) in [(1, vec![public(1), single.to_owned()]), (2, vec![public(2), public(3)])] {
+        task.record(Handoff {
+            when,
+            model: "m".into(),
+            outcome: "needs revision".into(),
+            check: "c".into(),
+            verdict: None,
+            changed: vec![],
+            report: "r".into(),
+            warnings,
+            read: vec![],
+            failures: vec![],
+        });
+    }
+    task.save(dir.path()).unwrap();
+    let primer = lint_primer(dir.path());
+    assert!(primer.ends_with("unreachable_pub (3), single_match (1)"), "{primer}");
+}

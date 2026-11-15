@@ -1523,6 +1523,54 @@ fn parse_warnings(text: &str) -> Vec<String> {
     warnings
 }
 
+/// How many of the newest handoffs the lint primer counts, and how many lints it names.
+const PRIMER_HANDOFFS: usize = 50;
+const PRIMER_LINTS: usize = 8;
+
+/// The lint a diagnostic names: the `#[warn(name)]` note, or the `index.html#name` link of its
+/// help line; `None` for a diagnostic that names none (a compile error).
+fn lint_name(warning: &str) -> Option<&str> {
+    fn name(rest: &str) -> Option<&str> {
+        let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':')).unwrap_or(rest.len());
+        (end > 0).then(|| &rest[..end])
+    }
+    for opening in ["#[warn(", "#[deny(", "#[forbid("] {
+        if let Some((_, rest)) = warning.split_once(opening) {
+            return name(rest).map(|n| n.strip_prefix("clippy::").unwrap_or(n));
+        }
+    }
+    warning.split_once("index.html#").and_then(|(_, rest)| name(rest))
+}
+
+/// The lints of the warnings in the newest [`PRIMER_HANDOFFS`] handoffs under `workspace`, as
+/// the worker's brief carries them: the commonest [`PRIMER_LINTS`] with their counts, commonest
+/// first. Empty when no handoff kept a warning that names its lint. The project's own linter
+/// writes the list, so nothing is kept up by hand.
+#[must_use]
+pub fn lint_primer(workspace: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(workspace.join(CONTEXT_DIR)) else { return String::new() };
+    let mut handoffs: Vec<Handoff> =
+        entries.flatten().filter_map(|entry| std::fs::read_to_string(entry.path()).ok()).flat_map(|text| parse_handoffs(&text)).collect();
+    handoffs.sort_by_key(|handoff| std::cmp::Reverse(handoff.when));
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for name in handoffs.iter().take(PRIMER_HANDOFFS).flat_map(|h| &h.warnings).filter_map(|w| lint_name(w)) {
+        match counts.iter_mut().find(|(known, _)| *known == name) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((name, 1)),
+        }
+    }
+    // a stable sort keeps the first-seen (newest) lint first among equal counts
+    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    if counts.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = counts.iter().take(PRIMER_LINTS).map(|(name, count)| format!("{name} ({count})")).collect();
+    format!(
+        "The lints this project's runs trip most, from the warnings of its last handoffs; write code that avoids them: {}",
+        list.join(", ")
+    )
+}
+
 /// The text of the last `heading` section before the handoffs of a task's file, to the next
 /// heading, trimmed; `None` when the file has no such section.
 fn section_of(text: &str, heading: &str) -> Option<String> {

@@ -8054,6 +8054,7 @@ pub(crate) fn harness_messages(
         machine_notes(root, project, (task.id, acceptance)),
         tools,
         warnings_note(task),
+        ra_context::lint_primer(root),
         digest_block(&crate::hub::digest_lines(root)),
     ]
     .into_iter()
