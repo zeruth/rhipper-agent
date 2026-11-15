@@ -187,9 +187,15 @@ fn a_status_counts_the_spend_of_today_only() {
 
 #[test]
 fn counting_build_slots_asks_without_taking_them() {
-    let slot = build_slot_count() - 1;
+    // the slots are the machine's: a build of another test or a walk may hold any of them, so the
+    // test takes the last free one (CI run 43743652158 failed on the last slot being held)
+    let Some((slot, held)) = (0..build_slot_count()).rev().find_map(|slot| {
+        try_guard_as(&build_lock_name(slot), "asker #1").ok().flatten().map(|guard| (slot, guard))
+    }) else {
+        eprintln!("SKIPPED: counting_build_slots_asks_without_taking_them: every build slot is held");
+        return;
+    };
     let name = build_lock_name(slot);
-    let held = try_guard_as(&name, "asker #1").unwrap().expect("the slot is free");
     assert_eq!(build_slots()[slot].as_ref().map(|(who, _)| who.as_str()), Some("asker #1"));
     drop(held);
     // asked while free, the slot is still free for the next builder

@@ -48,7 +48,8 @@ async fn reviewed(answer: &str) -> (tempfile::TempDir, Store, i64) {
     (dir, store, id)
 }
 
-const FOUR: &str = "needs_revision\n- the parser drops the last row of src/lib.rs\n- the header is not written\n- the footer repeats itself\n- the count is off by one";
+// each point cites its place, as a point must since #310; one without stands aside as vague
+const FOUR: &str = "needs_revision\n- src/lib.rs:1: the parser drops the last row\n- src/lib.rs:1: the header is not written\n- src/lib.rs:1: the footer repeats itself\n- src/lib.rs:1: the count is off by one";
 
 #[tokio::test]
 async fn four_points_file_a_card_each_and_the_parent_waits() {
@@ -67,7 +68,7 @@ async fn four_points_file_a_card_each_and_the_parent_waits() {
 
 #[tokio::test]
 async fn three_points_rerun_the_card() {
-    let answer = "needs_revision\n- the parser drops the last row\n- the header is not written\n- the footer repeats itself";
+    let answer = "needs_revision\n- src/lib.rs:1: the parser drops the last row\n- src/lib.rs:1: the header is not written\n- src/lib.rs:1: the footer repeats itself";
     let (_dir, store, id) = reviewed(answer).await;
     let nodes = store.all().await.expect("the nodes");
     assert_eq!(nodes.iter().filter(|n| n.kind == NodeKind::Task).count(), 1);

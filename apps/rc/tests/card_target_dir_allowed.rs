@@ -42,7 +42,9 @@ fn the_cards_own_target_and_scratch_are_allowed_and_another_cards_is_not() {
         let answer = pre(base, &shell(command.clone()));
         assert!(answer.contains("\"allow\""), "{command}: {answer}");
     }
-    let command = format!("ls {other}/debug");
+    // a listing of another card's target is the project's target root, which #805 lets through;
+    // running another card's binary stays refused
+    let command = format!("{other}/debug/rc.exe --version");
     let answer = pre(base, &shell(command.clone()));
     assert!(!answer.contains("\"allow\""), "{command}: {answer}");
 }
