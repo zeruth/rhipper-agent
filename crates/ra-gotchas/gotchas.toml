@@ -91,7 +91,7 @@ remedy = { kind = "hint" }
 # `sed -n '1,20p' file`: a worker pages a file through sed and the hook refuses it
 id = "sed-n"
 where = "command"
-pattern = '(^|[;&|]\s*)sed\s+-n\b'
+pattern = '^\s*sed\s+-n\b'
 message = "sed is refused: read a range of a file with the Read tool and its offset and limit arguments (offset is the first line, limit the line count), and search with the Grep tool"
 remedy = { kind = "hint" }
 
@@ -194,7 +194,7 @@ remedy = { kind = "hint" }
 id = "piped-or-chained"
 where = "command"
 pattern = '\|\s*(tail|head)\b|2>&1\s*\||;'
-message = "this pipeline or chain was refused: run each command alone, one per call, as a single unpiped command (no `;`, no `| head` or `| grep`), and read its output with Read or cut it with the command's own flags"
+message = "this pipeline or chain was refused: run each command alone, one per call, as a single unpiped command (no `;`, no `| head` or `| grep`), and read its output with Read or cut it with the command's own flags; a `sed -n` range is the Read tool's offset (first line) and limit (line count)"
 remedy = { kind = "hint" }
 
 [[gotcha]]
