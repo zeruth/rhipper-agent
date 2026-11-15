@@ -1,0 +1,11 @@
+[package]
+name = "tally-cli"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tally = { path = "../tally" }

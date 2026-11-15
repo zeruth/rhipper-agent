@@ -1,0 +1,18 @@
+# One implementer, one reviewer, no escalation.
+[worker]
+parallel = 4
+turns = 40
+check_timeout = 300
+borrow = false
+
+[[route]]
+model = "claude-sonnet-5-5"
+
+[ladder]
+models = ["claude-sonnet-5-5"]
+start = []
+up_after = 0
+
+[role]
+reviewer = "claude-sonnet-5-5"
+fix = ""
