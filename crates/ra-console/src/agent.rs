@@ -5017,7 +5017,9 @@ async fn catch_up(root: &Path, path: &Path, node: &Node) -> Option<(String, Catc
     if !open.is_empty() {
         return Some((main, CatchUp::Conflicts(open.len())));
     }
-    let behind = git(path, &["rev-list", "--count", &format!("HEAD..{main}")]).await.ok()?;
+    // the project's kept work only: a squash still under its landing's check is not merged
+    let target = catch_up_target(root, &main).await;
+    let behind = git(path, &["rev-list", "--count", &format!("HEAD..{target}")]).await.ok()?;
     if behind.trim() == "0" {
         return None;
     }
@@ -5031,14 +5033,14 @@ async fn catch_up(root: &Path, path: &Path, node: &Node) -> Option<(String, Catc
         let _ = git(path, &["commit", "-q", "-m", &message]).await;
     }
     let base = git(path, &["rev-parse", "HEAD"]).await.ok();
-    let mut outcome = merge_in(path, &main, behind.trim(), base.clone()).await;
+    let mut outcome = merge_in(path, &target, behind.trim(), base.clone()).await;
     // a refusal is not a conflict and never the worker's: what can be settled is, and the
     // merge is tried once more (#211, #213 and #216 went back to workers with nothing to resolve)
     if let CatchUp::Refused(why) = &outcome
-        && let Some(settled) = settle_refusal(path, &main, why).await
+        && let Some(settled) = settle_refusal(path, &target, why).await
     {
         tracing::info!(target: crate::trace::PROGRESS, "#{}: {settled}; merging {main} again", node.id);
-        outcome = merge_in(path, &main, behind.trim(), base).await;
+        outcome = merge_in(path, &target, behind.trim(), base).await;
     }
     Some((main, outcome))
 }
@@ -5722,6 +5724,8 @@ async fn land_branch(
     regenerate: bool,
     lines: &mut Vec<String>,
 ) -> anyhow::Result<()> {
+    // one landing at a time holds the project: a proving ref left now is a crashed landing's
+    let _ = git(root, &["update-ref", "-d", PROVING_REF]).await;
     let merged = git(root, &["merge-base", "--is-ancestor", branch, "HEAD"]).await.is_ok();
     if merged {
         lines.push(format!("{branch} is in HEAD already"));
@@ -5796,6 +5800,9 @@ async fn land_branch(
         }
         let message = landing_message(node, handoffs);
         git(root, &["commit", "-q", "-m", &message]).await?;
+        // the squash is on the project's branch before its check: the catch-ups of the other
+        // cards merge the commit before it until the check has passed
+        let _ = git(root, &["update-ref", PROVING_REF, "HEAD"]).await;
         lines.push(format!(
             "squashed {branch} into one commit on {}: {}",
             git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default(),
@@ -5808,7 +5815,27 @@ async fn land_branch(
             Err(e) => lines.push(format!("the person's files stay in `git stash`: {}", first_line(&format!("{e:#}")))),
         }
     }
-    check_merged(root, node, worker, regenerate, &staged, lines).await
+    let checked = check_merged(root, node, worker, regenerate, &staged, lines).await;
+    let _ = git(root, &["update-ref", "-d", PROVING_REF]).await;
+    checked
+}
+
+/// The ref of the squash commit a landing has put on the project's branch and is still
+/// proving with its merged check. card/835 caught up while #834's, #846's and #847's squashes
+/// stood on main under their checks, and kept them after the checks failed and main dropped
+/// them; a catch-up merges the commit before this one instead ([`catch_up_target`]).
+pub const PROVING_REF: &str = "refs/rhipper/proving";
+
+/// What a card's catch-up merges of the project's branch `main` in the checkout at `root`:
+/// `main` itself, or the commit before the squash a landing is still proving on it, so a
+/// card's branch takes only the work the project has kept. A proving ref whose commit is no
+/// longer on `main` (its check failed and the squash went) changes nothing.
+pub async fn catch_up_target(root: &Path, main: &str) -> String {
+    let Ok(proving) = git(root, &["rev-parse", "-q", "--verify", PROVING_REF]).await else { return main.to_owned() };
+    if git(root, &["merge-base", "--is-ancestor", &proving, main]).await.is_err() {
+        return main.to_owned();
+    }
+    git(root, &["rev-parse", "-q", "--verify", &format!("{proving}^1")]).await.unwrap_or_else(|_| main.to_owned())
 }
 
 /// The project's check on the merged tree: two cards right on their own are not always right
@@ -6342,7 +6369,17 @@ pub async fn worktree_drop(root: &Path, id: i64) -> anyhow::Result<Vec<String>> 
 
 /// One git command in `dir`, its stdout trimmed; the stderr is the error when it fails.
 async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = tokio::process::Command::new("git").args(args).current_dir(dir).output().await.context("cannot run git")?;
+    // an inherited repository or index (a hook's, a shell's) would point a worktree's commit
+    // at another tree's state; `dir` alone decides which repository a command acts on
+    let out = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .await
+        .context("cannot run git")?;
     anyhow::ensure!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
