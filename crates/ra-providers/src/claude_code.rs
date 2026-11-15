@@ -1233,8 +1233,9 @@ const POOL_PREFIX: &str = "wt-pool-";
 
 /// Leases a target of the project's pool to the worktree at `workspace`, so its first build
 /// starts from a landed card's artifacts and rebuilds only what its files changed: the one it
-/// holds, else a free one, else a new one. [`shared_target`] answers it from then on. `None` for
-/// a workspace that is not a worktree.
+/// holds, else a free one, else a new one. No run builds in one yet: [`shared_target`] names the
+/// card's own `wt-<id>`, so two cards never share build output. `None` for a workspace that is
+/// not a worktree.
 ///
 /// # Errors
 /// When the lease file cannot be made.

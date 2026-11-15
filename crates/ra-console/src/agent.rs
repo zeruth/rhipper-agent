@@ -1383,11 +1383,11 @@ async fn split_by_point(store: &Store, node: &Node, root: &Path, verdict: Verdic
         let title: String = point.chars().take(FOLLOW_UP_TITLE).collect();
         let files = files_named(root, point);
         let card = Card { objective: Some(point), files: &files, ..Card::new() };
-        let filed = match store.insert_card(node.parent, NodeKind::Task, title.trim(), &card).await {
+        let child_result = match store.insert_card(node.parent, NodeKind::Task, title.trim(), &card).await {
             Ok(child) => store.depend_on(node.id, child).await.map(|()| child),
             Err(e) => Err(e),
         };
-        match filed {
+        match child_result {
             Ok(child) => made.push(format!("{SPLIT_POINT}{child}: {point}")),
             Err(e) => {
                 // a point no card could take stays with the card: it reruns on that one
