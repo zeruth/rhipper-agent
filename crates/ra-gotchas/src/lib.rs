@@ -180,6 +180,9 @@ pub fn self_held(command: &str) -> Option<&str> {
 /// command sets [`Conditions::allowed`] and it stands aside.
 pub const ALLOWLIST_HINT: &str = "shell-outside-allowlist";
 
+/// The gotcha that names Read for a `sed -n`; a sed that only prints runs, and it stands aside.
+const SED_N: &str = "sed-n";
+
 /// The gotcha that denies a git command that writes the git state.
 const GIT_WRITES: &str = "git-writes";
 
@@ -604,6 +607,7 @@ impl Catalogue {
                 {
                     continue;
                 }
+                Remedy::Hint if gotcha.id == SED_N && shape::is_sed_print(&current) => continue,
                 Remedy::Hint if gotcha.id == WSL_SCRIPT && conditions.allowed => continue,
                 // the python hint stands aside where the project allows its shell commands, as the allowlist hint does
                 Remedy::Hint if matches!(gotcha.id.as_str(), "python" | "python-in-bash") && conditions.allowed => continue,
