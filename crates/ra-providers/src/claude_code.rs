@@ -329,8 +329,12 @@ impl ClaudeCode {
     /// allowed shapes block, so the rules are read before a refusal has to teach them.
     fn system_of(&self, request: &CompletionRequest) -> String {
         let mut system = system_prompt(&request.messages);
-        if request.workspace.is_some() && !request.read_only {
+        if let Some(workspace) = request.workspace.as_deref().filter(|_| !request.read_only) {
             if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            if let Some(line) = worktree_note(workspace) {
+                system.push_str(&line);
                 system.push_str("\n\n");
             }
             system.push_str(&ra_gotchas::shape::block_when(self.builds_refused));
@@ -993,6 +997,25 @@ impl ModelProvider for ClaudeCode {
         line.extend(self.args(request));
         Some(line)
     }
+}
+
+/// The line a worker in a card's worktree (`var/worktrees/<card>`) reads about where its files
+/// are: the worktree's path is the root the Read tool takes, and the main checkout's paths are
+/// refused. Nothing for a workspace that is no worktree: only the path's own last three
+/// components count, so a checkout that merely sits under some `var/worktrees` gets none.
+#[must_use]
+pub fn worktree_note(workspace: &Path) -> Option<String> {
+    let workspace = std::path::absolute(workspace).ok()?;
+    let card = workspace.file_name()?.to_str()?;
+    let worktrees = workspace.parent()?;
+    let is_card = !card.is_empty() && card.bytes().all(|b| b.is_ascii_digit());
+    let in_worktrees = worktrees.file_name()? == "worktrees" && worktrees.parent()?.file_name()? == "var";
+    (is_card && in_worktrees).then(|| {
+        format!(
+            "Your worktree root is {}: it is the only root the Read tool takes, so name files by absolute paths under it; paths under the main checkout are refused.",
+            workspace.display()
+        )
+    })
 }
 
 /// The system messages of a request, joined into the one system prompt the command line takes.
