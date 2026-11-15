@@ -1505,7 +1505,7 @@ pub fn changed_between(before: &str, after: &str) -> Vec<String> {
 pub const TREE_PREFIX: &str = "tree: at ";
 
 /// The prefixes of the lines the orchestrator writes at the head of a handoff's report.
-const HEAD_PREFIXES: [&str; 6] = [TREE_PREFIX, "since the last run: ", "build: ", "diff: ", "open: ", "route: "];
+const HEAD_PREFIXES: [&str; 8] = [TREE_PREFIX, "since the last run: ", "build: ", "diff: ", "open: ", "route: ", ALREADY_ON_BRANCH, "  "];
 
 /// How many of the branch's commits the head names.
 const COMMITS_SHOWN: usize = 5;
@@ -1532,7 +1532,12 @@ pub struct Tree {
     /// literal `git diff <sha> HEAD --stat`: a worker's own `$(git merge-base ..)` is refused
     /// and `git diff main HEAD` shows main's changes when the local ref is behind.
     pub merge_base: Option<String>,
+    /// The files the branch's commits touch since its base.
+    pub files: Vec<String>,
 }
+
+/// The opening of the section that lists the branch's commits and their files.
+pub const ALREADY_ON_BRANCH: &str = "Already on the branch:";
 
 /// The handoff's word on a worktree's cargo `target`: its build to run from when `built`, else
 /// that there is none and how to make one, so the next run looks nowhere else for a binary.
@@ -1581,6 +1586,23 @@ impl Tree {
         if !open.is_empty() {
             let items: Vec<String> = open.iter().map(|item| format!("`{item}`")).collect();
             let _ = writeln!(text, "open: {}", items.join(", "));
+        }
+        text
+    }
+
+    /// The section a rerun reads of what the branch already holds: every commit since its
+    /// base, then the files they touch; empty when the branch has no commit.
+    #[must_use]
+    pub fn already(&self) -> String {
+        if self.commits.is_empty() {
+            return String::new();
+        }
+        let mut text = format!("{ALREADY_ON_BRANCH}\n");
+        for commit in &self.commits {
+            let _ = writeln!(text, "  {commit}");
+        }
+        if !self.files.is_empty() {
+            let _ = writeln!(text, "  files: {}", self.files.join(", "));
         }
         text
     }

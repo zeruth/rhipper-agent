@@ -724,6 +724,7 @@ fn a_handoff_head_names_the_tip_the_branch_s_commits_what_happened_and_what_is_o
         since: Some("merged: Merge branch 'main'".to_owned()),
         build: Some(build_line(Path::new("t"), false)),
         merge_base: None,
+        files: Vec::new(),
     };
     let head = tree.head(&["cargo test -p x".to_owned()]);
     assert_eq!(

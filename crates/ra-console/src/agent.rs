@@ -6742,7 +6742,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             let tail = if head.is_empty() && !mid_checks.is_empty() { format!("\n{}", mid_checks.trim_end()) } else { String::new() };
             format!(
                 "{}{}{}{tail}",
-                if head.is_empty() { head } else { format!("{head}{mid_checks}route: {} · {}\n", worker.route().name(), worker.model) },
+                if head.is_empty() {
+                    head
+                } else {
+                    format!("{head}{mid_checks}route: {} · {}\n{}", worker.route().name(), worker.model, tree.already())
+                },
                 if lint_pass { format!("{LINT_PASS_FRESH}.\n") } else { String::new() },
                 worker.step.as_ref().map_or_else(|| report.to_owned(), |step| format!("Route: {step}.\n{report}"))
             )

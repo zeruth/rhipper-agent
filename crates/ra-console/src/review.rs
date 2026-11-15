@@ -132,7 +132,13 @@ pub async fn tree_of(root: &Path, base: &str, branch: Option<&str>, since: Optio
         Some(_) if base != "HEAD" => git(root, &["rev-parse", base]).await,
         _ => None,
     };
-    ra_context::Tree { tip, branch: branch.map(str::to_owned), commits, since, build, merge_base }
+    let files = match branch {
+        Some(_) if base != "HEAD" && !commits.is_empty() => {
+            git(root, &["diff", "--name-only", base, "HEAD"]).await.unwrap_or_default().lines().map(str::to_owned).collect()
+        }
+        _ => Vec::new(),
+    };
+    ra_context::Tree { tip, branch: branch.map(str::to_owned), commits, since, build, merge_base, files }
 }
 
 /// The commit `root`'s tree is at, abbreviated as a handoff's head has it; `None` when git cannot say.
