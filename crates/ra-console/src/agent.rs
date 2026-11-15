@@ -7193,6 +7193,7 @@ fn map_of_card(
     let text = |file: &str| std::fs::read_to_string(root.join(file)).ok();
     let mut map = ra_context::map::map_of(text, &files, &ask, changed, ra_context::MAP_ROOM).render(text, ra_context::QUOTE_ROOM);
     map.push_str(&ra_context::map::test_recipe(text, &files, &ask));
+    map.push_str(&ra_context::large_files_note(root, &files));
     map
 }
 

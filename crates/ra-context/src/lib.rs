@@ -1682,5 +1682,24 @@ fn clip(text: &str, room: usize) -> String {
     if text.chars().count() <= room { text.to_owned() } else { format!("{}…", text.chars().take(room - 1).collect::<String>()) }
 }
 
+/// The size in characters past which a card file is marked in the handoff as one to read by range.
+pub const LARGE_FILE: usize = 12_000;
+
+/// One line per card file over [`LARGE_FILE`] characters, read from `root`: its path, its size and
+/// the instruction to read the outline first and then only the line ranges needed. Smaller and
+/// unreadable files get none.
+#[must_use]
+pub fn large_files_note(root: &Path, files: &[String]) -> String {
+    let mut note = String::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(root.join(file)) else { continue };
+        let size = text.chars().count();
+        if size > LARGE_FILE {
+            let _ = writeln!(note, "Large file: {file} ({size} characters): read the outline first, then only the line ranges you need.");
+        }
+    }
+    note
+}
+
 #[cfg(test)]
 mod tests;
