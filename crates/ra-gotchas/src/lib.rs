@@ -289,6 +289,7 @@ const GIT_WRITES: &str = "git-writes";
 
 /// The gotcha that names the single-command form for a refused pipeline or `;` chain.
 const PIPED_OR_CHAINED: &str = "piped-or-chained";
+const PIPED_CARGO_TEST: &str = "piped-cargo-test";
 
 /// The gotcha that refuses a chained script quoted to `wsl -- bash -lc` where WSL is not allowed.
 const WSL_SCRIPT: &str = "wsl-quoted-script";
@@ -729,6 +730,8 @@ impl Catalogue {
                 Remedy::Hint if gotcha.id == PIPED_OR_CHAINED && (conditions.allowed || rewritten.is_some() || shaped_allowed(command)) => {
                     continue;
                 }
+                // a `cargo test` piped into tail runs on its build slot; only a refused one is named
+                Remedy::Hint if gotcha.id == PIPED_CARGO_TEST && (conditions.allowed || shaped_allowed(command)) => continue,
                 Remedy::Hint if gotcha.id == PIPED_OR_CHAINED => {
                     let reason = tool_pipe_form(command).unwrap_or_else(|| gotcha.message.clone());
                     return Verdict::Deny { id: gotcha.id.clone(), reason };

@@ -156,6 +156,15 @@ pattern = '(^|&&|\|\||;)\s*git\s+(stash|checkout|switch|restore|reset|clean|add|
 message = "the git state is the person's: only the read-only git commands run here (status, diff, log, show); leave the working tree as you changed it and report, the person reviews and commits"
 remedy = { kind = "hint" }
 
+# a `cargo test … 2>&1 | tail` is refused by the shape table, and the hook already cuts a cargo
+# command's output itself; ahead of worker-full-suite, which would rewrite the unpiped half
+[[gotcha]]
+id = "piped-cargo-test"
+where = "command"
+pattern = '^\s*cargo\s+test\b([^;&\n]|2>&1)*\|\s*(tail|head|grep)\b'
+message = "a `cargo test` piped into tail, head or grep is refused: run it without the pipe, through `rc check` or the card's check, which returns the failure excerpt, and read that excerpt (the hook already cuts a cargo command's output to its end)"
+remedy = { kind = "hint" }
+
 # before binary-locked and long-output: the `-p` it brings is what they stand aside for
 [[gotcha]]
 id = "worker-full-suite"
