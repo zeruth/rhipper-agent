@@ -1144,6 +1144,68 @@ pub fn result_of_stream(stream: &str) -> Result<Completion, ProviderError> {
     with_last_words(parse_result(result), &turns)
 }
 
+/// The tools whose call is a shell command.
+const SHELL_TOOLS: [&str; 2] = ["Bash", "PowerShell"];
+
+/// The last shell command a run's `stream-json` output shows, with how it ended, for the
+/// handoff of a run cut off before its report: `` `cargo test -q` · exit 1 ``, `exit 0` for a
+/// result the harness did not mark an error, and `no result` when the run ended before the
+/// command came back. `None` when the run ran no shell command.
+#[must_use]
+pub fn last_command(stream: &str) -> Option<String> {
+    let mut last: Option<(String, String)> = None;
+    let mut ended: Option<String> = None;
+    for line in stream.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let blocks = event.pointer("/message/content").and_then(serde_json::Value::as_array).into_iter().flatten();
+        for block in blocks {
+            match block.get("type").and_then(serde_json::Value::as_str) {
+                Some("tool_use") if SHELL_TOOLS.contains(&block.get("name").and_then(serde_json::Value::as_str).unwrap_or("")) => {
+                    let Some(command) = block.pointer("/input/command").and_then(serde_json::Value::as_str) else { continue };
+                    let id = block.get("id").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+                    last = Some((id, command.trim().to_owned()));
+                    ended = None;
+                }
+                Some("tool_result")
+                    if last.as_ref().is_some_and(|(id, _)| block.get("tool_use_id").and_then(serde_json::Value::as_str) == Some(id)) =>
+                {
+                    ended = Some(exit_of(block));
+                }
+                _ => {}
+            }
+        }
+    }
+    let (_, command) = last?;
+    Some(format!("`{}` · {}", snippet(&command), ended.as_deref().unwrap_or("no result: the run ended before it came back")))
+}
+
+/// How a shell command's `tool_result` block ended: the harness writes a failure's code as
+/// `Exit code N` at the head of its output and marks it an error.
+fn exit_of(block: &serde_json::Value) -> String {
+    if !block.get("is_error").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        return "exit 0".to_owned();
+    }
+    let content = block.get("content");
+    let text = content.and_then(serde_json::Value::as_str).map_or_else(
+        || {
+            content
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        str::to_owned,
+    );
+    let code = text
+        .trim_start()
+        .strip_prefix("Exit code ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|code| code.parse::<i64>().ok());
+    code.map_or_else(|| "failed".to_owned(), |code| format!("exit {code}"))
+}
+
 /// Reads the result JSON into a completion, or the error it reports.
 fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
     let parsed: WireResult = serde_json::from_str(stdout.trim())

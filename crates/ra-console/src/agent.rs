@@ -7438,25 +7438,23 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             let changed = card_changed(&root, &acting, &dirty_before, &git_status(&acting).await, run_started, said, &task).await;
             // a run its turn cap ended before a report leaves the agent's own handoff: the
             // tree's changes and the worker's last words, so the next run starts from them
-            let last = match cut {
-                Some(cut) => {
-                    let report = ra_context::cut_off_report(&cut.cap, &changed, &cut.said);
-                    handoff(
-                        ra_context::CUT_OFF,
-                        &format!("no check: {} ended the run before its report", cut.cap),
-                        &report,
-                        changed,
-                        &acceptance,
-                    )
+            let last = if let Some(cut) = cut {
+                let command = last_command_of(&acting, run_started);
+                let report = ra_context::cut_off_report(&cut.cap, &changed, command.as_deref(), &cut.said);
+                handoff(
+                    ra_context::CUT_OFF,
+                    &format!("no check: {} ended the run before its report", cut.cap),
+                    &report,
+                    changed,
+                    &acceptance,
+                )
+            } else {
+                let why = format!("{error:#}");
+                // a worker that died leaves its exit code and last stderr lines on the card
+                if why.contains("\nstderr, last ") {
+                    store.set_notes(id, &why).await?;
                 }
-                None => {
-                    let why = format!("{error:#}");
-                    // a worker that died leaves its exit code and last stderr lines on the card
-                    if why.contains("\nstderr, last ") {
-                        store.set_notes(id, &why).await?;
-                    }
-                    handoff("failed", "no check: the run failed", &why, changed, &acceptance)
-                }
+                handoff("failed", "no check: the run failed", &why, changed, &acceptance)
             };
             task.record(last);
             save_context(store, &root, &task).await;
@@ -7487,7 +7485,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         // has touched yet, beside what this one changed
         let touched: Vec<&String> = task.handoffs.iter().flat_map(|h| h.changed.iter()).chain(changed.iter()).collect();
         let untouched: Vec<String> = node.files.iter().filter(|file| !touched.contains(file)).cloned().collect();
-        let report = capped_report(cap, &session, &changed, &node, &acceptance, &untouched);
+        let command = last_command_of(&acting, run_started);
+        let report = capped_report(cap, &session, &changed, command.as_deref(), &node, &acceptance, &untouched);
         // the reviewer's points stand over a capped run as over a failed check: the next
         // session answers them still
         match carried_review(node.notes.as_deref()) {
@@ -9997,6 +9996,19 @@ fn tokens_line(session: &Session) -> String {
     )
 }
 
+/// The last shell command of the run in `acting` that started at `since`, with how it ended, as
+/// the harness's event stream ([`ra_providers::claude_code::STREAM_FILE`]) kept it: what a run
+/// cut off before its report was waiting on. `None` when the run ran none, or left no stream of
+/// its own (a stream older than `since` is an earlier run's).
+fn last_command_of(acting: &Path, since: std::time::SystemTime) -> Option<String> {
+    let path = acting.join(ra_providers::claude_code::STREAM_FILE);
+    let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+    if modified < since {
+        return None;
+    }
+    ra_providers::claude_code::last_command(&std::fs::read_to_string(path).ok()?)
+}
+
 /// What a tool call did, for the handoff of a run its cap ended: the tool and the path or the
 /// command it took, `write_file hello.txt`; the tool alone when it took neither.
 fn call_summary(call: &ra_providers::ToolCall) -> String {
@@ -10008,10 +10020,18 @@ fn call_summary(call: &ra_providers::ToolCall) -> String {
 }
 
 /// The report a run its cap ended leaves for the next run of the card, which starts fresh: how
-/// it ended, what changed, what the worker said and did, and what is left, which is the whole
-/// acceptance since no check ran: its `open` checks by name, and the card's files no run has
-/// touched yet (`untouched`).
-fn capped_report(cap: Capped, session: &Session, changed: &[String], node: &Node, open: &[String], untouched: &[String]) -> String {
+/// it ended, what changed, the last shell command and how it ended (`last_command`), what the
+/// worker said, and what is left, which is the whole acceptance since no check ran: its `open`
+/// checks by name, and the card's files no run has touched yet (`untouched`).
+fn capped_report(
+    cap: Capped,
+    session: &Session,
+    changed: &[String],
+    last_command: Option<&str>,
+    node: &Node,
+    open: &[String],
+    untouched: &[String],
+) -> String {
     let mut text = format!(
         "{cap} ended the run after {} turn(s), {} tool call(s); the card continues in a fresh session\n",
         session.turns, session.calls
@@ -10028,6 +10048,9 @@ fn capped_report(cap: Capped, session: &Session, changed: &[String], node: &Node
     }
     if !untouched.is_empty() {
         let _ = writeln!(text, "left to touch: {}, which the card names and no run has changed", untouched.join(", "));
+    }
+    if let Some(command) = last_command {
+        let _ = writeln!(text, "last command: {command}");
     }
     // the tail, as a cut-off run's: the latest words say where the worker was, and the whole of
     // a long message is context the fresh session would read in again

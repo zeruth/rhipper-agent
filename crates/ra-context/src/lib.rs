@@ -1333,7 +1333,7 @@ impl Handoff {
             outcome: CUT_OFF.to_owned(),
             check: format!("no check: {why} ended the run before its report"),
             verdict: None,
-            report: cut_off_report(why, &changed, last_message),
+            report: cut_off_report(why, &changed, None, last_message),
             changed,
             warnings: Vec::new(),
             read: Vec::new(),
@@ -1415,15 +1415,20 @@ const LAST_MESSAGE_LINES: usize = 12;
 /// The characters of the worker's last message a cut-off handoff keeps, from its end.
 const LAST_MESSAGE_ROOM: usize = 1_500;
 
-/// The report of a cut-off run: what ended it, what the tree shows changed, and the tail of the
-/// worker's last message, the latest words of what it was doing; the agent's, not the worker's.
+/// The report of a cut-off run: what ended it, what the tree shows changed, the last shell
+/// command with how it ended when the run ran one (`last_command`, as
+/// `` `cargo test -q` · exit 1 ``), and the tail of the worker's last message, the latest words
+/// of what it was doing; the agent's, not the worker's.
 #[must_use]
-pub fn cut_off_report(why: &str, changed: &[String], last_message: &str) -> String {
+pub fn cut_off_report(why: &str, changed: &[String], last_command: Option<&str>, last_message: &str) -> String {
     let mut text = format!("{why} ended the run before the worker reported; this handoff is the agent's\n");
     if changed.is_empty() {
         text.push_str("changed: nothing in the tree\n");
     } else {
         let _ = writeln!(text, "changed in the tree: {}", changed.join(", "));
+    }
+    if let Some(command) = last_command {
+        let _ = writeln!(text, "last command: {command}");
     }
     let tail = last_message_tail(last_message);
     if tail.is_empty() {
