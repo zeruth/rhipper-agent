@@ -763,6 +763,9 @@ async fn run_main() -> anyhow::Result<()> {
                         // a walk that ends on an error says so on the feed: its stderr goes to
                         // var/walk.log alone, and two walks that died on "no node" read as quiet
                         // stops for hours (2026-11-15)
+                        // it watches the install as the one-at-a-time walk does: without it the
+                        // walks of 2026-11-15 kept 0.2.510 through four installs, #820 untouched
+                        let worker = worker.with_install(Some(ra_console::install::default_dir()));
                         match ra_console::agent::run_parallel(&store, &worker, width, stop_on_revision).await {
                             Ok(lines) => lines,
                             Err(error) => {
