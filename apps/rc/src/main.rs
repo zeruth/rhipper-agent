@@ -1966,6 +1966,7 @@ async fn add(kind: NodeKind, title: &str, parent: Option<i64>, card: &Card<'_>) 
     if kind != NodeKind::Project && parent.is_none() {
         anyhow::bail!("{}{kind} needs --parent", if kind == NodeKind::Milestone { "a" } else { "a " });
     }
+    ra_console::commands::refuse_repeat(&store.all().await?, title)?;
     let id = store.insert_card(parent, kind, title, card).await?;
     println!("#{id} {title}");
     if !card.files.is_empty() {

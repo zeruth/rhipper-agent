@@ -275,6 +275,9 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             anyhow::ensure!(!title.is_empty(), "usage: add <kind> <title> [parent <id>]");
             anyhow::ensure!(kind != NodeKind::Project || parent.is_none(), "a project has no parent");
             anyhow::ensure!(kind == NodeKind::Project || parent.is_some(), "a node below a project needs parent <id>");
+            if kind != NodeKind::Project {
+                refuse_repeat(&store.all().await?, title)?;
+            }
             let id = store.insert(parent, kind, title, None, None, 3).await?;
             out.push(format!("#{id} {title}"));
         }
@@ -728,6 +731,34 @@ fn save_run_log(root: &std::path::Path, id: Option<i64>) -> anyhow::Result<Saved
     let path = dir.join(format!("{}-{when}.log", run.id));
     std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
     Ok(SavedLog { id: run.id, path, lines: run.lines.len(), events: !stream.is_empty() })
+}
+
+/// A title with its case and the punctuation around it taken off, for comparing two titles.
+fn bare_title(title: &str) -> String {
+    title.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
+}
+
+/// The accepted or open card whose title `title` repeats, ignoring case and the punctuation
+/// around it; a cancelled card does not count, its work was not done.
+#[must_use]
+pub fn repeated<'a>(nodes: &'a [Node], title: &str) -> Option<&'a Node> {
+    let bare = bare_title(title);
+    nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask))
+        .filter(|n| n.state != TaskState::Cancelled)
+        .find(|n| !bare.is_empty() && bare_title(&n.title) == bare)
+}
+
+/// The refusal for a title that repeats a card, naming it.
+///
+/// # Errors
+/// When `title` repeats an accepted or open card of `nodes`.
+pub fn refuse_repeat(nodes: &[Node], title: &str) -> anyhow::Result<()> {
+    if let Some(card) = repeated(nodes, title) {
+        anyhow::bail!("#{} {} already has this title ({}): not added", card.id, card.title, card.state.serde_name());
+    }
+    Ok(())
 }
 
 /// The ledger by card under `root`: every node of its subtree whose own subtree has calls, in

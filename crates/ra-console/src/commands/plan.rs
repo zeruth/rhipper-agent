@@ -125,7 +125,7 @@ pub async fn plan_to(
         return Ok(out);
     }
     let project = home::name_of(&root);
-    let (mut here, mut there) = (0, 0);
+    let (mut here, mut there, mut repeats) = (0, 0, 0);
     for card in &proposal.cards {
         let sources = cited(&lines, card);
         let complexity = planned_complexity(&card.item);
@@ -147,6 +147,12 @@ pub async fn plan_to(
                 sources.clone(),
             ),
         };
+        // work that already landed, or is open, is not planned twice
+        if let Some(known) = super::repeated(&target.all().await?, &card.item.title) {
+            out.push(format!("  dropped {} · repeats #{} {} ({})", card.item.title, known.id, known.title, known.state.serde_name()));
+            repeats += 1;
+            continue;
+        }
         let id = target
             .insert_card(
                 Some(under),
@@ -185,7 +191,7 @@ pub async fn plan_to(
         |turns| format!("one run each under the turn cap of {turns} turn(s)"),
     );
     let to_agent = if there > 0 { format!(", {there} to the agent's roadmap") } else { String::new() };
-    let joined = proposal.cards.len() - here - there;
+    let joined = proposal.cards.len() - here - there - repeats;
     let joined = if joined > 0 { format!(", {joined} joined an open agent card") } else { String::new() };
     let notice = format!("added {here} planned card(s) under {place}{to_agent}{joined} by {} · {budget}", agent::short(&proposal.model));
     crate::pair::event(&root, &notice);

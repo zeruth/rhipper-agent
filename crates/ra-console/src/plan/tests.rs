@@ -198,7 +198,9 @@ async fn a_run_adds_the_cards_under_the_look_back_milestone_with_their_evidence_
     // a second pass reuses the milestone, and a named milestone takes the cards instead
     let again = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(&cites_the_first(), vec![])]));
     let out = command::plan(&store, &again, Some(2), false).await.unwrap();
-    assert!(out.last().unwrap().starts_with("added 4 planned card(s) under #2 Phase N"), "{out:?}");
+    // the same titles are open cards by now: each is dropped with the card it repeats
+    assert!(out.iter().any(|l| l.starts_with("  dropped Card 1 · repeats #4 Card 1")), "{out:?}");
+    assert!(out.last().unwrap().starts_with("added 0 planned card(s) under #2 Phase N"), "{out:?}");
     let nodes = store.all().await.unwrap();
     assert_eq!(nodes.iter().filter(|n| n.title == "Look-back").count(), 1);
 }
