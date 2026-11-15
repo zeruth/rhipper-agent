@@ -1165,7 +1165,9 @@ fn hook(event: &str) -> anyhow::Result<()> {
         "pre" => {
             // a `cat` or `Get-Content` of a whole long file is that Read by another tool, ahead
             // of the shape table, which allows both
-            if let ra_gotchas::Verdict::Deny { reason, .. } = ra_providers::claude_code::read_verdict(&catalogue, &cwd, &call) {
+            if let Some(deny) = repeated_wait_denial(&cwd, &call) {
+                Some(deny)
+            } else if let ra_gotchas::Verdict::Deny { reason, .. } = ra_providers::claude_code::read_verdict(&catalogue, &cwd, &call) {
                 Some(
                     serde_json::json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}),
                 )
@@ -1203,6 +1205,30 @@ fn hook(event: &str) -> anyhow::Result<()> {
         println!("{answer}");
     }
     Ok(())
+}
+
+/// The deny for a second `rc wait` on a task in one session: the hook keeps each session's wait
+/// commands in `var/wait-calls.log` of `cwd`, tab-separated from the session id, since a hook
+/// call has no memory of the one before. `None` for any other command or a first wait.
+fn repeated_wait_denial(cwd: &Path, call: &serde_json::Value) -> Option<serde_json::Value> {
+    let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str)?;
+    if !command.trim_start().starts_with("rc wait") {
+        return None;
+    }
+    let session = call.get("session_id").and_then(serde_json::Value::as_str).unwrap_or("");
+    let log = cwd.join("var/wait-calls.log");
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let earlier: Vec<String> =
+        text.lines().filter_map(|l| l.split_once('\t')).filter(|(s, _)| *s == session).map(|(_, c)| c.to_owned()).collect();
+    if let Some(ra_gotchas::Verdict::Deny { reason, .. }) = ra_gotchas::repeated_wait(command, &earlier) {
+        return Some(
+            serde_json::json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}),
+        );
+    }
+    let one_line = command.lines().next().unwrap_or("");
+    let _ = std::fs::create_dir_all(cwd.join("var"));
+    let _ = std::fs::write(&log, format!("{text}{session}\t{one_line}\n"));
+    None
 }
 
 /// Prints the verdict of the pre hook on `command` without running it: `allow`, `deny: <reason>`,

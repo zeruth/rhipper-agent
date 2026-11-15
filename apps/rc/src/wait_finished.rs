@@ -60,7 +60,7 @@ pub(crate) fn wait_pid(dir: &Path, id: u32, limit: Duration) -> i32 {
             });
         }
         if started.elapsed() >= limit {
-            eprintln!("rc wait: pid {id} still runs after {} s", limit.as_secs());
+            eprintln!("rc wait: pid {id} still runs after {} s; {}", limit.as_secs(), ra_console::agent::WAIT_ALIVE);
             return 124;
         }
         std::thread::sleep(POLL);

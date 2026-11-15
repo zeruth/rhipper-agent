@@ -254,6 +254,29 @@ pub fn self_held(command: &str) -> Option<&str> {
     rest.strip_prefix("--").map(str::trim_start).filter(|inner| !inner.is_empty())
 }
 
+/// The target of an `rc wait <target>` command, when it is one.
+fn wait_target(command: &str) -> Option<&str> {
+    let rest = command.trim_start().strip_prefix("rc wait")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.split_whitespace().next().filter(|t| !t.starts_with('-')).unwrap_or(""))
+}
+
+/// The gotcha that fires on a second `rc wait` for a task already waited on: the first gave up at
+/// its limit with the task alive, and the task notification arrives without another call.
+/// `earlier` are the commands the run has already made.
+#[must_use]
+pub fn repeated_wait(command: &str, earlier: &[String]) -> Option<Verdict> {
+    let target = wait_target(command)?;
+    earlier.iter().any(|e| wait_target(e) == Some(target)).then(|| Verdict::Deny {
+        id: String::from("repeated-wait"),
+        reason: format!(
+            "`rc wait {target}` already gave up with the task alive: its task notification arrives without another call, so end the turn or do other work instead of waiting again"
+        ),
+    })
+}
+
 /// The gotcha that denies a shell outside the default allowlist; a project that allows the
 /// command sets [`Conditions::allowed`] and it stands aside.
 pub const ALLOWLIST_HINT: &str = "shell-outside-allowlist";

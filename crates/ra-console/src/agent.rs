@@ -3329,6 +3329,9 @@ pub fn hold(dir: &Path, shell: &str, command: &str) -> i32 {
 /// turn ends with an answer rather than a kill.
 pub const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_mins(9);
 
+/// What `rc wait` adds when it gives up on a task that still runs: a second call only waits again.
+pub const WAIT_ALIVE: &str = "the task is alive and its task notification arrives without another `rc wait`";
+
 /// How long a file `rc wait` watches must hold still before its job counts as done.
 const WAIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -3347,7 +3350,7 @@ pub fn wait(dir: &Path, target: &str, limit: std::time::Duration) -> i32 {
     if let Ok(pid) = target.trim().parse::<u32>() {
         while crate::hub::pid_alive(pid) {
             if started.elapsed() >= limit {
-                eprintln!("rc wait: pid {pid} still runs after {} s", limit.as_secs());
+                eprintln!("rc wait: pid {pid} still runs after {} s; {WAIT_ALIVE}", limit.as_secs());
                 return 124;
             }
             std::thread::sleep(poll);
@@ -3361,7 +3364,7 @@ pub fn wait(dir: &Path, target: &str, limit: std::time::Duration) -> i32 {
     let mut still = std::time::Instant::now();
     let code = loop {
         if started.elapsed() >= limit {
-            eprintln!("rc wait: {target} still changes after {} s", limit.as_secs());
+            eprintln!("rc wait: {target} still changes after {} s; {WAIT_ALIVE}", limit.as_secs());
             break 124;
         }
         std::thread::sleep(poll);
