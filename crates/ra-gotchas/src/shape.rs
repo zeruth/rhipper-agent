@@ -207,13 +207,24 @@ struct Part {
 #[must_use]
 pub fn judge(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool) -> Shape {
     let target = std::env::var_os("CARGO_TARGET_DIR").filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
-    judge_in(command, shell, workspace, own, target.as_deref())
+    // the run's TEMP is `<scratch>/tmp/<project>/run-<id>`: its parent is the project's tmp root
+    let tmp = std::env::var_os("TEMP")
+        .map(std::path::PathBuf::from)
+        .filter(|t| t.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run")))
+        .and_then(|t| t.parent().map(Path::to_path_buf));
+    let roots: Vec<&Path> = target.iter().chain(tmp.iter()).map(std::path::PathBuf::as_path).collect();
+    judge_roots(command, shell, workspace, own, &roots)
 }
 
 /// [`judge`] with the card's own `target` named: listing it and running a program under it pass,
 /// while any other directory outside the workspace stays the harness's to judge.
 #[must_use]
 pub fn judge_in(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool, target: Option<&Path>) -> Shape {
+    let roots: Vec<&Path> = target.into_iter().collect();
+    judge_roots(command, shell, workspace, own, &roots)
+}
+
+fn judge_roots(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool, target: &[&Path]) -> Shape {
     let Some(parts) = split(command, shell) else { return Shape::Unknown };
     if parts.is_empty() {
         return Shape::Unknown;
@@ -236,10 +247,10 @@ fn judge_part(
     shell: Shell,
     workspace: &Path,
     own: &dyn Fn(&str) -> bool,
-    target: Option<&Path>,
+    target: &[&Path],
     assigned: &mut Vec<String>,
 ) -> Shape {
-    let in_target = |w: &str| target.is_some_and(|t| in_target(w, t));
+    let in_target = |w: &str| target.iter().any(|t| in_target(w, t));
     let away = |w: &str| outside(w, workspace) && !in_target(w);
     if part.writes {
         return Shape::Denied(REDIRECT_FORM.to_owned());
