@@ -244,6 +244,15 @@ fn tool_pipe_form(command: &str) -> Option<String> {
     let alone = tool_part.trim().trim_end_matches("2>&1").trim();
     let tool = alone.split_whitespace().next()?;
     let stem = tool.rsplit(['/', '\\']).next()?.trim_end_matches(".exe");
+    if stem == "rc"
+        && alone.split_whitespace().nth(1) == Some("show")
+        && !alone.contains([';', '&'])
+        && matches!(filter.split_whitespace().next(), Some("head" | "tail"))
+    {
+        return Some(format!(
+            "this pipeline was refused: `rc show <id> --tail N` prints the last N lines of a card itself, and `rc show <id>` alone prints it whole, so run `{alone}` with `--tail N` as a single unpiped command"
+        ));
+    }
     if !(stem == "clang" || stem == "clang-cl" || stem.starts_with("llvm-")) || alone.contains([';', '&']) {
         return None;
     }

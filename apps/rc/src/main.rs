@@ -38,6 +38,9 @@ enum Command {
         /// Prints a plain Markdown checklist instead, for a README or an issue.
         #[arg(long)]
         markdown: bool,
+        /// Prints only the last N lines of each block, and says how many it left out.
+        #[arg(long, value_name = "N")]
+        tail: Option<usize>,
     },
     /// Adds a node to the roadmap.
     Add {
@@ -165,6 +168,9 @@ enum Command {
     History {
         /// The card; left out, every card.
         id: Option<i64>,
+        /// With a card: each run's whole report and kept check output, uncut.
+        #[arg(long)]
+        full: bool,
     },
     /// Removes a card; every waits-on reference to it goes with it.
     Remove {
@@ -507,9 +513,9 @@ fn main() -> anyhow::Result<()> {
 async fn run_main() -> anyhow::Result<()> {
     let options = Options::parse();
     match options.command {
-        Command::Show { ids, markdown } => {
+        Command::Show { ids, markdown, tail } => {
             plain_tracing()?;
-            if markdown { show_markdown(ids.first().copied()).await } else { show(&ids).await }
+            if markdown { show_markdown(ids.first().copied()).await } else { show(&ids, tail).await }
         }
         Command::Add { kind, title, parent, objective, acceptance, complexity, files, waits_on, model } => {
             plain_tracing()?;
@@ -657,9 +663,9 @@ async fn run_main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::History { id } => {
+        Command::History { id, full } => {
             plain_tracing()?;
-            show_history(id).await
+            show_history(id, full).await
         }
         Command::Remove { id, tree } => {
             plain_tracing()?;
@@ -1433,8 +1439,10 @@ fn ensure_roadmap(roadmap: &Path) -> anyhow::Result<()> {
 }
 
 /// Prints the roadmap when `ids` is empty, else one block per id in order; an id with no node
-/// prints `no such node` and the rest still print.
-async fn show(ids: &[i64]) -> anyhow::Result<()> {
+/// prints `no such node` and the rest still print. With `tail`, a block prints only its last
+/// lines, after a line saying how many were left out and how to get them; a card's notes print
+/// whole otherwise (since #703).
+async fn show(ids: &[i64], tail: Option<usize>) -> anyhow::Result<()> {
     let store = open_store().await?;
     let roadmap = store.load().await?;
     let nodes = roadmap.nodes;
@@ -1442,7 +1450,14 @@ async fn show(ids: &[i64]) -> anyhow::Result<()> {
     if !ids.is_empty() {
         for &id in ids {
             if nodes.iter().any(|n| n.id == id) {
-                for line in show_lines(&nodes, Some(id), &root)? {
+                let lines = show_lines(&nodes, Some(id), &root)?;
+                let skip = tail.map_or(0, |n| lines.len().saturating_sub(n));
+                if skip > 0 {
+                    println!(
+                        "… {skip} earlier line(s) of #{id} left out by --tail; `rc show {id}` prints them all, `rc history {id} --full` each run's whole report"
+                    );
+                }
+                for line in &lines[skip..] {
                     println!("{line}");
                 }
             } else {
@@ -2085,8 +2100,9 @@ async fn depend(id: i64, waits_for: &[i64]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints the history, one change a line as the log holds it; a card without any says so.
-async fn show_history(id: Option<i64>) -> anyhow::Result<()> {
+/// Prints the history, one change a line as the log holds it; a card without any says so. With
+/// `full` and a card, each run's whole report and the kept check output follow.
+async fn show_history(id: Option<i64>, full: bool) -> anyhow::Result<()> {
     let store = open_store().await?;
     if let Some(id) = id {
         store.read(id).await?;
@@ -2104,6 +2120,17 @@ async fn show_history(id: Option<i64>) -> anyhow::Result<()> {
     if let Some(last) = changes.last() {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         println!("last change {} ago", history::age(now.saturating_sub(last.at)));
+    }
+    if full && let Some(id) = id {
+        let root = store_path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let context = ra_context::TaskContext::open(&root, id);
+        for handoff in &context.handoffs {
+            println!("\nrun {} · {} · {}\ncheck: {}", handoff.when, handoff.model, handoff.outcome, handoff.check);
+            println!("report:\n{}", handoff.report);
+        }
+        if !context.check_output.trim().is_empty() {
+            println!("\ncheck output:\n{}", context.check_output.trim_end());
+        }
     }
     Ok(())
 }
