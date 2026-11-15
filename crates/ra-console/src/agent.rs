@@ -1062,6 +1062,14 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
     anyhow::ensure!(node.kind != NodeKind::Project, "#{id} is a project; run a task");
     // the model of this card, when the command left the choice to the card and the rules
     let root = workspace_of(store);
+    // a card the person blocked or cancelled after the walk picked it is theirs: no continuation
+    // or rerun starts over it (asm #81's walk started one on a card blocked to be finished by hand)
+    if held_by_person(node.state) {
+        let line = not_started_line(id, &node.title, node.state);
+        tracing::info!(target: crate::trace::PROGRESS, "{line}");
+        crate::pair::event(&root, &line);
+        return Ok(vec![line]);
+    }
     // a command the tool rejects holds the card before any worker is picked or started
     if let Some(lines) = held_by_preflight(store, &root, &node, worker).await? {
         return Ok(lines);
@@ -5238,7 +5246,7 @@ async fn conflict_pass(root: &Path, tree: &Path, node: &Node, worker: &Worker) -
         worker.record_as(&model, Some("conflict"), Some(id), &answer.usage, answer.turns).await;
     } else {
         let caps = Caps { hard: Some(CONFLICT_TURNS), ..Caps::default() };
-        tool_loop(provider.as_ref(), worker, id, prompt, Some(tree), None, caps).await.map_err(said)?;
+        tool_loop(provider.as_ref(), worker, (id, None), prompt, Some(tree), None, caps).await.map_err(said)?;
     }
     let left = unresolved(tree).await;
     if !left.is_empty() {
@@ -6707,6 +6715,15 @@ fn project_kind(root: &Path) -> PoolKind {
 #[allow(clippy::too_many_lines)]
 async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> anyhow::Result<(Vec<String>, Usage, usize)> {
     let id = node.id;
+    // the state as it is now, not as the caller read it: an absolute pass or a fix pass starts
+    // after a run whose card the person may have blocked meanwhile
+    if let Some(state) = state_now(store, id).await
+        && held_by_person(state)
+    {
+        let line = not_started_line(id, &node.title, state);
+        tracing::info!(target: crate::trace::PROGRESS, "{line}");
+        return Ok((vec![line], Usage::default(), 0));
+    }
     let provider = worker.provider()?;
     store.set_state_by(id, TaskState::InProgress, Source::Run).await?;
 
@@ -6955,9 +6972,16 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         }
     } else {
         let context = bare_context(shown, rerun.as_deref(), &project, worker.debug);
-        tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref(), budget, caps).await
+        tool_loop(provider.as_ref(), worker, (id, Some(store)), context, workspace.as_deref(), budget, caps).await
     };
     worker.end_run(id, end_reason(&session)).await;
+    // the person took the card out of progress while this run went: the run ends here, whatever
+    // it reached, and its state, notes and session are the person's, not a continuation's
+    if let Some(state) = card_left(store, id).await {
+        let line = stopped_line(id, &node.title, state);
+        let usage = session.map(|s| s.usage).unwrap_or_default();
+        return Ok((vec![line], usage, 0));
+    }
     // the head of the handoff is the orchestrator's, not the worker's: where the tree is, the
     // branch's commits, what happened to it since the last run, and the acceptance's checks
     // still open, so the next run reads them as facts
@@ -9670,6 +9694,58 @@ fn end_reason(session: &anyhow::Result<Session>) -> ra_context::EndReason {
     }
 }
 
+/// Whether a card in `state` is one the person took out of progress while a run of it went:
+/// blocked, cancelled or defined by `rc set`. The run's own states (failed, implemented, needs
+/// revision) are never it.
+#[must_use]
+pub fn ends_live_run(state: TaskState) -> bool {
+    matches!(state, TaskState::Blocked | TaskState::Cancelled | TaskState::Defined)
+}
+
+/// The line the feed and the walk show for a run the person's `rc set` ended.
+#[must_use]
+pub fn stopped_line(id: i64, title: &str, state: TaskState) -> String {
+    format!("stopped #{id} {title}: set {state} while its run was live; the run ended and the card is not continued or rerun")
+}
+
+/// What ended a run at a turn: the card was set out of progress by the person.
+#[derive(Debug)]
+struct Stopped(TaskState);
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the card was set {} while its run was live", self.0)
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// Whether a card in `state` is the person's to finish, so no run of it starts: blocked or
+/// cancelled. Defined is not: it is the state a walk picks a card in.
+#[must_use]
+pub fn held_by_person(state: TaskState) -> bool {
+    matches!(state, TaskState::Blocked | TaskState::Cancelled)
+}
+
+/// The line the feed and the walk show for a run that did not start on a card the person holds.
+#[must_use]
+pub fn not_started_line(id: i64, title: &str, state: TaskState) -> String {
+    format!("skipped #{id} {title}: it is {state}; no run started, the card waits for the person")
+}
+
+/// The state the person set the card to while its run went, when they did: the run's end
+/// leaves it as they set it.
+pub async fn card_left(store: &Store, id: i64) -> Option<TaskState> {
+    state_now(store, id).await.filter(|state| ends_live_run(*state))
+}
+
+/// The card's state as the roadmap holds it now: cancelled when it left the roadmap, since `rc
+/// set cancelled` removes it; `None` when the roadmap cannot be read.
+async fn state_now(store: &Store, id: i64) -> Option<TaskState> {
+    let nodes = store.all().await.ok()?;
+    Some(nodes.iter().find(|node| node.id == id).map_or(TaskState::Cancelled, |node| node.state))
+}
+
 /// The tool loop of a bare model: the model answers with tool calls, the toolbox executes them in
 /// the workspace, the results go back, until the hard cap of `caps` runs out when there is one,
 /// or the summed cost crosses `budget` when there is one. The restart cap of `caps` ends the run
@@ -9678,7 +9754,7 @@ fn end_reason(session: &anyhow::Result<Session>) -> ra_context::EndReason {
 async fn tool_loop(
     provider: &dyn ModelProvider,
     worker: &Worker,
-    id: i64,
+    (id, store): (i64, Option<&Store>),
     context: String,
     workspace: Option<&Path>,
     budget: Option<f64>,
@@ -9703,6 +9779,12 @@ async fn tool_loop(
     let limit = caps.limit();
     loop {
         turn += 1;
+        // a card set blocked, cancelled or defined while it runs ends the run at its next turn
+        if let Some(store) = store
+            && let Some(state) = card_left(store, id).await
+        {
+            return Err(Stopped(state).into());
+        }
         if let Some(cap) = caps.hard
             && turn > cap
         {
