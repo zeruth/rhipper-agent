@@ -3576,7 +3576,13 @@ fn on_path(program: &str) -> bool {
 pub async fn unrunnable_checks(root: &Path, nodes: &[Node]) -> Vec<String> {
     let mut faults = Vec::new();
     for node in nodes.iter().filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.state != TaskState::Accepted) {
+        let files = ra_roadmap::tree::files_of(nodes, node).0;
         for command in named_checks(node.acceptance.as_deref()) {
+            // a package or test the card itself creates is not there yet, as the run's own
+            // preflight knows (asm #180); agent #256, #291 and #488 were held on it
+            if names_created(&command, &files) {
+                continue;
+            }
             if let Some(why) = unrunnable(root, &command).await {
                 faults.push(format!("#{} {}: its check cannot run: {why}", node.id, node.title));
             }

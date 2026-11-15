@@ -1133,6 +1133,10 @@ async fn an_acceptance_command_whose_program_is_missing_cannot_run() {
     let faults = unrunnable_checks(root, &nodes).await;
     assert_eq!(faults.len(), 1, "{faults:?}");
     assert!(faults[0].starts_with("#1 T: its check cannot run"), "{faults:?}");
+    // a package the card's files create is not there yet, and is no fault
+    let card = "- 1 ‹task› T\n    acceptance: `cargo test -p ra-newcrate -q x` passes\n    files: +crates/ra-newcrate/Cargo.toml\n";
+    let nodes = ra_roadmap::markdown::parse(card).unwrap();
+    assert_eq!(unrunnable_checks(root, &nodes).await, Vec::<String>::new());
 }
 
 #[test]
