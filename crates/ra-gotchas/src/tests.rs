@@ -358,8 +358,10 @@ fn a_cargo_command_without_a_tail_gets_one_on_its_end() {
     ] {
         assert!(only_held(&catalogue.command(command, quiet), command), "{command}");
     }
-    // a format is heavy work too: it runs on a worker slot (it does not count as a build)
-    assert!(only_held(&catalogue.command("cargo fmt -p ra-gotchas", quiet), "cargo fmt -p ra-gotchas"));
+    // a format compiles nothing: it never waits for a slot
+    assert!(
+        !matches!(catalogue.command("cargo fmt -p ra-gotchas", quiet), Verdict::Rewrite { ref command, .. } if command.starts_with("rc hold"))
+    );
 }
 
 #[test]
