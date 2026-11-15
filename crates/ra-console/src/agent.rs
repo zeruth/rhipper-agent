@@ -3693,6 +3693,14 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
     Ok((path, branch))
 }
 
+/// The tree a run of card `id` in the project at `root` acts in: the card's worktree when it has
+/// one, else the project's own.
+#[must_use]
+pub fn card_tree(root: &Path, id: i64) -> PathBuf {
+    let worktree = root.join(WORKTREES_DIR).join(id.to_string());
+    if worktree.join(".git").exists() { worktree } else { root.to_path_buf() }
+}
+
 /// Gives the worktree at `tree` its own cargo target, seeded from the project's when it has
 /// none yet, off the async threads. A seed that fails leaves the first build cold, never wrong.
 async fn seed_target(tree: &Path) {
@@ -4833,6 +4841,11 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
                     }
                 } else {
                     lines.push(format!("check passed on the merged tree: {}", commands.join(" · ")));
+                    // nothing else builds a refused project's binaries in its main target, which
+                    // the next worktree is seeded from; a failed build is a line, not a failure
+                    if crate::router::Router::load(&root).is_ok_and(|r| r.worker.builds() == 0) {
+                        lines.push(build_main_binaries(&root).await);
+                    }
                 }
             }
         }
@@ -4846,6 +4859,18 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
     let line = format!("landed #{id} {} · {}", node.title, lines.join(" · "));
     crate::pair::event(&root, &line);
     Ok(lines)
+}
+
+/// Builds the project's binaries into its main target after a landing's check passed, off the
+/// async threads, under the slot the check holds. The line the landing carries, a failure too.
+async fn build_main_binaries(root: &Path) -> String {
+    let (tree, target) = (root.to_path_buf(), ra_providers::claude_code::project_target(root));
+    let shown = target.display().to_string();
+    match tokio::task::spawn_blocking(move || ra_providers::claude_code::build_binaries(&tree, &target)).await {
+        Ok(Ok(())) => format!("binaries built into {shown}"),
+        Ok(Err(e)) => format!("binaries not built into {shown}: {e}"),
+        Err(e) => format!("binaries not built into {shown}: {e}"),
+    }
 }
 
 /// The paths git's refusal lists as "would be overwritten by merge": the tab-indented lines.
@@ -6788,14 +6813,20 @@ pub(crate) fn harness_messages(
     messages.push(Message::system(COMMIT_PROMPT));
     // a project whose builds are the orchestrator's alone says so up front, so the worker does
     // not spend a turn finding the build refused
+    // the notes of the worktree are the card's tree's: `root` is the project's, whose target is
+    // the main one, so a seed from it copied nothing and a worktree kept the binaries it was
+    // made with (asm #238: only an rc.exe, hours after ras.exe was built into the main target)
+    let tree = card_tree(root, task.id);
     if crate::router::Router::load(root).is_ok_and(|r| r.worker.builds() == 0) {
         messages.push(Message::system(NO_BUILDS));
-        let binaries = ra_providers::claude_code::worktree_prebuilt_note(root);
+        // the seed runs at every run's start, so a binary built into the main target since the
+        // worktree was made reaches it
+        let binaries = ra_providers::claude_code::worktree_prebuilt_note(&tree);
         if !binaries.is_empty() {
             messages.push(Message::system(binaries));
         }
     }
-    let dirs = ra_providers::claude_code::session_dirs_note(root);
+    let dirs = ra_providers::claude_code::session_dirs_note(&tree);
     if !dirs.is_empty() {
         messages.push(Message::system(dirs));
     }

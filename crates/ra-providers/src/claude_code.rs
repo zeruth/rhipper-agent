@@ -1331,6 +1331,28 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// Builds the binary packages of the workspace at `root` (`cargo build --workspace --bins`) into
+/// `target`, the project's main target, so the next worktree of a project whose builds are
+/// refused is seeded with binaries that are current ([`seed_binaries`]). Blocking; the caller
+/// holds a build slot.
+///
+/// # Errors
+/// The last line of cargo's output when the build fails, or why it could not start.
+pub fn build_binaries(root: &Path, target: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("cargo")
+        .args(["build", "--workspace", "--bins", "--quiet"])
+        .current_dir(root)
+        .env("CARGO_TARGET_DIR", target)
+        .output()
+        .map_err(|e| format!("cargo did not start: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&out.stderr);
+    let last = text.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no output");
+    Err(format!("cargo build of the binaries failed ({}): {last}", out.status))
+}
+
 /// What the handoff of a worktree in a project whose builds are refused says of the binaries:
 /// the directory of the copies [`seed_binaries`] made, or that main has none and the card's
 /// generated files must be written by hand.
