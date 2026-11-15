@@ -4317,6 +4317,54 @@ async fn a_lint_still_red_after_the_fix_pass_leaves_the_card_needs_revision() {
 }
 
 #[tokio::test]
+async fn lint_beside_a_failed_check_sends_the_card_back_once_with_both_in_the_rerun_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status().unwrap().success());
+    assert!(std::process::Command::new("git").args(["add", "-A"]).current_dir(dir.path()).status().unwrap().success());
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let write = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"src/extra.rs","content":"pub fn extra() { let x = 1; }\n"}"#.into(),
+    };
+    let clippy = "    Checking probe v0.1.0\nwarning: unused variable: `x`\n --> src/extra.rs:1:22\n  |\n1 | pub fn extra() { let x = 1; }\n  |                      ^\n\nwarning: `probe` (lib) generated 1 warning\n";
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        log.lock().push(command.to_owned());
+        Ok(if command.starts_with("cargo clippy") {
+            (0, clippy.to_owned())
+        } else if command.starts_with("cargo test") {
+            (101, "test probe ... FAILED\nthe probe broke\n".to_owned())
+        } else {
+            (0, "ok\n".to_owned())
+        })
+    });
+    let provider = Scripted::new(vec![says("", vec![write]), says("added extra", vec![])]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider).with_script(script.clone());
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    // the lint ran although the check failed, and the card went back once, with no fix pass
+    let commands = seen.lock().clone();
+    assert_eq!(commands.iter().filter(|c| c.starts_with("cargo clippy")).count(), 1, "{commands:?}");
+    assert!(!out.iter().any(|l| l.contains("fix pass")), "{out:?}");
+    assert!(out.iter().any(|l| l.contains("check failed") && l.contains("lint: 1 warning(s) beside it")), "{out:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);
+    let handoffs = ra_context::TaskContext::open(dir.path(), 2).handoffs;
+    assert_eq!(handoffs.len(), 1);
+    assert_eq!(handoffs[0].warnings.len(), 1);
+    // the rerun's prompt carries the failed test and the warning
+    let provider = Scripted::new(vec![says("fixed", vec![])]);
+    let rerun = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(script);
+    run("/run 2", &store, &rerun).await.unwrap();
+    let request = provider.seen.lock().remove(0);
+    let prompt = request.messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
+    assert!(prompt.contains("the probe broke"), "{prompt}");
+    assert!(prompt.contains("warning: unused variable: `x`\n --> src/extra.rs:1:22"), "{prompt}");
+}
+
+#[tokio::test]
 async fn a_warning_elsewhere_leaves_the_card_implemented() {
     let (out, node, _dir) = linted_run("src/lib.rs").await;
     assert_eq!(node.state, ra_roadmap::model::TaskState::Implemented);

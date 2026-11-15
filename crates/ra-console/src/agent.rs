@@ -1668,7 +1668,7 @@ async fn lint_fix(store: &Store, id: i64, worker: &Worker, roles: &Roles, lines:
     let task = ra_context::TaskContext::open(&root, id);
     let warnings = task.last_warnings();
     // a failed check is the person's to read; only the lint's warnings take the pass
-    if warnings.is_empty() {
+    if warnings.is_empty() || task.handoffs.last().is_some_and(|h| h.check.starts_with("check failed")) {
         return;
     }
     // the cheapest rung of the card's route first; a `fix = ""` keeps the pass off
@@ -7608,7 +7608,12 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // verdict; a warning in a changed file is.
     let mut lint_lines = Vec::new();
     let mut lint_warnings = Vec::new();
-    if passed && let Ok(toolbox) = &toolbox {
+    // a failed check gets its lint too, so one rerun meets both lists; a card waiting on main is
+    // not sent back, and its lint would be spent on nothing
+    let check_failed = !passed;
+    if (passed || red.is_none())
+        && let Ok(toolbox) = &toolbox
+    {
         let base = diff_base(&root, &acting).await;
         let lint = lint_changed(toolbox, &acting, &changed, project_lint.as_deref(), &base).await;
         for skipped in &lint.skipped {
@@ -7620,12 +7625,21 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             }
         } else {
             passed = false;
-            report = format!("{}\n\n{}", lint.warnings.join("\n\n"), session.text);
-            check_line = format!(
-                "  check passed: {command} · lint: {} warning(s) in the changed files from {} · the lines are in the notes",
-                lint.warnings.len(),
-                lint.command
-            );
+            if check_failed {
+                report = format!("{report}\n\n{}", lint.warnings.join("\n\n"));
+                check_line = format!(
+                    "{check_line} · lint: {} warning(s) beside it from {} · the lines are in the notes",
+                    lint.warnings.len(),
+                    lint.command
+                );
+            } else {
+                report = format!("{}\n\n{}", lint.warnings.join("\n\n"), session.text);
+                check_line = format!(
+                    "  check passed: {command} · lint: {} warning(s) in the changed files from {} · the lines are in the notes",
+                    lint.warnings.len(),
+                    lint.command
+                );
+            }
             // each point quotes its line, so a merge from main that moves it is followed by text
             lint_warnings = lint
                 .warnings
@@ -7699,7 +7713,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // in its machine notes
     let summary = worker.ask_role(roles, Role::Summary, Some(id), SUMMARY_INSTRUCTION, &session.text).await;
     let answer = summary.as_deref().unwrap_or(&session.text);
-    let handed = if lint_warnings.is_empty() { format!("{lead}{answer}") } else { answer.to_owned() };
+    let handed = if lint_warnings.is_empty() || check_failed { format!("{lead}{answer}") } else { answer.to_owned() };
     let open: Vec<String> =
         acceptance.iter().filter(|item| !checks.iter().any(|run| run.passed && &run.command == *item)).cloned().collect();
     let outcome = if red.is_some() {
