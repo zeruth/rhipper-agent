@@ -1947,7 +1947,9 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     let brief = review_brief(&root, &acting, &node).await;
     let before = node.state;
     store.set_state_by(id, TaskState::Review, Source::Run).await?;
-    tracing::info!(target: crate::trace::PROGRESS, "#{id} {} · review by {} ({by})", node.title, short(&model));
+    let dropped = review_notes(&root, &node).1;
+    let dropped = if dropped > 0 { format!(" · {dropped} earlier point(s) dropped, the card's text changed") } else { String::new() };
+    tracing::info!(target: crate::trace::PROGRESS, "#{id} {} · review by {} ({by}){dropped}", node.title, short(&model));
     let ask = |turns: u32| CompletionRequest {
         model: model.clone(),
         messages: vec![Message::system(REVIEW_INSTRUCTION), Message::user(&brief)],
@@ -2195,17 +2197,25 @@ fn judged(verdict: &Verdict, id: i64, model: &str, root: &Path, accepted: TaskSt
 /// The reviewer's view of the last round: the output of the card's checks and its own last
 /// verdict, whose points it keeps by number. Without them a reviewer asked for a run the check
 /// had made, and its points rotated round after round (asm #53: 5, 5, 6, 4).
-fn last_round(task: &ra_context::TaskContext, node: &Node) -> String {
+fn last_round(task: &ra_context::TaskContext, notes: &str, dropped: usize) -> String {
     let mut text = String::new();
     if !task.check_output.trim().is_empty() {
         let _ = writeln!(text, "\n{}\n{}", ra_context::CHECK_OUTPUT_HEADING, task.check_output.trim_end());
     }
-    let last_verdict = node.notes.as_deref().and_then(ra_context::review_of).or_else(|| task.review.clone());
+    // points that judged other words of the card are dropped, and the reviewer is told so
+    if dropped > 0 {
+        let _ = writeln!(
+            text,
+            "\n## Earlier review points dropped\n{dropped} point(s) of earlier reviews judged the card before its objective or acceptance changed; they are not in this brief. Judge the card's current text and its diff alone."
+        );
+    }
+    let fresh = task.review_shown().filter(|review| !review.starts_with(ra_context::STALE_REVIEW));
+    let last_verdict = ra_context::review_of(notes).or(fresh);
     if let Some(verdict) = last_verdict {
         let _ =
             writeln!(text, "\n## Your last verdict on this card\nKeep the number of every point that still stands.\n{}", verdict.trim());
     }
-    let left = left_points(node.notes.as_deref().unwrap_or_default());
+    let left = left_points(notes);
     if !left.is_empty() {
         let _ = writeln!(
             text,
@@ -2223,20 +2233,22 @@ fn last_round(task: &ra_context::TaskContext, node: &Node) -> String {
 /// other dirty files are listed apart and kept out of the diff.
 /// `project` holds the card's context (the handoffs live under the project's `var`); `root`
 /// is where the run acted and the diff is read: the project, or the card's worktree.
-pub(crate) async fn review_brief(project: &Path, root: &Path, node: &Node) -> String {
+pub async fn review_brief(project: &Path, root: &Path, node: &Node) -> String {
     let mut text = format!("# #{} {}\n", node.id, node.title);
     if let Some(objective) = &node.objective {
         let _ = writeln!(text, "\nObjective: {objective}");
     }
     let _ = writeln!(text, "\nAcceptance: {}", node.acceptance.as_deref().unwrap_or("none written; the workspace tests are the check"));
-    let task = ra_context::TaskContext::open(project, node.id);
+    let mut task = ra_context::TaskContext::open(project, node.id);
+    task.card_print = Some(card_print(node));
+    let (notes, dropped) = review_notes(project, node);
     match task.handoffs.last() {
         Some(last) => {
             let _ = writeln!(text, "\n## Handoff of the last run\n{} on {} · {}\n{}", last.outcome, last.model, last.check, last.report);
         }
         None => text.push_str("\n## Handoff of the last run\nnone: no run of this card left one\n"),
     }
-    text.push_str(&last_round(&task, node));
+    text.push_str(&last_round(&task, &notes, dropped));
     // the diff's base: HEAD in the project's own tree; in a card's worktree the merge base
     // with the project's branch, so the checkpoints the walk commits on the card's branch
     // after each run are in the reviewer's view and not behind it
@@ -2260,7 +2272,7 @@ pub(crate) async fn review_brief(project: &Path, root: &Path, node: &Node) -> St
         text.push_str(&crate::review::diff_stat_section(root, &base, &files).await);
     }
     // the notes hold the worker's report whole where the handoff holds its summary
-    if let Some(notes) = node.notes.as_deref().filter(|notes| !notes.trim().is_empty()) {
+    if !notes.trim().is_empty() {
         let notes: String = notes.chars().take(DIGEST_NOTES).collect();
         let _ = writeln!(text, "\n## Notes of the card\n{notes}");
     }
@@ -10816,9 +10828,23 @@ fn sent_back(node: &Node) -> bool {
             .is_some_and(|review| review.lines().next().is_some_and(|first| first.contains("needs revision")))
 }
 
-/// The fingerprint of the words a review of `node` judges, its title and objective.
-fn card_print(node: &Node) -> String {
-    ra_context::brief_fingerprint(&node.title, node.objective.as_deref().unwrap_or_default())
+/// The fingerprint of the words a review of `node` judges, its title, objective and acceptance;
+/// a card without acceptance keeps the print of its title and objective.
+#[must_use]
+pub fn card_print(node: &Node) -> String {
+    let objective = node.objective.as_deref().unwrap_or_default();
+    match node.acceptance.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        Some(acceptance) => ra_context::brief_fingerprint(&node.title, &format!("{objective}\nAcceptance: {acceptance}")),
+        None => ra_context::brief_fingerprint(&node.title, objective),
+    }
+}
+
+/// The notes of `node` a review reads, and the points of earlier reviews dropped from them
+/// because the card's text changed since ([`crate::review::without_stale_points`]).
+fn review_notes(project: &Path, node: &Node) -> (String, usize) {
+    let task = ra_context::TaskContext::open(project, node.id);
+    let judged = task.handoffs.last().and_then(ra_context::Handoff::brief);
+    crate::review::without_stale_points(node.notes.as_deref().unwrap_or_default(), judged, &card_print(node))
 }
 
 /// The points a rerun carries: the failures and the warnings its last run left and the lines

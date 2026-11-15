@@ -16,6 +16,32 @@ use std::path::Path;
 #[cfg(test)]
 mod tests;
 
+/// A card's notes without the reviewers' blocks when the card's text changed since the review
+/// that `judged` fingerprints ([`ra_context::is_stale`]), and how many points that dropped:
+/// asm #86 was sent back on an Allegrex lift its objective had since handed to the next card,
+/// because the earlier reviews' points still rode into the review. The notes come back whole
+/// when the review is current or carries no fingerprint.
+#[must_use]
+pub fn without_stale_points(notes: &str, judged: Option<&str>, now: &str) -> (String, usize) {
+    if !ra_context::is_stale(judged, Some(now)) {
+        return (notes.to_owned(), 0);
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = 0;
+    let mut in_block = false;
+    for line in notes.lines() {
+        if line.starts_with("review by ") {
+            in_block = true;
+        } else if in_block && line.starts_with("- ") {
+            dropped += 1;
+        } else {
+            in_block = false;
+            kept.push(line);
+        }
+    }
+    (kept.join("\n"), dropped)
+}
+
 /// The heading of the dirty files of a shared tree that are not the card's change.
 pub const NOT_THE_CARDS: &str = "not this card’s (dirty before the run)";
 
