@@ -58,18 +58,28 @@ pub async fn ledger(store: &UsageStore, root: &Path) -> anyhow::Result<Vec<Line>
 /// runs are the worker's own calls, matched in order to `handoffs`.
 #[must_use]
 pub fn ledger_line_by_run(card: &CardCost, calls: &[Call], handoffs: &[Handoff]) -> Line {
-    let mut line = ledger_line(card);
-    let runs: Vec<String> = calls
+    // the card's totals cover the window's rows, which are the latest ones; the older calls are
+    // not runs of the line
+    let window = usize::try_from(card.totals.calls).unwrap_or(usize::MAX);
+    let worker: Vec<&Call> = calls.iter().take(window).rev().filter(|call| call.role.is_none()).collect();
+    // the handoffs are the card's every run, so the window's runs are matched from the latest back
+    let skipped = handoffs.len().saturating_sub(worker.len());
+    let runs: Vec<String> = worker
         .iter()
-        .rev()
-        .filter(|call| call.role.is_none())
         .enumerate()
         .map(|(i, call)| {
             let tokens = (call.prompt_tokens + call.completion_tokens).checked_div(call.turns).unwrap_or(0);
-            let outcome = handoffs.get(i).map_or_else(|| "unfinished (no report)".to_owned(), run_end);
+            let outcome = match handoffs.get(skipped + i) {
+                Some(handoff) => run_end(handoff),
+                None => match call.reason.as_deref() {
+                    Some(reason) => format!("unfinished ({})", reason.replace(' ', "-")),
+                    None => "unfinished (no report)".to_owned(),
+                },
+            };
             format!("r{} {}t {} {}", i + 1, call.turns, tokens_short(tokens), outcome)
         })
         .collect();
+    let mut line = if runs.is_empty() { ledger_line(card) } else { ledger_line_of(card, runs.len() as u64) };
     if !runs.is_empty() {
         line.text = format!("{}; runs: {}", line.text, runs.join(", "));
     }
@@ -97,8 +107,13 @@ fn tokens_short(tokens: u64) -> String {
 /// The line of one card's cost: the card, what it cost, its turns and its average tokens a turn.
 #[must_use]
 pub fn ledger_line(card: &CardCost) -> Line {
+    ledger_line_of(card, card.totals.calls)
+}
+
+/// [`ledger_line`] over `calls` runs, the count the line lists rather than the ledger's rows.
+fn ledger_line_of(card: &CardCost, calls: u64) -> Line {
     let cost = card.totals.cost_usd.map_or_else(|| "an unreported amount".to_owned(), |c| format!("${c:.2}"));
-    let runs = if card.totals.calls == 1 { "1 run".to_owned() } else { format!("{} runs", card.totals.calls) };
+    let runs = if calls == 1 { "1 run".to_owned() } else { format!("{calls} runs") };
     Line {
         source: format!("usage.db #{}", card.node),
         text: format!(
