@@ -6738,9 +6738,15 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     {
         task.brief = format!("{}\n\n{note}", task.brief);
     }
+    let acts_in = workspace.as_deref().unwrap_or(&root);
+    // a card that continues or came back already has files in its tree
+    if (task.handoffs.last().is_some_and(|last| last.outcome == ra_context::CONTINUES) || sent_back(node))
+        && let Some(note) = prior_files_note(acts_in, "main").await
+    {
+        task.brief = format!("{}\n\n{note}", task.brief);
+    }
     // the outline is read from the tree the worker acts in, as its quotes are, so a rerun in a
     // worktree gets the line numbers the file has there
-    let acts_in = workspace.as_deref().unwrap_or(&root);
     let changed = last_change(acts_in, node, &task).await;
     // a card sent back by its reviewer carries the verdict's points in its context: the notes
     // that hold them are in the roadmap, which the worker does not read
@@ -8288,6 +8294,36 @@ pub fn short_run_note(last: &ra_context::Handoff, turns: u64) -> Option<String> 
     }
     let reason = last.check.trim().strip_prefix("no check:").map(str::trim).filter(|why| !why.is_empty()).unwrap_or("no reason recorded");
     Some(format!("The last run of this card ended unfinished after {turns} turn(s): {reason}"))
+}
+
+/// The note a continuing run's handoff carries: the files the card's tree adds or changes against
+/// `main`, the committed, the modified and the untracked ones, each with its line counts, so the
+/// session writes on rather than finds them again. `None` when the tree differs from `main` in
+/// nothing or git cannot say.
+pub async fn prior_files_note(root: &Path, main: &str) -> Option<String> {
+    async fn git(root: &Path, args: &[&str]) -> Option<String> {
+        let out = tokio::process::Command::new("git").args(args).current_dir(root).output().await.ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+    let base = git(root, &["merge-base", "HEAD", main]).await?;
+    let mut rows = Vec::new();
+    for line in git(root, &["diff", "--numstat", base.trim()]).await?.lines() {
+        let mut cols = line.splitn(3, '\t');
+        if let (Some(added), Some(removed), Some(path)) = (cols.next(), cols.next(), cols.next()) {
+            rows.push(format!("- `{path}` +{added} -{removed}"));
+        }
+    }
+    for path in git(root, &["ls-files", "--others", "--exclude-standard"]).await?.lines() {
+        let lines = std::fs::read_to_string(root.join(path)).map_or(0, |text| text.lines().count());
+        rows.push(format!("- `{path}` new, {lines} line(s)"));
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Earlier runs of this card already added or changed these files against {main}; continue in them, do not look for them again:\n{}",
+        rows.join("\n")
+    ))
 }
 
 /// The warnings the last run of the card left, as a machine note: the lint found them in the
