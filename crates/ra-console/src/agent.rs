@@ -5201,6 +5201,24 @@ const TEMP_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(3600)
 /// When the card is not there, is not implemented or accepted, a git step fails, the merge
 /// conflicts, or the check fails on the merged tree.
 pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec<String>> {
+    // a merged check that failed only on the project's declared outputs rewrote them on the
+    // card's branch: the landing goes once more, and a second failure sends the card back
+    match land_once(store, id, worker, true).await {
+        Err(e) => match e.downcast::<Regenerated>() {
+            Ok(Regenerated { mut lines }) => {
+                lines.extend(land_once(store, id, worker, false).await?);
+                Ok(lines)
+            }
+            Err(e) => Err(e),
+        },
+        landed => landed,
+    }
+}
+
+/// One attempt of [`land`]; `regenerate` lets a merged check that failed only in tests of the
+/// project's `[worker] regenerate` rewrite their files on the card's branch and answer
+/// [`Regenerated`] instead of a [`LandCheck`].
+async fn land_once(store: &Store, id: i64, worker: &Worker, regenerate: bool) -> anyhow::Result<Vec<String>> {
     let node = store.read(id).await?;
     anyhow::ensure!(
         matches!(node.state, TaskState::Implemented | TaskState::Accepted),
@@ -5263,124 +5281,7 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
         }
     }
     if has_branch {
-        let merged = git(&root, &["merge-base", "--is-ancestor", &branch, "HEAD"]).await.is_ok();
-        if merged {
-            lines.push(format!("{branch} is in HEAD already"));
-        } else {
-            // one commit on the project's branch, squashed: the card's checkpoints and catch-up
-            // merges stay on its branch, which goes once it lands, and the commit is written
-            // about the change, not the card (the person: the history "should be concise and
-            // changes focused, not roadmap focused", 2026-11-12)
-            let mut aside = false;
-            if let Err(e) = git(&root, &["merge", "--squash", &branch]).await {
-                let conflicts = git(&root, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
-                let _ = git(&root, &["reset", "--merge"]).await;
-                if !conflicts.trim().is_empty() {
-                    return Err(anyhow::Error::new(LandConflict { branch, files: conflicts.replace('\n', ", ") }));
-                }
-                // no unmerged file: not a conflict, and the card stays accepted. Git's own line
-                // is the reason (asm and runelite cards went back to their workers 15 times
-                // for a dirty tree)
-                let why = first_line(&format!("{e:#}"));
-                let text = format!("{e:#}");
-                let named = overwritten_files(&text);
-                let cleared =
-                    if text.contains("would be overwritten") { clear_identical(&root, &branch, &named).await } else { Vec::new() };
-                if !named.is_empty() && cleared.len() == named.len() {
-                    // the person's untracked copies are the card's own files: nothing of theirs to keep
-                    lines.push(format!("cleared {} untracked file(s) identical to {branch}'s: {why}", cleared.len()));
-                } else if text.contains("would be overwritten") && !named.is_empty() {
-                    let mut args = vec!["stash", "push", "-q", "-u", "--"];
-                    args.extend(named.iter().map(String::as_str));
-                    git(&root, &args).await?;
-                    aside = true;
-                    lines.push(format!("the person's {} file(s) set aside for the squash: {why}", named.len()));
-                } else if LOCK_WORDS.iter().any(|word| text.contains(word)) {
-                    lines.push(format!("a file was locked, retrying: {why}"));
-                    tokio::time::sleep(LOCK_WAIT).await;
-                } else {
-                    return Err(anyhow::anyhow!("the squash of {branch} failed without a conflict: {text}"));
-                }
-                if let Err(again) = git(&root, &["merge", "--squash", &branch]).await {
-                    let _ = git(&root, &["reset", "--merge"]).await;
-                    if aside {
-                        let _ = git(&root, &["stash", "pop", "-q"]).await;
-                    }
-                    return Err(anyhow::anyhow!("the squash of {branch} failed again without a conflict: {again:#}"));
-                }
-            }
-            // the files the squash staged: the card's own, and the only ones this commit takes;
-            // whatever else the checkout holds uncommitted stays the person's
-            let staged = git(&root, &["diff", "--cached", "--name-only"]).await.unwrap_or_default();
-            let staged: Vec<String> = staged.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
-            if staged.is_empty() {
-                lines.push(format!("{branch} is in HEAD already"));
-            } else {
-                // a Rust tree is formatted as it lands, the card's files only, on a worker slot:
-                // a build on push that checks the format stays green without a worker running
-                // rustfmt, and the format is heavy work like any build
-                if root.join("Cargo.toml").is_file() {
-                    let _slot = hold_build(&root, &root).await;
-                    let formatted = tokio::process::Command::new("cargo").args(["fmt", "--all"]).current_dir(&root).output().await;
-                    if formatted.is_ok_and(|o| o.status.success()) {
-                        let rust: Vec<&str> = staged
-                            .iter()
-                            .map(String::as_str)
-                            .filter(|f| Path::new(f).extension().is_some_and(|e| e.eq_ignore_ascii_case("rs")) && root.join(f).is_file())
-                            .collect();
-                        if !rust.is_empty() {
-                            let mut args = vec!["add", "--"];
-                            args.extend(rust.iter().copied());
-                            git(&root, &args).await?;
-                        }
-                    }
-                }
-                git(&root, &["commit", "-q", "-m", &landing_message(&node, handoff)]).await?;
-                lines.push(format!(
-                    "squashed {branch} into one commit on {}",
-                    git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()
-                ));
-            }
-            if aside {
-                match git(&root, &["stash", "pop", "-q"]).await {
-                    Ok(_) => lines.push("the person's files are back".to_owned()),
-                    Err(e) => lines.push(format!("the person's files stay in `git stash`: {}", first_line(&format!("{e:#}")))),
-                }
-            }
-            // the project's check on the merged tree: two cards right on their own are not
-            // always right together (#176 and #181 compiled apart and not merged). A reviewed
-            // card ran it on the caught-up tree already; this is the last guard, for a project
-            // that moved on since the review
-            let Checks { commands, timeout, .. } = checks_of(&root, &node);
-            let commands = if commands.is_empty() { commands } else { merged_suite(&root, commands, &staged) };
-            if !commands.is_empty() && !staged.is_empty() {
-                let toolbox = worker.toolbox(&root).map(|t| t.with_timeout(timeout));
-                let _slot = hold_build(&root, &root).await;
-                let runs = run_checks(&toolbox, &commands, &[]).await;
-                if let Some(failed) = runs.iter().find(|r| !r.passed) {
-                    // a failure outside the card's files and crates is the project's: the card
-                    // lands and a note carries the failure (#207 failed another card's test)
-                    if let Some(outside) = outside_failure(&root, &failed.text, &staged) {
-                        lines.push(outside_note(&root, id, &failed.command, &outside));
-                    } else {
-                        // the squash commit goes; what the checkout held uncommitted stays
-                        let _ = git(&root, &["reset", "--merge", "HEAD~1"]).await;
-                        return Err(anyhow::Error::new(LandCheck {
-                            command: failed.command.clone(),
-                            exit: failed.exit.clone(),
-                            text: failed.text.clone(),
-                        }));
-                    }
-                } else {
-                    lines.push(format!("check passed on the merged tree: {}", commands.join(" · ")));
-                    // nothing else builds a refused project's binaries in its main target, which
-                    // the next worktree is seeded from; a failed build is a line, not a failure
-                    if crate::router::Router::load(&root).is_ok_and(|r| r.worker.builds() == 0) {
-                        lines.push(build_main_binaries(&root).await);
-                    }
-                }
-            }
-        }
+        land_branch(&root, &branch, &node, handoff, worker, regenerate, &mut lines).await?;
     }
     if node.state != TaskState::Accepted {
         store.set_state_by(id, TaskState::Accepted, Source::Run).await?;
@@ -5391,6 +5292,219 @@ pub async fn land(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<Vec
     let line = format!("landed #{id} {} · {}", node.title, lines.join(" · "));
     crate::pair::event(&root, &line);
     Ok(lines)
+}
+
+/// Squashes the card's branch into one commit on the project's and proves the merged tree with
+/// [`check_merged`]; a conflict, or a squash git refuses twice, answers an error. The outcome's
+/// lines join `lines`.
+async fn land_branch(
+    root: &Path,
+    branch: &str,
+    node: &Node,
+    handoff: Option<&ra_context::Handoff>,
+    worker: &Worker,
+    regenerate: bool,
+    lines: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let merged = git(root, &["merge-base", "--is-ancestor", branch, "HEAD"]).await.is_ok();
+    if merged {
+        lines.push(format!("{branch} is in HEAD already"));
+        return Ok(());
+    }
+    // one commit on the project's branch, squashed: the card's checkpoints and catch-up
+    // merges stay on its branch, which goes once it lands, and the commit is written
+    // about the change, not the card (the person: the history "should be concise and
+    // changes focused, not roadmap focused", 2026-11-12)
+    let mut aside = false;
+    if let Err(e) = git(root, &["merge", "--squash", branch]).await {
+        let conflicts = git(root, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
+        let _ = git(root, &["reset", "--merge"]).await;
+        if !conflicts.trim().is_empty() {
+            return Err(anyhow::Error::new(LandConflict { branch: branch.to_owned(), files: conflicts.replace('\n', ", ") }));
+        }
+        // no unmerged file: not a conflict, and the card stays accepted. Git's own line
+        // is the reason (asm and runelite cards went back to their workers 15 times
+        // for a dirty tree)
+        let why = first_line(&format!("{e:#}"));
+        let text = format!("{e:#}");
+        let named = overwritten_files(&text);
+        let cleared = if text.contains("would be overwritten") { clear_identical(root, branch, &named).await } else { Vec::new() };
+        if !named.is_empty() && cleared.len() == named.len() {
+            // the person's untracked copies are the card's own files: nothing of theirs to keep
+            lines.push(format!("cleared {} untracked file(s) identical to {branch}'s: {why}", cleared.len()));
+        } else if text.contains("would be overwritten") && !named.is_empty() {
+            let mut args = vec!["stash", "push", "-q", "-u", "--"];
+            args.extend(named.iter().map(String::as_str));
+            git(root, &args).await?;
+            aside = true;
+            lines.push(format!("the person's {} file(s) set aside for the squash: {why}", named.len()));
+        } else if LOCK_WORDS.iter().any(|word| text.contains(word)) {
+            lines.push(format!("a file was locked, retrying: {why}"));
+            tokio::time::sleep(LOCK_WAIT).await;
+        } else {
+            return Err(anyhow::anyhow!("the squash of {branch} failed without a conflict: {text}"));
+        }
+        if let Err(again) = git(root, &["merge", "--squash", branch]).await {
+            let _ = git(root, &["reset", "--merge"]).await;
+            if aside {
+                let _ = git(root, &["stash", "pop", "-q"]).await;
+            }
+            return Err(anyhow::anyhow!("the squash of {branch} failed again without a conflict: {again:#}"));
+        }
+    }
+    // the files the squash staged: the card's own, and the only ones this commit takes;
+    // whatever else the checkout holds uncommitted stays the person's
+    let staged = git(root, &["diff", "--cached", "--name-only"]).await.unwrap_or_default();
+    let staged: Vec<String> = staged.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
+    if staged.is_empty() {
+        lines.push(format!("{branch} is in HEAD already"));
+    } else {
+        // a Rust tree is formatted as it lands, the card's files only, on a worker slot:
+        // a build on push that checks the format stays green without a worker running
+        // rustfmt, and the format is heavy work like any build
+        if root.join("Cargo.toml").is_file() {
+            let _slot = hold_build(root, root).await;
+            let formatted = tokio::process::Command::new("cargo").args(["fmt", "--all"]).current_dir(root).output().await;
+            if formatted.is_ok_and(|o| o.status.success()) {
+                let rust: Vec<&str> = staged
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|f| Path::new(f).extension().is_some_and(|e| e.eq_ignore_ascii_case("rs")) && root.join(f).is_file())
+                    .collect();
+                if !rust.is_empty() {
+                    let mut args = vec!["add", "--"];
+                    args.extend(rust.iter().copied());
+                    git(root, &args).await?;
+                }
+            }
+        }
+        git(root, &["commit", "-q", "-m", &landing_message(node, handoff)]).await?;
+        lines.push(format!(
+            "squashed {branch} into one commit on {}",
+            git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()
+        ));
+    }
+    if aside {
+        match git(root, &["stash", "pop", "-q"]).await {
+            Ok(_) => lines.push("the person's files are back".to_owned()),
+            Err(e) => lines.push(format!("the person's files stay in `git stash`: {}", first_line(&format!("{e:#}")))),
+        }
+    }
+    check_merged(root, node, worker, regenerate, &staged, lines).await
+}
+
+/// The project's check on the merged tree: two cards right on their own are not always right
+/// together (#176 and #181 compiled apart and not merged). A reviewed card ran it on the
+/// caught-up tree already; this is the last guard, for a project that moved on since the
+/// review. A failure undoes the squash commit and answers a [`LandCheck`], or a
+/// [`Regenerated`] when `regenerate` and the failure was only in the declared outputs.
+async fn check_merged(
+    root: &Path,
+    node: &Node,
+    worker: &Worker,
+    regenerate: bool,
+    staged: &[String],
+    lines: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let id = node.id;
+    let Checks { commands, timeout, .. } = checks_of(root, node);
+    let commands = if commands.is_empty() { commands } else { merged_suite(root, commands, staged) };
+    if !commands.is_empty() && !staged.is_empty() {
+        let toolbox = worker.toolbox(root).map(|t| t.with_timeout(timeout));
+        let _slot = hold_build(root, root).await;
+        let runs = run_checks(&toolbox, &commands, &[]).await;
+        if let Some(failed) = runs.iter().find(|r| !r.passed) {
+            // a failure outside the card's files and crates is the project's: the card
+            // lands and a note carries the failure (#207 failed another card's test)
+            if let Some(outside) = outside_failure(root, &failed.text, staged) {
+                lines.push(outside_note(root, id, &failed.command, &outside));
+            } else {
+                // the squash commit goes; what the checkout held uncommitted stays
+                let _ = git(root, &["reset", "--merge", "HEAD~1"]).await;
+                let tree = root.join(WORKTREES_DIR).join(id.to_string());
+                if regenerate && let Some(line) = regenerate_outputs(root, &tree, id, worker, &runs, timeout).await {
+                    lines.push(line);
+                    return Err(anyhow::Error::new(Regenerated { lines: std::mem::take(lines) }));
+                }
+                return Err(anyhow::Error::new(LandCheck {
+                    command: failed.command.clone(),
+                    exit: failed.exit.clone(),
+                    text: failed.text.clone(),
+                }));
+            }
+        } else {
+            lines.push(format!("check passed on the merged tree: {}", commands.join(" · ")));
+            // nothing else builds a refused project's binaries in its main target, which
+            // the next worktree is seeded from; a failed build is a line, not a failure
+            if crate::router::Router::load(root).is_ok_and(|r| r.worker.builds() == 0) {
+                lines.push(build_main_binaries(root).await);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A landing attempt whose merged check failed only in the project's declared outputs, now
+/// rewritten and committed on the card's branch; the lines so far, the rewrite's the last.
+#[derive(Debug)]
+struct Regenerated {
+    lines: Vec<String>,
+}
+
+impl std::fmt::Display for Regenerated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.lines.last().map_or("regenerated", String::as_str))
+    }
+}
+
+impl std::error::Error for Regenerated {}
+
+/// Rewrites the files of the `[worker] regenerate` entries a merged check failed on, in the
+/// card's worktree at `tree`, and commits them on its branch with a subject naming them: the
+/// line saying so when every failed check failed only in tests an entry names, each command
+/// passed and one wrote a file. `None` sends the card back as before.
+async fn regenerate_outputs(
+    root: &Path,
+    tree: &Path,
+    id: i64,
+    worker: &Worker,
+    runs: &[CheckRun],
+    timeout: std::time::Duration,
+) -> Option<String> {
+    if !tree.join(".git").exists() {
+        return None;
+    }
+    let config = crate::router::Router::load(root).map(|router| router.worker).unwrap_or_default();
+    let failed: Vec<Vec<String>> = runs.iter().filter(|run| !run.passed).map(|run| run.tests.clone()).collect();
+    let entries = config.regenerations(tree, &failed)?;
+    let mut ran = Vec::new();
+    for entry in entries {
+        let (env, words) = entry.words().map_err(|e| tracing::warn!("#{id} cannot regenerate `{}`: {e:#}", entry.test)).ok()?;
+        let toolbox = worker.toolbox(tree).ok()?.with_timeout(timeout).with_env(env);
+        match toolbox.check_args(&words).await {
+            Ok((true, _)) => ran.push(entry.command.clone()),
+            Ok((false, output)) => {
+                tracing::warn!("#{id} the regenerate command `{}` failed: {}", entry.command, first_error(&output));
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("#{id} the regenerate command `{}` did not run: {e:#}", entry.command);
+                return None;
+            }
+        }
+    }
+    git(tree, &["add", "-A"]).await.ok()?;
+    let staged = git(tree, &["diff", "--cached", "--name-only"]).await.ok()?;
+    let files: Vec<String> = staged.lines().map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned).collect();
+    // nothing rewritten: the test fails on the card's code, not on its file
+    if files.is_empty() {
+        return None;
+    }
+    let message = format!("Regenerate {}\n\nRewritten by {}.", files.join(", "), ran.join(" and "));
+    git(tree, &["commit", "-q", "-m", &message]).await.ok()?;
+    let line = format!("regenerated {} on {}: {}", files.join(", "), worktree_branch(id), ran.join(" · "));
+    crate::pair::event(root, &format!("#{id} {line}"));
+    Some(line)
 }
 
 /// Builds the project's binaries into its main target after a landing's check passed, off the

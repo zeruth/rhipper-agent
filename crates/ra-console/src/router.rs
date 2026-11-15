@@ -214,6 +214,10 @@ impl fmt::Display for Rule {
 /// shell = "bash"                       # the one shell a worker gets; both without it
 /// web = true                           # the web tools for builders; investigators have them anyway
 /// slow = ["cargo test -p ras --features oracle"] # suites run on main once a day, a new failure a card
+/// regenerate = [                       # tracked outputs a landing rewrites when they alone fail
+///   { test = "tests/abi_snapshot.rs", command = "RA_SNAPSHOT=write cargo test -p ras --test abi_snapshot" },
+///   { test = "scoreboard_matches", command = "ras score --write testdata/bin" },
+/// ]
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -305,9 +309,106 @@ pub struct WorkerConfig {
     /// now. Asm's `--features oracle` broke on main hours before a fork found it by chance.
     #[serde(default)]
     pub slow: Vec<String>,
+    /// The tracked files a card may change on purpose, each checked by a test (a snapshot, a
+    /// known-differences list, a scoreboard), with the command that rewrites it. A landing whose
+    /// merged check fails only in tests these name rewrites them in the card's worktree, commits
+    /// them on its branch and checks again: a worker that cannot build cannot rewrite them, and
+    /// each one cost a send-back (asm #495 on its eh-clang ABI snapshot, 2026-11-15).
+    #[serde(default)]
+    pub regenerate: Vec<Regenerate>,
+}
+
+/// One `[worker] regenerate` entry: the test that checks a tracked file, by its name or by the
+/// file that defines it, and the command that rewrites the file, its leading `NAME=value` words
+/// the command's environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Regenerate {
+    /// The test: a name (`eh_clang_abi`, `abi::eh_clang_abi`, gradle's `ScoreTest`) or the path
+    /// of its file relative to the project (`tests/abi_snapshot.rs`).
+    pub test: String,
+    /// The command that rewrites what the test compares against.
+    pub command: String,
+}
+
+/// A command's environment variables and program with arguments.
+type EnvAndWords = (Vec<(String, String)>, Vec<String>);
+
+impl Regenerate {
+    /// Whether this entry names the failing test `name` in the tree at `tree`: the whole name,
+    /// its last segment, a module or class it lies under, or a file of the entry that defines it.
+    #[must_use]
+    pub fn names(&self, tree: &Path, name: &str) -> bool {
+        let test = self.test.trim();
+        if test.is_empty() || name.is_empty() {
+            return false;
+        }
+        let last = name.rsplit("::").next().unwrap_or(name);
+        // gradle names a test `Class.method`
+        let last = last.rsplit('.').next().unwrap_or(last);
+        if name == test
+            || last == test
+            || name.ends_with(&format!("::{test}"))
+            || name.starts_with(&format!("{test}::"))
+            || name.starts_with(&format!("{test}."))
+        {
+            return true;
+        }
+        let file = test.contains('/') || test.contains('\\') || Path::new(test).extension().is_some();
+        file && std::fs::read_to_string(tree.join(test)).is_ok_and(|text| defines(&text, last))
+    }
+
+    /// The environment and the words of the command: its leading `NAME=value` words are the
+    /// environment, the rest the program and its arguments.
+    ///
+    /// # Errors
+    /// When the command does not split into words or names no program.
+    pub fn words(&self) -> anyhow::Result<EnvAndWords> {
+        let mut words = ra_tools::words(&self.command)?;
+        let assignments = words.iter().take_while(|word| is_assignment(word)).count();
+        let env = words.drain(..assignments).filter_map(|word| word.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned()))).collect();
+        anyhow::ensure!(!words.is_empty(), "the regenerate command of `{}` names no program", self.test);
+        Ok((env, words))
+    }
+}
+
+/// Whether `word` sets a variable, `NAME=value`, rather than naming a program.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Whether `text` defines or calls a function `name`: `name(` not preceded by a word character.
+fn defines(text: &str, name: &str) -> bool {
+    let needle = format!("{name}(");
+    text.match_indices(&needle).any(|(at, _)| text[..at].chars().next_back().is_none_or(|c| !(c.is_alphanumeric() || c == '_')))
 }
 
 impl WorkerConfig {
+    /// The `regenerate` entries that rewrite what a check failed on, one per entry: `failed`
+    /// holds the tests each failed command names. `None` unless every failed command names its
+    /// tests and each test is one an entry names; a compile error names none.
+    #[must_use]
+    pub fn regenerations(&self, tree: &Path, failed: &[Vec<String>]) -> Option<Vec<&Regenerate>> {
+        if self.regenerate.is_empty() || failed.is_empty() {
+            return None;
+        }
+        let mut entries: Vec<&Regenerate> = Vec::new();
+        for tests in failed {
+            if tests.is_empty() {
+                return None;
+            }
+            for name in tests {
+                let entry = self.regenerate.iter().find(|entry| entry.names(tree, name))?;
+                if !entries.iter().any(|e| std::ptr::eq(*e, entry)) {
+                    entries.push(entry);
+                }
+            }
+        }
+        Some(entries)
+    }
+
     /// The cards a walk runs at once, when the table names more than one.
     #[must_use]
     pub fn parallel(&self) -> Option<u32> {
