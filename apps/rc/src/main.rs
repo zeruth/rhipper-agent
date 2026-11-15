@@ -1776,6 +1776,37 @@ fn missing_generators(nodes: &[ra_roadmap::model::Node]) -> Vec<String> {
     faults
 }
 
+/// A fault for each card not yet done whose objective adds a backticked `name:` line or field
+/// while neither the objective nor the notes says which section or struct holds it: the worker
+/// would guess the home, and a guess lands in the wrong file.
+fn unplaced_fields(nodes: &[ra_roadmap::model::Node]) -> Vec<String> {
+    let places = |text: &str| {
+        let lower = text.to_lowercase();
+        lower.contains("section") || lower.contains("struct")
+    };
+    let mut faults = Vec::new();
+    for node in nodes.iter().filter(|n| !matches!(n.state, TaskState::Accepted | TaskState::Cancelled)) {
+        let Some(objective) = node.objective.as_deref() else { continue };
+        let lower = objective.to_lowercase();
+        let introduces =
+            lower.split(|c: char| !c.is_alphabetic()).any(|w| matches!(w, "add" | "adds" | "new" | "introduce" | "introduces"));
+        if !introduces || places(objective) || node.notes.as_deref().is_some_and(places) {
+            continue;
+        }
+        let field = objective.split('`').skip(1).step_by(2).find_map(|span| {
+            let name = span.strip_suffix(':')?;
+            (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
+        });
+        if let Some(name) = field {
+            faults.push(format!(
+                "#{}: the objective adds `{name}:` without saying which section or struct holds it; name it in the objective or the notes",
+                node.id
+            ));
+        }
+    }
+    faults
+}
+
 /// Prints every fault the lint finds, and every named path missing from the project's tree,
 /// and exits 1 when there is one, so a script or a hook can gate on a clean roadmap.
 async fn check() -> anyhow::Result<()> {
@@ -1796,6 +1827,7 @@ async fn check() -> anyhow::Result<()> {
     faults.extend(unknown_rc_faults(&nodes));
     faults.extend(missing_test_targets(&nodes, root));
     faults.extend(missing_generators(&nodes));
+    faults.extend(unplaced_fields(&nodes));
     // a check that cannot run fails every run of its card for a reason no worker can fix
     faults.extend(ra_console::agent::unrunnable_checks(&ra_console::agent::workspace_of(&store), &nodes).await);
     // a command the tool rejects is a fault of the card's text, found before a walk holds it
