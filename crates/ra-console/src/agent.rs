@@ -5608,6 +5608,15 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                     }
                     started_held = true;
                 }
+                // the queue was read before the cards ahead of this one were set up: a card the
+                // person or a pairing session moved since is not started (asm #269, blocked by
+                // a session and started sixteen minutes later), and the slot goes to the next
+                if let Some(line) = skipped_now(store, node.id).await {
+                    tracing::info!(target: crate::trace::PROGRESS, "{line}");
+                    crate::pair::event(&root, &line);
+                    lines.push(line);
+                    continue;
+                }
                 let kind =
                     Pool::kind_of(&router.route(node, crate::router::IMPLEMENTER, &worker.model, rejections(&root, node.id)).0.model);
                 let held = flight.iter().filter(|(_, _, s)| *s == Seat::Build(kind)).count();
@@ -7700,6 +7709,15 @@ async fn held_by_preflight(store: &Store, root: &Path, node: &Node, worker: &Wor
     tracing::warn!("{text}");
     crate::pair::event(root, &text);
     Ok(Some(vec![format!("  {text}")]))
+}
+
+/// The line for a queued card whose state, read again just before its run starts, is one no run
+/// starts from: blocked, accepted, cancelled, or implemented with its review pending. `None`
+/// sends the card on. A card gone from the roadmap was cancelled, which removes it.
+pub async fn skipped_now(store: &Store, id: i64) -> Option<String> {
+    let Ok(node) = store.read(id).await else { return Some(format!("skipped: #{id} is cancelled now")) };
+    matches!(node.state, TaskState::Blocked | TaskState::Accepted | TaskState::Cancelled | TaskState::Implemented | TaskState::Review)
+        .then(|| format!("skipped: #{id} is {} now", node.state))
 }
 
 /// Whether the card's last run ended `implemented` and nothing happened since: the card is
