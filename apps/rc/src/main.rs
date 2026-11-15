@@ -711,6 +711,9 @@ async fn run_main() -> anyhow::Result<()> {
                 if let Some(stopped) = &row.stopped {
                     println!("  walk stopped: {stopped}");
                 }
+                if let Some(ci) = &row.ci {
+                    println!("  ci on main: {}", ci.line);
+                }
                 for waiting in &row.waiting {
                     println!("{}", waiting.line());
                 }

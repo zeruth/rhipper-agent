@@ -425,6 +425,45 @@ pub struct Status {
     pub stopped: Option<String>,
     /// The cards that landed today and their cost over every run, as [`landed_of`] reads them.
     pub landed_today: (u32, Option<f64>),
+    /// The project's CI on main as the walk last read it, when it has read one.
+    pub ci: Option<CiState>,
+}
+
+/// The CI of a project's main as the walk last read it, one line per workflow: the workflow,
+/// the conclusion, the commit, the run's id, its url and when it was read, tab-separated.
+pub const CI_FILE: &str = "var/ci.txt";
+
+/// A project's CI on main in a few words, for `rc status` and the dashboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiState {
+    /// `✓ build · ✗ release timed_out at 1a2b3c4`
+    pub line: String,
+    /// Whether a workflow's latest completed run is red.
+    pub red: bool,
+}
+
+/// The CI the walk last read for the project at `root` ([`CI_FILE`]); `None` before a read.
+#[must_use]
+pub fn ci_state(root: &Path) -> Option<CiState> {
+    let text = std::fs::read_to_string(root.join(CI_FILE)).ok()?;
+    let mut red = false;
+    let parts: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let (workflow, conclusion, commit) = (fields.next()?, fields.next()?, fields.next().unwrap_or_default());
+            if matches!(conclusion, "failure" | "timed_out" | "startup_failure") {
+                red = true;
+                let short: String = commit.chars().take(7).collect();
+                Some(format!("✗ {workflow} {conclusion} at {short}"))
+            } else if conclusion == "success" {
+                Some(format!("✓ {workflow}"))
+            } else {
+                Some(format!("· {workflow} {conclusion}"))
+            }
+        })
+        .collect();
+    (!parts.is_empty()).then(|| CiState { line: parts.join(" · "), red })
 }
 
 /// A card that waits on the person: blocked, sent back past the walk's reruns, or implemented
@@ -656,6 +695,7 @@ pub fn status_with(root: &Path, alive: impl Fn(u32) -> bool, spends: &[ra_usage:
         waiting,
         stopped: crate::pair::stop_of(&feed),
         landed_today: (0, None),
+        ci: ci_state(root),
     }
 }
 

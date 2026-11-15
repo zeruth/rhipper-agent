@@ -2662,6 +2662,273 @@ async fn file_slow_failure(
     Ok(id)
 }
 
+/// When the walk last read the project's CI, in unix seconds: a read that found no gh counts,
+/// so a machine without one pays for the look once an hour, not once a tick.
+const CI_STAMP: &str = "var/ci.stamp";
+
+/// How long after a read the CI on main is read again.
+const CI_EVERY: u64 = 3600;
+
+/// The workflows a red run filed a card for, one line each: the workflow and the card,
+/// tab-separated. A green run of the workflow takes its line out, so a red streak files once.
+const CI_FILED: &str = "var/runs/ci-red";
+
+/// Where gh lives when it is not on PATH.
+const GH_DEFAULT: &str = r"C:\Program Files\GitHub CLI\gh.exe";
+
+/// The fields of `gh run list` a CI read takes.
+const CI_FIELDS: &str = "databaseId,workflowName,headSha,status,conclusion,url,displayTitle";
+
+/// How a CI read calls gh: the arguments in, what gh printed when it exited zero out.
+pub type Gh = Arc<dyn Fn(&[&str]) -> Option<String> + Send + Sync>;
+
+/// The latest completed run of a workflow on main, as `gh run list` says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiRun {
+    pub workflow: String,
+    /// `success`, `failure`, `timed_out`, `cancelled`…
+    pub conclusion: String,
+    pub commit: String,
+    pub id: u64,
+    pub url: String,
+    /// The commit's subject, as the run shows it.
+    pub title: String,
+}
+
+impl CiRun {
+    /// Whether the run says main is broken: a failure, a timeout, or a workflow that never started.
+    #[must_use]
+    pub fn red(&self) -> bool {
+        matches!(self.conclusion.as_str(), "failure" | "timed_out" | "startup_failure")
+    }
+}
+
+/// What `gh run view --log-failed` says of a red run: the job and the step that failed, the
+/// first failing test, and the first error line.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CiFailure {
+    pub job: Option<String>,
+    pub step: Option<String>,
+    pub test: Option<String>,
+    pub error: String,
+}
+
+/// Whether the CI of the project at `root` is due a read at `now`: never read, or an hour since.
+#[must_use]
+pub fn ci_due(root: &Path, now: u64) -> bool {
+    let last = std::fs::read_to_string(root.join(CI_STAMP)).ok().and_then(|t| t.trim().parse::<u64>().ok());
+    last.is_none_or(|last| now.saturating_sub(last) >= CI_EVERY)
+}
+
+/// The latest completed run of each workflow in a `gh run list --json` text, newest first as gh
+/// lists them, in the order the workflows first appear; a run still going is passed over, so
+/// the one before it speaks for its workflow.
+#[must_use]
+pub fn ci_latest(json: &str) -> Vec<CiRun> {
+    let Ok(serde_json::Value::Array(runs)) = serde_json::from_str::<serde_json::Value>(json.trim()) else { return Vec::new() };
+    let mut latest: Vec<CiRun> = Vec::new();
+    for run in &runs {
+        let text = |key: &str| run.get(key).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        let workflow = text("workflowName");
+        if text("status") != "completed" || workflow.is_empty() || latest.iter().any(|r| r.workflow == workflow) {
+            continue;
+        }
+        latest.push(CiRun {
+            workflow,
+            conclusion: text("conclusion"),
+            commit: text("headSha"),
+            id: run.get("databaseId").and_then(serde_json::Value::as_u64).unwrap_or_default(),
+            url: text("url"),
+            title: text("displayTitle"),
+        });
+    }
+    latest
+}
+
+/// What a `gh run view --log-failed` text says failed. Each of its lines is the job, the step and
+/// the timestamped output, tab-separated; the first line's job and step are the ones that failed.
+#[must_use]
+pub fn ci_failure(log: &str) -> CiFailure {
+    let mut failure = CiFailure::default();
+    let mut output = String::new();
+    for line in log.lines() {
+        let line = line.trim_start_matches('\u{feff}');
+        let mut fields = line.splitn(3, '\t');
+        let (Some(job), Some(step), Some(rest)) = (fields.next(), fields.next(), fields.next()) else { continue };
+        if failure.job.is_none() {
+            failure.job = Some(job.trim().to_owned());
+            failure.step = Some(step.trim().to_owned());
+        }
+        // `2026-11-12T10:00:00.1234567Z text`
+        let text = match rest.split_once(' ') {
+            Some((stamp, text)) if stamp.ends_with('Z') && stamp.contains('T') => text,
+            _ => rest,
+        };
+        output.push_str(&without_ansi(text));
+        output.push('\n');
+    }
+    failure.test = failed_test_names(&output, false).into_iter().next().or_else(|| failed_test_names(&output, true).into_iter().next());
+    failure.error = first_error(&output);
+    failure
+}
+
+/// `text` without its terminal colour codes, which a CI log keeps.
+fn without_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // `ESC [ … letter`
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// gh as the machine has it, run in `root` so it reads the project's remote: on PATH, else
+/// where its installer puts it. `None` when there is none.
+fn gh_of(root: &Path) -> Option<Gh> {
+    let search: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let exe = crate::hub::manifest::resolve("gh", &search).or_else(|| Some(PathBuf::from(GH_DEFAULT)).filter(|p| p.is_file()))?;
+    let root = root.to_path_buf();
+    let gh: Gh = Arc::new(move |args: &[&str]| {
+        let mut command = std::process::Command::new(&exe);
+        command.args(args).current_dir(&root).stdin(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // a read from a walk with no console opens no window of its own
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = command.output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    });
+    Some(gh)
+}
+
+/// One gh call off the runtime's threads.
+async fn gh_call(gh: &Gh, args: &[&str]) -> Option<String> {
+    let gh = gh.clone();
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    tokio::task::spawn_blocking(move || gh(&args.iter().map(String::as_str).collect::<Vec<_>>())).await.ok().flatten()
+}
+
+/// Reads the project's CI on main when it is due at `now` ([`ci_due`]) and gh is on the machine
+/// and logged in: [`read_ci_with`] with the machine's gh. Nothing read the CI before, and the
+/// agent's own build went three days red (2026-11-12 to 11-15) unseen.
+pub async fn read_ci(store: &Store, now: u64) -> Vec<String> {
+    let root = workspace_of(store);
+    if !ci_due(&root, now) {
+        return Vec::new();
+    }
+    if let Some(gh) = gh_of(&root) {
+        read_ci_with(store, now, gh).await
+    } else {
+        let _ = std::fs::create_dir_all(root.join("var"));
+        let _ = std::fs::write(root.join(CI_STAMP), now.to_string());
+        Vec::new()
+    }
+}
+
+/// [`read_ci`] with gh named: the latest completed run of each workflow on main
+/// (`gh run list --branch main --limit 5`), kept in [`crate::hub::CI_FILE`] for `rc status` and
+/// the dashboard; a red one, which no green run of its workflow has superseded, files one
+/// priority-1 card under the Look-back milestone naming the workflow, the job, the step and the
+/// first failing test of `gh run view --log-failed`. One line for the read and one per card.
+pub async fn read_ci_with(store: &Store, now: u64, gh: Gh) -> Vec<String> {
+    let root = workspace_of(store);
+    if !ci_due(&root, now) {
+        return Vec::new();
+    }
+    let _ = std::fs::create_dir_all(root.join("var/runs"));
+    let _ = std::fs::write(root.join(CI_STAMP), now.to_string());
+    if gh_call(&gh, &["auth", "status"]).await.is_none() {
+        return Vec::new();
+    }
+    // a project with no GitHub remote, or a network down, keeps the last read
+    let Some(json) = gh_call(&gh, &["run", "list", "--branch", "main", "--limit", "5", "--json", CI_FIELDS]).await else {
+        return Vec::new();
+    };
+    let runs = ci_latest(&json);
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let mut text = String::new();
+    for run in &runs {
+        let _ = writeln!(text, "{}\t{}\t{}\t{}\t{}\t{now}", run.workflow, run.conclusion, run.commit, run.id, run.url);
+    }
+    let _ = std::fs::write(root.join(crate::hub::CI_FILE), text);
+    let mut lines = vec![format!("ci on main: {}", crate::hub::ci_state(&root).map(|s| s.line).unwrap_or_default())];
+    let mut filed: Vec<(String, String)> = std::fs::read_to_string(root.join(CI_FILED))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(w, c)| (w.to_owned(), c.to_owned())))
+        .collect();
+    filed.retain(|(workflow, _)| !runs.iter().any(|run| &run.workflow == workflow && !run.red()));
+    for run in runs.iter().filter(|run| run.red()) {
+        if filed.iter().any(|(workflow, _)| *workflow == run.workflow) {
+            continue;
+        }
+        let log = gh_call(&gh, &["run", "view", &run.id.to_string(), "--log-failed"]).await.unwrap_or_default();
+        let failure = ci_failure(&log);
+        match file_ci_failure(store, run, &failure).await {
+            Ok(id) => {
+                let line = format!("#{id} filed: the workflow `{}` is {} on main", run.workflow, run.conclusion);
+                crate::pair::event(&root, &line);
+                lines.push(line);
+                filed.push((run.workflow.clone(), id.to_string()));
+            }
+            Err(e) => lines.push(format!("the card for the workflow `{}` could not be filed: {e:#}", run.workflow)),
+        }
+    }
+    let mut text = String::new();
+    for (workflow, card) in &filed {
+        text.push_str(workflow);
+        text.push('\t');
+        text.push_str(card);
+        text.push('\n');
+    }
+    let _ = std::fs::write(root.join(CI_FILED), text);
+    lines
+}
+
+/// Files the card of a workflow red on main: priority 1, under the Look-back milestone, its
+/// check the first failing test when the log names one.
+async fn file_ci_failure(store: &Store, run: &CiRun, failure: &CiFailure) -> anyhow::Result<i64> {
+    let parent = crate::plan::home::ensure_milestone(store).await?;
+    let short: String = run.commit.chars().take(10).collect();
+    let unnamed = "none the log names";
+    let job = failure.job.as_deref().unwrap_or(unnamed);
+    let step = failure.step.as_deref().unwrap_or(unnamed);
+    let test = failure.test.as_deref().unwrap_or(unnamed);
+    let error = if failure.error.is_empty() { unnamed } else { failure.error.as_str() };
+    let objective = format!(
+        "The workflow {}'s latest completed run on main ended {} at {short} ({}), and no green run has superseded it: {}\n\nJob: {job}\nStep: {step}\nFirst failing test: {test}\nFirst error: {error}",
+        run.workflow, run.conclusion, run.title, run.url
+    );
+    // a cargo test's name is a filter of the workspace's tests; a timeout names none
+    let cargo = workspace_of(store).join("Cargo.toml").is_file();
+    let acceptance = match failure.test.as_deref() {
+        Some(test) if cargo && !test.contains(' ') => format!("`cargo test --workspace {test}` passes"),
+        _ => format!("the workflow {}'s next run on main ends green within its time limit", run.workflow),
+    };
+    let title = match failure.test.as_deref() {
+        Some(test) => format!("CI {} is {} on main: {test}", run.workflow, run.conclusion),
+        None => format!("CI {} is {} on main in {step}", run.workflow, run.conclusion),
+    };
+    let card = Card { objective: Some(&objective), acceptance: Some(&acceptance), ..Card::new() };
+    let id = store.insert_card(Some(parent), NodeKind::Task, &title, &card).await?;
+    store.set_priority(id, Some(1)).await?;
+    Ok(id)
+}
+
 /// Gives `session` a fresh build budget in `tree`, for a rerun whose prompt is a lint fix: the
 /// builds of the run before it were spent on the card's change, and the fix runs the checks.
 pub fn reset_builds(tree: &Path, session: &str) {
@@ -5641,6 +5908,9 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
         if stopped.is_none() {
             // the cards that wait on a red main are ready again once main moves
             lines.extend(requeue_red_main(store, &root).await);
+            // the project's CI on main, once an hour: a red one files its card before the
+            // roadmap is read, so the walk takes it up next
+            lines.extend(read_ci(store, unix_now()).await);
             let roadmap = store.load().await?;
             plans = crate::commands::run::plans_next(&roadmap.gambits);
             let router = crate::router::Router::load(&root).unwrap_or_default();

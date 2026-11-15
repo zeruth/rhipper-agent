@@ -1582,6 +1582,8 @@ struct Workspace {
     allocation_key: Option<AllocationKey>,
     /// The cards landed toward the next look-back pass, and whether one is running now.
     lookback: (u32, bool),
+    /// The project's CI on main as the walk last read it.
+    ci: Option<ra_console::hub::CiState>,
     /// What changed since the person last looked, read with the allocation.
     since: since::Since,
     /// The cards that wait on the person, read with the allocation.
@@ -1817,6 +1819,7 @@ impl Workspace {
             allocation_looked: None,
             allocation_key: None,
             lookback: (0, false),
+            ci: None,
             since: since::Since::default(),
             waiting: Vec::new(),
             landed: (0, None),
@@ -4289,6 +4292,7 @@ impl Workspace {
             self.waiting = ra_console::hub::waiting(&self.root, &nodes);
             self.landed = ra_console::allocation::landed(&self.root);
             self.lookback = (ra_console::lookback::landed_since(&self.root), ra_console::lookback::running(&self.root));
+            self.ci = ra_console::hub::ci_state(&self.root);
             self.since = since::of(&self.root, u32::try_from(self.waiting.len()).unwrap_or(u32::MAX));
             // only an idle project says how its walk ended, and only it pays for the read
             if live.is_none() {
@@ -4400,6 +4404,11 @@ impl Workspace {
                     .on_hover_text(format!(
                         "every {every} landed cards the walk reads this project's look-backs and gotchas, plans the cards they call for, and archives the logs"
                     ));
+                    // the CI on main, read by the walk once an hour; a red one has its card filed
+                    if let Some(ci) = &self.ci {
+                        let (text, color) = if ci.red { ("ci red", theme::warn_text()) } else { ("ci green", theme::online()) };
+                        cards::badge(ui, text, color).on_hover_text(ci.line.as_str());
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let button = egui::Button::new(RichText::new("open ›").color(theme::text()))
