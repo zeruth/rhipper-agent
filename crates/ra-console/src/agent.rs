@@ -4447,7 +4447,17 @@ async fn diff_base(project: &Path, root: &Path) -> String {
     if same_tree(project, root) {
         return String::from("HEAD");
     }
+    // a merge of the project's branch still waiting for its commit (a run capped before the
+    // checkpoint) leaves the merge base at the old one, and what main brought would read as
+    // the card's change: the incoming tip is the base then, when it is the project's (an
+    // ancestor of its branch, which may have moved on since); a merge of another branch is the
+    // card's own
     let Ok(main) = git(project, &["rev-parse", "--abbrev-ref", "HEAD"]).await else { return String::from("HEAD") };
+    if let Ok(incoming) = git(root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await
+        && git(root, &["merge-base", "--is-ancestor", &incoming, &main]).await.is_ok()
+    {
+        return incoming;
+    }
     git(root, &["merge-base", "HEAD", &main]).await.unwrap_or_else(|_| String::from("HEAD"))
 }
 
@@ -4461,7 +4471,7 @@ fn same_tree(project: &Path, root: &Path) -> bool {
 
 /// The files of a card's branch in its worktree: what differs from the merge base with the
 /// project's branch, committed in a checkpoint or not, and the new files not yet tracked.
-async fn branch_files(project: &Path, root: &Path) -> Vec<String> {
+pub async fn branch_files(project: &Path, root: &Path) -> Vec<String> {
     let base = diff_base(project, root).await;
     let mut files = Vec::new();
     for args in [&["diff", "--name-only", base.as_str()][..], &["ls-files", "--others", "--exclude-standard"][..]] {
