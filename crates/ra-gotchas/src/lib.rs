@@ -236,6 +236,25 @@ fn wsl_script(command: &str) -> Option<(usize, usize)> {
     (short_c && flags.iter().all(|f| f.starts_with('-'))).then_some((at, close + 1))
 }
 
+/// The form for `clang`, `clang-cl` or an `llvm-*` tool piped into `grep`, `head` or `tail`: such
+/// a tool has no flags to cut its output with, so the command runs alone, its output is kept in
+/// a file under `var/`, and the file is searched with Grep. `None` for any other command.
+fn tool_pipe_form(command: &str) -> Option<String> {
+    let (tool_part, filter) = command.split_once('|')?;
+    let alone = tool_part.trim().trim_end_matches("2>&1").trim();
+    let tool = alone.split_whitespace().next()?;
+    let stem = tool.rsplit(['/', '\\']).next()?.trim_end_matches(".exe");
+    if !(stem == "clang" || stem == "clang-cl" || stem.starts_with("llvm-")) || alone.contains([';', '&']) {
+        return None;
+    }
+    if !matches!(filter.split_whitespace().next(), Some("grep" | "head" | "tail")) {
+        return None;
+    }
+    Some(format!(
+        "this pipeline was refused: `{stem}` has no flag to cut its output, so run the command alone, as a single unpiped command: `{alone}`; its output is kept in var/{stem}-output.txt, and you search that file with Grep"
+    ))
+}
+
 /// Whether the shape table allows every part of `command` in either shell.
 fn shaped_allowed(command: &str) -> bool {
     [shape::Shell::Bash, shape::Shell::PowerShell]
@@ -595,6 +614,10 @@ impl Catalogue {
                 // command as written is judged, and a rewritten one is the rewrite's to answer
                 Remedy::Hint if gotcha.id == PIPED_OR_CHAINED && (conditions.allowed || rewritten.is_some() || shaped_allowed(command)) => {
                     continue;
+                }
+                Remedy::Hint if gotcha.id == PIPED_OR_CHAINED => {
+                    let reason = tool_pipe_form(command).unwrap_or_else(|| gotcha.message.clone());
+                    return Verdict::Deny { id: gotcha.id.clone(), reason };
                 }
                 Remedy::Hint => return Verdict::Deny { id: gotcha.id.clone(), reason: gotcha.message.clone() },
                 Remedy::Allow => break,
