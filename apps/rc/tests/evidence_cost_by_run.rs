@@ -50,5 +50,5 @@ fn the_evidence_line_lists_each_run_with_its_turns_tokens_and_outcome() {
 fn a_run_without_a_handoff_is_unfinished() {
     let card = CardCost { node: 9, totals: Totals { calls: 1, turns: 2, ..Totals::default() } };
     let line = ledger_line_by_run(&card, &[call(2, 400, None)], &[]);
-    assert!(line.text.ends_with("; runs: r1 2t 200 unfinished"), "{}", line.text);
+    assert!(line.text.ends_with("; runs: r1 2t 200 unfinished (no report)"), "{}", line.text);
 }
