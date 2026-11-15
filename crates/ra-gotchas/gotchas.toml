@@ -106,6 +106,14 @@ message = "sed is refused: read a range of a file with the Read tool and its off
 remedy = { kind = "hint" }
 
 [[gotcha]]
+# `python x.py` in Bash: the script is the form WSL takes, so the message names that route
+id = "python-in-bash"
+where = "command"
+pattern = '(^|[;&|]\s*)(&\s*)?python3?(\.exe)?\s+(-[A-Za-z]+\s+)*[^-\s]\S*\.py\b'
+message = "python <file>.py is refused in Bash: put the python3 call in a .sh with the Write tool and run that under `wsl -d Ubuntu-24.04 -- bash -l <script>.sh`"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 # `python x.py` or `python -c`: no runtime runs under the hook; WSL has python3 for a script
 id = "python"
 where = "command"

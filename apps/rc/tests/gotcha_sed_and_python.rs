@@ -20,7 +20,7 @@ fn sed_n_points_to_read_with_offset_and_limit() {
 
 #[test]
 fn python_points_to_wsl_bash_with_python3_inside() {
-    let reason = refusal("python tools/x.py", "python");
+    let reason = refusal("python -c \"print(1)\"", "python");
     assert!(reason.contains("wsl -- bash -l"), "{reason}");
     assert!(reason.contains("python3"), "{reason}");
 }

@@ -597,7 +597,7 @@ impl Catalogue {
                 }
                 Remedy::Hint if gotcha.id == WSL_SCRIPT && conditions.allowed => continue,
                 // the python hint stands aside where the project allows its shell commands, as the allowlist hint does
-                Remedy::Hint if gotcha.id == "python" && conditions.allowed => continue,
+                Remedy::Hint if matches!(gotcha.id.as_str(), "python" | "python-in-bash") && conditions.allowed => continue,
                 // a catalogue from before `git merge-base` was read as a read ends its git
                 // writes at a `\b`, which `merge-base` passes: a match running into a hyphen
                 // is another subcommand
