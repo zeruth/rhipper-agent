@@ -8665,6 +8665,32 @@ fn held_reason(report: &str, changed: &[String], failed: Option<&CheckRun>, prin
 /// How many lines of a passed command's output the notes keep.
 const PASSED_TAIL_LINES: usize = 5;
 
+/// The output a passed, filtered `cargo test` keeps: the result lines of the binaries that ran
+/// a test, so the last binary's `0 passed; 11 filtered out` cannot read as the test not
+/// running. Every binary reporting `0 passed` is a filter that matched no test: an error. An
+/// output with no result line at all (not a cargo test's) is kept as it is.
+///
+/// # Errors
+/// When the output has result lines and none of them ran a test.
+pub fn ran_of(output: &str) -> anyhow::Result<String> {
+    let results: Vec<&str> = output.lines().filter(|line| line.trim_start().starts_with("test result:")).collect();
+    if results.is_empty() {
+        return Ok(output.to_owned());
+    }
+    let ran: Vec<&str> = results
+        .iter()
+        .copied()
+        .filter(|line| {
+            let before = line.split(" passed").next().unwrap_or_default();
+            before.rsplit(' ').next().and_then(|n| n.parse::<u64>().ok()).is_some_and(|n| n > 0) && line.contains(" passed")
+        })
+        .collect();
+    if ran.is_empty() {
+        anyhow::bail!("the filter matched no test: every test binary reported 0 passed\n{}", results.join("\n"));
+    }
+    Ok(ran.join("\n"))
+}
+
 /// Runs the checks of a card in the project directory, in the order written, and stops at the
 /// first failure; each command's verdict goes to the activity log as it comes. Each command is
 /// split into its words once, here, and they reach the program as its arguments. A passed
@@ -8681,6 +8707,10 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
         let outcome = match (outcome, toolbox, ra_tools::words(command)) {
             (Ok((false, output)), Ok(toolbox), Ok(words)) => Ok(rerun_alone(toolbox, &words, output).await),
             (outcome, ..) => outcome,
+        };
+        let outcome = match outcome {
+            Ok((true, output)) if names_tests(command) && command.contains("cargo") => ran_of(&output).map(|kept| (true, kept)),
+            outcome => outcome,
         };
         let kept = if orchestrated.contains(command) { TAIL_LINES } else { PASSED_TAIL_LINES };
         let run = match outcome {
