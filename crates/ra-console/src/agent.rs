@@ -6833,10 +6833,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         if let Some(again) = reread(&session.reads) {
             lines.push(format!("  re-read: {again}"));
         }
-        let mut notes = crate::retro::parse(&session.text);
+        let mut lookback_notes = crate::retro::kept(crate::retro::parse(&session.text));
         // a bullet without its tag is put to the classify role, when it has a model: the
         // worker forgets the tag more often than it misplaces it
-        for note in notes.iter_mut().filter(|note| !note.machine) {
+        for note in lookback_notes.iter_mut().filter(|note| !note.machine) {
             if let Some(answer) = worker.ask_role(roles, Role::Classify, Some(id), crate::retro::CLASSIFY, &note.text).await
                 && let Some(machine) = crate::retro::classified(&answer)
             {
@@ -6845,13 +6845,13 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         }
         // the acceptance the notes were written against, so a later change of it retires them
         let print = crate::retro::acceptance_print(node.acceptance.as_deref());
-        for note in &mut notes {
+        for note in &mut lookback_notes {
             note.against = Some(print.clone());
         }
-        if let Err(e) = crate::retro::record(&root, Some(id), &notes) {
+        if let Err(e) = crate::retro::record(&root, Some(id), &lookback_notes) {
             tracing::warn!("the look back of #{id} was not kept: {e:#}");
         }
-        for note in &notes {
+        for note in &lookback_notes {
             lines.push(format!("  ↯ {}{}", if note.machine { "[machine] " } else { "" }, note.text));
         }
     }

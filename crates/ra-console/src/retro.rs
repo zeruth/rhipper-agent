@@ -126,6 +126,24 @@ pub fn parse(report: &str) -> Vec<Note> {
     notes
 }
 
+/// The bullets of a look-back worth keeping: one tagged `[machine]` or `[saving]`, or whose text
+/// names a cost (time, turns, tokens, reads, calls, refusals, reruns); a bullet that names none
+/// is not evidence and is dropped before it is logged.
+#[must_use]
+pub fn kept(notes: Vec<Note>) -> Vec<Note> {
+    const COSTS: [&str; 16] = [
+        "turn", "token", "cost", "time", "read", "search", "call", "refus", "rerun", "wait", "slow", "minute", "second", "saved", "extra",
+        "retry",
+    ];
+    notes
+        .into_iter()
+        .filter(|note| {
+            let lower = note.text.to_lowercase();
+            note.machine || lower.starts_with(SAVING) || COSTS.iter().any(|word| lower.contains(word))
+        })
+        .collect()
+}
+
 /// Keeps the bullets of a run of `node`, newest last; the `[machine]` ones go to the shared
 /// store too.
 ///
