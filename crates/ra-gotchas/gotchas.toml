@@ -45,7 +45,7 @@ remedy = { kind = "hint" }
 # PowerShell `& $var` call are refused whole; named before the run, ahead of the allowlist hint
 id = "shell-variable-command"
 where = "command"
-pattern = '\$\?|\bfor\s+\$?\w+\s+in\b[^\n]*\$\w|\bfor\s*\(\s*\$\w|(^|[;|&(]|&&)\s*&\s+\$\w'
+pattern = '\$\?|\bfor\s+\$?\w+\s+in\b[^\n]*\$\w|\bfor\s*\(\s*\$\w|(^|[;|(]|&&)\s*&\s+\$\w'
 message = "the hook cannot check a variable before it runs: drop `$?` (the exit status comes back in the tool result), and instead of a `for` loop over a variable or `& $var`, write the literal path once per file, one command each"
 remedy = { kind = "hint" }
 
