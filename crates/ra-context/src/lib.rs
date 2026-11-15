@@ -1177,6 +1177,28 @@ pub const FINGERPRINT_MARK: &str = " · fingerprint ";
 /// The verdict is kept in the file, so the next run of the card tells the same points again.
 pub const POINTS_MARK: &str = " · points ";
 
+/// How many `needs revision` verdicts, of any points, a card draws before it is held.
+pub const REVISIONS_BEFORE_HOLD: usize = 4;
+
+impl TaskContext {
+    /// Whether the card's verdicts hold it for the person: its last handoff carries the third
+    /// `needs revision` verdict with points an earlier one drew too, or the fourth of any
+    /// points. The reason names which; `None` leaves the card to another run.
+    #[must_use]
+    pub fn review_hold(&self) -> Option<String> {
+        let rejected: Vec<&Handoff> =
+            self.handoffs.iter().filter(|h| h.verdict.as_deref().is_some_and(|v| v.starts_with("needs revision"))).collect();
+        let (last, earlier) = rejected.split_last()?;
+        let count = rejected.len();
+        if count >= REVISIONS_BEFORE_HOLD {
+            return Some(format!("the reviewer sent it back {count} times"));
+        }
+        let print = last.points()?;
+        (count >= 3 && earlier.iter().any(|h| h.points() == Some(print)))
+            .then(|| format!("the reviewer sent it back {count} times, with the same points again"))
+    }
+}
+
 impl Handoff {
     /// The fingerprint of the failed check the run ended on, as its check line carries it;
     /// `None` for a run whose check passed or that predates the fingerprints.

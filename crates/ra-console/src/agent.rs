@@ -1752,7 +1752,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
         }
         Verdict::Accepted | Verdict::Malformed => String::new(),
     };
-    let Judged { state, mut head, said, trivial } = judged(&verdict, id, &model, &root, accepted);
+    let Judged { mut state, mut head, said, trivial } = judged(&verdict, id, &model, &root, accepted);
     // the notes say the verdict came from the second ask; the first answer's usage is booked above
     if reasked {
         head = match head.split_once('\n') {
@@ -1782,6 +1782,19 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
         if let Err(e) = task.save(&root) {
             tracing::warn!("the verdict of #{id} was not saved on its handoff: {e:#}");
         }
+    }
+    // a card the reviewer keeps sending back is held for the person, not queued again
+    if state == TaskState::NeedsRevision
+        && let Verdict::NeedsRevision(points) = &verdict
+        && let Some(why) = task.review_hold()
+    {
+        let list: Vec<String> = points.iter().map(|point| format!("- {point}")).collect();
+        let reason = format!("blocked by the review loop: {why}");
+        head = format!("{reason}\nrecurring points:\n{}", list.join("\n"));
+        let text = format!("#{id} {reason}: {}; a person sets it defined again", points.join("; "));
+        tracing::warn!("{text}");
+        crate::pair::event(&root, &text);
+        state = TaskState::Blocked;
     }
     // the verdict leads the notes when it is the next reader's task: a rejection's points for
     // the next run, or an acceptance the person asked for. An acceptance after a run leaves the
