@@ -9421,6 +9421,13 @@ async fn settle_idle(store: &Store, root: &Path, id: i64) -> Option<String> {
     Some(format!("  {text}; a person sets it defined again"))
 }
 
+/// Drives [`held_round`] for an integration test.
+#[doc(hidden)]
+#[must_use]
+pub fn held_round_hook(last: &ra_context::Handoff, previous: Option<&ra_context::Handoff>, notes: &str) -> Option<String> {
+    held_round(last, previous, notes)
+}
+
 /// Why the run of `last` holds its card on this round, before any second idle run: it changed
 /// no file, and its report stands under `## Blocked`, says only a person can move the card, or
 /// it drew the reviewer's points the run of `previous` drew. `None` leaves the round to
