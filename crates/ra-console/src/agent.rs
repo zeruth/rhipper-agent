@@ -3079,11 +3079,29 @@ async fn walk_runner(store: &Store, root: &Path, id: i64, worker: &Worker) -> an
     // a clean merge is proven before the worker gets the tree; a failure is the run's first job
     if let Some((line, merge_base)) = catch_up_worktree(root, &path, &node).await {
         lines.push(line);
+        relocate_handoff_points(root, &path, id);
         if let Some(merge_base) = merge_base {
             lines.extend(prove_tree(root, &path, &node, &runner, &merge_base, "the merge of the project's branch").await);
         }
     }
     Ok((runner, lines))
+}
+
+/// After a catch-up merge, the last handoff's warnings are found again by their quoted text in
+/// the merged tree and their line numbers rewritten; a point whose text is gone says `resolved?`.
+fn relocate_handoff_points(root: &Path, tree: &Path, id: i64) {
+    let mut task = ra_context::TaskContext::open(root, id);
+    let Some(last) = task.handoffs.last_mut() else { return };
+    if last.warnings.is_empty() {
+        return;
+    }
+    let moved = crate::commands::review::points::relocate_all(&last.warnings, |file| std::fs::read_to_string(tree.join(file)).ok());
+    if moved != last.warnings {
+        last.warnings = moved;
+        if let Err(e) = task.save(root) {
+            tracing::warn!("the context of #{id} was not saved: {e:#}");
+        }
+    }
 }
 
 /// How many times a walk reruns a card whose check (or lint) failed before it leaves the card
@@ -5320,6 +5338,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 let merged = match catch_up_worktree(&root, &path, node).await {
                     Some((line, merge_base)) => {
                         lines.push(line);
+                        relocate_handoff_points(&root, &path, id);
                         merge_base
                     }
                     None => None,
@@ -6321,7 +6340,12 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 lint.warnings.len(),
                 lint.command
             );
-            lint_warnings = lint.warnings;
+            // each point quotes its line, so a merge from main that moves it is followed by text
+            lint_warnings = lint
+                .warnings
+                .iter()
+                .map(|w| crate::commands::review::points::quote(w, |file| std::fs::read_to_string(acting.join(file)).ok()))
+                .collect();
         }
     }
     // a card no rerun can move is held for a person on the first sight, with the line that

@@ -2,6 +2,8 @@
 //! for a person's attention. Rule-based, on the words of the reviewer's points; the tag goes on
 //! the card's handoff so the walk and the pair feed can tell the two apart.
 
+pub mod points;
+
 /// How much a needs-revision verdict asks of the next run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Weight {
