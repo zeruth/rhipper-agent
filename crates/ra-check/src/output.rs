@@ -59,6 +59,45 @@ fn failed_name(line: &str) -> Option<String> {
     Some(format!("{class}.{method}"))
 }
 
+/// The names of the test functions a unified diff adds: an added `#[test]`-style attribute
+/// followed by an added `fn`.
+#[must_use]
+pub fn new_tests(diff: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut pending = false;
+    for line in diff.lines() {
+        let Some(added) = line.strip_prefix('+').filter(|_| !line.starts_with("+++")) else {
+            // a context or removed line breaks the attribute from its function
+            pending = false;
+            continue;
+        };
+        let added = added.trim();
+        if added.starts_with("#[test") || added.starts_with("#[tokio::test") {
+            pending = true;
+        } else if pending && added.starts_with("#[") {
+            // another attribute between the test attribute and its function
+        } else if pending {
+            pending = false;
+            let rest = added.strip_prefix("async ").unwrap_or(added);
+            if let Some(name) = rest.strip_prefix("fn ").and_then(|r| r.split('(').next()) {
+                names.push(name.trim().to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// The tests among `names` that the output printed a `test path::name ... ` line for.
+#[must_use]
+pub fn ran_of(names: &[String], output: &str) -> Vec<String> {
+    let printed: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("test "))
+        .filter_map(|rest| rest.split_once(" ... ").map(|(name, _)| name))
+        .collect();
+    names.iter().filter(|name| printed.iter().any(|p| *p == name.as_str() || p.ends_with(&format!("::{name}")))).cloned().collect()
+}
+
 fn is_compile_error(line: &str) -> bool {
     if line.starts_with("error[") || line.starts_with("e: ") {
         return true;

@@ -41,6 +41,16 @@ fn gradle_failures_read_as_class_dot_method() {
     assert_eq!(ran.failed, vec!["FooTest.bar".to_owned()]);
 }
 
+const DIFF: &str = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,12 @@\n fn old() {}\n+\n+#[test]\n+fn first_new() {}\n+\n+#[test]\n+fn second_new() {}\n+\n+fn helper() {}\n";
+
+#[test]
+fn new_tests_name_the_added_tests_and_which_the_run_printed() {
+    let added = new_tests(DIFF);
+    assert_eq!(added, vec!["first_new".to_owned(), "second_new".to_owned()]);
+    let ran = ran_of(&added, "running 1 test\ntest tests::first_new ... ok\n");
+    assert_eq!(ran, vec!["first_new".to_owned()]);
+}
+
 #[test]
 fn quiet_cargo_failures_read_by_name() {
     let ran = parse("bad::case --- FAILED\n");
