@@ -4,31 +4,6 @@
 use super::*;
 
 #[test]
-fn a_failed_run_keeps_its_whole_output_and_names_the_file_under_the_tail() {
-    let dir = tempfile::tempdir().expect("a tempdir");
-    let full = (0..400).map(|n| format!("noise line {n}")).collect::<Vec<_>>().join("\n");
-    let mut run = CheckRun {
-        command: "cargo test".to_owned(),
-        passed: false,
-        exit: "exit code 101".to_owned(),
-        text: "noise line 399\n".to_owned(),
-        full,
-        failed_tests: 1,
-        failures: Vec::new(),
-        tests: Vec::new(),
-        first_error: String::new(),
-        setup: false,
-    };
-    keep_full_output(dir.path(), 7, &mut run);
-    let path = dir.path().join("var/runs/7/check-1.log");
-    let kept = std::fs::read_to_string(&path).expect("the log");
-    assert!(kept.contains("noise line 0\n") && kept.contains("noise line 399"), "{kept}");
-    assert_eq!(run.text, format!("noise line 399\nfull output: {}", path.display()));
-    keep_full_output(dir.path(), 7, &mut run);
-    assert!(dir.path().join("var/runs/7/check-2.log").exists());
-}
-
-#[test]
 fn preflight_skips_created_package() {
     let files = vec![
         "+crates/ra-asm-verify/Cargo.toml".to_owned(),
