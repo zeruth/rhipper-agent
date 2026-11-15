@@ -592,7 +592,7 @@ pub(crate) fn harness_of(
     if let Some(shell) = &worker.shell {
         harness = harness.with_shell(shell);
     }
-    harness.with_web(worker.web.unwrap_or(false)).with_read_roots(read_roots(root, worker, var))
+    harness.with_builds_refused(worker.builds() == 0).with_web(worker.web.unwrap_or(false)).with_read_roots(read_roots(root, worker, var))
 }
 
 /// The directories outside its worktree a run of the project at `root` may read, absolute and

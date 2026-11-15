@@ -605,10 +605,26 @@ fn on_path(program: &str) -> bool {
 /// list leaves `rg` out and names what searches in its place.
 #[must_use]
 pub fn block_for(rg: bool) -> String {
+    block_with(rg, false)
+}
+
+/// [`block`] for a project whose builds are `refused` or not, on this shell's PATH.
+#[must_use]
+pub fn block_when(builds_refused: bool) -> String {
+    block_with(on_path("rg"), builds_refused)
+}
+
+/// [`block_for`] for a project whose builds are refused: `cargo` is not listed as running,
+/// one line says `cargo fmt` and `rustfmt` are the only cargo commands that do.
+#[must_use]
+pub fn block_with(rg: bool, builds_refused: bool) -> String {
     let names = |shell: Shell| {
         let mut seen: Vec<&str> = Vec::new();
         for rule in shell.allowed() {
             let name = rule.trim_end_matches('*').trim_end();
+            if builds_refused && matches!(name, "cargo" | "rustfmt") {
+                continue;
+            }
             if (rg || name != "rg") && !seen.contains(&name) {
                 seen.push(name);
             }
@@ -625,6 +641,9 @@ pub fn block_for(rg: bool) -> String {
         "- a `$( )` or backtick substitution, a `( )` or `{ }` block, a heredoc and a `<` redirect are not judged by the hook, and the allowlist usually refuses them".to_owned(),
         "- refused, with what to use instead:".to_owned(),
     ];
+    if builds_refused {
+        lines.insert(3, "- this project's builds are refused: `cargo fmt`/`rustfmt` are the only cargo commands that run, and the check does the building".to_owned());
+    }
     if !rg {
         lines.insert(3, "- `rg` is not on this shell's PATH: search with the Grep tool or `grep`".to_owned());
     }

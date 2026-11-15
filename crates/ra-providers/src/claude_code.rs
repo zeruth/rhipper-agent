@@ -88,6 +88,8 @@ pub struct ClaudeCode {
     shell: Option<String>,
     /// The project lets its builders use the web tools.
     web: bool,
+    /// The project refuses every build: the handoff says only `cargo fmt` runs.
+    builds_refused: bool,
 }
 
 impl Default for ClaudeCode {
@@ -117,7 +119,15 @@ impl ClaudeCode {
             read_roots: Vec::new(),
             shell: None,
             web: false,
+            builds_refused: false,
         }
+    }
+
+    /// Whether the project refuses every build, so the prompt's shell rules say so.
+    #[must_use]
+    pub fn with_builds_refused(mut self, refused: bool) -> Self {
+        self.builds_refused = refused;
+        self
     }
 
     /// The one shell a worker gets, by the tool's name or in any case (`bash`, `powershell`,
@@ -323,7 +333,7 @@ impl ClaudeCode {
             if !system.is_empty() {
                 system.push_str("\n\n");
             }
-            system.push_str(&ra_gotchas::shape::block());
+            system.push_str(&ra_gotchas::shape::block_when(self.builds_refused));
             if !self.own_prefixes.is_empty() {
                 let _ = writeln!(system, "\n- the project's own commands run too: {}", self.own_prefixes.join(", "));
             }
