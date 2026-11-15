@@ -36,7 +36,7 @@ impl Job {
 
     /// Writes the exit line the waiters read.
     pub(crate) fn finish(&self, code: i32) {
-        let _ = std::fs::write(jobs_dir(&self.dir).join(format!("{}.exit", self.id)), format!("{} exited {code}\n", self.id));
+        let _ = std::fs::write(jobs_dir(&self.dir).join(format!("{}.exit", self.id)), crate::wait_finished::exit_line(self.id, code));
     }
 }
 
@@ -62,8 +62,12 @@ fn newest(dir: &Path) -> Option<u32> {
 pub(crate) fn run(dir: &Path, target: Option<&str>, timeout: Option<Duration>) -> i32 {
     let id = if let Some(t) = target {
         match t.trim().parse::<u32>() {
+            // a build that ended while queued is answered at once, whatever its record says
+            Ok(id) if jobs_dir(dir).join(format!("{id}.exit")).exists() => return crate::wait_finished::finished(dir, id).unwrap_or(1),
             Ok(id) if jobs_dir(dir).join(format!("{id}.job")).exists() => id,
-            _ => return ra_console::agent::wait(dir, t, timeout.unwrap_or(ra_console::agent::WAIT_LIMIT)),
+            // a pid whose job is not recorded yet is still watched for its exit line
+            Ok(id) => return crate::wait_finished::wait_pid(dir, id, timeout.unwrap_or(ra_console::agent::WAIT_LIMIT)),
+            Err(_) => return ra_console::agent::wait(dir, t, timeout.unwrap_or(ra_console::agent::WAIT_LIMIT)),
         }
     } else {
         let Some(id) = newest(dir) else {
@@ -79,17 +83,18 @@ pub(crate) fn run(dir: &Path, target: Option<&str>, timeout: Option<Duration>) -
 /// is waited on whatever the limit, a compile is not a silence.
 fn wait_job(dir: &Path, id: u32, progress: Duration) -> i32 {
     println!("waiting {id}");
-    let exit = jobs_dir(dir).join(format!("{id}.exit"));
     let started = Instant::now();
     let mut last_line = started;
     loop {
-        if let Ok(line) = std::fs::read_to_string(&exit) {
-            print!("{line}");
-            return line.split_whitespace().last().and_then(|c| c.parse().ok()).unwrap_or(0);
+        if let Some(code) = crate::wait_finished::finished(dir, id) {
+            return code;
         }
-        if !ra_console::hub::pid_alive(id) && !exit.exists() {
-            println!("{id} ended without an exit line");
-            return 1;
+        if !ra_console::hub::pid_alive(id) {
+            // the exit line may land between the read and the pid's end
+            return crate::wait_finished::finished(dir, id).unwrap_or_else(|| {
+                println!("{id} ended without an exit line");
+                1
+            });
         }
         if last_line.elapsed() >= progress {
             println!("still running {id} · {}s", started.elapsed().as_secs());

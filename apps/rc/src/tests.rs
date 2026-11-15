@@ -348,6 +348,14 @@ fn wait_outlives_a_running_job() {
 }
 
 #[test]
+fn the_exit_line_a_job_writes_reads_back_as_its_code() {
+    assert_eq!(wait_finished::exit_code(42, &wait_finished::exit_line(42, 3)), Some(3));
+    assert_eq!(wait_finished::exit_code(42, &wait_finished::exit_line(42, -1)), Some(-1));
+    assert_eq!(wait_finished::exit_code(42, "42 exited\n"), None);
+    assert_eq!(wait_finished::exit_code(42, "41 exited 0\n"), None);
+}
+
+#[test]
 fn bench_reads_the_hub() {
     let known = vec![PathBuf::from("no-such/asm"), PathBuf::from("no-such/agent"), PathBuf::from("no-such/runelite")];
     let order = vec!["Agent".to_owned(), "runelite".to_owned()];

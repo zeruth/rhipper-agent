@@ -19,6 +19,7 @@ mod bench;
 mod doctor;
 mod status;
 mod wait;
+mod wait_finished;
 
 #[derive(Parser)]
 #[command(name = "rc", version = ra_console::VERSION, about = "Rhipper Agent: the roadmap-driven multi-model development orchestrator")]
