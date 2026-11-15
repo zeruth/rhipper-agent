@@ -11030,7 +11030,62 @@ const RERUN_REPORT_LINES: usize = 20;
 fn rerun_block(task: &ra_context::TaskContext, node: &Node, acting: &Path, root: &Path) -> Option<String> {
     let mut since = task.handoffs.last().map(|last| since_last_run(acting, root, node.id, last.when)).unwrap_or_default();
     since.extend(behind_main(acting, &node.files));
+    if let Some(last) = task.handoffs.last() {
+        since.extend(commits_touching_failures(acting, last, &node.files));
+    }
     rerun_text(task, node, &since)
+}
+
+/// How many commits a rerun's block lists for a failed test's files.
+const FAILURE_COMMITS: usize = 10;
+
+/// The source paths a failure text names: a panic's `file.rs:12:5` and a compiler's `--> file.rs:3:1`.
+fn failure_paths(failures: &[String]) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for word in failures.iter().flat_map(|f| f.split_whitespace()) {
+        let path = word.trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | ',')).replace('\\', "/");
+        let path = path.split(".rs").next().filter(|_| path.contains(".rs")).map(|stem| format!("{stem}.rs"));
+        if let Some(path) = path.filter(|p| p.len() > 3 && !p.contains(':') && !p.starts_with('/'))
+            && !paths.contains(&path)
+        {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// The commits since the last run (`last`) that touch the file of a test it failed or the card's
+/// `files`, as hash and subject, newest first, at most [`FAILURE_COMMITS`]; nothing when the run
+/// failed no test or the tree has no such commit.
+pub fn commits_touching_failures(acting: &Path, last: &ra_context::Handoff, files: &[String]) -> Vec<String> {
+    let mut paths = failure_paths(&last.failures);
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    paths.extend(files.iter().map(|f| f.trim_start_matches('+').replace('\\', "/")));
+    paths.sort();
+    paths.dedup();
+    let mut args = vec!["log", "--format=%h %ct %s", "-n", "200", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    let Some(log) = std::process::Command::new("git")
+        .args(&args)
+        .current_dir(acting)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    else {
+        return Vec::new();
+    };
+    log.lines()
+        .filter_map(|line| {
+            let (hash, rest) = line.split_once(' ')?;
+            let (at, subject) = rest.split_once(' ')?;
+            (at.parse::<u64>().ok()? > last.when)
+                .then(|| format!("commit {hash} {subject} (touches a failed test's file or the card's files)"))
+        })
+        .take(FAILURE_COMMITS)
+        .collect()
 }
 
 /// How far the tree a card acts in is behind `main`: the count of commits it lacks, the subjects
