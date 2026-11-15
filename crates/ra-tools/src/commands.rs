@@ -65,7 +65,9 @@ impl Toolbox {
             !allowlisted || allowed(program, &args),
             "{program} is not allowed; the commands are cargo, and git status, diff, log and show"
         );
-        let (code, mut text) = if let Some(script) = &self.script {
+        let is_cargo = std::path::Path::new(program).file_stem().is_some_and(|stem| stem.eq_ignore_ascii_case("cargo"));
+        let script = self.script.as_ref().or(self.cargo.as_ref().filter(|_| is_cargo));
+        let (code, mut text) = if let Some(script) = script {
             let (code, text) = script(command)?;
             (Some(code), text)
         } else {

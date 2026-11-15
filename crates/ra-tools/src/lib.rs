@@ -42,6 +42,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_mins(10);
 pub struct Toolbox {
     root: PathBuf,
     script: Option<Script>,
+    /// What answers the cargo commands alone when no [`script`](Self::with_script) answers
+    /// every one: the rest run in the shell, under the timeout and the environment.
+    cargo: Option<Script>,
     /// How long a command may run before it is stopped.
     timeout: Duration,
     /// The environment a command gets beyond the process's own; set last, so it wins.
@@ -62,7 +65,7 @@ impl Toolbox {
     pub fn new(root: &Path) -> anyhow::Result<Self> {
         let root = root.canonicalize().with_context(|| format!("no workspace at {}", root.display()))?;
         anyhow::ensure!(root.is_dir(), "the workspace {} is not a directory", root.display());
-        Ok(Self { root, script: None, timeout: DEFAULT_TIMEOUT, env: Vec::new() })
+        Ok(Self { root, script: None, cargo: None, timeout: DEFAULT_TIMEOUT, env: Vec::new() })
     }
 
     /// The same toolbox, giving every command `env` over the process's own environment.
@@ -76,6 +79,13 @@ impl Toolbox {
     #[must_use]
     pub fn with_script(mut self, script: Script) -> Self {
         self.script = Some(script);
+        self
+    }
+
+    /// The same toolbox, with `script` answering the cargo commands and the shell the rest.
+    #[must_use]
+    pub fn with_cargo(mut self, script: Script) -> Self {
+        self.cargo = Some(script);
         self
     }
 

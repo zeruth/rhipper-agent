@@ -130,6 +130,9 @@ pub struct Worker {
     /// What answers the commands of a run instead of the shell; the tests script the check and
     /// the lint with it.
     script: Option<ra_tools::Script>,
+    /// What answers the cargo commands of a run alone, the shell the rest: a test whose check is
+    /// a real process scripts its builds with it.
+    cargo: Option<ra_tools::Script>,
     /// Whether a dispatch dry-runs the acceptance's commands first; `None` is on for the shell
     /// and off for a scripted worker, whose script counts the commands it is asked.
     preflight: Option<bool>,
@@ -172,6 +175,7 @@ impl Worker {
             debug: !std::env::var("RHIPPER_DEBUG")
                 .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
             script: None,
+            cargo: None,
             preflight: None,
             roles: None,
             workspace: None,
@@ -241,6 +245,14 @@ impl Worker {
         self
     }
 
+    /// The same worker, with `script` answering the cargo commands a run makes and the shell
+    /// the rest.
+    #[must_use]
+    pub fn with_cargo(mut self, script: ra_tools::Script) -> Self {
+        self.cargo = Some(script);
+        self
+    }
+
     /// The same worker, with the dispatch's dry run of the acceptance forced on or off.
     #[must_use]
     pub fn with_preflight(mut self, on: bool) -> Self {
@@ -248,11 +260,18 @@ impl Worker {
         self
     }
 
-    /// The toolbox of a run over `root`, scripted when the worker is.
+    /// The toolbox of a run over `root`, scripted when the worker is. In a test build cargo
+    /// is never left to the shell: an unscripted build panics instead.
     fn toolbox(&self, root: &Path) -> anyhow::Result<ra_tools::Toolbox> {
         let toolbox = ra_tools::Toolbox::new(root)?;
-        Ok(match &self.script {
-            Some(script) => toolbox.with_script(script.clone()),
+        if let Some(script) = &self.script {
+            return Ok(toolbox.with_script(script.clone()));
+        }
+        let cargo = self.cargo.clone();
+        #[cfg(test)]
+        let cargo = cargo.or_else(|| Some(Arc::new(crate::unscripted) as ra_tools::Script));
+        Ok(match cargo {
+            Some(cargo) => toolbox.with_cargo(cargo),
             None => toolbox,
         })
     }

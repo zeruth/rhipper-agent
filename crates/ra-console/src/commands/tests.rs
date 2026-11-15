@@ -9,6 +9,12 @@ fn worker() -> Worker {
 }
 
 #[test]
+#[should_panic(expected = "unscripted cargo in a test")]
+fn unscripted_cargo_panics() {
+    let _ = crate::unscripted("cargo test -q");
+}
+
+#[test]
 fn a_model_id_routes_by_its_vendor_prefix() {
     use crate::agent::Route;
     assert_eq!(Route::of("claude-opus-5-5"), Route::ClaudeCode);
@@ -253,7 +259,7 @@ async fn run_honors_the_model_of_the_node() {
     let provider = Scripted::new(vec![says("done", Vec::new())]);
     // the badge is another OpenRouter model, so the scripted provider serves both; the node's
     // own model is what the request names
-    let worker = Worker::new("deepseek/deepseek-v4-flash").with_provider(provider.clone());
+    let worker = Worker::new("deepseek/deepseek-v4-flash").with_provider(provider.clone()).with_script(no_manifest());
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
     assert!(out[0].contains("on glm-5.3-flash"), "{out:?}");
     assert_eq!(provider.seen.lock()[0].model, "z-ai/glm-5.3-flash");
@@ -270,7 +276,7 @@ async fn files_names_the_paths_and_the_prompt_lists_them() {
     assert!(out.iter().any(|l| l == "    files: crates/a/src/lib.rs crates/b/src/main.rs"), "{out:?}");
 
     let provider = Scripted::new(vec![says("done", Vec::new())]);
-    let runner = worker().with_provider(provider.clone());
+    let runner = worker().with_provider(provider.clone()).with_script(no_manifest());
     run("/run 2", &store, &runner).await.unwrap();
     let seen = provider.seen.lock();
     let prompt = seen[0].messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
@@ -519,7 +525,7 @@ async fn run_on_a_bare_model_loops_through_the_tools_and_lands_the_answer() {
         says("wrote hello.txt and read it back", vec![]),
         says("accepted", vec![]),
     ]);
-    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone());
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(green());
 
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
     // no cap by default: the line names the turns used alone
@@ -562,7 +568,7 @@ async fn a_run_whose_mean_turn_passes_the_ceiling_is_noted_heavy_with_its_bigges
     let ceiling = crate::retro::TURN_CEILING;
     // two turns at 100,000 tokens and one at 10: the mean passes the ceiling
     let provider = Scripted::new(vec![says_at(100_000, "", vec![big, small]), says_at(100_000, "", vec![]), says("accepted", vec![])]);
-    let heavy = Worker::new("z-ai/glm-5.3-flash").with_provider(provider);
+    let heavy = Worker::new("z-ai/glm-5.3-flash").with_provider(provider).with_script(green());
     let (out, _) = run("/run 2", &store, &heavy).await.unwrap();
     let heavy = out.iter().find(|l| l.contains("[heavy]")).unwrap_or_else(|| panic!("{out:?}"));
     let expected = format!("[heavy] #2 100000 tokens/turn over the ceiling of {ceiling}; largest tool results: read_file big.txt (");
@@ -575,7 +581,9 @@ async fn a_run_whose_mean_turn_passes_the_ceiling_is_noted_heavy_with_its_bigges
     assert!(!crate::retro::machine_lines(dir.path()).contains("[heavy]"));
     // a run under the ceiling writes nothing
     run("/add task Light parent 1", &store, &worker()).await.unwrap();
-    let light = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![]), says("accepted", vec![])]));
+    let light = Worker::new("z-ai/glm-5.3-flash")
+        .with_provider(Scripted::new(vec![says("done", vec![]), says("accepted", vec![])]))
+        .with_script(green());
     let (out, _) = run("/run 3", &store, &light).await.unwrap();
     assert!(!out.iter().any(|l| l.contains("[heavy]")), "{out:?}");
     assert_eq!(crate::retro::recent(dir.path(), 5).len(), 1);
@@ -604,7 +612,7 @@ async fn a_project_turn_cap_ends_the_run_with_a_handoff_and_the_walk_takes_the_c
         says("wrote hello.txt and read it back", vec![]),
         says("accepted", vec![]),
     ]);
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(green());
 
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(out[0].starts_with("↻ #2 Probe continues on glm-5.3-flash · turns 2/2, 2 tool call(s)"), "{out:?}");
@@ -688,7 +696,7 @@ async fn a_harness_run_the_turn_cap_ends_books_its_usage_and_the_card_sums_its_s
     capped.whole_reads = 2;
     let script = vec![Ok(says("done", vec![])), Err(ra_providers::ProviderError::TurnsOut(Box::new(capped)))];
     let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
-    let runner = Worker::new("claude-opus-5-5").with_provider(CappedHarness::new(script)).with_ledger(ledger);
+    let runner = Worker::new("claude-opus-5-5").with_provider(CappedHarness::new(script)).with_ledger(ledger).with_script(green());
 
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(
@@ -745,8 +753,10 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_context_cap_
         Err(ra_providers::ProviderError::ContextOut { completion: Box::new(capped), cap: 120_000, size: 131_000 }),
     ];
     let harness = CappedHarness::new(script);
-    let runner =
-        Worker::new("claude-opus-5-5").with_provider(harness.clone()).with_ledger(ra_usage::UsageStore::in_memory().await.unwrap());
+    let runner = Worker::new("claude-opus-5-5")
+        .with_provider(harness.clone())
+        .with_ledger(ra_usage::UsageStore::in_memory().await.unwrap())
+        .with_script(green());
 
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(
@@ -822,7 +832,7 @@ async fn a_finished_run_end_line_carries_the_read_in_and_the_files_read_whole_an
     done.read_in = 3208;
     done.whole_reads = 2;
     let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
-    let runner = Worker::new("claude-opus-5-5").with_provider(CappedHarness::new(vec![Ok(done)])).with_ledger(ledger);
+    let runner = Worker::new("claude-opus-5-5").with_provider(CappedHarness::new(vec![Ok(done)])).with_ledger(ledger).with_script(green());
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(
         out[0].starts_with(
@@ -895,8 +905,10 @@ async fn a_placeholder_report_is_asked_again_on_its_session_and_a_real_one_is_no
         Ok(placeholder),
     ];
     let harness = CappedHarness::new(script);
-    let runner =
-        Worker::new("claude-opus-5-5").with_provider(harness.clone()).with_ledger(ra_usage::UsageStore::in_memory().await.unwrap());
+    let runner = Worker::new("claude-opus-5-5")
+        .with_provider(harness.clone())
+        .with_ledger(ra_usage::UsageStore::in_memory().await.unwrap())
+        .with_script(green());
 
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(out[0].starts_with("✓ #2 Probe implemented on claude-opus-5-5 · turns 2,"), "{out:?}");
@@ -1265,6 +1277,30 @@ fn cargo_project(dir: &std::path::Path, passing: bool) {
     std::fs::write(dir.join("src/lib.rs"), format!("#[test]\nfn probe() {{ assert!({passing}, \"the probe broke\"); }}\n")).unwrap();
 }
 
+/// A script that answers every command as a passing check, for a run whose probe would pass.
+fn green() -> ra_tools::Script {
+    std::sync::Arc::new(|_: &str| Ok((0, "test result: ok. 1 passed\n".to_owned())))
+}
+
+/// A script whose `cargo test` fails as the probe of a failing [`cargo_project`] does under
+/// `-q`; any other command passes.
+fn red_probe() -> ra_tools::Script {
+    std::sync::Arc::new(|command: &str| {
+        Ok(if command.starts_with("cargo test") {
+            let output = "probe --- FAILED\n\nfailures:\n\n---- probe stdout ----\nthread 'probe' panicked at src\\lib.rs:2:13:\nthe probe broke\n\nfailures:\n    probe\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+            (101, output.to_owned())
+        } else {
+            (0, "ok\n".to_owned())
+        })
+    })
+}
+
+/// A script that answers every command as cargo does in a directory with no manifest, for a
+/// run in a project the test never made a crate of.
+fn no_manifest() -> ra_tools::Script {
+    std::sync::Arc::new(|_: &str| Ok((101, "error: could not find `Cargo.toml` in the directory or any parent directory\n".to_owned())))
+}
+
 /// The package name of the probe in `dir`.
 fn probe_name(dir: &std::path::Path) -> String {
     let unique: String = dir.file_name().unwrap_or_default().to_string_lossy().chars().filter(char::is_ascii_alphanumeric).collect();
@@ -1328,7 +1364,10 @@ async fn checked_run(passing: bool) -> (Vec<String>, ra_roadmap::model::Node) {
     cargo_project(dir.path(), passing);
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
-    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![]), says("accepted", vec![])]));
+    let check = if passing { green() } else { red_probe() };
+    let worker = Worker::new("z-ai/glm-5.3-flash")
+        .with_provider(Scripted::new(vec![says("done", vec![]), says("accepted", vec![])]))
+        .with_script(check);
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
     let node = store.read(2).await.unwrap();
     (out, node)
@@ -1407,7 +1446,8 @@ async fn a_walk_judges_a_landed_cards_saving_on_the_ledger_before_and_after_its_
         read_in: 0,
     };
     ledger.record(&before).await.unwrap();
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(accepted_runs(&["did it"]))).with_ledger(ledger);
+    let runner =
+        Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(accepted_runs(&["did it"]))).with_ledger(ledger).with_script(green());
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
     // the run's two turns, its cost from the list prices, against the one card before it
     let held = format!("[saving] #{id} held: 2 turns, 110 tokens/turn, $0.02 vs median 1000; claimed \"fewer tokens a turn\"");
@@ -1537,7 +1577,7 @@ async fn run_all_walks_the_ready_cards_in_order_and_a_dependent_after_its_depend
     let dir = tempfile::tempdir().unwrap();
     let store = three_cards(dir.path(), true).await;
     let script = Scripted::new(accepted_runs(&["did A", "did B", "did C"]));
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(green());
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
     // #4 is not ready while #3 is open; it runs once #3 is implemented, after #2 and #3
     let ran = implemented(&out);
@@ -1568,7 +1608,11 @@ fn relaunched(_dir: &std::path::Path, _root: &std::path::Path) -> anyhow::Result
 async fn a_walk_moves_to_a_newer_installed_rc_after_its_card_and_goes_on_when_the_install_did_not_move() {
     let install = tempfile::tempdir().unwrap();
     let walk = |dir: &std::path::Path, script| {
-        Worker::new("z-ai/glm-5.3-flash").with_provider(script).with_install(Some(dir.to_path_buf())).with_relaunch(relaunched)
+        Worker::new("z-ai/glm-5.3-flash")
+            .with_provider(script)
+            .with_install(Some(dir.to_path_buf()))
+            .with_relaunch(relaunched)
+            .with_script(green())
     };
     // the install is newer than this build: the walk ends after its first card, never inside it
     std::fs::write(install.path().join(crate::hub::INSTALLED_FILE), "99.0.0 1\n").unwrap();
@@ -1608,7 +1652,7 @@ async fn a_matching_gambit_pulls_a_later_card_ahead_in_the_walk_and_a_priority_a
     store.set_priority(2, None).await.unwrap();
     // the walk itself runs in the scored order
     let script = Scripted::new(accepted_runs(&["did B", "did A", "did C"]));
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(green());
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
     let ran = implemented(&out);
     assert_eq!(ran.len(), 3, "{out:?}");
@@ -1638,7 +1682,7 @@ async fn a_walk_with_nothing_ready_plans_the_next_milestone_when_a_gambit_says_s
     store.set_gambit_plan_next(g1, true).await.unwrap();
     // the planner answers first, then the worker on the card it added, then its reviewer
     let script = Scripted::new(vec![says(PLANNED_CARD, vec![]), says("wrote it", vec![]), says("accepted", vec![])]);
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(green());
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
     assert_eq!(out[0], "#3 task Write the greeting {c2}", "{out:?}");
     assert!(out.iter().any(|l| l == "planned #2 M: 1 task added as defined by glm-5.3-flash"), "{out:?}");
@@ -2531,7 +2575,7 @@ async fn run_all_in_a_tight_window_takes_the_smallest_ready_card_first_and_the_s
     // a tenth of the window left: the walk takes the c1 before the c4 that stands earlier
     plan_at(dir.path(), 0.9);
     let script = Scripted::new(accepted_runs(&["did B", "did C", "did A"]));
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(green());
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
     let ran = implemented(&out);
     assert_eq!(ran.len(), 3, "{out:?}");
@@ -2547,7 +2591,7 @@ async fn run_all_in_a_tight_window_takes_the_smallest_ready_card_first_and_the_s
     store.set_complexity(3, 1).await.unwrap();
     plan_at(dir.path(), 0.5);
     let script = Scripted::new(accepted_runs(&["did A", "did B", "did C"]));
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone()).with_script(green());
     let out = crate::agent::run_all(&store, &runner, false).await.unwrap();
     let ran = implemented(&out);
     assert!(ran[0].starts_with("✓ #2 A implemented"), "{out:?}");
@@ -2934,7 +2978,9 @@ async fn in_debug_mode_the_run_keeps_the_worker_s_look_back_for_the_next_one() {
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     let report = "done\n\n## Faster next time\n- [machine] cargo test relinks rc.exe while the window runs: test with -p\n- the card named no files; a files line would have saved the search\n";
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(report, vec![]), says("accepted", vec![])]));
+    let runner = Worker::new("z-ai/glm-5.3-flash")
+        .with_provider(Scripted::new(vec![says(report, vec![]), says("accepted", vec![])]))
+        .with_script(green());
     assert!(runner.debug, "debug mode is on unless turned off");
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(out.iter().any(|l| l.contains("↯ [machine] cargo test relinks")), "{out:?}");
@@ -2947,7 +2993,8 @@ async fn in_debug_mode_the_run_keeps_the_worker_s_look_back_for_the_next_one() {
     run("/add task Quiet parent 1", &store, &worker()).await.unwrap();
     let quiet = Worker::new("z-ai/glm-5.3-flash")
         .with_provider(Scripted::new(vec![says(report, vec![]), says("accepted", vec![])]))
-        .with_debug(false);
+        .with_debug(false)
+        .with_script(green());
     let (out, _) = run("/run 3", &store, &quiet).await.unwrap();
     assert!(!out.iter().any(|l| l.contains('↯')), "{out:?}");
     assert_eq!(crate::retro::recent(dir.path(), 10).len(), 2);
@@ -3744,7 +3791,7 @@ pub(crate) async fn judged_run(
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     let model = Scripted::new(answers.into_iter().map(|answer| says(answer, vec![])).collect());
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(model.clone());
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(model.clone()).with_script(green());
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     let handoff = ra_context::TaskContext::open(dir.path(), 2).handoffs.pop().expect("the run's handoff");
     (out, store.read(2).await.unwrap(), handoff, model)
@@ -3757,7 +3804,7 @@ async fn an_implemented_card_never_reviewed_is_reviewed_before_it_lands_and_the_
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     // the reviewer never answers: the run leaves the card in review with no verdict
-    let silent = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])]));
+    let silent = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])])).with_script(green());
     run("/run 2", &store, &silent).await.unwrap();
     // a walk killed between the check and the review left it implemented
     store.set_state_by(2, ra_roadmap::model::TaskState::Implemented, ra_roadmap::history::Source::Run).await.unwrap();
@@ -3765,7 +3812,7 @@ async fn an_implemented_card_never_reviewed_is_reviewed_before_it_lands_and_the_
     assert!(format!("{refused:#}").contains("never reviewed"), "{refused:#}");
     // the walk's landing sends it to the review first
     let model = Scripted::new(vec![says("accepted", vec![])]);
-    let reviewer = Worker::new("z-ai/glm-5.3-flash").with_provider(model.clone());
+    let reviewer = Worker::new("z-ai/glm-5.3-flash").with_provider(model.clone()).with_script(green());
     let out = crate::agent::land_or_say(&store, 2, &reviewer).await;
     assert!(out.iter().any(|l| l.contains("accepted by glm-5.3-flash")), "{out:?}");
     assert_eq!(model.seen.lock().len(), 1);
@@ -3880,7 +3927,8 @@ async fn the_summary_role_runs_on_the_local_provider_and_not_on_the_cards_model(
     let runner = Worker::new("z-ai/glm-5.3-flash")
         .with_provider(card.clone())
         .with_role_provider("local/qwen3-8b", local.clone())
-        .with_ledger(ledger);
+        .with_ledger(ledger)
+        .with_script(green());
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     // the card's model answered as the worker and as the reviewer; every cheap role went to the
     // local provider
@@ -3955,7 +4003,7 @@ async fn without_a_local_server_the_roles_make_no_call_and_the_rule_based_path_s
     let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
     // no role provider and no server: a run resolves no role at all; the card's model is the
     // worker and the reviewer, nothing else is called
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger).with_script(green());
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert_eq!(card.seen.lock().len(), 2);
     assert_eq!(runner.tally().calls, 2);
@@ -3979,7 +4027,7 @@ async fn a_role_without_a_local_server_makes_no_call() {
     let card = Scripted::new(vec![says(ROLE_REPORT, vec![]), says("accepted", vec![])]);
     let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
     // no `[role]` table and no server: every role resolves to off, and the start line says so
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger).with_script(green());
     assert_eq!(runner.roles(dir.path()).await.summary(), "roles: summary off · digest off · classify off");
     run("/run 2", &store, &runner).await.unwrap();
     // the card's model answered as the worker and the reviewer; no role fell to a Claude model,
@@ -4010,7 +4058,7 @@ async fn a_role_named_in_the_table_goes_to_that_model() {
     let card =
         Scripted::new(vec![says(ROLE_REPORT, vec![]), says("wrote hello.txt; verified by cargo test", vec![]), says("accepted", vec![])]);
     let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger);
+    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_ledger(ledger).with_script(green());
     assert_eq!(runner.roles(dir.path()).await.summary(), "roles: summary z-ai/glm-5.3-flash · digest off · classify off");
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     {
@@ -4051,8 +4099,11 @@ async fn a_local_server_that_went_down_degrades_the_roles_to_no_call_and_never_t
     let local: std::sync::Arc<dyn ra_providers::ModelProvider> =
         std::sync::Arc::new(ra_providers::openrouter::OpenRouter::at(&url, "").unwrap());
     let ledger = ra_usage::UsageStore::in_memory().await.unwrap();
-    let runner =
-        Worker::new("z-ai/glm-5.3-flash").with_provider(card.clone()).with_role_provider("local/qwen3-8b", local).with_ledger(ledger);
+    let runner = Worker::new("z-ai/glm-5.3-flash")
+        .with_provider(card.clone())
+        .with_role_provider("local/qwen3-8b", local)
+        .with_ledger(ledger)
+        .with_script(green());
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     // the summary role found the server gone; the digest and the classification made no call
     // after it, and none of the three went to the card's model
@@ -4078,7 +4129,9 @@ async fn a_notes_for_line_lands_on_the_other_card_and_leaves_this_cards_notes() 
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     run("/add task Next parent 1", &store, &worker()).await.unwrap();
     let report = "wrote hello.txt\nnotes-for #3: the greeting lives in hello.txt\nnotes-for #99: nobody\n";
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(report, vec![]), says("accepted", vec![])]));
+    let runner = Worker::new("z-ai/glm-5.3-flash")
+        .with_provider(Scripted::new(vec![says(report, vec![]), says("accepted", vec![])]))
+        .with_script(green());
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     // the card's own notes and handoff lose the lines
     assert_eq!(store.read(2).await.unwrap().notes.as_deref(), Some("wrote hello.txt\n"));
@@ -4540,7 +4593,7 @@ async fn a_check_that_outlives_its_budget_is_killed() {
     .await
     .unwrap();
     std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 1\n").unwrap();
-    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])]));
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])])).with_cargo(green());
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
     assert!(out.iter().any(|l| l.contains("check failed: python -c") && l.contains(" · timed out after 1s")), "{out:?}");
     let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
@@ -4591,7 +4644,9 @@ async fn a_worktree_check_builds_in_the_worktrees_target() {
     )
     .await
     .unwrap();
-    let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(std::sync::Arc::new(ByTurn { seen: parking_lot::Mutex::new(0) }));
+    let runner = Worker::new("z-ai/glm-5.3-flash")
+        .with_provider(std::sync::Arc::new(ByTurn { seen: parking_lot::Mutex::new(0) }))
+        .with_cargo(green());
     let out = crate::agent::run_parallel(&store, &runner, 1, false).await.unwrap();
     assert!(out.iter().any(|l| l.contains("branch card/2")), "{out:?}");
     // the run's lines ride every panic: a check that never ran leaves no file to read
@@ -4906,7 +4961,8 @@ async fn sized_run(tokens: u64, turns: u64, estimate: Option<ra_roadmap::model::
     answer.turns = turns;
     let a_turn = ra_providers::Usage { prompt_tokens: tokens / turns, completion_tokens: 10 / turns, ..answer.usage };
     answer.turn_usage = (0..turns).map(|_| ra_providers::TurnUsage::of(&a_turn)).collect();
-    let worker = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(Scripted::new(vec![answer]))));
+    let worker =
+        Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(Scripted::new(vec![answer])))).with_script(green());
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
     let context = std::fs::read_to_string(dir.path().join("var/context/2.md")).unwrap();
     let handoff = context.split("## Handoff ").nth(1).unwrap().to_owned();
@@ -4958,7 +5014,7 @@ async fn a_second_run_of_a_node_resumes_its_session() {
     let mut first = says("done: the tree already holds the work", vec![]);
     first.session_id = Some("sess-1".into());
     let script = Scripted::new(vec![first, says("done again", vec![])]);
-    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone()))).with_script(no_manifest());
     run("/run 2", &store, &runner).await.unwrap();
     assert_eq!(store.read(2).await.unwrap().session.as_deref(), Some("sess-1"));
     // the person takes the card up again rather than the check sending it back: not a rerun
@@ -5202,7 +5258,7 @@ async fn a_changed_objective_drops_the_resume() {
     let mut first = says("done: the tree already holds the work", vec![]);
     first.session_id = Some("sess-1".into());
     let script = Scripted::new(vec![first, says("done again", vec![])]);
-    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone()))).with_script(no_manifest());
     run("/run 2", &store, &runner).await.unwrap();
     store.set_details(2, Some("another goal"), None).await.unwrap();
     store.set_state(2, ra_roadmap::model::TaskState::InProgress).await.unwrap();
@@ -5221,7 +5277,7 @@ async fn no_turn_cap_stands_by_default_and_turns_sets_one() {
     let mut answer = says("done", vec![]);
     answer.turns = 12;
     let script = Scripted::new(vec![answer]);
-    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone())));
+    let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone()))).with_script(no_manifest());
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(out[0].contains("turns 12,"), "{out:?}");
     assert_eq!(script.seen.lock()[0].max_turns, None, "nothing caps a run by default");
@@ -5229,8 +5285,11 @@ async fn no_turn_cap_stands_by_default_and_turns_sets_one() {
     // --turns caps one run, and the line names the cap
     run("/add task U parent 1", &store, &worker()).await.unwrap();
     let script = Scripted::new(vec![says("done", vec![])]);
-    let runner =
-        Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(script.clone()))).with_budgets(false).with_turns(Some(12));
+    let runner = Worker::new("claude-opus-5-5")
+        .with_provider(std::sync::Arc::new(Harness(script.clone())))
+        .with_budgets(false)
+        .with_turns(Some(12))
+        .with_script(no_manifest());
     let (out, _) = run("/run 3", &store, &runner).await.unwrap();
     assert!(out[0].contains("turns 1/12"), "{out:?}");
     let seen = script.seen.lock();
@@ -5309,7 +5368,7 @@ async fn a_run_past_its_budget_stops_and_fails_the_node_with_a_note() {
     // --budget overrides the complexity
     run("/add task U parent 1", &store, &worker()).await.unwrap();
     let provider = Scripted::new(vec![says("done", vec![])]);
-    let capped = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_budget(Some(0.1));
+    let capped = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_budget(Some(0.1)).with_script(no_manifest());
     run("/run 3", &store, &capped).await.unwrap();
     assert_eq!(provider.seen.lock()[0].budget_usd, Some(0.1));
 }

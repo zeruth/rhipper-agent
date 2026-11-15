@@ -33,6 +33,13 @@ pub mod trace;
 pub mod ui;
 pub mod walk;
 
+/// What answers a cargo command in a test whose worker scripts no cargo: a panic, since a real
+/// build runs for the length of a suite and makes the tests that wait on it look hung.
+#[cfg(test)]
+pub(crate) fn unscripted(command: &str) -> anyhow::Result<(i32, String)> {
+    panic!("unscripted cargo in a test: {command}")
+}
+
 /// The feed's `wait:` line of a check that `who` (a [`hub::builder_name`]) runs: `text` with the
 /// check's builder after it, so a timed-out check names its own waits, not another card's.
 #[must_use]
