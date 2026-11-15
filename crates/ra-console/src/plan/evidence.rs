@@ -182,7 +182,15 @@ pub fn gotchas(root: &Path) -> Vec<Line> {
         .and_then(|text| ra_gotchas::Catalogue::parse(&text).ok())
         .unwrap_or_else(ra_gotchas::Catalogue::seed);
     summary.counts.retain(|(id, _)| !catalogue.is_routine(id));
-    gotcha_lines(&summary)
+    let project = crate::hub::project_name(root);
+    let mut lines = gotcha_lines(&summary);
+    for (line, (id, _)) in lines.iter_mut().zip(&summary.counts) {
+        if let Some(commands) = summary.commands.get(id) {
+            let named: Vec<String> = commands.iter().take(3).map(|(command, n)| format!("`{command}` ×{n}")).collect();
+            line.text = format!("{} · refused {} in {project}", line.text, named.join(", "));
+        }
+    }
+    lines
 }
 
 /// [`gotchas`] from a summary already read, for the tests.

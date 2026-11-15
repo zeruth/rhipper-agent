@@ -12,6 +12,7 @@ fn the_journals_counts_and_unmatched_commands_are_cited_by_gotcha_with_their_tal
     let summary = Summary {
         counts: vec![("mojibake".to_owned(), 2)],
         unmatched: vec![("Get-ChildItem -Recurse".to_owned(), 3), ("Select-String foo".to_owned(), 1)],
+        ..Summary::default()
     };
     assert_eq!(
         gotcha_lines(&summary).iter().map(ToString::to_string).collect::<Vec<_>>(),

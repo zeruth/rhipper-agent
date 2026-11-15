@@ -107,6 +107,8 @@ pub struct Summary {
     pub counts: Vec<(String, usize)>,
     /// Each refused command no gotcha names and how often it was refused.
     pub unmatched: Vec<(String, usize)>,
+    /// For each gotcha that fired, the commands it refused and how often, the most often first.
+    pub commands: BTreeMap<String, Vec<(String, usize)>>,
 }
 
 impl Summary {
@@ -138,11 +140,16 @@ pub fn summary_since(path: &Path, since: u64) -> Summary {
     let Ok(text) = std::fs::read_to_string(path) else { return Summary::default() };
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut unmatched: BTreeMap<String, usize> = BTreeMap::new();
+    let mut commands: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     for row in text.lines().filter_map(row).filter(|r| r.time >= since) {
         let (bucket, key) = if row.id == UNMATCHED { (&mut unmatched, row.excerpt) } else { (&mut counts, row.id) };
         *bucket.entry(key.to_owned()).or_default() += 1;
+        if row.id != UNMATCHED && !row.excerpt.is_empty() {
+            *commands.entry(row.id.to_owned()).or_default().entry(row.excerpt.to_owned()).or_default() += 1;
+        }
     }
-    Summary { counts: by_count(counts), unmatched: by_count(unmatched) }
+    let commands = commands.into_iter().map(|(id, tally)| (id, by_count(tally))).collect();
+    Summary { counts: by_count(counts), unmatched: by_count(unmatched), commands }
 }
 
 /// The map as a list, the largest count first, ties by name.
