@@ -9522,8 +9522,48 @@ const RERUN_REPORT_LINES: usize = 20;
 /// What a rerun reads in place of the handoffs, from [`rerun_text`], with what changed in the
 /// tree it acts in and in the run's environment since the last run.
 fn rerun_block(task: &ra_context::TaskContext, node: &Node, acting: &Path, root: &Path) -> Option<String> {
-    let since = task.handoffs.last().map(|last| since_last_run(acting, root, node.id, last.when)).unwrap_or_default();
+    let mut since = task.handoffs.last().map(|last| since_last_run(acting, root, node.id, last.when)).unwrap_or_default();
+    since.extend(behind_main(acting, &node.files));
     rerun_text(task, node, &since)
+}
+
+/// How far the tree a card acts in is behind `main`: the count of commits it lacks, the subjects
+/// of those that touch the card's `files` or their crates, and the order to merge main first.
+/// Nothing when the tree is level with main or has no `main`.
+pub fn behind_main(acting: &Path, files: &[String]) -> Vec<String> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(acting)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let Some(count) = git(&["rev-list", "--count", "HEAD..main"]).and_then(|n| n.trim().parse::<usize>().ok()).filter(|n| *n > 0) else {
+        return Vec::new();
+    };
+    // a crate is the first two components of a path under `crates/` or `apps/`
+    let mut paths: Vec<String> = Vec::new();
+    for file in files {
+        let file = file.trim_start_matches('+').replace('\\', "/");
+        let parts: Vec<&str> = file.split('/').collect();
+        if matches!(parts.first(), Some(&"crates" | &"apps")) && parts.len() > 2 {
+            paths.push(parts[..2].join("/"));
+        }
+        paths.push(file);
+    }
+    paths.sort();
+    paths.dedup();
+    let mut lines =
+        vec![format!("this tree is {count} commit{} behind main; merge main first, before any change", if count == 1 { "" } else { "s" })];
+    if !paths.is_empty() {
+        let mut args = vec!["log", "--format=%s", "-n", "20", "HEAD..main", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        let log = git(&args).unwrap_or_default();
+        lines.extend(log.lines().filter(|s| !s.trim().is_empty()).map(|s| format!("main commit touching the card's files or crates: {s}")));
+    }
+    lines
 }
 
 /// What a rerun reads in place of the handoffs: the last run's check line, its verdict and the
