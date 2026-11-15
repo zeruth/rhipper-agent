@@ -350,6 +350,9 @@ fn judge_part(
     if mid_check(name, rest) {
         return Shape::Allowed;
     }
+    if var_script(name, rest) {
+        return Shape::Allowed;
+    }
     if name == "git" && rest.first() == Some(&"branch") {
         match branch_shape(&rest[1..]) {
             Shape::Unknown => {}
@@ -469,6 +472,20 @@ fn mid_check(name: &str, rest: &[&str]) -> bool {
 pub fn is_mid_check(command: &str) -> bool {
     let words: Vec<&str> = command.split_whitespace().collect();
     words.split_first().is_some_and(|(&first, rest)| mid_check(program(first), rest))
+}
+
+/// Whether `name` with `rest` runs a script the worker wrote under `var/`, `python var/x.py
+/// <args>`: the script is a file, not stdin or `-c`, and it stays inside `var/`.
+fn var_script(name: &str, rest: &[&str]) -> bool {
+    let python = ["python", "python3", "py"].iter().any(|p| p.eq_ignore_ascii_case(name));
+    let Some(script) = rest.first().map(|w| w.trim_start_matches("./")) else { return false };
+    python
+        && script.strip_prefix("var/").is_some_and(|file| {
+            file.len() > 3
+                && file.to_lowercase().ends_with(".py")
+                && !file.split('/').any(|s| s.is_empty() || s == "..")
+                && !file.contains('\\')
+        })
 }
 
 /// The form to use instead of a refused program, when `name` with `rest` is one.
