@@ -344,6 +344,10 @@ fn judge_part(
         let fine = files.iter().all(|w| !away(w) && known(w, shell, assigned));
         return if fine { Shape::Allowed } else { Shape::Unknown };
     }
+    if let Some(files) = awk_reads(name, rest) {
+        let fine = files.iter().all(|w| !away(w) && known(w, shell, assigned));
+        return if fine { Shape::Allowed } else { Shape::Unknown };
+    }
     if words.iter().any(|w| away(w) || !known(w, shell, assigned)) {
         return Shape::Unknown;
     }
@@ -490,7 +494,7 @@ fn var_script(name: &str, rest: &[&str]) -> bool {
 
 /// The form to use instead of a refused program, when `name` with `rest` is one.
 fn refusal(name: &str, rest: &[&str]) -> Option<&'static str> {
-    if sed_prints(name, rest).is_some() {
+    if sed_prints(name, rest).is_some() || awk_reads(name, rest).is_some() {
         return None;
     }
     if let Some(form) = REFUSED.iter().find(|(names, _)| names.iter().any(|n| n.eq_ignore_ascii_case(name))).map(|(_, form)| *form) {
@@ -538,6 +542,28 @@ fn sed_prints<'a, 'b>(name: &str, rest: &'a [&'b str]) -> Option<&'a [&'b str]> 
         script.match_indices('$').any(|(at, _)| script[at + 1..].starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '_' | '{')));
     let prints = !script.is_empty() && script.split(';').all(|command| SED_PRINT.is_match(command.trim()));
     (flags_read && flags.iter().any(|f| quiet(f)) && !variable && prints && !files.iter().any(|f| f.starts_with('-'))).then_some(files)
+}
+
+/// The files of an `awk` that only filters, `awk -F: '$1>5' f`: at most `-F` flags and one
+/// program that neither runs a command, reads another file, writes (`print >`, `|`) nor
+/// closes a pipe; `None` for any other `awk`. The program's `$1` is a field, not a variable.
+fn awk_reads<'a, 'b>(name: &str, rest: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    if !name.eq_ignore_ascii_case("awk") {
+        return None;
+    }
+    let mut at = 0;
+    while let Some(flag) = rest.get(at).filter(|w| w.starts_with('-')) {
+        match *flag {
+            "-F" => at += 2,
+            f if f.starts_with("-F") => at += 1,
+            _ => return None,
+        }
+    }
+    let script = rest.get(at)?;
+    let files = &rest[at + 1..];
+    let effects = ["system", "getline", "close", "fflush", "ENVIRON", "|"].iter().any(|w| script.contains(w));
+    let writes = script.find("print").is_some_and(|p| script[p..].contains('>'));
+    (!effects && !writes && !files.iter().any(|f| f.starts_with('-') || f.contains('='))).then_some(files)
 }
 
 /// Whether `command` starts with a `sed` that only prints, as [`sed_prints`] judges it: the
