@@ -40,6 +40,8 @@ pub const READ_HINTS_FILE: &str = "var/runs/read-hints";
 const LONG_READ: usize = 400;
 /// How many function ranges the hint names.
 const HINT_RANGES: usize = 8;
+/// How many characters of a dependency's notes a brief carries: the review at their head.
+const DEPENDENCY_NOTES_ROOM: usize = 2000;
 
 /// The short names of the Claude models and the ids they stand for on the Claude Code route: the
 /// ids move with the releases, the names stay, and a person types the name.
@@ -11319,11 +11321,20 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<Brief> {
             dep.objective.as_deref().unwrap_or("no objective")
         ));
         if let Some(notes) = &dep.notes {
-            text.push_str(&format!("  notes of #{}: {notes}\n", dep.id));
+            text.push_str(&dependency_notes_line(dep.id, notes));
         }
     }
     text.push_str(context_cancel_line::CANCEL_LINE);
     Ok(Brief { text, files: files.to_vec() })
+}
+
+/// The brief's line of a dependency's notes, cut to their head, where the review sits: asm
+/// #147's brief carried #86's whole notes, a 1.5 MB clippy dump, and every turn of its run
+/// was 780k tokens (2026-11-15).
+fn dependency_notes_line(id: i64, notes: &str) -> String {
+    let end = notes.char_indices().nth(DEPENDENCY_NOTES_ROOM).map_or(notes.len(), |(at, _)| at);
+    let more = if end < notes.len() { " …(clipped)" } else { "" };
+    format!("  notes of #{id}: {}{more}\n", &notes[..end])
 }
 
 /// Maps a provider error to a refusal that names what to do.

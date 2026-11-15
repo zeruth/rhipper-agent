@@ -360,6 +360,16 @@ fn brief_of_ancestors_skips_one_without_an_objective_and_cuts_the_others_to_a_se
 }
 
 #[test]
+fn a_dependency_s_notes_reach_the_brief_cut_to_their_head() {
+    assert_eq!(dependency_notes_line(86, "review: one point"), "  notes of #86: review: one point\n");
+    let dump = format!("review: the point\n{}", "warning: long literal lacking separators\n".repeat(40_000));
+    let line = dependency_notes_line(86, &dump);
+    assert!(line.starts_with("  notes of #86: review: the point\n"), "{}", &line[..80]);
+    assert!(line.ends_with(" …(clipped)\n"));
+    assert!(line.chars().count() < DEPENDENCY_NOTES_ROOM + 40, "{}", line.len());
+}
+
+#[test]
 fn a_session_within_the_day_is_resumed_and_an_older_one_is_not() {
     let now = 1_800_000_000;
     assert_eq!(resume_of(&with_session(SESSION_LIFE - 60, now), now), Ok(Some("sess-1".to_owned())));
