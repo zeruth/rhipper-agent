@@ -600,11 +600,29 @@ impl ClaudeCode {
             completion.reads = reads;
             Err(ProviderError::ContextOut { completion: Box::new(completion), cap, size })
         } else {
-            let reason = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).next_back().unwrap_or(last_line.trim());
-            let reason = if reason.is_empty() { "no output" } else { reason };
-            Err(ProviderError::Other(format!("claude exited with {status} and no result: {}", snippet(reason))))
+            Err(ProviderError::Other(crash_text(&status.to_string(), &stderr, &last_line)))
         }
     }
+}
+
+/// How many of a crashed worker's last standard-error lines the failure keeps.
+pub const CRASH_STDERR_LINES: usize = 20;
+
+/// The failure a worker process that exited without a result reads as: its exit `status`, the
+/// reason in one line (the last of `stderr`, else `last_line` of its output), and the last
+/// [`CRASH_STDERR_LINES`] lines of `stderr`, so the card's notes and the rerun's handoff carry
+/// what the process said as it died.
+#[must_use]
+pub fn crash_text(status: &str, stderr: &str, last_line: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    let reason = lines.last().map_or_else(|| last_line.trim(), |l| l.trim());
+    let reason = if reason.is_empty() { "no output" } else { reason };
+    let mut text = format!("claude exited with {status} and no result: {}", snippet(reason));
+    if !lines.is_empty() {
+        write!(text, "\nstderr, last {} lines:\n", lines.len().min(CRASH_STDERR_LINES)).ok();
+        text.push_str(&lines[lines.len().saturating_sub(CRASH_STDERR_LINES)..].join("\n"));
+    }
+    text
 }
 
 /// The event stream of a run, written to [`STREAM_FILE`] as it comes, so a run that ends badly

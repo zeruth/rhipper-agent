@@ -7144,7 +7144,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                         &acceptance,
                     )
                 }
-                None => handoff("failed", "no check: the run failed", &format!("{error:#}"), changed, &acceptance),
+                None => {
+                    let why = format!("{error:#}");
+                    // a worker that died leaves its exit code and last stderr lines on the card
+                    if why.contains("\nstderr, last ") {
+                        store.set_notes(id, &why).await?;
+                    }
+                    handoff("failed", "no check: the run failed", &why, changed, &acceptance)
+                }
             };
             task.record(last);
             save_context(store, &root, &task).await;
