@@ -1277,3 +1277,29 @@ fn a_project_ahead_keeps_no_more_seats_than_its_runners_can_use() {
     // seats already held stay held, even past the runners after a change of setting
     assert_eq!(ahead_demand(8, 5, 6), 8);
 }
+
+#[tokio::test]
+async fn a_leased_target_returned_by_a_landed_card_is_taken_by_the_next_and_the_pool_is_capped() {
+    use ra_providers::claude_code::{lease_target, project_target};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let tree = |id: i64| root.join(WORKTREES_DIR).join(id.to_string());
+    for id in 1..=3 {
+        std::fs::create_dir_all(tree(id)).unwrap();
+    }
+    let first = lease_target(&tree(1)).unwrap().unwrap();
+    std::fs::create_dir_all(&first).unwrap();
+    let lines = clean_after(root, 1, false).await;
+    assert!(lines.iter().any(|l| l.contains("released to the pool")), "{lines:?}");
+    assert!(first.is_dir(), "the returned target keeps its build");
+    assert_eq!(lease_target(&tree(2)).unwrap().unwrap(), first, "the second card takes the target the first returned");
+    // one runner keeps two targets: the third, past the cap, is removed when it comes back
+    let second = lease_target(&tree(3)).unwrap().unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let third = lease_target(&tree(1)).unwrap().unwrap();
+    std::fs::create_dir_all(&third).unwrap();
+    let lines = clean_after(root, 1, false).await;
+    assert!(lines.iter().any(|l| l.contains("pool is full")), "{lines:?}");
+    assert!(!third.exists());
+    let _ = std::fs::remove_dir_all(project_target(root));
+}

@@ -4331,6 +4331,11 @@ pub async fn worktree_make(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Str
         return Ok((path, branch));
     }
     std::fs::create_dir_all(root.join(WORKTREES_DIR)).with_context(|| format!("cannot create {WORKTREES_DIR}"))?;
+    // the lease comes before the files: their fresh mtimes would make cargo rebuild everything
+    // in a target leased after them
+    if let Err(e) = ra_providers::claude_code::lease_target(&path) {
+        tracing::warn!("#{id} leased no target: {e}");
+    }
     // the branch outlives a dropped worktree: a new worktree takes it up where it was
     let exists = git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).await.is_ok();
     let target = path.to_string_lossy().into_owned();
@@ -5813,6 +5818,21 @@ async fn say_landing(store: &Store, id: i64, landed: anyhow::Result<Vec<String>>
     }
 }
 
+/// What becomes of a target just released to the project's pool: kept, or removed when the pool
+/// holds more targets than the walk's width plus one.
+fn pool_cap(root: &Path, target: &Path) -> String {
+    let pooled = target.parent().and_then(|base| std::fs::read_dir(base).ok()).map_or(0, |dir| {
+        dir.flatten().filter(|e| e.file_name().to_string_lossy().strip_prefix("wt-pool-").is_some_and(|n| n.parse::<u32>().is_ok())).count()
+    });
+    if pooled <= crate::allocation::runners(root) as usize + 1 {
+        return "target released to the pool".to_owned();
+    }
+    match std::fs::remove_dir_all(target) {
+        Ok(()) => "target released and removed: the pool is full".to_owned(),
+        Err(e) => format!("target released, kept past the pool's size: {e}"),
+    }
+}
+
 /// What a landed card leaves behind, removed: its worktree and branch, its target directory
 /// under the project's, its research brief and its proof, and the old entries of the project's
 /// temp names.
@@ -5835,8 +5855,8 @@ async fn clean_after(root: &Path, id: i64, has_branch: bool) -> Vec<String> {
         }
     }
     // a pooled target outlives the card, its build kept for the next one's lease
-    if ra_providers::claude_code::release_target(&path).is_some() {
-        lines.push("target released to the pool".to_owned());
+    if let Some(target) = ra_providers::claude_code::release_target(&path) {
+        lines.push(pool_cap(root, &target));
     } else if let Some(target) = ra_providers::claude_code::shared_target(&path)
         && target.is_dir()
     {
