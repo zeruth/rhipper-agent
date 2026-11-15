@@ -1574,6 +1574,19 @@ pub fn project_of(workspace: &Path) -> (PathBuf, Option<i64>) {
     (workspace.to_path_buf(), None)
 }
 
+/// The directories outside a card's worktree its worker may read and run from: the card's own
+/// cargo target and its run's temp directory under the scratch root. Empty for a workspace that
+/// is no card's worktree or a machine with no scratch root.
+#[must_use]
+pub fn card_dirs(workspace: &Path) -> Vec<PathBuf> {
+    let Some(scratch) = scratch() else { return Vec::new() };
+    let Ok(workspace) = std::path::absolute(workspace) else { return Vec::new() };
+    let (root, Some(card)) = project_of(&workspace) else { return Vec::new() };
+    let root = std::path::absolute(&root).unwrap_or(root);
+    let name = root.file_name().map_or_else(|| "project".into(), |n| n.to_string_lossy().into_owned());
+    vec![project_target(&root).join(format!("wt-{card}")), scratch.join("tmp").join(name).join(format!("run-{card}"))]
+}
+
 /// The environment a run or a check gets from the scratch root: its temp directory (the tests'
 /// leftovers land there, not on the system drive) and the Gradle cache. Empty without one.
 #[must_use]

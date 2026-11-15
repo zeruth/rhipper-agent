@@ -1017,8 +1017,29 @@ fn hook_pre(
     // the full suite is the orchestrator's when it is the project's check: a worker's own run
     // of it goes to the crates the run has changed
     let suite_check = worker.is_none_or(ra_console::router::WorkerConfig::checks_the_suite);
+    // the hook is the judge of a command's shape: every part allowed is an allow the static
+    // allowlist, which cannot parse a chain or a prefix, would have refused; a part refused
+    // denies the whole, a rewrite's allow included; a shape it cannot read is left to the
+    // allowlist. The card's own target and run directory count as the workspace.
+    let dirs = ra_providers::claude_code::card_dirs(cwd);
+    let shape = call.get("tool_name").and_then(serde_json::Value::as_str).and_then(ra_gotchas::shape::Shell::of_tool).map_or(
+        ra_gotchas::shape::Shape::Unknown,
+        |shell| {
+            let own_part = |part: &str| worker.is_some_and(|w| w.allows(part));
+            ra_gotchas::shape::judge_with(judged, shell, cwd, &own_part, &dirs)
+        },
+    );
+    // the outside-path hints name a path the worker may not read; the card's own directories
+    // are the one outside the shape table has judged allowed
+    let in_dirs = matches!(shape, ra_gotchas::shape::Shape::Allowed)
+        && judged.split_whitespace().any(|w| ra_gotchas::shape::in_dirs(w.trim_matches(['"', '\'']), &dirs));
     let verdict = match catalogue.command_in(cwd, command, &held, suite_check, own) {
         ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. } if own && id == "shell-outside-allowlist" => {
+            ra_gotchas::Verdict::Pass
+        }
+        ra_gotchas::Verdict::Deny { id, .. }
+            if in_dirs && matches!(id.as_str(), "path-outside-workspace" | "ls-outside-worktree" | "outside-workspace") =>
+        {
             ra_gotchas::Verdict::Pass
         }
         other => other,
@@ -1028,17 +1049,6 @@ fn hook_pre(
     // refused command spends nothing
     let session = call.get("session_id").and_then(serde_json::Value::as_str).unwrap_or("-");
     let verdict = ra_console::agent::budget_build(cwd, session, command, verdict);
-    // the hook is the judge of a command's shape: every part allowed is an allow the static
-    // allowlist, which cannot parse a chain or a prefix, would have refused; a part refused
-    // denies the whole, a rewrite's allow included; a shape it cannot read is left to the
-    // allowlist
-    let shape = call.get("tool_name").and_then(serde_json::Value::as_str).and_then(ra_gotchas::shape::Shell::of_tool).map_or(
-        ra_gotchas::shape::Shape::Unknown,
-        |shell| {
-            let own_part = |part: &str| worker.is_some_and(|w| w.allows(part));
-            ra_gotchas::shape::judge(judged, shell, cwd, &own_part)
-        },
-    );
     match ra_gotchas::Answer::of(verdict, shape) {
         ra_gotchas::Answer::Pass => None,
         ra_gotchas::Answer::Allow => Some(serde_json::json!({
@@ -1103,6 +1113,20 @@ fn hook(event: &str) -> anyhow::Result<()> {
     let Ok(call) = serde_json::from_str::<serde_json::Value>(input.trim_start_matches('\u{feff}')) else { return Ok(()) };
     let cwd =
         call.get("cwd").and_then(serde_json::Value::as_str).map_or_else(|| std::env::current_dir().unwrap_or_default(), PathBuf::from);
+    // a file or directory under the card's own target or run directory is the card's to read:
+    // the tool's outside-the-workspace refusal stands aside for it, another card's stays
+    if event == "pre"
+        && matches!(call.get("tool_name").and_then(serde_json::Value::as_str), Some("Read" | "Glob" | "Grep"))
+        && let Some(path) =
+            ["/tool_input/file_path", "/tool_input/path"].iter().find_map(|p| call.pointer(p).and_then(serde_json::Value::as_str))
+        && ra_gotchas::shape::in_dirs(path, &ra_providers::claude_code::card_dirs(&cwd))
+    {
+        println!(
+            "{}",
+            serde_json::json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "the card's own target or run directory"}})
+        );
+        return Ok(());
+    }
     // a file the worker read is not the machine talking: no gotcha reads it, but a whole long
     // file the card outlines is refused with its items, and any other gets the outline after
     if call.get("tool_name").and_then(serde_json::Value::as_str) == Some("Read") {

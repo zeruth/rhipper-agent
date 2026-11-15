@@ -207,13 +207,26 @@ struct Part {
 /// (the project's `[worker] allow`) does, pass; the first refused part denies the whole.
 #[must_use]
 pub fn judge(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool) -> Shape {
+    judge_with(command, shell, workspace, own, &[])
+}
+
+/// Whether `word` is an absolute path under one of `dirs`.
+#[must_use]
+pub fn in_dirs(word: &str, dirs: &[std::path::PathBuf]) -> bool {
+    dirs.iter().any(|dir| in_target(word, dir))
+}
+
+/// [`judge`] with the card's own `extra` directories (its target, its run's temp) judged as the
+/// environment's are: listed, read and run from, while any other outside path is refused.
+#[must_use]
+pub fn judge_with(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool, extra: &[std::path::PathBuf]) -> Shape {
     let target = std::env::var_os("CARGO_TARGET_DIR").filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
     // the run's TEMP is `<scratch>/tmp/<project>/run-<id>`: its parent is the project's tmp root
     let tmp = std::env::var_os("TEMP")
         .map(std::path::PathBuf::from)
         .filter(|t| t.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run")))
         .and_then(|t| t.parent().map(Path::to_path_buf));
-    let roots: Vec<&Path> = target.iter().chain(tmp.iter()).map(std::path::PathBuf::as_path).collect();
+    let roots: Vec<&Path> = target.iter().chain(tmp.iter()).chain(extra).map(std::path::PathBuf::as_path).collect();
     judge_roots(command, shell, workspace, own, &roots)
 }
 
