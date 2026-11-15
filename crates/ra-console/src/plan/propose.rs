@@ -82,7 +82,8 @@ impl std::error::Error for Refusal {}
 /// Sends the numbered evidence to the planning route and judges the cards it answers with. The
 /// planner's model is the `planner` rule of `rhipper.toml` that names no kind, else the worker's
 /// own; the call is booked under it as the planner's. `agent_open` are the agent's open cards,
-/// which the planner is told not to propose again. A card's files are looked for in its owner's
+/// which the planner is told not to propose again, as `landed` are the cards landed since the
+/// evidence was written. A card's files are looked for in its owner's
 /// tree: the project's under `root`, the agent's under `agent_root`, and not at all when the
 /// agent is not loaded, since nothing here holds its tree.
 ///
@@ -95,6 +96,7 @@ pub async fn propose(
     worker: &Worker,
     lines: &[Line],
     agent_open: &[String],
+    landed: &[String],
 ) -> anyhow::Result<Proposal> {
     anyhow::ensure!(!lines.is_empty(), "no evidence to plan from");
     let planner = crate::router::Router::load(root)?;
@@ -108,7 +110,7 @@ pub async fn propose(
     let answer = provider
         .complete(CompletionRequest {
             model: model.clone(),
-            messages: vec![Message::system(prompt::INSTRUCTION), Message::user(prompt::brief(lines, agent_open))],
+            messages: vec![Message::system(prompt::INSTRUCTION), Message::user(prompt::brief(lines, agent_open, landed))],
             temperature: Some(0.2),
             max_tokens: Some(4000),
             tools: Vec::new(),

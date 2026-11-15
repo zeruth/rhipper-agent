@@ -115,8 +115,21 @@ pub async fn plan_to(
         None => Vec::new(),
     };
     let lines = gather(store, &root, worker).await?;
-    let proposal = propose::propose(&root, agent_root, worker, &lines, &home::open_titles(&agent_nodes, OPEN_TITLES)).await?;
+    let landed = landed_cards(&nodes, &root, worker).await;
+    let mut proposal =
+        propose::propose(&root, agent_root, worker, &lines, &home::open_titles(&agent_nodes, OPEN_TITLES), &retro::landed_lines(&landed))
+            .await?;
     let mut out = vec![head_line(&proposal, lines.len())];
+    // a card a landed one already meets is not planned: the look-back line says which
+    let (cards, answered): (Vec<_>, Vec<_>) = std::mem::take(&mut proposal.cards)
+        .into_iter()
+        .partition(|card| retro::answered_by(&landed, &card.item.title, card.item.objective.as_deref()).is_none());
+    proposal.cards = cards;
+    for card in &answered {
+        if let Some(by) = retro::answered_by(&landed, &card.item.title, card.item.objective.as_deref()) {
+            out.push(format!("  dropped {} · answered by landed #{} {}", card.item.title, by.id, by.title));
+        }
+    }
     out.extend(proposal.dropped.iter().map(|dropped| format!("  dropped {dropped}")));
     let place = named.as_ref().map_or_else(|| format!("the {} milestone", home::MILESTONE), |(id, title)| format!("#{id} {title}"));
     if dry {
@@ -197,6 +210,31 @@ pub async fn plan_to(
     crate::pair::event(&root, &notice);
     out.push(notice);
     Ok(out)
+}
+
+/// How many accepted cards, the newest first, are looked at for having landed since the evidence.
+const LANDED_CARDS: usize = 30;
+
+/// The accepted cards whose last run ended after the oldest look-back line the planner reads
+/// was written, as the ledger has it. None without a ledger or a look-back log.
+async fn landed_cards(nodes: &[Node], root: &Path, worker: &Worker) -> Vec<retro::Landed> {
+    let (Some(since), Some(ledger)) = (retro::evidence_written(root), worker.ledger()) else { return Vec::new() };
+    let mut done: Vec<&Node> =
+        nodes.iter().filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::Subtask) && n.state == TaskState::Accepted).collect();
+    done.sort_by_key(|n| std::cmp::Reverse(n.id));
+    let mut landed = Vec::new();
+    for node in done.into_iter().take(LANDED_CARDS) {
+        let Ok(calls) = ledger.calls_of(Some(node.id)).await else { continue };
+        if let Some(at) = retro::landed_at(&calls).filter(|at| *at >= since) {
+            landed.push(retro::Landed {
+                id: node.id,
+                title: node.title.clone(),
+                objective: node.objective.clone().unwrap_or_default(),
+                at,
+            });
+        }
+    }
+    landed
 }
 
 /// The plan's first line: how many cards from how many lines, by which planner, at what cost.

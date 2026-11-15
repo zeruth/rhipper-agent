@@ -606,6 +606,67 @@ fn tagged(note: &Note) -> String {
     if note.machine { format!("[machine] {}", note.text) } else { note.text.clone() }
 }
 
+/// A card that landed after an evidence line was written: the planner is told of it, and a
+/// proposal it already meets is dropped (#826 was planned an hour after #816 had answered it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landed {
+    pub id: i64,
+    pub title: String,
+    pub objective: String,
+    /// When its last run ended, as seconds since the Unix epoch.
+    pub at: u64,
+}
+
+/// When the oldest look-back line the planner reads was written, as seconds since the Unix
+/// epoch: the cards landed since are the ones that may have answered the evidence.
+#[must_use]
+pub fn evidence_written(root: &Path) -> Option<u64> {
+    tail(parse_log(&root.join(RETRO_FILE))).into_iter().map(|(_, _, note)| note.when).filter(|when| *when > 0).min()
+}
+
+/// When the newest of a card's ledger `calls` was written, as seconds since the Unix epoch.
+#[must_use]
+pub fn landed_at(calls: &[ra_usage::Call]) -> Option<u64> {
+    calls.iter().filter_map(|call| sqlite_secs(&call.at)).max()
+}
+
+/// `YYYY-MM-DD HH:MM:SS` (UTC, as `SQLite` writes it) as seconds since the Unix epoch.
+fn sqlite_secs(at: &str) -> Option<u64> {
+    let (date, time) = at.split_once(' ')?;
+    let mut day = date.split('-').map(|part| part.parse::<i64>().ok());
+    let (year, month, dom) = (day.next()??, day.next()??, day.next()??);
+    let mut clock = time.split(':').map(|part| part.parse::<i64>().ok());
+    let (hour, minute, second) = (clock.next()??, clock.next()??, clock.next()??);
+    // days from the civil date, counted from 1970-01-01
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let of_era = year - era * 400;
+    let of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + dom - 1;
+    let of_day = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    let days = era * 146_097 + of_day - 719_468;
+    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second).ok()
+}
+
+/// The landed card that already meets a proposed card: one whose title names the same change,
+/// or whose objective does.
+#[must_use]
+pub fn answered_by<'a>(landed: &'a [Landed], title: &str, objective: Option<&str>) -> Option<&'a Landed> {
+    use crate::plan::home::same_change;
+    landed.iter().find(|card| same_change(&card.title, title) || objective.is_some_and(|o| same_change(o, &card.objective)))
+}
+
+/// The landed cards as the planner's brief lists them: id, title, objective.
+#[must_use]
+pub fn landed_lines(landed: &[Landed]) -> Vec<String> {
+    landed
+        .iter()
+        .map(|card| {
+            let objective: String = card.objective.chars().take(200).collect();
+            format!("#{} {} — {objective}", card.id, card.title)
+        })
+        .collect()
+}
+
 /// The last `EVIDENCE_LINES` of `all`, in their order.
 fn tail<T>(mut all: Vec<T>) -> Vec<T> {
     let skip = all.len().saturating_sub(EVIDENCE_LINES);

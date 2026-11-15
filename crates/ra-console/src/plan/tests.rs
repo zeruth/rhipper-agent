@@ -54,7 +54,7 @@ async fn an_uncited_card_is_dropped_with_its_reason_and_the_rest_stand() {
     let text = format!("{}{}", well_formed(4), card("Guess", "", "turns", "`cargo test -p x` passes"));
     let script = Scripted::new(vec![says(&text, vec![])]);
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(script.clone());
-    let plan = propose::propose(dir.path(), None, &worker, &evidence(), &[]).await.unwrap();
+    let plan = propose::propose(dir.path(), None, &worker, &evidence(), &[], &[]).await.unwrap();
     assert_eq!(plan.cards.iter().map(|c| c.item.title.as_str()).collect::<Vec<_>>(), ["Card 1", "Card 2", "Card 3", "Card 4"]);
     assert_eq!(plan.dropped.iter().map(ToString::to_string).collect::<Vec<_>>(), ["Guess: cites no evidence line"]);
     // the planner read the numbered brief under the instruction
@@ -68,7 +68,7 @@ async fn a_well_formed_outline_of_five_is_kept_with_what_each_card_cites_and_sav
     let dir = project_dir();
     let text = format!("```\n{}```\n", well_formed(5));
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(&text, vec![])]));
-    let plan = propose::propose(dir.path(), None, &worker, &evidence(), &[]).await.unwrap();
+    let plan = propose::propose(dir.path(), None, &worker, &evidence(), &[], &[]).await.unwrap();
     assert_eq!(plan.cards.len(), 5, "{:?}", plan.dropped);
     assert!(plan.dropped.is_empty(), "{:?}", plan.dropped);
     let third = &plan.cards[2];
@@ -82,7 +82,7 @@ async fn a_well_formed_outline_of_five_is_kept_with_what_each_card_cites_and_sav
 async fn a_three_card_outline_is_refused_not_planned() {
     let dir = project_dir();
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says(&well_formed(3), vec![])]));
-    let error = propose::propose(dir.path(), None, &worker, &evidence(), &[]).await.unwrap_err();
+    let error = propose::propose(dir.path(), None, &worker, &evidence(), &[], &[]).await.unwrap_err();
     let refusal = error.downcast_ref::<Refusal>().unwrap_or_else(|| panic!("{error:#}"));
     assert_eq!(refusal.kept, 3);
     assert_eq!(format!("{error:#}"), "the planner's 3 card(s) are no plan: 4 to 8 must stand");

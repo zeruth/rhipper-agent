@@ -19,10 +19,16 @@ pub const INSTRUCTION: &str = "You plan the next cards of a development agent fr
 /// The brief: the evidence lines numbered from 1, one per line, as the cards cite them, then
 /// the agent's open cards, which no card proposes again.
 #[must_use]
-pub fn brief(lines: &[Line], agent_open: &[String]) -> String {
+pub fn brief(lines: &[Line], agent_open: &[String], landed: &[String]) -> String {
     let mut text = String::from("# Evidence\n");
     for (index, line) in lines.iter().enumerate() {
         let _ = writeln!(text, "{}. {line}", index + 1);
+    }
+    if !landed.is_empty() {
+        text.push_str("\n# Cards landed since the evidence was written (propose none of what they already do)\n");
+        for card in landed {
+            let _ = writeln!(text, "- {card}");
+        }
     }
     if !agent_open.is_empty() {
         text.push_str("\n# The agent's open cards\n");
