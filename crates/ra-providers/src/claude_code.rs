@@ -1221,7 +1221,7 @@ pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
     match worktree() {
         Some((root, id)) => {
             let base = std::path::absolute(project_target(&root)).ok()?;
-            Some(held_in(&base, &id).unwrap_or_else(|| base.join(format!("wt-{id}"))))
+            Some(base.join(format!("wt-{id}")))
         }
         // the project's own tree builds in its own target, on the scratch drive when there is one
         None => scratch().map(|_| project_target(workspace)),
@@ -1323,17 +1323,13 @@ fn release_in(base: &Path, id: &str) -> Option<PathBuf> {
     Some(target)
 }
 
-/// Leases the worktree at `workspace` a target of the project's pool and seeds it from its
-/// project's target when it has none yet; see [`lease_target`] and [`seed_target`]. The number of
-/// files copied, 0 for a workspace that is not a worktree.
+/// Seeds the worktree at `workspace`'s own `wt-<id>` target from its project's target when it has
+/// none yet; see [`seed_target`]. No pooled target is leased: two cards never share build output.
+/// The number of files copied, 0 for a workspace that is not a worktree.
 ///
 /// # Errors
 /// When a file cannot be copied.
 pub fn seed_worktree_target(workspace: &Path) -> std::io::Result<usize> {
-    // a lease that cannot be made leaves the card its own `wt-<id>`, cold but never shared
-    if let Err(e) = lease_target(workspace) {
-        tracing::warn!("no pooled target for {}: {e}", workspace.display());
-    }
     let Some(own) = shared_target(workspace) else { return Ok(0) };
     let main = std::path::absolute(project_target(&project_of(workspace).0))?;
     // the project's own tree builds in the project's target, which is no worktree's to seed
