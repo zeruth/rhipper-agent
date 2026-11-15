@@ -3664,10 +3664,22 @@ pub fn worktree_branch(id: i64) -> String {
 /// # Errors
 /// When the project is not a git repository, or git cannot add the worktree.
 pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, String)> {
+    let (path, branch) = worktree_make(root, id).await?;
+    seed_target(&path).await;
+    Ok((path, branch))
+}
+
+/// [`worktree_add`] without the seed of its target: the parallel walk seeds inside the card's
+/// own run, since a seed copies gigabytes (asm's main target is 47 GB) and, awaited in the
+/// walk's loop, stopped every other card from starting or being polled while it ran (the
+/// dashboard's bubbles all dropped out, 2026-11-15).
+///
+/// # Errors
+/// When the worktree cannot be made.
+pub async fn worktree_make(root: &Path, id: i64) -> anyhow::Result<(PathBuf, String)> {
     let path = root.join(WORKTREES_DIR).join(id.to_string());
     let branch = worktree_branch(id);
     if path.join(".git").exists() {
-        seed_target(&path).await;
         return Ok((path, branch));
     }
     std::fs::create_dir_all(root.join(WORKTREES_DIR)).with_context(|| format!("cannot create {WORKTREES_DIR}"))?;
@@ -3685,7 +3697,6 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
     if let Ok(router) = crate::router::Router::load(root) {
         carry(root, &path, &router.worker.carry, id);
     }
-    seed_target(&path).await;
     // a project whose builds are refused gets the project's built binaries at the worktree's target
     if crate::router::Router::load(root).is_ok_and(|r| r.worker.builds() == 0) {
         let _ = ra_providers::claude_code::worktree_prebuilt_note(&path);
@@ -5433,7 +5444,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // a builder on a card an investigator is still in: the brief, when it lands,
                 // is the next run's; the investigator goes on, its seat is its own
                 taken.insert(id);
-                let (path, branch) = worktree_add(&root, id).await?;
+                let (path, branch) = worktree_make(&root, id).await?;
                 // the project's branch comes into the card's before the run: a card that
                 // started from an older main lands without a conflict later, and a conflict
                 // there is now is the worker's first job (the brief names the files)
@@ -5459,6 +5470,9 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                     Box::pin(
                         async move {
                             let _slot = slot;
+                            // the card's target is seeded here, in its own run: the copy takes
+                            // minutes on a big project and the walk goes on with the others
+                            seed_target(&tree).await;
                             // a clean merge is proven before the worker gets the tree, inside
                             // the run's future so its compile stalls no other card; a failure
                             // is the run's first job
