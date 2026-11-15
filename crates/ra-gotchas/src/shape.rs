@@ -60,10 +60,15 @@ const BASH: &[&str] = &[
     "git diff*",
     "git log*",
     "git show*",
+    // a blob or a merge stage read by its id, as `git show :2:<path>` is
+    "git cat-file -p *",
     "ls*",
     "cat *",
     "head *",
     "tail *",
+    // the end of a pipe takes no argument: `git cat-file -p <blob> | head | tail`
+    "head",
+    "tail",
     "wc *",
     "grep *",
     "rg *",
@@ -101,6 +106,7 @@ const POWERSHELL: &[&str] = &[
     "git diff*",
     "git log*",
     "git show*",
+    "git cat-file -p *",
     "Get-ChildItem*",
     "Get-Content *",
     "Select-String *",

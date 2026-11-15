@@ -98,6 +98,15 @@ message = "a `<(...)` process substitution is refused whole: write the tool's ou
 remedy = { kind = "hint" }
 
 [[gotcha]]
+# a merge stage or a blob dumped to a file (`git show :2:path > /tmp/ours`): the redirect is
+# refused, and the piped form reads the same range without a file
+id = "git-stage-redirect"
+where = "command"
+pattern = '^\s*git\s+(show|cat-file)\b[^|;&\n]*>\s*["\x27]?([^\s"\x27&/$nv]|/[^d]|n[^u]|v[^a]|\$[^n])'
+message = "a `>` redirect to a file is refused: read a merge stage or a blob through a pipe, `git show :2:<path> | sed -n '1230,1245p'` or `git cat-file -p <blob> | head -n 40 | tail -n 10`, and write what you need to keep with Write under `var/`"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 # `sed -n '1,20p' file`: a worker pages a file through sed and the hook refuses it
 id = "sed-n"
 where = "command"
