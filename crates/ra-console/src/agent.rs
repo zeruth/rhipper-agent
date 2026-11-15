@@ -3623,6 +3623,10 @@ pub async fn worktree_add(root: &Path, id: i64) -> anyhow::Result<(PathBuf, Stri
         carry(root, &path, &router.worker.carry, id);
     }
     seed_target(&path).await;
+    // a project whose builds are refused gets the project's built binaries at the worktree's target
+    if crate::router::Router::load(root).is_ok_and(|r| r.worker.builds() == 0) {
+        let _ = ra_providers::claude_code::worktree_prebuilt_note(&path);
+    }
     Ok((path, branch))
 }
 
@@ -6649,6 +6653,10 @@ pub(crate) fn harness_messages(
     // not spend a turn finding the build refused
     if crate::router::Router::load(root).is_ok_and(|r| r.worker.builds() == 0) {
         messages.push(Message::system(NO_BUILDS));
+        let binaries = ra_providers::claude_code::worktree_prebuilt_note(root);
+        if !binaries.is_empty() {
+            messages.push(Message::system(binaries));
+        }
     }
     // the investigator's brief, when one went ahead: where the code is and what to change,
     // so the builder writes rather than reads

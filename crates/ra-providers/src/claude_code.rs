@@ -1210,6 +1210,79 @@ pub fn seed_target(main: &Path, own: &Path) -> std::io::Result<usize> {
     Ok(copied)
 }
 
+/// Copies the executables of `main`'s `debug` directory into `own`'s, each with its modified
+/// time, for a worktree of a project whose builds are refused: the binaries the project's own
+/// build made (a generator, a tool the card's tests run) are then at a path the worker may
+/// run. One already there and as new is left alone. The copies' paths; empty when `main` has
+/// no built binary.
+///
+/// # Errors
+/// When a file cannot be copied.
+pub fn seed_binaries(main: &Path, own: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let (from, to) = (main.join("debug"), own.join("debug"));
+    let Ok(entries) = std::fs::read_dir(&from) else { return Ok(Vec::new()) };
+    let mut copied = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if !path.is_file() || !is_executable(&path) {
+            continue;
+        }
+        let Some(name) = path.file_name() else { continue };
+        let dest = to.join(name);
+        let theirs = std::fs::metadata(&path)?.modified()?;
+        let current = std::fs::metadata(&dest).and_then(|m| m.modified()).is_ok_and(|have| have >= theirs);
+        if !current {
+            std::fs::create_dir_all(&to)?;
+            copy_dated(&path, &dest)?;
+        }
+        copied.push(dest);
+    }
+    copied.sort();
+    Ok(copied)
+}
+
+/// Whether the file at `path` is a program: an `.exe` on Windows, an execute bit elsewhere.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+}
+
+/// What the handoff of a worktree in a project whose builds are refused says of the binaries:
+/// the directory of the copies [`seed_binaries`] made, or that main has none and the card's
+/// generated files must be written by hand.
+#[must_use]
+pub fn prebuilt_note(main: &Path, own: &Path) -> String {
+    match seed_binaries(main, own) {
+        Ok(copied) if !copied.is_empty() => {
+            let names: Vec<String> = copied.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+            format!(
+                "The main checkout's built binaries are copied to {}, an allowed path you may run: {}.",
+                own.join("debug").display(),
+                names.join(", ")
+            )
+        }
+        _ => "The main checkout has no built binary to copy, so a file the card's build would generate must be hand-written.".to_owned(),
+    }
+}
+
+/// [`prebuilt_note`] for the worktree at `workspace`; empty when it is not a worktree.
+#[must_use]
+pub fn worktree_prebuilt_note(workspace: &Path) -> String {
+    let Some(own) = shared_target(workspace) else { return String::new() };
+    let Ok(main) = std::path::absolute(project_target(&project_of(workspace).0)) else { return String::new() };
+    if own.parent() != Some(main.as_path()) {
+        return String::new();
+    }
+    prebuilt_note(&main, &own)
+}
+
 /// Copies the file or directory `from` to `to`, each file with its modified time.
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<usize> {
     let kind = std::fs::symlink_metadata(from)?.file_type();
