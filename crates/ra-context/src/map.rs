@@ -496,6 +496,10 @@ pub fn test_recipe(read: impl Fn(&str) -> Option<String>, files: &[String], ask:
         let _ = writeln!(out, "test: {beside} is not there yet; create it and declare `mod tests;` at the end of its parent");
     }
 
+    for file in files {
+        out.push_str(&test_entry_line(&read, file));
+    }
+
     // how many tests' names hold each word, so a word every test holds weighs little
     let words = words_of(ask.card);
     let mut spread: HashMap<String, usize> = HashMap::new();
@@ -523,6 +527,22 @@ pub fn test_recipe(read: impl Fn(&str) -> Option<String>, files: &[String], ask:
         }
     }
     out
+}
+
+/// The line for a `+` integration test file of a crate whose Cargo.toml turns automatic test
+/// discovery off or lists `[[test]]` targets: the file is not run until an entry names it.
+/// Empty for any other file, a crate with automatic discovery, or an entry already there.
+fn test_entry_line(read: &impl Fn(&str) -> Option<String>, file: &str) -> String {
+    let Some(file) = file.trim().strip_prefix('+').map(|f| f.replace('\\', "/")) else { return String::new() };
+    let Some((dir, name)) = file.rsplit_once("/tests/") else { return String::new() };
+    let Some(name) = name.strip_suffix(".rs").filter(|n| !n.is_empty() && !n.contains('/')) else { return String::new() };
+    let manifest = format!("{dir}/Cargo.toml");
+    let Some(text) = read(&manifest) else { return String::new() };
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if !(compact.contains("autotests=false") || compact.contains("[[test]]")) || text.contains(&format!("tests/{name}.rs")) {
+        return String::new();
+    }
+    format!("test: {manifest} has explicit test targets; add `[[test]]` with `name = \"{name}\"` and `path = \"tests/{name}.rs\"` to it\n")
 }
 
 /// The integration tests file the card itself names: the `--test <name>` of a `cargo test` in
