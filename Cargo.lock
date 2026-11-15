@@ -3270,6 +3270,7 @@ dependencies = [
  "anyhow",
  "keyring",
  "parking_lot",
+ "ra-check",
  "ra-context",
  "ra-gotchas",
  "ra-providers",

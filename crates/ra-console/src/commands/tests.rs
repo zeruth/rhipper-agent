@@ -4210,8 +4210,46 @@ async fn linted_run(at: &str) -> (Vec<String>, ra_roadmap::model::Node, tempfile
     // the check, then the lines the change touched (the script's "ok" is no diff, so the new
     // file counts whole), then the lint of the crate of the change
     let lint = format!("cargo clippy -p {}", probe_name(dir.path()));
-    assert_eq!(*seen.lock(), ["cargo test --workspace -q", "git diff -U0 HEAD -- src/extra.rs", lint.as_str()]);
+    let json = format!("{lint} --message-format=json");
+    assert_eq!(*seen.lock(), ["cargo test --workspace -q", "git diff -U0 HEAD -- src/extra.rs", json.as_str(), lint.as_str()]);
     (out, store.read(2).await.unwrap(), dir)
+}
+
+/// Whether a scripted command is the plain lint, not the machine's pass that reads its fixes.
+fn plain_clippy(command: &str) -> bool {
+    command.starts_with("cargo clippy") && !command.contains("--message-format=json")
+}
+
+#[tokio::test]
+async fn lint_fixed_by_the_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status().unwrap().success());
+    assert!(std::process::Command::new("git").args(["add", "-A"]).current_dir(dir.path()).status().unwrap().success());
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    let write = ra_providers::ToolCall {
+        id: "call_1".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"src/extra.rs","content":"pub fn extra() { let x = 1; }\n"}"#.into(),
+    };
+    // the first lint offers one fix: `x` becomes `_x`; the second is clean
+    let fix = r#"{"reason":"compiler-message","message":{"spans":[{"file_name":"src/extra.rs","line_start":1,"line_end":1,"byte_start":21,"byte_end":22,"suggestion_applicability":"MachineApplicable","suggested_replacement":"_x"}],"children":[]}}"#;
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
+        log.lock().push(command.to_owned());
+        Ok((0, if command.contains("--message-format=json") { format!("{fix}\n") } else { "ok\n".to_owned() }))
+    });
+    let provider = Scripted::new(vec![says("", vec![write]), says("added extra", vec![]), says("accepted", vec![])]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider).with_script(script);
+    let (out, _) = run("/run 2", &store, &worker).await.unwrap();
+    assert!(out.iter().any(|l| l == "  lint: 1 fixed by the machine"), "{out:?}");
+    assert!(out.iter().any(|l| l.contains("lint clean: cargo clippy -p probe")), "{out:?}");
+    assert_eq!(std::fs::read_to_string(dir.path().join("src/extra.rs")).unwrap(), "pub fn extra() { let _x = 1; }\n");
+    let commands = seen.lock().clone();
+    assert_eq!(commands.iter().filter(|c| plain_clippy(c)).count(), 1, "{commands:?}");
+    assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::Implemented);
 }
 
 #[tokio::test]
@@ -4273,9 +4311,9 @@ async fn lint_fixed_run(
     let log = seen.clone();
     let script: ra_tools::Script = std::sync::Arc::new(move |command: &str| {
         let mut log = log.lock();
-        let lints = log.iter().filter(|c| c.starts_with("cargo clippy")).count();
+        let lints = log.iter().filter(|c| plain_clippy(c)).count();
         log.push(command.to_owned());
-        let warns = command.starts_with("cargo clippy") && (lints == 0 || !clean_after);
+        let warns = plain_clippy(command) && (lints == 0 || !clean_after);
         Ok((0, if warns { clippy.to_owned() } else { "ok\n".to_owned() }))
     });
     let mut answers = vec![says("", vec![write]), says("added extra", vec![]), says("dropped the unused x", vec![])];
@@ -4303,7 +4341,7 @@ async fn a_lint_only_failure_takes_the_cheap_fix_pass_and_goes_on_to_the_reviewe
     assert!(clean < before && before < first && first < verdict, "{out:?}");
     assert!(!out.iter().any(|l| l.contains("waits for the person")), "{out:?}");
     // the pass ran the check and the lint again
-    assert_eq!(commands.iter().filter(|c| c.starts_with("cargo clippy")).count(), 2, "{commands:?}");
+    assert_eq!(commands.iter().filter(|c| plain_clippy(c)).count(), 2, "{commands:?}");
     assert_eq!(commands.iter().filter(|c| c.starts_with("cargo test")).count(), 2, "{commands:?}");
     // the warning lines led the pass's task; the reviewer came after
     let seen = model.seen.lock();
@@ -4331,7 +4369,7 @@ async fn a_lint_still_red_after_the_fix_pass_leaves_the_card_needs_revision() {
     assert!(!out.iter().any(|l| l.contains("lint fixed on")), "{out:?}");
     assert_eq!(out.iter().filter(|l| l.contains("lint: 1 warning(s)")).count(), 2, "{out:?}");
     // one pass, no reviewer, no third run
-    assert_eq!(commands.iter().filter(|c| c.starts_with("cargo clippy")).count(), 2, "{commands:?}");
+    assert_eq!(commands.iter().filter(|c| plain_clippy(c)).count(), 2, "{commands:?}");
     assert_eq!(model.seen.lock().len(), 3);
     let handoffs = ra_context::TaskContext::open(dir.path(), 2).handoffs;
     assert_eq!(handoffs.len(), 2);
@@ -4370,7 +4408,7 @@ async fn lint_beside_a_failed_check_sends_the_card_back_once_with_both_in_the_re
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
     // the lint ran although the check failed, and the card went back once, with no fix pass
     let commands = seen.lock().clone();
-    assert_eq!(commands.iter().filter(|c| c.starts_with("cargo clippy")).count(), 1, "{commands:?}");
+    assert_eq!(commands.iter().filter(|c| plain_clippy(c)).count(), 1, "{commands:?}");
     assert!(!out.iter().any(|l| l.contains("fix pass")), "{out:?}");
     assert!(out.iter().any(|l| l.contains("check failed") && l.contains("lint: 1 warning(s) beside it")), "{out:?}");
     assert_eq!(store.read(2).await.unwrap().state, ra_roadmap::model::TaskState::NeedsRevision);

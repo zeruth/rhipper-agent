@@ -7691,6 +7691,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         for skipped in &lint.skipped {
             lint_lines.push(format!("  lint skipped: {skipped}"));
         }
+        if lint.fixed > 0 {
+            lint_lines.push(format!("  lint: {} fixed by the machine", lint.fixed));
+        }
         if lint.warnings.is_empty() {
             if !lint.command.is_empty() {
                 lint_lines.push(format!("  lint clean: {}", lint.command));
@@ -8285,6 +8288,8 @@ struct Lint {
     command: String,
     /// The diagnostics pointing at a changed file, whole.
     warnings: Vec<String>,
+    /// The fixes the machine applied before the lint judged.
+    fixed: usize,
     /// The lints that could not run, each with its reason.
     skipped: Vec<String>,
 }
@@ -8298,12 +8303,12 @@ struct Lint {
 /// against: `HEAD` in the project's own tree, the merge base in a worktree, so the card's
 /// committed checkpoints count as its lines and the lines the catch-up merge brought in do not.
 async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[String], project: Option<&str>, base: &str) -> Lint {
+    let mut crates: Vec<String> = Vec::new();
     let command = match project {
         Some("") => return Lint::default(),
         Some(command) if !changed.is_empty() => command.to_owned(),
         Some(_) => return Lint::default(),
         None => {
-            let mut crates: Vec<String> = Vec::new();
             for file in changed {
                 if let Some(krate) = ra_tools::crate_of(root, file)
                     && !crates.contains(&krate)
@@ -8330,6 +8335,20 @@ async fn lint_changed(toolbox: &ra_tools::Toolbox, root: &Path, changed: &[Strin
         let known = ranges.iter().any(|(f, _, _)| f == &file.replace('\\', "/"));
         if !known {
             ranges.push((file.replace('\\', "/"), 1, u32::MAX - 2));
+        }
+    }
+    // what clippy marks machine-applicable inside the card's lines is written by the machine, then
+    // formatted; the lint below judges what is left, with no model and no turn
+    if !crates.is_empty() {
+        let json = format!("{} --message-format=json", lint.command);
+        if let Ok((_, output)) = toolbox.check(&json).await {
+            let fixes = ra_check::fixes::fixes(&output, &ranges);
+            if let Ok(applied) = ra_check::fixes::apply(root, &fixes)
+                && applied > 0
+            {
+                lint.fixed = applied;
+                let _ = toolbox.check(&format!("cargo fmt -p {}", crates.join(" -p "))).await;
+            }
         }
     }
     // one clippy over every crate: a crate's warnings come out again under each crate that
