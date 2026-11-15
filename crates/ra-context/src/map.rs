@@ -462,7 +462,9 @@ struct Test {
 /// open on `test: `; empty for a card with no files.
 #[must_use]
 pub fn test_recipe(read: impl Fn(&str) -> Option<String>, files: &[String], ask: &Ask) -> String {
-    let Some(beside) = files.first().and_then(|f| tests_beside(f)) else { return String::new() };
+    let Some(beside) = named_tests(files, ask.card).or_else(|| files.first().and_then(|f| tests_beside(f))) else {
+        return String::new();
+    };
     let crates: Vec<&str> = files.iter().filter_map(|f| crate_of(f)).collect();
     let mut test_files = vec![beside.clone()];
     for file in files.iter().chain(ask.sources).map(|f| f.trim_start_matches('+').replace('\\', "/")) {
@@ -521,6 +523,27 @@ pub fn test_recipe(read: impl Fn(&str) -> Option<String>, files: &[String], ask:
         }
     }
     out
+}
+
+/// The integration tests file the card itself names: the `--test <name>` of a `cargo test` in
+/// its backticks, in the crate of its first file, else the first `tests/` file it lists.
+fn named_tests(files: &[String], card: &str) -> Option<String> {
+    let first = files.first()?.trim_start_matches('+').replace('\\', "/");
+    let named = card.split('`').skip(1).step_by(2).filter(|span| span.contains("cargo test")).find_map(|span| {
+        let mut words = span.split_whitespace();
+        words.find(|w| *w == "--test")?;
+        words.next().map(str::to_owned)
+    });
+    if let Some(name) = named {
+        return Some(match crate_of(&first) {
+            Some(krate) => format!("{krate}/tests/{name}.rs"),
+            None => format!("tests/{name}.rs"),
+        });
+    }
+    files
+        .iter()
+        .map(|f| f.trim_start_matches('+').replace('\\', "/"))
+        .find(|f| (f.starts_with("tests/") || f.contains("/tests/")) && is_tests(f) && !f.ends_with("/tests.rs"))
 }
 
 /// The tests file beside `file` as the project lays them out: `src/tests.rs` beside a `lib.rs`,
