@@ -36,6 +36,7 @@ fn says(text: &str, calls: Vec<ra_providers::ToolCall>) -> ra_providers::Complet
         reads: Vec::new(),
         read_in: 100,
         whole_reads: 0,
+        whole_files: Vec::new(),
     }
 }
 

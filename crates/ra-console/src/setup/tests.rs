@@ -24,6 +24,7 @@ impl ModelProvider for Answers {
                 reads: Vec::new(),
                 read_in: 0,
                 whole_reads: 0,
+                whole_files: Vec::new(),
             })
         })
     }

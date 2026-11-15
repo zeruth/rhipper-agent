@@ -81,6 +81,7 @@ impl ModelProvider for CappedAtContext {
             reads: Vec::new(),
             read_in: 400_000,
             whole_reads: 0,
+            whole_files: Vec::new(),
         };
         Box::pin(async move { Err(ProviderError::ContextOut { completion: Box::new(completion), cap: 120_000, size: 131_000 }) })
     }

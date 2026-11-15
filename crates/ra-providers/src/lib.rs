@@ -156,6 +156,9 @@ pub struct Completion {
     /// How many distinct files the run read whole, with no range: each is context every later
     /// turn carried. Zero from a provider that cannot tell.
     pub whole_reads: u64,
+    /// The files read whole with their line counts, as the run left them; empty from a provider
+    /// that cannot tell.
+    pub whole_files: Vec<(String, u64)>,
 }
 
 /// The tokens of one assistant turn: what it read, cached or not, and what it wrote.

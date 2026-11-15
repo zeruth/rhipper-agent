@@ -224,6 +224,7 @@ fn the_turn_sizes_lead_with_the_average_and_name_the_largest_when_shown() {
         biggest: Vec::new(),
         read_in: 12_500,
         whole_reads: 9,
+        whole_files: Vec::new(),
     };
     // a provider that showed only the sum: the average over the turns
     assert_eq!(turn_sizes(&session), "avg 10k tokens a turn");

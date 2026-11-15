@@ -7317,6 +7317,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                     reads: answer.reads,
                     read_in: answer.read_in,
                     whole_reads: answer.whole_reads,
+                    whole_files: answer.whole_files,
                 })
             }
             // the harness reports its turns running out as an error, with what the run read,
@@ -7339,6 +7340,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                         reads: answer.reads,
                         read_in: answer.read_in,
                         whole_reads: answer.whole_reads,
+                        whole_files: answer.whole_files,
                     }),
                     // the hard cap fails the run, but what the worker got to stays for the next
                     None => Err(anyhow::Error::new(CutOff {
@@ -7365,6 +7367,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                     reads: answer.reads,
                     read_in: answer.read_in,
                     whole_reads: answer.whole_reads,
+                    whole_files: answer.whole_files,
                 })
             }
             Err(error) => Err(map_error(error)),
@@ -9951,19 +9954,46 @@ struct Session {
     read_in: u64,
     /// How many distinct files the run read whole.
     whole_reads: u64,
+    /// The files read whole with their line counts, when the run could tell.
+    whole_files: Vec<(String, u64)>,
+}
+
+/// The files read whole with the lines each holds now, read from `workspace`; a file gone counts
+/// as empty.
+fn counted_files(workspace: &Path, whole: &std::collections::BTreeSet<String>) -> Vec<(String, u64)> {
+    whole
+        .iter()
+        .map(|path| {
+            let lines =
+                std::fs::read_to_string(workspace.join(path)).map_or(0, |text| u64::try_from(text.lines().count()).unwrap_or(u64::MAX));
+            (path.clone(), lines)
+        })
+        .collect()
+}
+
+/// The largest three of the files read whole, largest first, as ` (src/big.rs 2400 lines, …)`;
+/// empty when none is known.
+#[must_use]
+pub fn largest_whole_files(files: &[(String, u64)]) -> String {
+    let mut files: Vec<&(String, u64)> = files.iter().collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let named: Vec<String> = files.iter().take(3).map(|(path, lines)| format!("{path} {lines} lines")).collect();
+    if named.is_empty() { String::new() } else { format!(" ({})", named.join(", ")) }
 }
 
 /// The tokens of a session for the end line: the input with its cached share, then the read-in
-/// and the files read whole, as `in 2900000 (91% cached) out 1200 · read-in 740k, 9 files whole`.
+/// and the files read whole with the largest named, as `in 2900000 (91% cached) out 1200 ·
+/// read-in 740k, 9 files whole (src/big.rs 2400 lines)`.
 fn tokens_line(session: &Session) -> String {
     let usage = &session.usage;
     let cached = usage.cached_tokens * 100 / usage.prompt_tokens.max(1);
     format!(
-        "in {} ({cached}% cached) out {} · read-in {}, {} files whole",
+        "in {} ({cached}% cached) out {} · read-in {}, {} files whole{}",
         usage.prompt_tokens,
         usage.completion_tokens,
         kilo(session.read_in),
-        session.whole_reads
+        session.whole_reads,
+        largest_whole_files(&session.whole_files)
     )
 }
 
@@ -10296,6 +10326,7 @@ async fn tool_loop(
                 biggest,
                 read_in,
                 whole_reads: u64::try_from(whole.len()).unwrap_or(u64::MAX),
+                whole_files: counted_files(workspace, &whole),
             });
         }
         let answer = provider
@@ -10336,6 +10367,7 @@ async fn tool_loop(
                 biggest,
                 read_in,
                 whole_reads: u64::try_from(whole.len()).unwrap_or(u64::MAX),
+                whole_files: counted_files(workspace, &whole),
             });
         }
         // the budget is checked before the tools run: the work it would pay for is not done

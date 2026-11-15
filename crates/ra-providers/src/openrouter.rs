@@ -626,6 +626,7 @@ impl OpenRouter {
                     reads: Vec::new(),
                     read_in: 0,
                     whole_reads: 0,
+                    whole_files: Vec::new(),
                 })
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ProviderError::Auth(error_text(&body, status))),

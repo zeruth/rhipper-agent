@@ -22,6 +22,7 @@ fn says(text: &str) -> ra_providers::Completion {
         reads: Vec::new(),
         read_in: 100,
         whole_reads: 0,
+        whole_files: Vec::new(),
     }
 }
 

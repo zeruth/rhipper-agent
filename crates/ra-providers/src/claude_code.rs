@@ -588,6 +588,7 @@ impl ClaudeCode {
                 completion.gotchas = gotchas;
                 completion.read_in = turns.read_in();
                 completion.whole_reads = turns.whole_reads();
+                completion.whole_files = turns.whole_files();
                 completion.turn_usage = turns.into_turns();
                 completion.reads = reads;
             })
@@ -787,6 +788,18 @@ impl TurnTally {
         u64::try_from(self.whole.len()).unwrap_or(u64::MAX)
     }
 
+    /// The files read whole with their line counts as the files stand now, a file that is gone
+    /// counted as empty.
+    fn whole_files(&self) -> Vec<(String, u64)> {
+        self.whole
+            .iter()
+            .map(|path| {
+                let lines = std::fs::read_to_string(path).map_or(0, |text| u64::try_from(text.lines().count()).unwrap_or(u64::MAX));
+                (path.clone(), lines)
+            })
+            .collect()
+    }
+
     /// The input of the last turn, when the stream showed one.
     fn last_input(&self) -> Option<u64> {
         self.turns.last().map(|(_, turn)| turn.input_tokens)
@@ -820,7 +833,7 @@ impl TurnTally {
             cost_usd,
             cost_computed: cost_usd.is_some(),
         };
-        let (read_in, whole_reads) = (self.read_in(), self.whole_reads());
+        let (read_in, whole_reads, whole_files) = (self.read_in(), self.whole_reads(), self.whole_files());
         Completion {
             text: self.said.join("\n"),
             usage,
@@ -832,6 +845,7 @@ impl TurnTally {
             reads: Vec::new(),
             read_in,
             whole_reads,
+            whole_files,
         }
     }
 
@@ -1172,6 +1186,7 @@ fn parse_result(stdout: &str) -> Result<Completion, ProviderError> {
         reads: Vec::new(),
         read_in: 0,
         whole_reads: 0,
+        whole_files: Vec::new(),
     };
     if turns_out { Err(ProviderError::TurnsOut(Box::new(completion))) } else { Ok(completion) }
 }
