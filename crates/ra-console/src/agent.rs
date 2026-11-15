@@ -6770,6 +6770,10 @@ pub(crate) fn harness_messages(
             messages.push(Message::system(binaries));
         }
     }
+    let dirs = ra_providers::claude_code::session_dirs_note(root);
+    if !dirs.is_empty() {
+        messages.push(Message::system(dirs));
+    }
     // the investigator's brief, when one went ahead: where the code is and what to change,
     // so the builder writes rather than reads
     let mut text = task_text(task, rerun);

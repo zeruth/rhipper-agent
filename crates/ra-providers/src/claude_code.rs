@@ -407,7 +407,9 @@ impl ClaudeCode {
             // the reads a run needs outside its worktree (a gitignored source tree, the cargo
             // registry, a JDK's src.zip) and its own temp: refused, they cost a turn each, or a
             // worker wrote from memory what it could have read
-            let dirs: Vec<String> = self.read_roots.iter().cloned().chain(run_temp(request)).map(|d| d.display().to_string()).collect();
+            let target = request.workspace.as_deref().filter(|w| project_of(w).1.is_some()).and_then(shared_target);
+            let dirs: Vec<String> =
+                self.read_roots.iter().cloned().chain(run_temp(request)).chain(target).map(|d| d.display().to_string()).collect();
             if !dirs.is_empty() {
                 args.push("--add-dir".to_owned());
                 args.extend(dirs);
@@ -1324,6 +1326,22 @@ pub fn prebuilt_note(main: &Path, own: &Path) -> String {
     }
 }
 
+/// What the handoff of a worktree says of the two directories outside it that the session may
+/// list, read and run from: its cargo target and its kept scratch. Empty when `workspace` is not
+/// a worktree.
+#[must_use]
+pub fn session_dirs_note(workspace: &Path) -> String {
+    if project_of(workspace).1.is_none() {
+        return String::new();
+    }
+    let (Some(target), Some(temp)) = (shared_target(workspace), temp_of(workspace)) else { return String::new() };
+    format!(
+        "Outside the worktree you may list, read and run from two directories: the card's cargo target {} (built binaries under debug/) and its kept scratch {}.",
+        target.display(),
+        temp.display()
+    )
+}
+
 /// [`prebuilt_note`] for the worktree at `workspace`; empty when it is not a worktree.
 #[must_use]
 pub fn worktree_prebuilt_note(workspace: &Path) -> String {
@@ -1426,7 +1444,12 @@ pub fn scratch_env(workspace: &Path) -> Vec<(String, PathBuf)> {
 /// completion, which runs nothing.
 #[must_use]
 pub fn run_temp(request: &CompletionRequest) -> Option<PathBuf> {
-    let workspace = std::path::absolute(request.workspace.as_deref()?).ok()?;
+    temp_of(request.workspace.as_deref()?)
+}
+
+/// [`run_temp`] of the workspace itself.
+fn temp_of(workspace: &Path) -> Option<PathBuf> {
+    let workspace = std::path::absolute(workspace).ok()?;
     let (root, card) = project_of(&workspace);
     let name = root.file_name().map_or_else(|| "project".into(), |n| n.to_string_lossy().into_owned());
     let base = scratch().map_or_else(|| std::env::temp_dir().join("rhipper"), |s| s.join("tmp"));
