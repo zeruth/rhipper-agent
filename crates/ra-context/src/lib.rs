@@ -1048,8 +1048,11 @@ impl TaskContext {
             let _ = write!(text, "\n{REVIEW_HEADING}\n{lead}\n{review}\n");
         }
         let shown = &self.handoffs[self.handoffs.len().saturating_sub(HANDOFFS_SHOWN)..];
-        if !shown.is_empty() {
-            text.push_str("\nEarlier runs of this task, oldest first; continue from the last one:\n");
+        if let Some(last) = shown.last() {
+            // why the last run stopped decides how the next one starts: a capped run continues,
+            // a crashed or refused one retries another way
+            let _ = writeln!(text, "\n{LAST_ENDED} {}.", last.end_reason());
+            text.push_str("Earlier runs of this task, oldest first; continue from the last one:\n");
             for handoff in shown {
                 text.push_str(&handoff.render());
             }
@@ -1251,6 +1254,20 @@ impl Handoff {
         self.failures.first().and_then(|f| f.lines().next())
     }
 
+    /// Why the run ended, read off the check line the agent wrote for it and its report.
+    #[must_use]
+    pub fn end_reason(&self) -> EndReason {
+        let check = self.check.to_lowercase();
+        match check.strip_prefix("no check:") {
+            Some(why) if why.contains("context cap") => EndReason::TokenCeiling,
+            Some(why) if why.contains("cap") => EndReason::TurnCap,
+            Some(_) if self.report.contains("stopped over budget") => EndReason::TokenCeiling,
+            Some(_) => EndReason::Crash,
+            None if self.outcome == CUT_OFF => EndReason::TurnCap,
+            None => EndReason::of_report(&self.report),
+        }
+    }
+
     /// Whether the run moved the card on from `before`: its standing fell or the check's first
     /// error changed.
     #[must_use]
@@ -1347,6 +1364,59 @@ pub fn cut_off_report(why: &str, changed: &[String], last_message: &str) -> Stri
 /// The outcome of a run the project's turn or context cap ended: the card continues in a fresh
 /// session, its handoff carrying the changed files and the tail of the worker's last message.
 pub const CONTINUES: &str = "continues";
+
+/// Why a run ended, as the ledger stores it beside the run's turns and tokens and the next
+/// handoff opens with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    /// A turn cap, the project's or the harness's, ended the run.
+    TurnCap,
+    /// A context cap or the run's budget ended it after the turn that crossed it.
+    TokenCeiling,
+    /// The worker or its provider failed before an answer.
+    Crash,
+    /// The worker stopped blocked on a command the hook refused.
+    Refused,
+    /// The worker answered with its report.
+    Reported,
+}
+
+impl EndReason {
+    /// The words the ledger stores and `rc history` prints.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnCap => "turn cap",
+            Self::TokenCeiling => "token ceiling",
+            Self::Crash => "crash",
+            Self::Refused => "refused command",
+            Self::Reported => "reported",
+        }
+    }
+
+    /// The reason of stored words; `None` for words no reason writes.
+    #[must_use]
+    pub fn parse(words: &str) -> Option<Self> {
+        [Self::TurnCap, Self::TokenCeiling, Self::Crash, Self::Refused, Self::Reported].into_iter().find(|r| r.as_str() == words.trim())
+    }
+
+    /// The reason of a run that answered: refused when its report stops blocked on a refused
+    /// command, else reported.
+    #[must_use]
+    pub fn of_report(report: &str) -> Self {
+        let lower = report.to_lowercase();
+        if lower.contains("## blocked") && lower.contains("refused") { Self::Refused } else { Self::Reported }
+    }
+}
+
+impl std::fmt::Display for EndReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The opening of the line the handoffs of a prompt start with, naming the last run's reason.
+pub const LAST_ENDED: &str = "The last run ended on:";
 
 /// The end of a worker's message: its last [`LAST_MESSAGE_LINES`] non-blank lines within
 /// [`LAST_MESSAGE_ROOM`] characters, behind a `…` line when the head is clipped; empty when the

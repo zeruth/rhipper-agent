@@ -14,6 +14,7 @@ fn call() -> Call {
         cost_usd: None,
         cost_computed: false,
         read_in: 0,
+        reason: None,
     }
 }
 

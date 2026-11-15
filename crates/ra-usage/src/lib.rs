@@ -78,6 +78,26 @@ pub struct Call {
     pub cost_computed: bool,
     /// The read-in of the call, as [`Entry::read_in`] has it.
     pub read_in: u64,
+    /// Why the run ended, on a worker's last row of a run (`turn cap`, `token ceiling`,
+    /// `crash`, `refused command`, `reported`); `None` on the other rows and the older ledgers.
+    pub reason: Option<String>,
+}
+
+impl Call {
+    /// The row as `rc history <id>` lists a run: when, the model, the turns and the tokens, and
+    /// why it ended beside them.
+    #[must_use]
+    pub fn run_line(&self) -> String {
+        let model = self.model.rsplit('/').next().unwrap_or(&self.model);
+        format!(
+            "run {} · {} · {} turn(s) · {} tokens · ended: {}",
+            self.at,
+            model.strip_prefix("claude-").unwrap_or(model),
+            self.turns,
+            self.prompt_tokens + self.completion_tokens,
+            self.reason.as_deref().unwrap_or("unrecorded")
+        )
+    }
 }
 
 /// One row as the dashboard's token gauges read it: when it was written, the tokens in and
@@ -179,14 +199,16 @@ impl UsageStore {
                 turns integer not null default 1,
                 cost_computed integer not null default 0,
                 role text,
-                read_in integer not null default 0
+                read_in integer not null default 0,
+                reason text
             )",
         )
         .execute(&self.pool)
         .await?;
         // a ledger from before the turn count reads as one turn each; one from before the
         // computed mark reads as reported throughout; one from before the role tag reads as
-        // the worker's calls throughout; one from before the read-in reads as none
+        // the worker's calls throughout; one from before the read-in reads as none, and one
+        // from before the end reason as unrecorded
         let columns = sqlx::query("pragma table_info(usage)").fetch_all(&self.pool).await?;
         let has = |name: &str| columns.iter().any(|c| c.get::<String, _>("name") == name);
         if !has("turns") {
@@ -201,6 +223,24 @@ impl UsageStore {
         if !has("read_in") {
             sqlx::query("alter table usage add column read_in integer not null default 0").execute(&self.pool).await?;
         }
+        if !has("reason") {
+            sqlx::query("alter table usage add column reason text").execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    /// Marks why the latest run on `node` ended, on the newest of the worker's own rows for it:
+    /// a cheap role's call after the run keeps no reason. Nothing changes when the node has no
+    /// worker's row.
+    ///
+    /// # Errors
+    /// When the row cannot be written.
+    pub async fn set_reason(&self, node: i64, reason: &str) -> anyhow::Result<()> {
+        sqlx::query("update usage set reason = ? where id = (select max(id) from usage where node = ? and role is null)")
+            .bind(reason)
+            .bind(node)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -391,8 +431,8 @@ impl UsageStore {
     /// When the query fails.
     pub async fn calls_of(&self, node: Option<i64>) -> anyhow::Result<Vec<Call>> {
         let rows = sqlx::query(
-            "select at, model, role, turns, prompt_tokens, completion_tokens, cached_tokens, cost_usd, cost_computed, read_in from usage \
-             where node is ? order by id desc",
+            "select at, model, role, turns, prompt_tokens, completion_tokens, cached_tokens, cost_usd, cost_computed, read_in, reason \
+             from usage where node is ? order by id desc",
         )
         .bind(node)
         .fetch_all(&self.pool)
@@ -412,6 +452,7 @@ impl UsageStore {
                     cost_usd: row.get("cost_usd"),
                     cost_computed: row.get("cost_computed"),
                     read_in: count("read_in"),
+                    reason: row.get("reason"),
                 }
             })
             .collect())

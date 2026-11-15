@@ -501,6 +501,16 @@ impl Worker {
         self.book(entry_of(model, role, node, usage, turns, 0)).await;
     }
 
+    /// Marks why the card's latest run ended on its ledger row, which `rc history <id>` prints;
+    /// a ledger that cannot be written is a warning, as a booking's is.
+    pub(crate) async fn end_run(&self, node: i64, reason: ra_context::EndReason) {
+        if let Some(ledger) = &self.ledger
+            && let Err(e) = ledger.set_reason(node, reason.as_str()).await
+        {
+            tracing::warn!("cannot write the usage ledger: {e:#}");
+        }
+    }
+
     async fn book(&self, entry: Entry) {
         self.tally.lock().add(&entry);
         if let Some(ledger) = &self.ledger
@@ -6828,6 +6838,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         let context = bare_context(shown, rerun.as_deref(), &project, worker.debug);
         tool_loop(provider.as_ref(), worker, id, context, workspace.as_deref(), budget, caps).await
     };
+    worker.end_run(id, end_reason(&session)).await;
     // the head of the handoff is the orchestrator's, not the worker's: where the tree is, the
     // branch's commits, what happened to it since the last run, and the acceptance's checks
     // still open, so the next run reads them as facts
@@ -9457,6 +9468,23 @@ impl std::fmt::Display for CutOff {
 }
 
 impl std::error::Error for CutOff {}
+
+/// Why a run's session ended, as the ledger stores it: the cap that ended it, the budget, a
+/// failure, or the worker's own answer, refused when it stops blocked on a refused command.
+fn end_reason(session: &anyhow::Result<Session>) -> ra_context::EndReason {
+    use ra_context::EndReason;
+    match session {
+        Ok(Session { capped: Some(Capped::Turns(_)), .. }) => EndReason::TurnCap,
+        Ok(Session { capped: Some(Capped::Context { .. }), .. }) => EndReason::TokenCeiling,
+        Ok(session) => EndReason::of_report(&session.text),
+        // the tool loop's hard cap fails the run in words, the harness's as a cut-off
+        Err(error) if error.downcast_ref::<CutOff>().is_some() || error.to_string().contains("turns without finishing") => {
+            EndReason::TurnCap
+        }
+        Err(error) if error.downcast_ref::<OverBudget>().is_some() => EndReason::TokenCeiling,
+        Err(_) => EndReason::Crash,
+    }
+}
 
 /// The tool loop of a bare model: the model answers with tool calls, the toolbox executes them in
 /// the workspace, the results go back, until the hard cap of `caps` runs out when there is one,

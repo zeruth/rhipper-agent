@@ -16,6 +16,7 @@ fn call(turns: u64, tokens: u64, role: Option<&str>) -> Call {
         cost_usd: None,
         cost_computed: false,
         read_in: 0,
+        reason: None,
     }
 }
 

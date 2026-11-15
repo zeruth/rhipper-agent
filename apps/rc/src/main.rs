@@ -2149,6 +2149,14 @@ async fn show_history(id: Option<i64>, full: bool) -> anyhow::Result<()> {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         println!("last change {} ago", history::age(now.saturating_sub(last.at)));
     }
+    // the card's runs from the ledger, oldest first, each with why it ended; the cheap roles'
+    // calls are not runs
+    if let Some(id) = id {
+        let calls = open_ledger().await?.calls_of(Some(id)).await?;
+        for call in calls.iter().rev().filter(|call| call.role.is_none()) {
+            println!("{}", call.run_line());
+        }
+    }
     if full && let Some(id) = id {
         let root = store_path().parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let context = ra_context::TaskContext::open(&root, id);

@@ -43,6 +43,7 @@ fn call(at: &str, role: Option<&str>, turns: u64, cost: f64) -> ra_usage::Call {
         cost_usd: Some(cost),
         cost_computed: false,
         read_in: 0,
+        reason: None,
     }
 }
 
