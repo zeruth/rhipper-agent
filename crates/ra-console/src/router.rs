@@ -218,6 +218,7 @@ impl fmt::Display for Rule {
 ///   { test = "tests/abi_snapshot.rs", command = "RA_SNAPSHOT=write cargo test -p ras --test abi_snapshot" },
 ///   { test = "scoreboard_matches", command = "ras score --write testdata/bin" },
 /// ]
+/// landing_always = ["cargo test -q -p ra-asm-testing"] # run by every landing's merged-tree check, after the card's
 /// [worker.env]
 /// CARGO_BUILD_JOBS = "6"               # the environment its harness runs with
 /// ```
@@ -316,6 +317,11 @@ pub struct WorkerConfig {
     /// each one cost a send-back (asm #495 on its eh-clang ABI snapshot, 2026-11-15).
     #[serde(default)]
     pub regenerate: Vec<Regenerate>,
+    /// Commands every landing's merged-tree check runs after the card's own, whatever crates it
+    /// touched: a repo-wide data test (a manifest, a scoreboard) that no touched crate runs went
+    /// red on main unseen (asm CI, 2026-11-15). A failure sends the card back with its output.
+    #[serde(default)]
+    pub landing_always: Vec<String>,
 }
 
 /// One `[worker] regenerate` entry: the test that checks a tracked file, by its name or by the

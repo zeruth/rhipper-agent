@@ -4949,6 +4949,22 @@ pub(crate) fn merged_suite(root: &Path, mut commands: Vec<String>, changed: &[St
     commands
 }
 
+/// The commands a landing's merged tree is checked with: the card's, the suites of the crates
+/// it changed ([`merged_suite`]), then the project's `[worker] landing_always`, which run
+/// whatever the card touched.
+#[must_use]
+pub fn landing_commands(root: &Path, commands: Vec<String>, changed: &[String]) -> Vec<String> {
+    let mut commands = if commands.is_empty() { commands } else { merged_suite(root, commands, changed) };
+    let always = crate::router::Router::load(root).map(|router| router.worker.landing_always).unwrap_or_default();
+    for command in always {
+        let command = command.trim().to_owned();
+        if !command.is_empty() && !commands.contains(&command) {
+            commands.push(command);
+        }
+    }
+    commands
+}
+
 /// The tests a failed check of the merged tree names when every one of them panics in a crate
 /// the card neither changed nor is a direct dependent of, as `name (path)` joined by commas.
 /// `None` leaves the failure the card's: a compile error (a card that breaks an API breaks its
@@ -5557,7 +5573,7 @@ async fn check_merged(
 ) -> anyhow::Result<()> {
     let id = node.id;
     let Checks { commands, timeout, .. } = checks_of(root, node);
-    let commands = if commands.is_empty() { commands } else { merged_suite(root, commands, staged) };
+    let commands = landing_commands(root, commands, staged);
     if !commands.is_empty() && !staged.is_empty() {
         let toolbox = worker.toolbox(root).map(|t| t.with_timeout(timeout));
         let _slot = hold_build(root, root).await;
@@ -7882,6 +7898,10 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
         ),
     ];
     lines.extend(route);
+    let always = landing_commands(&root, Vec::new(), &[]);
+    if !always.is_empty() {
+        lines.push(format!("  every landing's merged tree also runs: {}", always.join(" · ")));
+    }
     // what the pre hook makes of a check when the worker runs it itself: the command as it
     // runs, with its tail, shown before a run does it
     if let Ok(catalogue) = Catalogue::load(&root.join(GOTCHAS_FILE)) {
