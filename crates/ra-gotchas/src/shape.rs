@@ -348,6 +348,12 @@ fn judge_part(
     if mid_check(name, rest) {
         return Shape::Allowed;
     }
+    if name == "git" && rest.first() == Some(&"branch") {
+        match branch_shape(&rest[1..]) {
+            Shape::Unknown => {}
+            shape => return shape,
+        }
+    }
     // the program is the card's own build output, run by `&` or by its path alike
     if in_target(first) {
         return Shape::Allowed;
@@ -361,6 +367,38 @@ fn judge_part(
     }
     let fold = shell == Shell::PowerShell;
     if shell.allowed().iter().any(|rule| matches(rule, &line, fold)) { Shape::Allowed } else { Shape::Unknown }
+}
+
+/// `git branch` with `args` (after `branch`): allowed when its flags only list (`-a`, `-r`, `-l`,
+/// `--list`, `-v`, `--format=`, `--contains`, `--merged`) and a bare word is a pattern or the
+/// commit those two take; refused when it would create, change or delete a branch; anything else
+/// (`--show-current`, `--sort=`) is left to the static allowlist.
+fn branch_shape(args: &[&str]) -> Shape {
+    let listing = |w: &str| matches!(w, "-a" | "-r" | "-l" | "--list" | "-v" | "--contains" | "--merged") || w.starts_with("--format=");
+    let list_mode = args.iter().any(|w| matches!(*w, "-l" | "--list"));
+    let mut takes_commit = false;
+    for &word in args {
+        if word.starts_with('-') {
+            if !listing(word) {
+                let writes = matches!(
+                    word,
+                    "-d" | "-D" | "-m" | "-M" | "-c" | "-C" | "-f" | "--delete" | "--move" | "--copy" | "--force" | "--edit-description"
+                ) || word.starts_with("--set-upstream-to")
+                    || word.starts_with("--unset-upstream")
+                    || word == "-u"
+                    || word == "-t"
+                    || word.starts_with("--track");
+                return if writes { Shape::Denied(GIT_FORM.to_owned()) } else { Shape::Unknown };
+            }
+            takes_commit = matches!(word, "--contains" | "--merged");
+        } else if !takes_commit && !list_mode {
+            // a bare word with no listing flag names a branch to create
+            return Shape::Denied(GIT_FORM.to_owned());
+        } else {
+            takes_commit = false;
+        }
+    }
+    Shape::Allowed
 }
 
 /// `git mv` with `args` (after `mv`): allowed when it names a source and a destination and every
@@ -598,6 +636,25 @@ fn in_target(word: &str, target: &Path) -> bool {
     absolute && path != "/dev/null" && !outside(word, target)
 }
 
+/// The `%(…)` atoms of a git `--format=` the splitter reads as text when they stand unquoted.
+const FORMAT_ATOMS: &[&str] = &[
+    "refname",
+    "objectname",
+    "objecttype",
+    "upstream",
+    "push",
+    "HEAD",
+    "subject",
+    "authorname",
+    "authordate",
+    "committerdate",
+    "creatordate",
+    "worktreepath",
+    "symref",
+    "contents",
+    "ahead-behind",
+];
+
 /// The simple commands of `command`, or `None` for a shape it does not read: a subshell, a
 /// substitution, a block, a heredoc or input redirect, a background `&`, an open quote.
 fn split(command: &str, shell: Shell) -> Option<Vec<Part>> {
@@ -680,6 +737,22 @@ fn split(command: &str, shell: Shell) -> Option<Vec<Part>> {
                     return None;
                 }
                 part.writes |= !["/dev/null", "$null", "nul"].iter().any(|d| d.eq_ignore_ascii_case(&target));
+            }
+            // a git format atom, `--format=%(refname:short)`, is the command's text: Bash refuses
+            // it as a syntax error and PowerShell looks up a command by the atom's name, so only
+            // the atoms no machine has a command for are read
+            '(' if in_word && word.starts_with("--format=") && word.ends_with('%') => {
+                let mut atom = String::new();
+                while let Some(a) = chars.next_if(|a| a.is_ascii_alphanumeric() || matches!(a, ':' | '-' | '_' | ',' | '=')) {
+                    atom.push(a);
+                }
+                let name = atom.split(':').next().unwrap_or("");
+                if chars.next_if_eq(&')').is_none() || !FORMAT_ATOMS.contains(&name) {
+                    return None;
+                }
+                word.push('(');
+                word.push_str(&atom);
+                word.push(')');
             }
             '&' | '<' | '(' | ')' | '{' | '}' | '`' => return None,
             '$' if chars.peek() == Some(&'(') => return None,
