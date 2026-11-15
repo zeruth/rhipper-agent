@@ -1209,9 +1209,12 @@ fn slot_note(slot: usize) -> Option<String> {
 
 /// The cargo target a check in `root` builds in: `CARGO_TARGET_DIR` when set (a relative one
 /// under `root`), else `target` under the outermost workspace above `root`, or `root` itself.
+/// This crate's own tests read no `CARGO_TARGET_DIR`: theirs is the target the suite was built
+/// in, and every test's check queued on the one lock of it.
 #[must_use]
 pub fn cargo_target(root: &Path) -> PathBuf {
-    cargo_target_with(root, std::env::var_os("CARGO_TARGET_DIR").as_deref())
+    let target_dir = if cfg!(test) { None } else { std::env::var_os("CARGO_TARGET_DIR") };
+    cargo_target_with(root, target_dir.as_deref())
 }
 
 /// [`cargo_target`] with `CARGO_TARGET_DIR` as named, for the tests.

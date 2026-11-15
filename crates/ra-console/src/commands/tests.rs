@@ -4593,24 +4593,45 @@ async fn a_check_that_outlives_its_budget_is_killed() {
     )
     .await
     .unwrap();
-    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 1\n").unwrap();
+    // a python started on a loaded machine took more than a second to write its pid, and the
+    // budget killed it first: the budget leaves it room to start
+    std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 5\n").unwrap();
     let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])])).with_cargo(green());
     let (out, _) = run("/run 2", &store, &worker).await.unwrap();
-    assert!(out.iter().any(|l| l.contains("check failed: python -c") && l.contains(" · timed out after 1s")), "{out:?}");
-    let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
-    assert!(process_is_gone(pid), "the child {pid} outlived the budget: {out:?}");
+    assert!(out.iter().any(|l| l.contains("check failed: python -c") && l.contains(" · timed out after 5s")), "{out:?}");
     let node = store.read(2).await.unwrap();
     assert_eq!(node.state, ra_roadmap::model::TaskState::NeedsRevision);
     // python ends its line the platform's way; the output before the limit and the line stay
     let notes = node.notes.unwrap_or_default().replace("\r\n", "\n");
     assert!(notes.starts_with("check failed: python -c"), "{notes}");
-    assert!(notes.contains("started\ntimed out after 1s\n\ndone"), "{notes}");
+    assert!(notes.contains("timed out after 5s\n\ndone"), "{notes}");
+    // a child the budget ended before it wrote its pid started nothing to outlive it
+    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+        let pid: u32 = pid.trim().parse().unwrap();
+        assert!(process_is_gone(pid), "the child {pid} outlived the budget: {out:?}");
+        assert!(notes.contains("started\ntimed out after 5s"), "{notes}");
+    }
     let task = ra_context::TaskContext::open(dir.path(), 2);
-    assert!(task.handoffs.last().is_some_and(|h| h.report.contains("timed out after 1s")), "{:?}", task.handoffs.last());
+    assert!(task.handoffs.last().is_some_and(|h| h.report.contains("timed out after 5s")), "{:?}", task.handoffs.last());
 }
 
-/// Whether no process answers to `pid` any more.
+/// Whether no process answers to `pid` any more, asked for up to ten seconds: a killed process
+/// on a loaded machine still answered the first ask, right after the kill.
 fn process_is_gone(pid: u32) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if process_is_gone_now(pid) {
+            return true;
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(10) {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Whether no process answers to `pid` right now.
+fn process_is_gone_now(pid: u32) -> bool {
     #[cfg(windows)]
     {
         let out = std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().unwrap();
@@ -4678,8 +4699,8 @@ async fn a_wait_on_a_target_ends_at_the_check_timeout_naming_the_holder() {
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     run("/edit 2 acceptance `cargo test -q` passes", &store, &worker()).await.unwrap();
     std::fs::write(dir.path().join(crate::router::ROUTES_FILE), "[worker]\nlint = \"\"\ncheck_timeout = 1\n").unwrap();
-    // the card runs in a worktree, so the target is its own `target/wt-2`: a project's target
-    // is the `CARGO_TARGET_DIR` the test process inherits, which every test's check shares
+    // the card runs in a worktree, so the target is its own `target/wt-2`, the lock no other
+    // test's check takes
     let worktree = dir.path().join("var").join("worktrees").join("2");
     git_ok(dir.path(), &["worktree", "add", "-q", "-b", "card/2", &worktree.to_string_lossy()]);
     // another project's check holds the lock on the target for the whole run

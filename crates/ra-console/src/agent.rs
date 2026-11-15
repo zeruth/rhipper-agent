@@ -2675,6 +2675,12 @@ pub const BUILDS_A_SESSION: u32 = 2;
 /// # Errors
 /// The reason the build is refused, for the worker.
 pub fn build_allowance(tree: &Path, session: &str, command: &str) -> Result<(), String> {
+    build_allowance_for(tree, session, command, card_of_run)
+}
+
+/// [`build_allowance`] with the card of the run asked of `card`, given the project's root, so a
+/// test is not at the mercy of the [`CARD_VAR`] the runs of other tests set.
+fn build_allowance_for(tree: &Path, session: &str, command: &str, card: impl FnOnce(&Path) -> Option<i64>) -> Result<(), String> {
     // the project's table, read above a worktree, which has no copy of it
     let allowed = crate::router::Router::load(&crate::hub::project_root_of(tree)).map_or(BUILDS_A_SESSION, |r| r.worker.builds());
     if allowed == 0 {
@@ -2691,7 +2697,7 @@ pub fn build_allowance(tree: &Path, session: &str, command: &str) -> Result<(), 
         .current_dir(tree)
         .output()
         .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty());
-    if matches!(changed, Ok(false)) && !review_asked_test_run(tree, command) {
+    if matches!(changed, Ok(false)) && !review_asked_test_run(tree, command, card) {
         return Err(String::from(
             "nothing is changed yet: write the card's change first, then build once if a compile is in doubt; the project's check compiles after the report and a failure comes back as a rerun with its output",
         ));
@@ -2711,12 +2717,12 @@ pub fn build_allowance(tree: &Path, session: &str, command: &str) -> Result<(), 
 
 /// Whether `command` is a `cargo test` that the card's last verdict, a needs-revision, asked for
 /// in its points: a rerun may run it before its first edit, counted as any build is.
-fn review_asked_test_run(tree: &Path, command: &str) -> bool {
+fn review_asked_test_run(tree: &Path, command: &str, card: impl FnOnce(&Path) -> Option<i64>) -> bool {
     if !command.contains("cargo test") {
         return false;
     }
     let root = crate::hub::project_root_of(tree);
-    let Some(id) = card_of_run(&root) else {
+    let Some(id) = card(&root) else {
         return false;
     };
     let Some(review) = ra_context::TaskContext::open(&root, id).review else {

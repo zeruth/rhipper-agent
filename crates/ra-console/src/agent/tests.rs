@@ -1337,9 +1337,9 @@ fn tree_with_review(review: &str) -> Option<tempfile::TempDir> {
     if !git.is_ok_and(|s| s.success()) {
         return None;
     }
-    // a run sets the card's variable; a test under one reads the same card
-    let id = std::env::var(CARD_VAR).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(7);
-    let mut task = ra_context::TaskContext::open(dir.path(), id);
+    // the card is named outright, as the allowance is asked of it: the runs of other tests set
+    // the card's variable while this one reads
+    let mut task = ra_context::TaskContext::open(dir.path(), 7);
     task.review = Some(review.to_owned());
     task.save(dir.path()).unwrap();
     Some(dir)
@@ -1352,7 +1352,7 @@ fn review_asked_test_runs_before_change_allows_one_cargo_test() {
         return;
     };
     let command = "rc hold -- cargo test -p ra-console -q";
-    assert!(build_allowance(dir.path(), "s1", command).is_ok());
+    assert!(build_allowance_for(dir.path(), "s1", command, |_| Some(7)).is_ok());
 }
 
 #[test]
@@ -1361,7 +1361,7 @@ fn review_asked_test_runs_before_change_still_refuses_without_the_ask() {
         return;
     };
     let command = "rc hold -- cargo test -p ra-console -q";
-    assert!(build_allowance(dir.path(), "s1", command).is_err());
+    assert!(build_allowance_for(dir.path(), "s1", command, |_| Some(7)).is_err());
 }
 
 #[tokio::test]
