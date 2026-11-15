@@ -1886,6 +1886,13 @@ async fn check_card(card: i64) -> anyhow::Result<()> {
     {
         println!("main was merged since the last check: {} rebuild", rebuild.cleaned.join(", "));
     }
+    let named = ra_providers::rebuild::crates_of(&commands);
+    // a stale binary left in place would run unrebuilt: the check fails rather than run it
+    let lines = ra_providers::rebuild::rebuild_stale_binaries(&target, &named)
+        .map_err(|e| anyhow::anyhow!("a stale test binary in {} could not be removed: {e}", target.display()))?;
+    for line in lines {
+        println!("{line}");
+    }
     let mut kept = String::new();
     let mut passed = true;
     for command in commands {

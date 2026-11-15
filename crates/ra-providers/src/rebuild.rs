@@ -113,6 +113,105 @@ pub fn rebuild_after_merge(worktree: &Path, target: &Path, commands: &[String]) 
     Ok(rebuild)
 }
 
+/// The `<16 hex digits>` hash a cargo artifact's name ends in, split from its stem.
+fn split_hash(stem: &str) -> Option<(&str, &str)> {
+    stem.rsplit_once('-').filter(|(_, hash)| hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The crates a test binary links, by its fingerprint directory `print`: its own crate `name`, and
+/// every dependency its `test-*.json` names. None when the fingerprint is not a test target's, so
+/// a build script or a plain binary is never taken for a test.
+fn test_links(print: &Path, name: &str) -> Option<Vec<String>> {
+    let entries = std::fs::read_dir(print).ok()?;
+    let mut test = false;
+    let mut links = vec![name.to_owned()];
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if !file.starts_with("test-") {
+            continue;
+        }
+        test = true;
+        if file.ends_with(".json")
+            && let Ok(text) = std::fs::read_to_string(entry.path())
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            // `"deps": [[<hash>, "<extern name>", <public>, <fingerprint>], …]`
+            let deps = json["deps"].as_array().into_iter().flatten();
+            links.extend(deps.filter_map(|dep| dep.get(1)?.as_str().map(str::to_owned)));
+        }
+    }
+    test.then_some(links)
+}
+
+/// Removes every test binary in `target` that links the library of one of `crates` and is older
+/// than that library's rlib, with its fingerprint so cargo rebuilds it instead of running it.
+/// Returns one line per binary, `<binary> rebuilt: stale against <lib>`. A merge can leave a
+/// binary built before the rlib it links; its mtime is then no proof it is fresh. A binary that
+/// links none of `crates`, and an artifact that is not a test binary, are left alone.
+///
+/// # Errors
+/// When a stale binary or its fingerprint cannot be removed.
+pub fn rebuild_stale_binaries(target: &Path, crates: &[String]) -> std::io::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let crates: Vec<String> = crates.iter().map(|c| c.replace('-', "_")).collect();
+    let Ok(profiles) = std::fs::read_dir(target) else { return Ok(lines) };
+    for profile in profiles.flatten() {
+        let Ok(entries) = std::fs::read_dir(profile.path().join("deps")) else { continue };
+        let entries: Vec<_> = entries.flatten().collect();
+        // the newest rlib of each of the card's crates, by its extern name
+        let mut libs: Vec<(String, std::time::SystemTime, String)> = Vec::new();
+        for entry in &entries {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = file.strip_prefix("lib").and_then(|f| f.strip_suffix(".rlib")) else { continue };
+            let Some((name, _)) = split_hash(stem) else { continue };
+            let Some(name) = crates.iter().find(|c| *c == name) else { continue };
+            let Ok(built) = entry.metadata().and_then(|m| m.modified()) else { continue };
+            match libs.iter_mut().find(|(n, ..)| n == name) {
+                Some(lib) if built > lib.1 => *lib = (name.clone(), built, file),
+                Some(_) => {}
+                None => libs.push((name.clone(), built, file)),
+            }
+        }
+        if libs.is_empty() {
+            continue;
+        }
+        // the fingerprint directory is named by the package (`ra-providers-<hash>`), the binary by
+        // the crate (`ra_providers-<hash>`)
+        let prints: Vec<PathBuf> =
+            std::fs::read_dir(profile.path().join(".fingerprint")).into_iter().flatten().flatten().map(|entry| entry.path()).collect();
+        let print_of = |name: &str, hash: &str| {
+            let wanted = format!("{name}-{hash}");
+            prints.iter().find(|p| p.file_name().is_some_and(|f| f.to_string_lossy().replace('-', "_") == wanted.replace('-', "_")))
+        };
+        // gathered before any removal: the `.exe` and the bare binary share one fingerprint
+        let mut stale: Vec<(PathBuf, &PathBuf, &str)> = Vec::new();
+        for entry in &entries {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e != "exe") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
+            let Some((name, hash)) = split_hash(&stem) else { continue };
+            let Some(print) = print_of(name, hash) else { continue };
+            let Some(links) = test_links(print, name) else { continue };
+            let Ok(built) = entry.metadata().and_then(|m| m.modified()) else { continue };
+            let against = libs.iter().filter(|(lib, ..)| links.contains(lib)).filter(|(_, at, _)| built < *at).max_by_key(|(_, at, _)| *at);
+            if let Some((.., lib_name)) = against {
+                stale.push((path, print, lib_name.as_str()));
+            }
+        }
+        for (path, print, lib_name) in stale {
+            std::fs::remove_file(&path)?;
+            if print.exists() {
+                std::fs::remove_dir_all(print)?;
+            }
+            let binary = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+            lines.push(format!("{binary} rebuilt: stale against {lib_name}"));
+        }
+    }
+    Ok(lines)
+}
+
 /// Removes the fingerprints of `name` from every profile of `target`; whether any was there.
 fn forget(target: &Path, name: &str) -> std::io::Result<bool> {
     let prefix = format!("{name}-");
