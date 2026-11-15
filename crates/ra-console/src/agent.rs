@@ -1140,6 +1140,13 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
         if outcome.is_err() || !node.is_absolute() || node.state != TaskState::NeedsRevision {
             break;
         }
+        // a send-back split into cards waits on them
+        if !node.depends_on.is_empty() {
+            let all = store.all().await.unwrap_or_default();
+            if node.depends_on.iter().any(|dep| !all.iter().any(|d| d.id == *dep && d.state == TaskState::Accepted)) {
+                break;
+            }
+        }
         if ra_context::TaskContext::open(&root, id).idle_rounds() >= RERUNS_A_WALK {
             break;
         }
@@ -1325,6 +1332,69 @@ async fn split_points(store: &Store, node: &Node, verdict: Verdict) -> (Verdict,
         }
     }
     (Verdict::NeedsRevision(work), left)
+}
+
+/// How many substantive points of one send-back make the walk file a card per point.
+const SPLIT_AT: usize = 4;
+
+/// The prefix of a notes line that names the card a point of a split send-back became.
+const SPLIT_POINT: &str = "split to #";
+
+/// The paths a point names: the words of it that are a file of the project under `root`.
+fn files_named(root: &Path, point: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for word in point.split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | '(' | ')' | ';')) {
+        let path = word.trim_end_matches(['.', ':']).replace('\\', "/");
+        let path = path.split_once(':').map_or(path.as_str(), |(file, _)| file).to_owned();
+        if path.contains('.') && root.join(&path).is_file() && !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// A substantive send-back of [`SPLIT_AT`] points or more filed as one card per point: each
+/// carries its point as its objective and the files the point names, under the card's parent,
+/// and the card waits on them all. The verdict then holds no point for a rerun, and the notes
+/// lines name the cards. One rerun of the whole list spent its turns on the points one after
+/// the other and met the same review again.
+async fn split_by_point(store: &Store, node: &Node, root: &Path, verdict: Verdict) -> (Verdict, Vec<String>) {
+    let Verdict::NeedsRevision(points) = &verdict else {
+        return (verdict, Vec::new());
+    };
+    if points.len() < SPLIT_AT
+        || for_the_person(points)
+        || crate::commands::review::classify(points) != crate::commands::review::Weight::Substantive
+    {
+        return (verdict, Vec::new());
+    }
+    let mut made = Vec::new();
+    for point in points {
+        let title: String = point.chars().take(FOLLOW_UP_TITLE).collect();
+        let files = files_named(root, point);
+        let card = Card { objective: Some(point), files: &files, ..Card::new() };
+        let filed = match store.insert_card(node.parent, NodeKind::Task, title.trim(), &card).await {
+            Ok(child) => store.depend_on(node.id, child).await.map(|()| child),
+            Err(e) => Err(e),
+        };
+        match filed {
+            Ok(child) => made.push(format!("{SPLIT_POINT}{child}: {point}")),
+            Err(e) => {
+                // a point no card could take stays with the card: it reruns on that one
+                tracing::warn!("#{} could not file a card for {point}: {e:#}", node.id);
+                return (verdict_with_unfiled(&verdict, &made), made);
+            }
+        }
+    }
+    (Verdict::NeedsRevision(Vec::new()), made)
+}
+
+/// The verdict of a split that stopped partway: the points past the cards made stay.
+fn verdict_with_unfiled(verdict: &Verdict, made: &[String]) -> Verdict {
+    match verdict {
+        Verdict::NeedsRevision(points) => Verdict::NeedsRevision(points.iter().skip(made.len()).cloned().collect()),
+        other => other.clone(),
+    }
 }
 
 /// Whether a line of a card's notes is a point that left the card ([`split_points`]).
@@ -1749,7 +1819,10 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
             return Ok((vec![line], None));
         }
     }
-    let (verdict, left) = split_points(store, &node, verdict).await;
+    let (verdict, mut left) = split_points(store, &node, verdict).await;
+    let (verdict, filed) = split_by_point(store, &node, &root, verdict).await;
+    let split = !filed.is_empty() && matches!(&verdict, Verdict::NeedsRevision(rest) if rest.is_empty());
+    left.extend(filed);
     // the points' fingerprint rides the handoff's verdict, so a run that changed nothing and drew
     // the same points again is held on that round, not run a third time; the words the review
     // judged ride beside them, so a rewrite of the card after it, as in a split, shows it stale
@@ -1759,7 +1832,11 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
         }
         Verdict::Accepted | Verdict::Malformed => String::new(),
     };
-    let Judged { mut state, mut head, said, trivial } = judged(&verdict, id, &model, &root, accepted);
+    let Judged { mut state, mut head, mut said, trivial } = judged(&verdict, id, &model, &root, accepted);
+    if split {
+        let cards = left.iter().filter(|line| line.starts_with(SPLIT_POINT)).count();
+        said = format!("needs revision (substantive) · split into {cards} card(s)");
+    }
     // the notes say the verdict came from the second ask; the first answer's usage is booked above
     if reasked {
         head = match head.split_once('\n') {
@@ -3072,7 +3149,14 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
         let tight = plan_tight(&root);
         // a rerun the walk queued goes first, while the card still waits on it: a person who
         // took the card meanwhile has the say
-        let retried = retry.take().filter(|id| roadmap.nodes.iter().any(|n| n.id == *id && n.state == TaskState::NeedsRevision));
+        // and not while it waits on cards a send-back split off
+        let retried = retry.take().filter(|id| {
+            roadmap.nodes.iter().any(|n| {
+                n.id == *id
+                    && n.state == TaskState::NeedsRevision
+                    && n.depends_on.iter().all(|dep| roadmap.nodes.iter().any(|d| d.id == *dep && d.state == TaskState::Accepted))
+            })
+        });
         // a card past its reruns in this walk waits for the next walk: the queue counts a card
         // sent back as ready, and without this the one-at-a-time walk took the same card again;
         // a card whose prerequisites are missing waits too, named
