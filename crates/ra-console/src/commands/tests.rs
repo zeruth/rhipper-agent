@@ -4484,6 +4484,7 @@ async fn a_worktree_check_builds_in_the_worktrees_target() {
         std::fs::read_to_string(outside.path().join("seen.txt")).unwrap_or_else(|e| panic!("the check left no seen.txt ({e}): {out:?}"));
     let first = targets.split(';').next().unwrap_or_default().replace('\\', "/");
     // the worktree's own directory under the project's target, wherever the target lives: the
+<<<<<<< Updated upstream
     // project's tree, or a scratch root's target/<project> when the machine has one (`rc scratch`);
     // its own `wt-2`, or the pool's target it leased, released by the time the run ends
     let base = std::path::absolute(ra_providers::claude_code::project_target(dir.path())).unwrap();
@@ -4494,6 +4495,16 @@ async fn a_worktree_check_builds_in_the_worktrees_target() {
         own.is_some_and(|name| name == "wt-2" || name.starts_with("wt-pool-")),
         "the worktree's check built in {first}, not the worktree's target under {base}: {out:?}"
     );
+=======
+    // project's tree, or a scratch root's target/<project> when the machine has one (`rc scratch`)
+    let worktree = dir.path().join("var").join("worktrees").join("2");
+    let expected = ra_providers::claude_code::shared_target(&worktree).unwrap().display().to_string().replace('\\', "/");
+    let expected = expected.trim_start_matches("//?/");
+    // or the pooled target the card leased for its run (#320): the lease goes back to the pool
+    // when the card lands, so after the walk only the card's own name is left to compute
+    let pool = format!("{}/wt-pool-", expected.rsplit_once('/').map_or(expected, |(base, _)| base));
+    assert!(first.ends_with(expected) || first.contains(&pool), "the worktree's check built in {first}, not {expected} or a target of {pool}*: {out:?}");
+>>>>>>> Stashed changes
 }
 
 #[tokio::test]
