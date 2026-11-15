@@ -742,7 +742,18 @@ async fn run_main() -> anyhow::Result<()> {
                 Some(id) => ra_console::agent::run(&store, id, &worker).await?,
                 None if all => {
                     if let Some(width) = parallel {
-                        ra_console::agent::run_parallel(&store, &worker, width, stop_on_revision).await?
+                        // a walk that ends on an error says so on the feed: its stderr goes to
+                        // var/walk.log alone, and two walks that died on "no node" read as quiet
+                        // stops for hours (2026-11-15)
+                        match ra_console::agent::run_parallel(&store, &worker, width, stop_on_revision).await {
+                            Ok(lines) => lines,
+                            Err(error) => {
+                                if let Ok(root) = std::env::current_dir() {
+                                    ra_console::pair::event(&root, &format!("walk stopped on an error: {error:#}"));
+                                }
+                                return Err(error);
+                            }
+                        }
                     } else {
                         // one card at a time, each in its worktree as the parallel walk's are; the
                         // walk moves to a newer rc that `rc install` put on the path, between cards

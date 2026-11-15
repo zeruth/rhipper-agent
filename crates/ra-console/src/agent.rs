@@ -5544,7 +5544,19 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 lines.extend(run_lines);
                 ran += 1;
                 planned = false;
-                let sent_back = store.read(id).await?.state == TaskState::NeedsRevision;
+                // a card cancelled while it ran is gone from the roadmap: the walk says so and
+                // goes on (asm #488 and agent #674, cancelled mid-run on 2026-11-15, ended both
+                // walks with "no node" and no line saying why)
+                let sent_back = match store.read(id).await {
+                    Ok(node) => node.state == TaskState::NeedsRevision,
+                    Err(error) => {
+                        let text = format!("#{id} left the roadmap while it ran ({error:#}); the walk goes on");
+                        tracing::warn!("{text}");
+                        crate::pair::event(&root, &text);
+                        lines.push(text);
+                        false
+                    }
+                };
                 if stop_on_revision && stopped.is_none() && sent_back {
                     stopped = Some(format!("stopped: #{id} needs revision"));
                 }
