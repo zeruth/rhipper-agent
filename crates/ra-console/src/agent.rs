@@ -8172,12 +8172,43 @@ fn names_created(command: &str, files: &[String]) -> bool {
     false
 }
 
+/// Whether a cargo `command` names a package by `-p`/`--package` whose directory `<dir>/<pkg>/`
+/// does not exist in `root` yet while a file of the card lies under it: a card that makes a new
+/// crate names its sources but not a `+` Cargo.toml (asm #143 and #80).
+#[must_use]
+pub fn names_new_package(root: &Path, command: &str, files: &[String]) -> bool {
+    let Ok(words) = ra_tools::words(command) else { return false };
+    if words.first().map(String::as_str) != Some("cargo") {
+        return false;
+    }
+    let stop = words.iter().position(|w| w == "--").unwrap_or(words.len());
+    let mut packages = Vec::new();
+    let mut args = words[..stop].iter();
+    while let Some(word) = args.next() {
+        match word.as_str() {
+            "-p" | "--package" => packages.extend(args.next().map(String::as_str)),
+            other => packages.extend(other.strip_prefix("--package=")),
+        }
+    }
+    let paths: Vec<String> = files.iter().map(|f| f.trim().trim_start_matches('+').trim().replace('\\', "/")).collect();
+    packages.iter().any(|pkg| {
+        paths.iter().any(|path| {
+            let parts: Vec<&str> = path.split('/').collect();
+            parts
+                .iter()
+                .enumerate()
+                .take(parts.len().saturating_sub(1))
+                .any(|(at, part)| part == pkg && at > 0 && !root.join(parts[..=at].join("/")).exists())
+        })
+    })
+}
+
 /// The first command of `commands` the tool rejects before building, with its first error
 /// line. A command that fails for another reason, or whose program cannot start, is the run's
 /// to find.
-async fn rejected_command(toolbox: &ra_tools::Toolbox, commands: &[String], files: &[String]) -> Option<(String, String)> {
+async fn rejected_command(root: &Path, toolbox: &ra_tools::Toolbox, commands: &[String], files: &[String]) -> Option<(String, String)> {
     for command in commands {
-        if names_created(command, files) {
+        if names_created(command, files) || names_new_package(root, command, files) {
             continue;
         }
         let Some(words) = dry_words(command) else { continue };
@@ -8322,7 +8353,7 @@ async fn preflight(root: &Path, node: &Node, files: &[String], toolbox: anyhow::
     }
     let toolbox = toolbox.ok()?.with_timeout(checks_of(root, node).timeout);
     let _slot = hold_build(root, root).await;
-    rejected_command(&toolbox, &commands, files).await
+    rejected_command(root, &toolbox, &commands, files).await
 }
 
 /// The programs a worker's shell runs a check through by itself; any other is the
