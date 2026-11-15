@@ -5304,16 +5304,6 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     lines.extend(crate::commands::plan::read_back(store, &root, worker).await);
     // the cards a review off the form held are judged again, and landed when accepted
     lines.extend(review_held(store, worker).await);
-    // the cards the reviewer accepted that a walk stopped before they landed: landed first, so
-    // a restart never strands accepted work (runelite #21 and #35, 2026-11-12)
-    for node in store.all().await? {
-        if node.state == TaskState::Implemented && matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
-            // under the card's span, so its check reads on the card's own console card rather
-            // than an untagged one the window shows as "worker" (asm #39, 2026-11-12)
-            let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id = node.id);
-            lines.extend(land_or_say(store, node.id, worker).instrument(span).await);
-        }
-    }
     let mut ran = 0;
     // the runs in flight, as a pool of `width`: when one ends the next ready card starts in
     // its slot at once, rather than the pool waiting for the slowest of a wave (the person
@@ -5325,6 +5315,28 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     let git_lock_owned = tokio::sync::Mutex::new(());
     let root_owned = root.clone();
     let mut flight: Vec<(i64, InFlight<'_>, Seat)> = Vec::new();
+    // the cards the reviewer accepted that a walk stopped before they landed are landed so a
+    // restart never strands accepted work (runelite #21 and #35, 2026-11-12), each in flight on
+    // a seat of its own beside the runs under the project's git lock: landed one by one before
+    // the first run, a landing waiting for a worker slot held every runner idle (asm, 17 cards
+    // ready and one bubble on the dashboard, 2026-11-15)
+    for node in store.all().await? {
+        if node.state == TaskState::Implemented && matches!(node.kind, NodeKind::Task | NodeKind::Subtask) {
+            let id = node.id;
+            let git_lock = &git_lock_owned;
+            flight.push((
+                id,
+                Box::pin(async move {
+                    // under the card's span, so its check reads on the card's own console card
+                    // rather than an untagged one the window shows as "worker" (asm #39)
+                    let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id = id);
+                    let _git = git_lock.lock().await;
+                    Ok(land_or_say(store, id, worker).instrument(span).await)
+                }),
+                Seat::Investigate,
+            ));
+        }
+    }
     let mut stopped: Option<String> = None;
     // the cards parked past [`RERUNS_A_WALK`] or failed in this walk; the count of the rounds is
     // the card's context's, so a restarted window counts on
