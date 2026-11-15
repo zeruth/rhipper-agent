@@ -291,8 +291,14 @@ pub async fn run(line: &str, store: &Store, worker: &Worker) -> anyhow::Result<(
             let mut edit = Edit::default();
             match field.to_ascii_lowercase().as_str() {
                 "title" => edit.title = Some(text),
-                "objective" => edit.objective = Some(text),
-                "acceptance" => edit.acceptance = Some(text),
+                "objective" => {
+                    crate::agent::refuse_timeout(text)?;
+                    edit.objective = Some(text);
+                }
+                "acceptance" => {
+                    crate::agent::refuse_timeout(text)?;
+                    edit.acceptance = Some(text);
+                }
                 "complexity" => edit.complexity = Some(text.parse().context("complexity is 1 to 5")?),
                 "files" => {
                     // a path is stored with forward slashes, so the file reads the same on every platform

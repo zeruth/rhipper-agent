@@ -8659,7 +8659,9 @@ fn checks_of(root: &Path, node: &Node) -> Checks {
         ra_roadmap::check::commands(&node.files)
     };
     let orchestrated = orchestrated_checks(node.acceptance.as_deref(), &worker);
-    Checks { commands, lint: worker.lint().map(str::to_owned), timeout: worker.check_timeout(), orchestrated, named }
+    let timeout = card_check_timeout::card_check_timeout(&[node.objective.as_deref(), node.acceptance.as_deref()])
+        .unwrap_or_else(|| worker.check_timeout());
+    Checks { commands, lint: worker.lint().map(str::to_owned), timeout, orchestrated, named }
 }
 
 /// The words of a dry run of `command`, which the tool answers without running the check: cargo
@@ -11542,8 +11544,10 @@ pub(crate) fn short(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
+mod card_check_timeout;
 mod context_cancel_line;
 #[cfg(test)]
 mod tests;
 mod turn_cap_warning;
+pub use card_check_timeout::refuse_timeout;
 pub use turn_cap_warning::turn_cap_warning;
