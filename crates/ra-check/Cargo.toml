@@ -1,0 +1,11 @@
+[package]
+name = "ra-check"
+description = "What a check's output means: the tests it ran, the tests that failed, the first compile error"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

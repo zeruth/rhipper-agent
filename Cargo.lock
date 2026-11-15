@@ -3256,6 +3256,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ra-check"
+version = "0.2.0"
+
+[[package]]
 name = "ra-console"
 version = "0.2.0"
 dependencies = [

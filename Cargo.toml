@@ -10,6 +10,7 @@ publish = false
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
+ra-check = { path = "crates/ra-check" }
 ra-console = { path = "crates/ra-console" }
 ra-context = { path = "crates/ra-context" }
 ra-providers = { path = "crates/ra-providers" }
