@@ -186,6 +186,24 @@ fn a_status_counts_the_spend_of_today_only() {
 }
 
 #[test]
+fn counting_build_slots_asks_without_taking_them() {
+    let slot = build_slot_count() - 1;
+    let name = build_lock_name(slot);
+    let held = try_guard_as(&name, "asker #1").unwrap().expect("the slot is free");
+    assert_eq!(build_slots()[slot].as_ref().map(|(who, _)| who.as_str()), Some("asker #1"));
+    drop(held);
+    // asked while free, the slot is still free for the next builder
+    assert_eq!(build_slots()[slot], None);
+    let again = try_guard_as(&name, "asker #2").unwrap();
+    assert!(again.is_some(), "counting the slots took none");
+    // a note of a holder that died is no build
+    drop(again);
+    std::fs::write(locks_dir().join(format!("{name}.who")), "ghost #9").unwrap();
+    std::fs::write(locks_dir().join(format!("{name}.pid")), (u32::MAX - 1).to_string()).unwrap();
+    assert_eq!(build_slots()[slot], None);
+}
+
+#[test]
 fn two_roots_in_one_workspace_guard_the_same_target_and_the_second_waits() {
     let hub = tempfile::tempdir().unwrap();
     let locks = hub.path().join("locks");

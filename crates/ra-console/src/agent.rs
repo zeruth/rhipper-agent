@@ -3754,7 +3754,15 @@ const WALK_PID: &str = "var/walk.pid";
 const WALK_LOCK: &str = "var/walk.lock";
 
 /// The lock a running walk holds; dropping it lets the next walk start.
-pub struct WalkLock(#[allow(dead_code)] std::fs::File);
+pub struct WalkLock(#[allow(dead_code)] std::fs::File, PathBuf);
+
+impl Drop for WalkLock {
+    /// The pid note goes before the lock does, so a question about the walk never finds a note
+    /// of a walk that is over.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.1);
+    }
+}
 
 /// Takes the project's walk lock: `None` while a walk runs there. On Windows the file is opened
 /// with no sharing, which a second opener cannot do; elsewhere a pid file stands in.
@@ -3766,7 +3774,7 @@ pub fn take_walk_lock(root: &Path) -> Option<WalkLock> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(&path).ok()?;
-        Some(WalkLock(file))
+        Some(walk_lock_noted(root, file))
     }
     #[cfg(not(windows))]
     {
@@ -3780,14 +3788,21 @@ pub fn take_walk_lock(root: &Path) -> Option<WalkLock> {
         let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path).ok()?;
         use std::io::Write;
         let _ = write!(file, "{}", std::process::id());
-        Some(WalkLock(file))
+        Some(walk_lock_noted(root, file))
     }
 }
 
-/// Whether a walk is running in the project right now.
+/// The lock with the holder's pid noted beside it, for [`walk_running`].
+fn walk_lock_noted(root: &Path, file: std::fs::File) -> WalkLock {
+    note_walk_pid(root);
+    WalkLock(file, root.join(WALK_PID))
+}
+
+/// Whether a walk is running in the project right now: asked of the pid the holder noted, never
+/// by taking the lock, which a walk starting in that instant would find held.
 #[must_use]
 pub fn walk_running(root: &Path) -> bool {
-    take_walk_lock(root).is_none()
+    std::fs::read_to_string(root.join(WALK_PID)).ok().and_then(|t| t.trim().parse::<u32>().ok()).is_some_and(crate::hub::pid_alive)
 }
 
 /// Asks the window that has the project to start the walk: leaves the file its tick reads,

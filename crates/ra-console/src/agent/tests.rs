@@ -36,6 +36,22 @@ fn a_stale_marker_stop_for_another_walk_stops_nothing_and_one_for_this_walk_stop
     assert!(!stop.exists());
 }
 
+#[test]
+fn asking_whether_a_walk_runs_asks_without_taking_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!walk_running(dir.path()));
+    // the question left the lock free: a walk starting after it takes it at once
+    let lock = take_walk_lock(dir.path()).expect("the lock is free after the question");
+    assert!(walk_running(dir.path()));
+    // asking again, with the lock held, takes nothing and gives nothing away
+    assert!(walk_running(dir.path()));
+    drop(lock);
+    assert!(!walk_running(dir.path()), "a walk that is over leaves no note of itself");
+    std::fs::write(dir.path().join(WALK_PID), (u32::MAX - 1).to_string()).unwrap();
+    assert!(!walk_running(dir.path()), "a note of a dead walk is no walk");
+    assert!(take_walk_lock(dir.path()).is_some());
+}
+
 /// A test that bounds elapsed time from above fails on a busy machine and proves nothing about
 /// the code: it asserts the thing that ended (the text, the child gone), not how fast.
 #[test]

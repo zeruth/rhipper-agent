@@ -794,7 +794,16 @@ pub fn day_of(when: u64) -> String {
 /// A lock under `locks/<name>.lock` in the hub, shared by every project on the machine: the
 /// cargo target two projects build in, around a check; the install directory, around
 /// `rc install` and `rc restart`. Dropping it, or the holder's death, releases it.
-pub struct Guard(#[allow(dead_code)] std::fs::File);
+pub struct Guard(#[allow(dead_code)] std::fs::File, Vec<PathBuf>);
+
+impl Drop for Guard {
+    /// The notes a holder left beside the lock go before the lock does, so none outlives it.
+    fn drop(&mut self) {
+        for note in &self.1 {
+            let _ = std::fs::remove_file(note);
+        }
+    }
+}
 
 /// The locks' directory under the hub.
 fn locks_dir() -> PathBuf {
@@ -825,7 +834,7 @@ pub fn try_guard_in(dir: &Path, name: &str) -> anyhow::Result<Option<Guard>> {
         .with_context(|| format!("cannot open {}", path.display()))?;
     // an OS lock on the open file, not the open itself: it goes with the holder, dead or done
     match file.try_lock() {
-        Ok(()) => Ok(Some(Guard(file))),
+        Ok(()) => Ok(Some(Guard(file, Vec::new()))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::new(e).context(format!("cannot lock {}", path.display()))),
     }
@@ -962,10 +971,14 @@ pub fn in_priority_order(mut projects: Vec<PathBuf>, order: &[String]) -> Vec<Pa
 /// When the lock file cannot be made or opened.
 pub fn try_guard_as(name: &str, who: &str) -> anyhow::Result<Option<Guard>> {
     let guard = try_guard(name)?;
-    if guard.is_some() {
+    Ok(guard.map(|mut guard| {
+        // the pid beside the note lets a question about the lock be answered without taking it
+        let pid = locks_dir().join(format!("{name}.pid"));
         let _ = std::fs::write(locks_dir().join(format!("{name}.who")), who);
-    }
-    Ok(guard)
+        let _ = std::fs::write(&pid, std::process::id().to_string());
+        guard.1.push(pid);
+        guard
+    }))
 }
 
 /// How many of the locks named `prefix-<n>`, `n` under `count`, are held right now by `who`:
@@ -1166,8 +1179,7 @@ pub fn try_build_slot(root: &Path) -> anyhow::Result<Option<Guard>> {
 
 /// The machine's build slots as the window shows them: for each, who holds it (`runelite #42`,
 /// without the target the note also names) and since when (unix seconds), or `None` when it is
-/// free. A slot is asked by taking its lock and letting it go at once; a builder that tries in
-/// that instant tries again on its next poll.
+/// free. A slot is asked of its holder's note and pid, so asking never takes the lock.
 #[must_use]
 pub fn build_slots() -> Vec<Option<(String, u64)>> {
     (0..build_slot_count())
@@ -1186,7 +1198,10 @@ pub fn build_slots() -> Vec<Option<(String, u64)>> {
 /// The whole note beside a held build slot, builder and target; `None` when the slot is free.
 fn slot_note(slot: usize) -> Option<String> {
     let name = build_lock_name(slot);
-    if !matches!(try_guard(&name), Ok(None)) {
+    // asked of the holder's pid note, never by taking the lock: a builder trying in that instant
+    // would be told the slot is held
+    let pid = std::fs::read_to_string(locks_dir().join(format!("{name}.pid"))).ok()?.trim().parse::<u32>().ok()?;
+    if !pid_alive(pid) {
         return None;
     }
     Some(std::fs::read_to_string(locks_dir().join(format!("{name}.who"))).map(|w| w.trim().to_owned()).unwrap_or_default())
