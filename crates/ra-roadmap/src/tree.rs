@@ -275,6 +275,40 @@ pub fn missing_files(nodes: &[Node], exists: impl Fn(&str) -> bool) -> Vec<Strin
     out
 }
 
+/// A card whose `files:` marks as new a path already in the tree: the faults to report, and the
+/// entries with those marks dropped, for the check to write back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingNew {
+    pub id: i64,
+    pub faults: Vec<String>,
+    pub files: Vec<String>,
+}
+
+/// Each node not yet started that marks as new a path already in the tree: the `+` is dropped,
+/// so the handoff offers the file to read first and the worker does not overwrite it as one to
+/// create. A started card is left alone, as in [`missing_files`].
+#[must_use]
+pub fn existing_new_files(nodes: &[Node], exists: impl Fn(&str) -> bool) -> Vec<ExistingNew> {
+    let mut out = Vec::new();
+    for node in nodes.iter().filter(|n| matches!(n.state, TaskState::Defined | TaskState::Ready | TaskState::Blocked)) {
+        let stale = |entry: &String| is_new(entry) && exists(path_of(entry));
+        let faults: Vec<String> = node
+            .files
+            .iter()
+            .filter(|entry| stale(entry))
+            .map(|entry| {
+                format!("#{}: marks {} as new, but it is in the tree; the {NEW_MARK} is dropped to read it first", node.id, path_of(entry))
+            })
+            .collect();
+        if faults.is_empty() {
+            continue;
+        }
+        let files = node.files.iter().map(|entry| if stale(entry) { path_of(entry).to_owned() } else { entry.clone() }).collect();
+        out.push(ExistingNew { id: node.id, faults, files });
+    }
+    out
+}
+
 /// The words of an acceptance that ask for what only a person, a CI run or an emulator gives.
 const HUMAN_CLAUSES: [&str; 9] =
     ["manually", "by hand", "a person", "the person", "reviewer confirms", "on ci", "ci run", "emulator", "on a device"];

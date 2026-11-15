@@ -1729,6 +1729,12 @@ async fn check() -> anyhow::Result<()> {
     let root = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut faults = tree::lint(&nodes);
     faults.extend(tree::missing_files(&nodes, |file| root.join(file).exists()));
+    // a `+` on a file the tree holds is fixed on the card, not only reported: the next handoff
+    // offers it to read first
+    for stale in tree::existing_new_files(&nodes, |file| root.join(file).exists()) {
+        store.set_files(stale.id, &stale.files).await?;
+        faults.extend(stale.faults);
+    }
     faults.extend(wrong_crate_paths(&nodes, root));
     faults.extend(unknown_rc_faults(&nodes));
     faults.extend(missing_test_targets(&nodes, root));
