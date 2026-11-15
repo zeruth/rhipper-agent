@@ -54,6 +54,12 @@ fn newest(dir: &Path) -> Option<u32> {
         .map(|(_, id)| id)
 }
 
+/// Whether `target` reads as an id (letters and digits only) and is no file of `dir` either.
+fn is_unknown_id(dir: &Path, target: &str) -> bool {
+    let t = target.trim();
+    !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()) && !dir.join(t).exists()
+}
+
 /// Waits for a job of `dir` for `rc wait`: `target` is its id, the newest job when left out; a
 /// target that is no job is a pid or a file, waited on as before under the `timeout`. A job is
 /// waited on until its exit line however long it runs, with a progress line a minute. Answers the
@@ -67,6 +73,11 @@ pub(crate) fn run(dir: &Path, target: Option<&str>, timeout: Option<Duration>) -
             Ok(id) if jobs_dir(dir).join(format!("{id}.job")).exists() => id,
             // a pid whose job is not recorded yet is still watched for its exit line
             Ok(id) => return crate::wait_finished::wait_pid(dir, id, timeout.unwrap_or(ra_console::agent::WAIT_LIMIT)),
+            // a bare word that names no file is an id of someone else's, a shell background task
+            Err(_) if is_unknown_id(dir, t) => {
+                eprintln!("rc wait: {t} is not a task of the agent; wait on its task notification instead");
+                return 1;
+            }
             Err(_) => return ra_console::agent::wait(dir, t, timeout.unwrap_or(ra_console::agent::WAIT_LIMIT)),
         }
     } else {
