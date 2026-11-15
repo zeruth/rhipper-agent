@@ -699,6 +699,7 @@ pub fn block_with(rg: bool, builds_refused: bool) -> String {
         "- one command per call: no `;`, `&&` or pipe between commands; a call passes when its command does, with a `2>&1`, `> /dev/null` or `2>$null`, a `VAR=value` prefix in Bash, and in PowerShell a `& \"path\\tool.exe\"` call or a `$name = 'value'` assignment".to_owned(),
         "- a command chained with `;` or `&&`, or one that tests `$?`, is refused whole: send each command in its own call".to_owned(),
         "- paths are the workspace's, relative or absolute; `..` and paths outside it are the harness's to judge".to_owned(),
+        "- a Grep over Rust sources passes `type: rust` with a directory `path`; a `glob` starting with `*/` under a `path` matches nothing and looks like an empty result".to_owned(),
         "- hash a file with `sha256sum <file>` in Bash, on a path inside the workspace".to_owned(),
         "- a `$( )` or backtick substitution, a `( )` or `{ }` block, a heredoc and a `<` redirect are not judged by the hook, and the allowlist usually refuses them".to_owned(),
         "- refused, with what to use instead:".to_owned(),
