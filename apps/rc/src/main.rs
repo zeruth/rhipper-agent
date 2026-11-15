@@ -2201,7 +2201,18 @@ async fn set(id: i64, state: TaskState) -> anyhow::Result<()> {
 async fn land(id: i64) -> anyhow::Result<()> {
     let store = open_store().await?;
     let worker = Worker::new(ra_console::ui::DEFAULT_MODEL).with_ledger(open_ledger().await?);
-    for line in ra_console::agent::land(&store, id, &worker).await? {
+    let lines = match ra_console::agent::land(&store, id, &worker).await {
+        Ok(lines) => lines,
+        // a conflict counts toward the card's hold as the walk's do: the second holds it
+        Err(e) if e.downcast_ref::<ra_console::agent::LandConflict>().is_some() => {
+            if ra_console::agent::hold_on_conflict(&store, id, &e.to_string()).await? {
+                anyhow::bail!("#{id} not landed: {e}; {}", ra_context::HELD_SUPERSEDED);
+            }
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
+    for line in lines {
         println!("{line}");
     }
     println!("#{id} is now accepted");

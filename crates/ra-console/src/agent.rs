@@ -5678,6 +5678,31 @@ const LOOKBACK_SEAT: i64 = 0;
 /// ([`ra_context::TaskContext::idle_rounds`]), so the count outlives the walk.
 const RERUNS_A_WALK: u32 = 3;
 
+/// Records a landing conflict of card `id` (`why`) in its context with the commits on main
+/// since its base that touch its files, and at the [`ra_context::CONFLICTS_HELD`]th holds the
+/// card: blocked, with [`ra_context::HELD_SUPERSEDED`] at the head of its notes, not rerun.
+/// Whether it held it.
+///
+/// # Errors
+/// When the card cannot be read, its context written, or its notes or state set.
+pub async fn hold_on_conflict(store: &Store, id: i64, why: &str) -> anyhow::Result<bool> {
+    let root = workspace_of(store);
+    let node = store.read(id).await?;
+    let args = ra_context::touching_log_args(&worktree_branch(id), &node.files);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // a log git cannot give leaves the list empty, not the conflict unrecorded
+    let log = git(&root, &args).await.unwrap_or_default();
+    let mut task = ra_context::TaskContext::open(&root, id);
+    let held = task.record_landing_conflict(ra_context::Handoff::landing_conflict(crate::clock::unix_now(), why, &log));
+    task.save(&root)?;
+    if held {
+        let notes = node.notes.unwrap_or_default();
+        store.set_notes(id, format!("{}\n\n{notes}", ra_context::HELD_SUPERSEDED).trim_end()).await?;
+        store.set_state(id, TaskState::Blocked).await?;
+    }
+    Ok(held)
+}
+
 /// A landing whose merge into the project's branch conflicted; the merge was aborted.
 #[derive(Debug)]
 pub struct LandConflict {
@@ -5739,14 +5764,20 @@ async fn say_landing(store: &Store, id: i64, landed: anyhow::Result<Vec<String>>
         Ok(lines) => lines,
         // the conflict pass could not resolve it: the card goes back to its worker, whose rerun
         // merges the project's branch in first and resolves the conflicts the brief names,
-        // rather than waiting on a person (asm #73 and #78, 2026-11-12)
+        // rather than waiting on a person (asm #73 and #78, 2026-11-12); at the second conflict
+        // it is held instead, since main has likely moved past it (#320 was rerun three times)
         Err(e) if e.downcast_ref::<LandConflict>().is_some() => {
             let pass = failed_pass.map(|why| format!(" (the conflict pass: {why})")).unwrap_or_default();
-            let text = match store.set_state(id, TaskState::NeedsRevision).await {
-                Ok(()) => {
-                    format!("#{id} not landed: {e}; sent back to its worker to merge the project's branch in and resolve them{pass}")
-                }
-                Err(set) => format!("#{id} not landed: {e}; it could not be sent back ({set:#}), land it by hand"),
+            let held = hold_on_conflict(store, id, &e.to_string()).await;
+            let text = match held {
+                Ok(true) => format!("#{id} not landed: {e}; {}", ra_context::HELD_SUPERSEDED),
+                Err(err) => format!("#{id} not landed: {e}; it could not be held ({err:#}), land it by hand"),
+                Ok(false) => match store.set_state(id, TaskState::NeedsRevision).await {
+                    Ok(()) => {
+                        format!("#{id} not landed: {e}; sent back to its worker to merge the project's branch in and resolve them{pass}")
+                    }
+                    Err(set) => format!("#{id} not landed: {e}; it could not be sent back ({set:#}), land it by hand"),
+                },
             };
             tracing::warn!("{text}");
             crate::pair::event(&workspace_of(store), &text);

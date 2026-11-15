@@ -1100,6 +1100,15 @@ impl TaskContext {
         self.handoffs.drain(..excess);
     }
 
+    /// Records a landing conflict ([`Handoff::landing_conflict`]) and says whether the card is
+    /// now held: at the [`CONFLICTS_HELD`]th it is not rerun, since main has likely superseded
+    /// it, and [`HELD_SUPERSEDED`] says why.
+    #[must_use]
+    pub fn record_landing_conflict(&mut self, handoff: Handoff) -> bool {
+        self.record(handoff);
+        landing_conflicts(&self.handoffs) >= CONFLICTS_HELD
+    }
+
     /// Leaves a word from the run of card `from` on card `to`'s file, as a handoff from another
     /// card: the next run of `to` reads it with its own. Only the handoffs of the file survive
     /// this; the run of `to` sets the brief and the outlines afresh anyway.
@@ -1331,6 +1340,70 @@ impl Handoff {
             failures: Vec::new(),
         }
     }
+
+    /// The handoff the landing writes when the card's branch conflicted with main: outcome
+    /// [`LANDING_CONFLICT`], `why` the conflict as the landing met it, and the commits on main
+    /// since the card's base that touch its files, from `log` as [`touching_log_args`] asks git
+    /// for it, so the next run or the person sees what main decided meanwhile.
+    #[must_use]
+    pub fn landing_conflict(when: u64, why: &str, log: &str) -> Self {
+        let commits: Vec<&str> = log.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let mut report = format!("the landing conflicted with main: {}\n", why.trim());
+        if commits.is_empty() {
+            report.push_str("commits on main since the card's base touching its files: none found");
+        } else {
+            let _ = writeln!(report, "commits on main since the card's base touching its files ({}):", commits.len());
+            for commit in &commits[..commits.len().min(TOUCHING_SHOWN)] {
+                let _ = writeln!(report, "- {commit}");
+            }
+            if commits.len() > TOUCHING_SHOWN {
+                let _ = writeln!(report, "… and {} more", commits.len() - TOUCHING_SHOWN);
+            }
+        }
+        Self {
+            when,
+            model: "landing".to_owned(),
+            outcome: LANDING_CONFLICT.to_owned(),
+            check: "no check: the landing conflicted with main".to_owned(),
+            verdict: None,
+            changed: Vec::new(),
+            report: report.trim_end().to_owned(),
+            warnings: Vec::new(),
+            read: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
+/// The outcome of a handoff the landing wrote for a conflict with main
+/// ([`Handoff::landing_conflict`]).
+pub const LANDING_CONFLICT: &str = "landing conflict";
+
+/// How many landing conflicts hold a card: past them main has likely moved where the card no
+/// longer applies, and a rerun only meets the conflict again (#320 met it three times while main
+/// had decided the opposite of what it asked).
+pub const CONFLICTS_HELD: usize = 2;
+
+/// How many touching commits a landing-conflict handoff names; past them a line counts the rest.
+const TOUCHING_SHOWN: usize = 20;
+
+/// The note a held card carries: why it is not rerun and where to look.
+pub const HELD_SUPERSEDED: &str = "held: possibly superseded; its landing conflicted with main twice, and its context lists the commits on main that touched its files since its base: read them before rerunning it";
+
+/// The arguments of the `git log` that lists the commits on main (`HEAD` of the project's tree)
+/// not on the card's `branch` that touch the card's `files`, one `<hash> <subject>` a line; a
+/// file still marked new (`+path`) is named without its mark.
+#[must_use]
+pub fn touching_log_args(branch: &str, files: &[String]) -> Vec<String> {
+    let mut args = vec!["log".to_owned(), "--format=%h %s".to_owned(), format!("{branch}..HEAD"), "--".to_owned()];
+    args.extend(files.iter().map(|f| f.trim_start_matches('+').to_owned()));
+    args
+}
+
+/// How many times the card's landing conflicted with main, among the handoffs its file keeps.
+#[must_use]
+pub fn landing_conflicts(handoffs: &[Handoff]) -> usize {
+    handoffs.iter().filter(|h| h.outcome == LANDING_CONFLICT).count()
 }
 
 /// The outcome of a run a cap ended before the worker reported ([`Handoff::cut_off`]).
