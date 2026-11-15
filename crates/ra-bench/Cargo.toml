@@ -1,0 +1,17 @@
+[package]
+name = "ra-bench"
+description = "The workflow benchmark, embedded in the binary of its own commit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

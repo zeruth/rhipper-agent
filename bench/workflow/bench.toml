@@ -1,0 +1,7 @@
+version = 1
+repeats = 5
+max_usd = 15.0
+max_minutes = 40
+max_rounds = 5        # a card's sixth start stops the walk
+
+card = []

@@ -36,6 +36,7 @@ regex = "1"
 toml = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unreachable_pub = "warn"

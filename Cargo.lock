@@ -3245,6 +3245,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "ra-bench"
+version = "0.2.0"
+dependencies = [
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "ra-console"
 version = "0.2.0"
 dependencies = [

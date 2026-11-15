@@ -1,0 +1,2 @@
+bench/workflow/** text eol=lf
+bench/results/ledger.log merge=union
