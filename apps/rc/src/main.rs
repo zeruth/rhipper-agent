@@ -1026,9 +1026,17 @@ fn hook_pre(
         ra_gotchas::Answer::Allow => Some(serde_json::json!({
             "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "every part of the command is allowed"}
         })),
-        ra_gotchas::Answer::Deny { reason, .. } => Some(serde_json::json!({
-            "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
-        })),
+        ra_gotchas::Answer::Deny { reason, .. } => {
+            // a refused script beside an allowed one names the line that would allow it, and
+            // the card's note keeps the line for the person
+            let reason = match worker {
+                Some(w) => ra_console::allow_exe::deny_reason(cwd, &w.binaries, judged, reason),
+                None => reason,
+            };
+            Some(serde_json::json!({
+                "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
+            }))
+        }
         ra_gotchas::Answer::Rewrite { command, reason } => {
             // a command put under `rc hold` runs through the shell of the tool that called it:
             // the Bash tool's bash, the PowerShell tool's powershell

@@ -4484,10 +4484,16 @@ async fn a_worktree_check_builds_in_the_worktrees_target() {
         std::fs::read_to_string(outside.path().join("seen.txt")).unwrap_or_else(|e| panic!("the check left no seen.txt ({e}): {out:?}"));
     let first = targets.split(';').next().unwrap_or_default().replace('\\', "/");
     // the worktree's own directory under the project's target, wherever the target lives: the
-    // project's tree, or a scratch root's target/<project> when the machine has one (`rc scratch`)
-    let worktree = dir.path().join("var").join("worktrees").join("2");
-    let expected = ra_providers::claude_code::shared_target(&worktree).unwrap().display().to_string().replace('\\', "/");
-    assert!(first.ends_with(expected.trim_start_matches("//?/")), "the worktree's check built in {first}, not {expected}: {out:?}");
+    // project's tree, or a scratch root's target/<project> when the machine has one (`rc scratch`);
+    // its own `wt-2`, or the pool's target it leased, released by the time the run ends
+    let base = std::path::absolute(ra_providers::claude_code::project_target(dir.path())).unwrap();
+    let base = base.display().to_string().replace('\\', "/");
+    let base = base.trim_start_matches("//?/");
+    let own = first.rsplit_once('/').filter(|(parent, _)| parent.ends_with(base)).map(|(_, name)| name);
+    assert!(
+        own.is_some_and(|name| name == "wt-2" || name.starts_with("wt-pool-")),
+        "the worktree's check built in {first}, not the worktree's target under {base}: {out:?}"
+    );
 }
 
 #[tokio::test]
