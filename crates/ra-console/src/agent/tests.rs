@@ -900,7 +900,7 @@ fn a_whole_file_read_of_a_long_file_is_answered_with_the_outline_once_per_run() 
     // the same file again this run: the worker was told
     assert_eq!(hint_of(root, &read_event(root, "src/big.rs", None, None), Some(7)), None);
     // a ranged read, a short file and no card at all need no hint
-    begin_run(root, 7);
+    begin_run(root, 7, None);
     assert_eq!(hint_of(root, &read_event(root, "src/big.rs", Some(200), Some(60)), Some(7)), None);
     assert_eq!(hint_of(root, &read_event(root, "src/big.rs", None, Some(60)), Some(7)), None);
     assert_eq!(hint_of(root, &read_event(root, "src/small.rs", None, None), Some(7)), None);

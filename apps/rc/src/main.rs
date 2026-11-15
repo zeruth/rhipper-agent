@@ -1133,6 +1133,13 @@ fn hook(event: &str) -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    // five turns from the turn cap the worker is told to report; that call's other hints wait
+    if event == "post"
+        && let Some(warning) = ra_console::agent::turn_cap_warning(&cwd)
+    {
+        println!("{}", serde_json::json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": warning}}));
+        return Ok(());
+    }
     // a file the worker read is not the machine talking: no gotcha reads it, but a whole long
     // file the card outlines is refused with its items, and any other gets the outline after
     if call.get("tool_name").and_then(serde_json::Value::as_str) == Some("Read") {

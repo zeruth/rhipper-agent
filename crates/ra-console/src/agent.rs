@@ -886,11 +886,18 @@ fn settings_check(root: &Path) -> Result<String, String> {
 /// Marks the start of a run of card `id` for the hooks: the card id in this process's
 /// environment, which the harness and its hooks inherit, and the read hints of the last run
 /// forgotten.
-fn begin_run(root: &Path, id: i64) {
+fn begin_run(root: &Path, id: i64, cap: Option<u32>) {
     // SAFETY: the console runs one card at a time and reads no environment on another thread
     // while a run starts
-    unsafe { std::env::set_var(CARD_VAR, id.to_string()) };
+    unsafe {
+        std::env::set_var(CARD_VAR, id.to_string());
+        match cap {
+            Some(cap) => std::env::set_var(turn_cap_warning::CAP_VAR, cap.to_string()),
+            None => std::env::remove_var(turn_cap_warning::CAP_VAR),
+        }
+    };
     let _ = std::fs::remove_file(root.join(READ_HINTS_FILE));
+    let _ = std::fs::remove_file(root.join(turn_cap_warning::TURNS_FILE));
 }
 
 /// The hint the post hook answers a whole-file Read with: for a `Read` of a file of
@@ -6883,7 +6890,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     let session = if provider.has_own_tools() {
         // a harness acts in the workspace by itself: one call carries the whole task, and the
         // harness holds it to the budget; its hooks learn the card from the environment
-        begin_run(&acting, id);
+        begin_run(&acting, id, caps.limit());
         let answer = provider
             .complete(CompletionRequest {
                 model: worker.model.clone(),
@@ -11097,3 +11104,5 @@ pub(crate) fn short(model: &str) -> &str {
 
 #[cfg(test)]
 mod tests;
+mod turn_cap_warning;
+pub use turn_cap_warning::turn_cap_warning;
