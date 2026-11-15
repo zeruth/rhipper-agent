@@ -3751,6 +3751,29 @@ pub(crate) async fn judged_run(
 }
 
 #[tokio::test]
+async fn an_implemented_card_never_reviewed_is_reviewed_before_it_lands_and_the_landing_refuses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    cargo_project(dir.path(), true);
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    // the reviewer never answers: the run leaves the card in review with no verdict
+    let silent = Worker::new("z-ai/glm-5.3-flash").with_provider(Scripted::new(vec![says("done", vec![])]));
+    run("/run 2", &store, &silent).await.unwrap();
+    // a walk killed between the check and the review left it implemented
+    store.set_state_by(2, ra_roadmap::model::TaskState::Implemented, ra_roadmap::history::Source::Run).await.unwrap();
+    let refused = crate::agent::land(&store, 2, &silent).await.unwrap_err();
+    assert!(format!("{refused:#}").contains("never reviewed"), "{refused:#}");
+    // the walk's landing sends it to the review first
+    let model = Scripted::new(vec![says("accepted", vec![])]);
+    let reviewer = Worker::new("z-ai/glm-5.3-flash").with_provider(model.clone());
+    let out = crate::agent::land_or_say(&store, 2, &reviewer).await;
+    assert!(out.iter().any(|l| l.contains("accepted by glm-5.3-flash")), "{out:?}");
+    assert_eq!(model.seen.lock().len(), 1);
+    let handoff = ra_context::TaskContext::open(dir.path(), 2).handoffs.pop().expect("the run's handoff");
+    assert!(handoff.verdict.is_some(), "{handoff:?}");
+}
+
+#[tokio::test]
 async fn a_run_that_passes_its_checks_is_judged_and_an_accepting_verdict_leaves_it_implemented_with_the_verdict_on_the_handoff() {
     let (out, node, handoff, model) = judged_run(vec!["done", "accepted"]).await;
     // the run line, then the verdict's

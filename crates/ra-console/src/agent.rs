@@ -5564,6 +5564,7 @@ async fn land_once(store: &Store, id: i64, worker: &Worker, regenerate: bool) ->
         "#{id} is {}: a card lands once the reviewer accepted it (implemented), not before",
         node.state
     );
+    anyhow::ensure!(!never_reviewed(store, id).await, "#{id} was never reviewed: `review {id}` judges it before it lands");
     let root = workspace_of(store);
     // one landing at a time in the project's checkout across processes: `rc land` from a shell
     // and a walk's own landings merge into the same tree, and the walk's lock is its own
@@ -5940,6 +5941,15 @@ impl std::error::Error for LandCheck {}
 /// [`land`] for a walk: the lines it answers, or the one line of why it did not, on the feed
 /// too; never an error, since a card the person must land by hand is not the walk's end.
 pub(crate) async fn land_or_say(store: &Store, id: i64, worker: &Worker) -> Vec<String> {
+    // an implemented card whose run was killed between its check and its review has no verdict:
+    // it is reviewed first, and lands only if the review leaves it implemented
+    let mut reviewed = Vec::new();
+    if never_reviewed(store, id).await {
+        reviewed = review_after_run(store, id, worker).await;
+        if never_reviewed(store, id).await || store.read(id).await.is_ok_and(|n| n.state != TaskState::Implemented) {
+            return reviewed;
+        }
+    }
     let mut landed = land(store, id, worker).await;
     // the project moved on under the card: a conflict pass in the card's worktree resolves the
     // hunks, and the landing is tried once more; only a pass that could not sends the card back
@@ -5954,9 +5964,18 @@ pub(crate) async fn land_or_say(store: &Store, id: i64, worker: &Worker) -> Vec<
             Err(why) => failed_pass = Some(why),
         }
     }
-    let mut lines = passed;
+    let mut lines = reviewed;
+    lines.extend(passed);
     lines.extend(say_landing(store, id, landed, failed_pass).await);
     lines
+}
+
+/// Whether card `id` is implemented while its last handoff carries no verdict: the check passed
+/// and the review never answered, so the card is not offered for landing.
+async fn never_reviewed(store: &Store, id: i64) -> bool {
+    let Ok(node) = store.read(id).await else { return false };
+    node.state == TaskState::Implemented
+        && ra_context::TaskContext::open(&workspace_of(store), id).handoffs.last().is_some_and(|h| h.verdict.is_none())
 }
 
 /// The lines of a landing as [`land_or_say`] answers them, `failed_pass` the reason the
