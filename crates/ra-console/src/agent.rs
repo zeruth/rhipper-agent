@@ -4873,6 +4873,9 @@ async fn merge_in(path: &Path, main: &str, behind: &str, base: Option<String>) -
             {
                 return CatchUp::Merged(behind.to_owned(), base);
             }
+            if conflicts.trim() == "Cargo.lock" && regenerate_lock(path, main).await {
+                return CatchUp::Merged(behind.to_owned(), base);
+            }
             if conflicts.trim().is_empty() {
                 let _ = git(path, &["merge", "--abort"]).await;
                 CatchUp::Refused(format!("{e:#}"))
@@ -4880,6 +4883,44 @@ async fn merge_in(path: &Path, main: &str, behind: &str, base: Option<String>) -
                 CatchUp::Conflicts(conflicts.lines().count())
             }
         }
+    }
+}
+
+/// Settles a merge whose only conflict is `Cargo.lock`: main's lock is taken, cargo rewrites it
+/// for the worktree's manifests, and the merge is concluded. `false` leaves the merge as it
+/// was, for the worker.
+async fn regenerate_lock(path: &Path, main: &str) -> bool {
+    if git(path, &["checkout", main, "--", "Cargo.lock"]).await.is_err() {
+        return false;
+    }
+    let cargo = |offline: bool| {
+        let mut command = tokio::process::Command::new("cargo");
+        command.args(["update", "--workspace"]).current_dir(path);
+        if offline {
+            command.arg("--offline");
+        }
+        command.output()
+    };
+    let regenerated = match cargo(true).await {
+        Ok(out) if out.status.success() => true,
+        _ => cargo(false).await.is_ok_and(|out| out.status.success()),
+    };
+    if !regenerated {
+        // the conflict returns as it was
+        let _ = git(path, &["checkout", "-m", "--", "Cargo.lock"]).await;
+        return false;
+    }
+    git(path, &["add", "Cargo.lock"]).await.is_ok() && git(path, &["commit", "-q", "--no-edit"]).await.is_ok()
+}
+
+/// Merges `main` into the tree at `path` the way a run's catch-up does: `None` when it went in
+/// clean (a `Cargo.lock`-only conflict is settled on the way), else the number of files left
+/// in conflict, 0 for a merge git refused and that was aborted.
+pub async fn merge_main_in(path: &Path, main: &str) -> Option<usize> {
+    match merge_in(path, main, "0", None).await {
+        CatchUp::Merged(..) => None,
+        CatchUp::Conflicts(files) => Some(files),
+        CatchUp::Refused(_) => Some(0),
     }
 }
 
