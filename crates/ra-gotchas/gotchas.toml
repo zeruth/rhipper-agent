@@ -194,7 +194,7 @@ id = "long-output"
 where = "command"
 pattern = '^\s*cargo\s+(test|build|clippy|check)\b'
 message = "a cargo test, build or clippy prints more than a turn should carry, and every later turn carries it again; the tail is what matters, so the command runs with `2>&1 | tail -n 80` on its end"
-remedy = { kind = "rewrite", insert = "2>&1 | tail -n 80", append = true, unless = '\|\s*\S|>\s*[^&\s]' }
+remedy = { kind = "rewrite", insert = "2>&1 | tail -n 80", append = true, unless = '\|\s*\S|>\s*[^&\s]|\stest\b.*\s--test[\s=]+\S' }
 
 [[gotcha]]
 # the last of the command rewrites: the ones before it read the command's own first words.
