@@ -43,7 +43,8 @@ fn the_evidence_line_lists_each_run_with_its_turns_tokens_and_outcome() {
     let handoffs = [handoff("failed"), handoff("needs revision (trivial)")];
     let line = ledger_line_by_run(&card, &calls, &handoffs);
     assert!(line.text.contains("25 turn(s)"), "{}", line.text);
-    assert!(line.text.ends_with("; runs: r1 3t 300 failed, r2 22t 51k needs-revision"), "{}", line.text);
+    // the ledger keeps why a run ended (#799); these calls recorded none
+    assert!(line.text.ends_with("; runs: r1 3t 300 failed (no-reason-recorded), r2 22t 51k needs-revision"), "{}", line.text);
 }
 
 #[test]
