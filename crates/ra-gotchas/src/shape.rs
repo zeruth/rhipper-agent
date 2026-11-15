@@ -342,8 +342,8 @@ fn judge_part(
     if mid_check(name, rest) {
         return Shape::Allowed;
     }
-    // the program is the card's own build output
-    if in_target(first) && !part.call {
+    // the program is the card's own build output, run by `&` or by its path alike
+    if in_target(first) {
         return Shape::Allowed;
     }
     let line = std::iter::once(name).chain(rest.iter().copied()).collect::<Vec<_>>().join(" ");
