@@ -2586,7 +2586,7 @@ async fn guard_target(
         }
         if !said {
             said = true;
-            let text = format!("wait: the check waits on the cargo target {}, held by {holder}", target.display());
+            let text = crate::wait_line(&format!("wait: the check waits on the cargo target {}, held by {holder}", target.display()), &who);
             tracing::info!(target: crate::trace::PROGRESS, "  {text}");
             crate::pair::event(root, &text);
         }
@@ -2624,10 +2624,13 @@ async fn hold_build(root: &Path, building: &Path) -> Option<crate::hub::Guard> {
         }
         if !said {
             said = true;
-            let text = format!(
-                "wait: the check waits for a worker slot, {} of the machine's {} are running",
-                crate::hub::builds_running(),
-                crate::hub::build_slot_count()
+            let text = crate::wait_line(
+                &format!(
+                    "wait: the check waits for a worker slot, {} of the machine's {} are running",
+                    crate::hub::builds_running(),
+                    crate::hub::build_slot_count()
+                ),
+                &crate::hub::builder_name(building),
             );
             tracing::info!(target: crate::trace::PROGRESS, "  {text}");
             crate::pair::event(root, &text);
@@ -9163,7 +9166,10 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
             (_, Err(e)) => Err(e),
         };
         let outcome = match (outcome, toolbox, ra_tools::words(command)) {
-            (Ok((false, output)), Ok(toolbox), Ok(words)) => Ok(rerun_alone(toolbox, &words, output).await),
+            (Ok((false, output)), Ok(toolbox), Ok(words)) => {
+                let (passed, output) = rerun_alone(toolbox, &words, output).await;
+                Ok((passed, crate::timeout_note(toolbox.root(), &output)))
+            }
             (outcome, ..) => outcome,
         };
         let outcome = match outcome {
