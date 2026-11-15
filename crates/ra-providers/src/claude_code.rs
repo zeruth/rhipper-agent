@@ -1675,6 +1675,24 @@ pub fn edit_missed_message(message: &str, new_string: &str) -> String {
     if ends_in_whitespace(new_string) { format!("{message}; {TRAILING_SPACE_NOTE}") } else { message.to_string() }
 }
 
+/// The `edit-missed` message for the tool error it answers: the advice that fixes that error,
+/// not the catalogue's general one. An error of none of the three kinds keeps `message`.
+#[must_use]
+pub fn edit_missed_for_error(message: &str, error: &str) -> String {
+    let error = error.to_lowercase();
+    if error.contains("has not been read yet") {
+        "Read the file first, then edit it".to_owned()
+    } else if error.contains("found ") && error.contains(" matches") {
+        "add surrounding lines until the old text is unique, or set replace_all".to_owned()
+    } else if error.contains("string to replace not found") {
+        "Read the lines again and quote them exactly, whitespace included; when they were quoted right and it still missed, \
+         the file is CRLF: edit one line at a time"
+            .to_owned()
+    } else {
+        message.to_owned()
+    }
+}
+
 /// The gotchas one stream event shows: a command about to run that the catalogue would refuse
 /// or rewrite, a shell result with a known error in it, the final answer with a claim in it, and
 /// a command the harness refused that no gotcha names (`unmatched-denied`, for the catalogue
@@ -1753,6 +1771,9 @@ fn gotchas_of_event(
                     _ => continue,
                 };
                 let mut found = catalogue.scan(place, &content);
+                for hit in found.iter_mut().filter(|hit| hit.id == "edit-missed") {
+                    hit.message = edit_missed_for_error(&hit.message, &content);
+                }
                 // an Edit whose replacement ended in whitespace: the tool dropped it
                 let spaced =
                     block.get("tool_use_id").and_then(Value::as_str).is_some_and(|id| tools.contains_key(&format!("{id}{SPACED_MARK}")));
