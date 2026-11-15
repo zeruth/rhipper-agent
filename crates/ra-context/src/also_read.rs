@@ -102,6 +102,26 @@ pub fn also_read(workspace: &Path, text: &str, files: &[String]) -> Vec<String> 
     found.into_iter().take(ALSO_READ_CAP).map(|(_, path)| path).collect()
 }
 
+/// The symbols `text` names that no source file under `workspace` defines, the card's own
+/// files included: a type or function the card expects to find and will not.
+#[must_use]
+pub fn missing_symbols(workspace: &Path, text: &str) -> Vec<String> {
+    let mut missing = symbols_of(text);
+    if missing.is_empty() {
+        return missing;
+    }
+    let mut sources = Vec::new();
+    collect_sources(workspace, workspace, &mut sources);
+    for path in sources {
+        let Ok(content) = std::fs::read_to_string(workspace.join(&path)) else { continue };
+        missing.retain(|symbol| standing(&content, symbol) != Some(0));
+        if missing.is_empty() {
+            break;
+        }
+    }
+    missing
+}
+
 /// How `content` stands to `symbol`: 0 when it defines it, 1 when it only uses it.
 fn standing(content: &str, symbol: &str) -> Option<u8> {
     if !has_word(content, symbol) {

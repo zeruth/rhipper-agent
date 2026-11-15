@@ -627,3 +627,50 @@ async fn a_missing_binary_is_unavailable() {
     let error = provider.complete(request(None)).await.unwrap_err();
     assert!(matches!(&error, ProviderError::Unavailable(text) if text.contains("not installed")), "{error}");
 }
+
+/// A project at `<dir>/project` with worktrees for `cards`, and its pool's base `<dir>/target`.
+fn pool_project(dir: &Path, cards: &[&str]) -> (PathBuf, PathBuf) {
+    let root = dir.join("project");
+    for card in cards {
+        std::fs::create_dir_all(root.join("var").join("worktrees").join(card)).unwrap();
+    }
+    (root, dir.join("target"))
+}
+
+#[test]
+fn two_cards_never_lease_one_target_and_a_card_keeps_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, base) = pool_project(dir.path(), &["1", "2"]);
+    let one = lease_in(&base, &root, "1").unwrap();
+    let two = lease_in(&base, &root, "2").unwrap();
+    assert_ne!(one, two);
+    assert_eq!(lease_in(&base, &root, "1").unwrap(), one);
+    assert_eq!((held_in(&base, "1"), held_in(&base, "2")), (Some(one), Some(two)));
+    assert_eq!(held_in(&base, "3"), None);
+}
+
+#[test]
+fn a_released_lease_target_is_taken_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, base) = pool_project(dir.path(), &["1", "2", "3"]);
+    let one = lease_in(&base, &root, "1").unwrap();
+    let two = lease_in(&base, &root, "2").unwrap();
+    std::fs::create_dir_all(&one).unwrap();
+    assert_eq!(release_in(&base, "1"), Some(one.clone()));
+    assert_eq!(release_in(&base, "1"), None);
+    // the build stays for the next card
+    assert!(one.is_dir());
+    assert_eq!(lease_in(&base, &root, "3").unwrap(), one);
+    assert_eq!(held_in(&base, "2"), Some(two));
+}
+
+#[test]
+fn a_lease_left_by_a_card_with_no_worktree_is_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, base) = pool_project(dir.path(), &["1", "2"]);
+    let one = lease_in(&base, &root, "1").unwrap();
+    // card 1 crashed and its worktree is gone; its lease file is still there
+    std::fs::remove_dir_all(root.join("var").join("worktrees").join("1")).unwrap();
+    assert_eq!(lease_in(&base, &root, "2").unwrap(), one);
+    assert_eq!(held_in(&base, "1"), None);
+}

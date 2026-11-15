@@ -1219,19 +1219,121 @@ pub fn shared_target(workspace: &Path) -> Option<PathBuf> {
         Some((var.parent()?.to_path_buf(), workspace.file_name()?.to_string_lossy().into_owned()))
     };
     match worktree() {
-        Some((root, id)) => std::path::absolute(project_target(&root).join(format!("wt-{id}"))).ok(),
+        Some((root, id)) => {
+            let base = std::path::absolute(project_target(&root)).ok()?;
+            Some(held_in(&base, &id).unwrap_or_else(|| base.join(format!("wt-{id}"))))
+        }
         // the project's own tree builds in its own target, on the scratch drive when there is one
         None => scratch().map(|_| project_target(workspace)),
     }
 }
 
-/// Seeds the cargo target of the worktree at `workspace` from its project's target, when the
-/// worktree has none yet; see [`seed_target`]. The number of files copied, 0 for a workspace
-/// that is not a worktree.
+/// The name of a pooled target, `wt-pool-<n>` under the project's target.
+const POOL_PREFIX: &str = "wt-pool-";
+
+/// Leases a target of the project's pool to the worktree at `workspace`, so its first build
+/// starts from a landed card's artifacts and rebuilds only what its files changed: the one it
+/// holds, else a free one, else a new one. [`shared_target`] answers it from then on. `None` for
+/// a workspace that is not a worktree.
+///
+/// # Errors
+/// When the lease file cannot be made.
+pub fn lease_target(workspace: &Path) -> std::io::Result<Option<PathBuf>> {
+    let (root, Some(id)) = project_of(workspace) else { return Ok(None) };
+    let base = std::path::absolute(project_target(&root))?;
+    lease_in(&base, &root, &id.to_string()).map(Some)
+}
+
+/// Gives the pooled target the worktree at `workspace` holds back to the pool, its build kept for
+/// the next card; the target, or `None` when it held none.
+#[must_use]
+pub fn release_target(workspace: &Path) -> Option<PathBuf> {
+    let (root, Some(id)) = project_of(workspace) else { return None };
+    release_in(&std::path::absolute(project_target(&root)).ok()?, &id.to_string())
+}
+
+/// The lease file of a pooled target, beside it: the target itself is made by its seed.
+fn lease_file(target: &Path) -> PathBuf {
+    target.with_file_name(format!("{}.lease", target.file_name().unwrap_or_default().to_string_lossy()))
+}
+
+/// The pool's slots under `base`, by number: a target or a lease names one.
+fn pool_slots(base: &Path) -> Vec<u32> {
+    let mut slots: Vec<u32> = std::fs::read_dir(base)
+        .map(|dir| {
+            dir.flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let n = name.strip_prefix(POOL_PREFIX)?;
+                    n.strip_suffix(".lease").unwrap_or(n).parse().ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+/// The pooled target under `base` whose lease names card `id`.
+fn held_in(base: &Path, id: &str) -> Option<PathBuf> {
+    pool_slots(base)
+        .into_iter()
+        .map(|n| base.join(format!("{POOL_PREFIX}{n}")))
+        .find(|target| std::fs::read_to_string(lease_file(target)).is_ok_and(|holder| holder.trim() == id))
+}
+
+/// [`lease_target`] in the pool under `base` of the project at `root`. A lease whose card has no
+/// worktree is free: a run that crashed frees its target by leaving its worktree gone.
+fn lease_in(base: &Path, root: &Path, id: &str) -> std::io::Result<PathBuf> {
+    if let Some(held) = held_in(base, id) {
+        return Ok(held);
+    }
+    std::fs::create_dir_all(base)?;
+    let slots = pool_slots(base);
+    let fresh = slots.last().map_or(1, |n| n + 1);
+    for n in slots.into_iter().chain(fresh..) {
+        let target = base.join(format!("{POOL_PREFIX}{n}"));
+        let lease = lease_file(&target);
+        if let Ok(holder) = std::fs::read_to_string(&lease) {
+            let holder = holder.trim();
+            // an empty lease is one being written; a holder with a worktree is still building
+            if holder.is_empty() || root.join("var").join("worktrees").join(holder).exists() {
+                continue;
+            }
+            let _ = std::fs::remove_file(&lease);
+        }
+        // `create_new`: of two cards after one slot, one makes the file and the other moves on
+        match std::fs::File::options().write(true).create_new(true).open(&lease) {
+            Ok(mut file) => {
+                std::io::Write::write_all(&mut file, id.as_bytes())?;
+                return Ok(target);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the slots after the last are unbounded")
+}
+
+/// [`release_target`] in the pool under `base`.
+fn release_in(base: &Path, id: &str) -> Option<PathBuf> {
+    let target = held_in(base, id)?;
+    std::fs::remove_file(lease_file(&target)).ok()?;
+    Some(target)
+}
+
+/// Leases the worktree at `workspace` a target of the project's pool and seeds it from its
+/// project's target when it has none yet; see [`lease_target`] and [`seed_target`]. The number of
+/// files copied, 0 for a workspace that is not a worktree.
 ///
 /// # Errors
 /// When a file cannot be copied.
 pub fn seed_worktree_target(workspace: &Path) -> std::io::Result<usize> {
+    // a lease that cannot be made leaves the card its own `wt-<id>`, cold but never shared
+    if let Err(e) = lease_target(workspace) {
+        tracing::warn!("no pooled target for {}: {e}", workspace.display());
+    }
     let Some(own) = shared_target(workspace) else { return Ok(0) };
     let main = std::path::absolute(project_target(&project_of(workspace).0))?;
     // the project's own tree builds in the project's target, which is no worktree's to seed

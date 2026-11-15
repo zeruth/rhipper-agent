@@ -5020,7 +5020,10 @@ async fn clean_after(root: &Path, id: i64, has_branch: bool) -> Vec<String> {
             Err(e) => lines.push(format!("branch kept: {}", first_line(&format!("{e:#}")))),
         }
     }
-    if let Some(target) = ra_providers::claude_code::shared_target(&path)
+    // a pooled target outlives the card, its build kept for the next one's lease
+    if ra_providers::claude_code::release_target(&path).is_some() {
+        lines.push("target released to the pool".to_owned());
+    } else if let Some(target) = ra_providers::claude_code::shared_target(&path)
         && target.is_dir()
     {
         match std::fs::remove_dir_all(&target) {
@@ -5078,7 +5081,8 @@ fn sweep_orphan_targets(root: &Path) -> Option<String> {
     let (mut count, mut bytes) = (0usize, 0u64);
     for entry in std::fs::read_dir(&target).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(id) = name.strip_prefix("wt-") else { continue };
+        // a card's own target only: the pool's `wt-pool-<n>` and `wt-base` outlive the cards
+        let Some(id) = name.strip_prefix("wt-").filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())) else { continue };
         if root.join(WORKTREES_DIR).join(id).exists() || !entry.path().is_dir() {
             continue;
         }
@@ -9817,6 +9821,23 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<Brief> {
         text.push_str("Also read, where the symbols the card names are defined or used:\n");
         for file in also {
             let _ = writeln!(text, "  {file}");
+        }
+    }
+    // a symbol the card names that no file defines, and the open card that adds it: the worker
+    // does not search for what is not there
+    for symbol in ra_context::also_read::missing_symbols(&workspace_of(store), &named) {
+        let _ = write!(text, "Not defined in the tree: `{symbol}`");
+        let adder = nodes.iter().find(|n| {
+            n.id != node.id
+                && !matches!(n.state, TaskState::Accepted | TaskState::Cancelled)
+                && ra_context::also_read::symbols_of(&format!("{}\n{}", n.title, n.objective.as_deref().unwrap_or_default()))
+                    .contains(&symbol)
+        });
+        match adder {
+            Some(card) => {
+                let _ = writeln!(text, "; the open card #{} {} [{}] adds it", card.id, card.title, card.state);
+            }
+            None => text.push('\n'),
         }
     }
     // the ancestors: the chain of parents above the task, nearest first
