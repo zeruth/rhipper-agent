@@ -1303,3 +1303,37 @@ async fn a_leased_target_returned_by_a_landed_card_is_taken_by_the_next_and_the_
     assert!(!third.exists());
     let _ = std::fs::remove_dir_all(project_target(root));
 }
+
+/// A tree with nothing changed and a card whose last verdict is `review`.
+fn tree_with_review(review: &str) -> Option<tempfile::TempDir> {
+    let dir = tempfile::tempdir().unwrap();
+    let git = std::process::Command::new("git").arg("init").arg("-q").current_dir(dir.path()).status();
+    if !git.is_ok_and(|s| s.success()) {
+        return None;
+    }
+    // a run sets the card's variable; a test under one reads the same card
+    let id = std::env::var(CARD_VAR).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(7);
+    let mut task = ra_context::TaskContext::open(dir.path(), id);
+    task.review = Some(review.to_owned());
+    task.save(dir.path()).unwrap();
+    Some(dir)
+}
+
+#[test]
+fn review_asked_test_runs_before_change_allows_one_cargo_test() {
+    let Some(dir) = tree_with_review("review by r: needs revision (substantive)\n- run `cargo test -p ra-console x` and show it passes")
+    else {
+        return;
+    };
+    let command = "rc hold -- cargo test -p ra-console -q";
+    assert!(build_allowance(dir.path(), "s1", command).is_ok());
+}
+
+#[test]
+fn review_asked_test_runs_before_change_still_refuses_without_the_ask() {
+    let Some(dir) = tree_with_review("review by r: needs revision (substantive)\n- the name of the function is wrong") else {
+        return;
+    };
+    let command = "rc hold -- cargo test -p ra-console -q";
+    assert!(build_allowance(dir.path(), "s1", command).is_err());
+}

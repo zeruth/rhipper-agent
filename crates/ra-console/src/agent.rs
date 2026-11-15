@@ -2529,7 +2529,7 @@ pub fn build_allowance(tree: &Path, session: &str, command: &str) -> Result<(), 
         .current_dir(tree)
         .output()
         .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty());
-    if matches!(changed, Ok(false)) {
+    if matches!(changed, Ok(false)) && !review_asked_test_run(tree, command) {
         return Err(String::from(
             "nothing is changed yet: write the card's change first, then build once if a compile is in doubt; the project's check compiles after the report and a failure comes back as a rerun with its output",
         ));
@@ -2545,6 +2545,29 @@ pub fn build_allowance(tree: &Path, session: &str, command: &str) -> Result<(), 
         let _ = std::fs::write(&file, (spent + 1).to_string());
     }
     Ok(())
+}
+
+/// Whether `command` is a `cargo test` that the card's last verdict, a needs-revision, asked for
+/// in its points: a rerun may run it before its first edit, counted as any build is.
+fn review_asked_test_run(tree: &Path, command: &str) -> bool {
+    if !command.contains("cargo test") {
+        return false;
+    }
+    let root = crate::hub::project_root_of(tree);
+    let Some(id) = card_of_run(&root) else {
+        return false;
+    };
+    let Some(review) = ra_context::TaskContext::open(&root, id).review else {
+        return false;
+    };
+    // the stored block is `review by <model> …` over its `- ` points, not the reviewer's answer
+    if review.lines().any(|l| l == ra_context::STALE_REVIEW) || !review.lines().next().is_some_and(|l| l.contains("needs revision")) {
+        return false;
+    }
+    review.lines().filter(|l| l.starts_with("- ")).any(|point| {
+        let point = point.to_lowercase();
+        ["cargo test", "run the test", "run test", "test run", "tests run"].iter().any(|ask| point.contains(ask))
+    })
 }
 
 /// Whether a shell command is a build the session's budget counts: gradle, cargo or the
