@@ -7542,6 +7542,14 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // a wait that ran out is the check's failure, named as the output a timed-out check leaves
     let (_target, mut checks) = match waited {
         Ok(guard) => {
+            // a test binary the card's earlier runs left running holds the target the check
+            // links into: the card's own are stopped, never another card's
+            if let Some(dir) = workspace_dir.as_deref() {
+                let stopped = ra_tools::stale::stop_card_processes(dir);
+                if stopped > 0 {
+                    tracing::info!(target: crate::trace::PROGRESS, "stopped {stopped} stale process(es) of the card's target");
+                }
+            }
             let checks = run_checks(&toolbox, &commands, &orchestrated).await;
             (guard, checks)
         }

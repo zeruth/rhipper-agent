@@ -440,9 +440,6 @@ impl ClaudeCode {
         if let Some(dir) = &request.workspace {
             command.envs(scratch_env(dir));
         }
-        if let Some(temp) = run_temp(&request) {
-            let _ = std::fs::create_dir_all(temp);
-        }
         command.envs(self.run_env(request.workspace.as_deref()));
         command.envs(self.temp_env(&request));
         // a run dropped mid-way, a walk stopped or timed out, takes its worker with it
@@ -1496,7 +1493,8 @@ pub fn session_dirs_note(workspace: &Path) -> String {
     if project_of(workspace).1.is_none() {
         return String::new();
     }
-    let (Some(target), Some(temp)) = (shared_target(workspace), temp_of(workspace)) else { return String::new() };
+    let Some(target) = shared_target(workspace) else { return String::new() };
+    let temp = card_temp(workspace);
     format!(
         "Outside the worktree you may list, read and run from two directories: the card's cargo target {} (built binaries under debug/) and its kept scratch {}.",
         target.display(),
@@ -1631,17 +1629,24 @@ pub fn scratch_env(workspace: &Path) -> Vec<(String, PathBuf)> {
 /// completion, which runs nothing.
 #[must_use]
 pub fn run_temp(request: &CompletionRequest) -> Option<PathBuf> {
-    temp_of(request.workspace.as_deref()?)
+    let workspace = std::path::absolute(request.workspace.as_deref()?).ok()?;
+    Some(card_temp(&workspace))
 }
 
-/// [`run_temp`] of the workspace itself.
-fn temp_of(workspace: &Path) -> Option<PathBuf> {
-    let workspace = std::path::absolute(workspace).ok()?;
+/// The temp directory of the runs and the checks in a workspace: `<scratch>/tmp/<project>/run-<id>`
+/// for a card's worktree (`run` for the project's own tree), the system temp's `rhipper` without
+/// a scratch root; outside any git repository, so a project a test creates there never sees the
+/// branch's tree. Created here, so neither a worker nor a check has to make it.
+#[must_use]
+pub fn card_temp(workspace: &Path) -> PathBuf {
+    let workspace = std::path::absolute(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let (root, card) = project_of(&workspace);
     let name = root.file_name().map_or_else(|| "project".into(), |n| n.to_string_lossy().into_owned());
     let base = scratch().map_or_else(|| std::env::temp_dir().join("rhipper"), |s| s.join("tmp"));
     let dir = base.join(name);
-    Some(card.map_or_else(|| dir.join("run"), |id| dir.join(format!("run-{id}"))))
+    let dir = card.map_or_else(|| dir.join("run"), |id| dir.join(format!("run-{id}")));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 /// The program a permission rule names: `python` of `Bash(python *)`, `gw.ps1` of

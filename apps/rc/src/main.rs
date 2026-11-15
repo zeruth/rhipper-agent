@@ -2004,20 +2004,19 @@ fn bring_main_in(here: &Path) -> MainMerge {
 /// Runs the checks of a card here, in the order written, and stops at the first failure. Each
 /// command's whole output, stdout and stderr, is kept in `var/checks/<card>-<run>.log` and the
 /// path is the last line printed, so a failure is read from the file and never lost to a `tail`.
-/// `TEMP` and `TMP` point outside the worktree's repo: the scratch root's, else the system's.
+/// `TEMP` and `TMP` are the card's own directory outside the worktree's repo, the worker's, and
+/// the test processes a worktree's earlier runs left running are stopped first.
 async fn check_card(card: i64) -> anyhow::Result<()> {
     let store = open_store().await?;
     let node = store.read(card).await?;
     let here = std::env::current_dir()?;
     let (project, _) = ra_providers::claude_code::project_of(&here);
     let log = next_check_log(&project.join("var").join("checks"), card)?;
-    let temp = ra_providers::claude_code::scratch_env(&here)
-        .into_iter()
-        .find(|(key, _)| key == "TEMP")
-        .map_or_else(|| std::env::temp_dir().join("rhipper"), |(_, dir)| dir);
-    std::fs::create_dir_all(&temp)?;
-    let temp = temp.to_string_lossy().into_owned();
-    let toolbox = ra_tools::Toolbox::new(&here)?.with_env([("TEMP".to_owned(), temp.clone()), ("TMP".to_owned(), temp)]);
+    let stopped = ra_tools::stale::stop_card_processes(&here);
+    if stopped > 0 {
+        eprintln!("stopped {stopped} process{} left running from this worktree's target", if stopped == 1 { "" } else { "es" });
+    }
+    let toolbox = ra_tools::Toolbox::new(&here)?;
     let commands = ra_console::agent::check_commands(node.acceptance.as_deref());
     // a branch behind main fails for what main already fixed: main comes in before anything runs
     match bring_main_in(&here) {

@@ -95,6 +95,9 @@ impl Toolbox {
             }
             // the scratch drive's temp directory and Gradle cache, when the machine has one
             command.envs(ra_providers::claude_code::scratch_env(&self.root));
+            // the card's own temp directory, the one its worker had, outside any git repository
+            let temp = ra_providers::claude_code::card_temp(&self.root);
+            command.env("TEMP", &temp).env("TMP", &temp);
             command.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
             let mut child = command.spawn().with_context(|| format!("cannot start {program}"))?;
             // the check is a build: it runs on its share of the builders' CPU, which follows

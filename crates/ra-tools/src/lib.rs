@@ -20,6 +20,7 @@ pub use commands::{missing_test_target, words};
 
 mod commands;
 pub mod cpu;
+pub mod stale;
 
 /// The most matches a search reports.
 const MAX_HITS: usize = 200;
