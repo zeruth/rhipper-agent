@@ -1646,6 +1646,51 @@ fn wrong_crate_paths(nodes: &[ra_roadmap::model::Node], root: &Path) -> Vec<Stri
     faults
 }
 
+/// The `files:` of each card not yet done with a path under a directory that is not in the tree
+/// corrected to the workspace member's real directory (`crates/rc/` to `apps/rc/`), stored on the
+/// card and in `nodes`; a fault line for each card says what was corrected.
+async fn correct_crate_files(
+    store: &ra_roadmap::store::Store,
+    nodes: &mut [ra_roadmap::model::Node],
+    root: &Path,
+) -> anyhow::Result<Vec<String>> {
+    let mut faults = Vec::new();
+    for node in nodes.iter_mut().filter(|n| !matches!(n.state, TaskState::Accepted | TaskState::Cancelled)) {
+        let mut named: Vec<String> = Vec::new();
+        let files: Vec<String> = node
+            .files
+            .iter()
+            .map(|file| {
+                let mark =
+                    if file.starts_with(ra_roadmap::tree::NEW_MARK) { ra_roadmap::tree::NEW_MARK.to_string() } else { String::new() };
+                let path = file.trim_start_matches(ra_roadmap::tree::NEW_MARK);
+                let mut segments = path.splitn(3, '/');
+                let (Some(parent @ ("crates" | "apps")), Some(member), Some(rest)) = (segments.next(), segments.next(), segments.next())
+                else {
+                    return file.clone();
+                };
+                if member.is_empty() || root.join(parent).join(member).exists() {
+                    return file.clone();
+                }
+                let Some(real) = ["crates", "apps"].into_iter().find(|p| root.join(p).join(member).join("Cargo.toml").exists()) else {
+                    return file.clone();
+                };
+                let wrong = format!("{parent}/{member}/");
+                if !named.contains(&wrong) {
+                    faults.push(format!("#{}: {wrong} is not in the tree; the crate is {real}/{member}/ (files corrected)", node.id));
+                    named.push(wrong);
+                }
+                format!("{mark}{real}/{member}/{rest}")
+            })
+            .collect();
+        if !named.is_empty() {
+            store.set_files(node.id, &files).await?;
+            node.files = files;
+        }
+    }
+    Ok(faults)
+}
+
 /// A fault for each `--test <name>` a card not yet done names in its acceptance while no
 /// `tests/<name>.rs` is in the tree or in the card's own `files:`. The fault names the open card
 /// whose files list that test, so the card creates it or waits on that card.
@@ -1724,10 +1769,11 @@ fn missing_generators(nodes: &[ra_roadmap::model::Node]) -> Vec<String> {
 /// and exits 1 when there is one, so a script or a hook can gate on a clean roadmap.
 async fn check() -> anyhow::Result<()> {
     let store = open_store().await?;
-    let nodes = store.all().await?;
+    let mut nodes = store.all().await?;
     let path = store_path();
     let root = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let mut faults = tree::lint(&nodes);
+    let mut faults = correct_crate_files(&store, &mut nodes, root).await?;
+    faults.extend(tree::lint(&nodes));
     faults.extend(tree::missing_files(&nodes, |file| root.join(file).exists()));
     // a `+` on a file the tree holds is fixed on the card, not only reported: the next handoff
     // offers it to read first
