@@ -163,6 +163,15 @@ message = "a refusal cost a turn: put the exact command and the refusal's words 
 remedy = { kind = "hint" }
 
 [[gotcha]]
+# a `cargo test --no-run 2>&1` ends in the redirect the tail rewrite cannot follow; named ahead of
+# the generic long-output text, with the form that passes
+id = "no-run-long-output"
+where = "command"
+pattern = '^\s*cargo\s+test\b[^|;]*--no-run\b[^|;]*2>&1\s*$'
+message = "a cargo test --no-run prints a compile log a turn should not carry: run the same command with `-q` and without `2>&1`, as in `cargo test -p <crate> --no-run -q`"
+remedy = { kind = "hint" }
+
+[[gotcha]]
 id = "long-output"
 where = "command"
 pattern = '^\s*cargo\s+(test|build|clippy|check)\b'

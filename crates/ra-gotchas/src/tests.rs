@@ -613,6 +613,20 @@ fn a_refresh_brings_the_seeds_new_entries_and_keeps_the_files_own() {
 }
 
 #[test]
+fn no_run_long_output_names_form() {
+    let catalogue = Catalogue::seed();
+    match catalogue.command("cargo test -p ra-gotchas --no-run 2>&1", Conditions::default()) {
+        Verdict::Deny { id, reason } => {
+            assert_eq!(id, "no-run-long-output");
+            assert!(reason.contains("-q") && reason.contains("without `2>&1`"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let accepted = catalogue.command("cargo test -p ra-gotchas --no-run -q", Conditions::default());
+    assert!(!matches!(accepted, Verdict::Deny { .. }), "{accepted:?}");
+}
+
+#[test]
 fn a_build_put_on_a_slot_is_routine_and_a_refusal_is_not() {
     let seed = Catalogue::seed();
     assert!(["build-slot", "heavy-work-slot", "contract-runner-slot"].iter().all(|id| seed.is_routine(id)));
