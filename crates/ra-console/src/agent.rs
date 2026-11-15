@@ -4182,6 +4182,17 @@ pub fn relaunch(dir: &Path, root: &Path) -> anyhow::Result<u32> {
     Ok(child.id())
 }
 
+/// The feed's line when a parallel walk sees `version` installed with `in_flight` runs going:
+/// it starts no new card and hands over to the new rc once they end.
+#[must_use]
+pub fn handover_line(version: &str, in_flight: usize) -> String {
+    if in_flight == 0 {
+        format!("walk moving to {version}: it starts no new card and hands over now")
+    } else {
+        format!("walk moving to {version}: it starts no new card and hands over once its {in_flight} run(s) in flight end")
+    }
+}
+
 /// Records the running walk's pid where a `stop` can read it: the walk lock cannot be read
 /// while it is held.
 fn note_walk_pid(root: &Path) {
@@ -6302,7 +6313,8 @@ type InFlight<'a> = std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Vec<Str
 /// are read, up to `width` of them run together, and readiness is read again once the wave
 /// ends, until no card is ready, a run fails, or with `stop_on_revision` a card needs revision.
 /// A dependent starts only once its dependency's landing is in HEAD, the base its worktree
-/// starts from, and its needs are on the machine ([`prerequisites_missing`]).
+/// starts from, and its needs are on the machine ([`prerequisites_missing`]). A newer `rc`
+/// installed meanwhile takes the walk over once the runs in flight end ([`handover_line`]).
 ///
 /// # Errors
 /// When the roadmap cannot be read between waves, or a worktree cannot be made.
@@ -6312,10 +6324,21 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     // a walk that dies takes its workers with it
     ra_tools::cpu::own_children();
     let root = workspace_of(store);
-    let Some(_lock) = take_walk_lock(&root) else {
+    // a walk started by one moving to a newer install takes the lock as that one exits
+    let lock = match take_walk_lock(&root) {
+        Some(lock) => Some(lock),
+        None => handed_walk_lock(&root).await,
+    };
+    let Some(_lock) = lock else {
         anyhow::bail!("a walk is already running in this project; `rc walk --stop` ends it after its current card")
     };
     note_walk_pid(&root);
+    // what the install said at the start: a change since is a newer rc to move to
+    let seen = worker.install.as_deref().and_then(crate::hub::installed);
+    // the version this walk hands over to once its runs in flight end, and whether a move that
+    // failed keeps it on its own rc for good
+    let mut moving: Option<String> = None;
+    let mut stays = false;
     probe_the_machine(&root).await;
     let mut lines = Vec::new();
     // the cards a killed walk left in progress go back on the queue before this one reads it
@@ -6378,8 +6401,24 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     loop {
         // `stop` from the console or the window: nothing new starts, and the walk ends when
         // the runs it is in have ended
-        if stopped.is_none() && take_stop(&root) {
+        // a walk on its way to a newer rc still takes a stop: it ends rather than hand over
+        if (stopped.is_none() || moving.is_some()) && take_stop(&root) {
             stopped = Some("stopped as asked, after the cards it was in".to_owned());
+        }
+        // a newer rc installed: a parallel walk is never between cards, so it starts no new one
+        // and hands over once the runs in flight end; the walks of 2026-11-15 kept the rc they
+        // started with all day and ran cards a later install would have held
+        if stopped.is_none()
+            && !stays
+            && let Some(dir) = &worker.install
+            && let Some(version) = crate::hub::moved_to(crate::VERSION, seen.as_deref(), crate::hub::installed(dir).as_deref())
+        {
+            let text = handover_line(&version, flight.len());
+            tracing::info!(target: crate::trace::PROGRESS, "{text}");
+            crate::pair::event(&root, &text);
+            lines.push(text);
+            stopped = Some(format!("moving to {version}"));
+            moving = Some(version);
         }
         // the slots: the machine's pool, shared by every project's walk (see [`Pool`]). A
         // card takes a slot of its model's kind before it starts, holds it for the run, and
@@ -6580,6 +6619,32 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // every slot of the kind is another project's: wait for one
                 tokio::time::sleep(WALK_TICK).await;
                 continue;
+            }
+            // the move waited for the runs in flight: the new rc takes the walk up now, with
+            // the same arguments, so the runners stay as they were. A stop or a full stop that
+            // came meanwhile ends the walk instead
+            if let Some(version) = moving.take()
+                && stopped.as_deref() == Some(format!("moving to {version}").as_str())
+                && let Some(dir) = &worker.install
+            {
+                match (worker.relaunch)(dir, &root) {
+                    Ok(pid) => {
+                        let text = format!("moved to {version} · ran {ran} card(s) · pid {pid}");
+                        crate::pair::event(&root, &format!("walk {text}"));
+                        write_digest(store, &root, None, None, None).await;
+                        lines.push(text);
+                        return Ok(lines);
+                    }
+                    Err(error) => {
+                        // the walk stays on its own rc and goes on; it does not try again
+                        let text = format!("the walk stays on {}: {error:#}", crate::VERSION);
+                        crate::pair::event(&root, &text);
+                        lines.push(text);
+                        stays = true;
+                        stopped = None;
+                        continue;
+                    }
+                }
             }
             let mut why = "no card is ready".to_owned();
             // a `plan-next` gambit lets the planner fill the next empty milestone; its cards
