@@ -1626,7 +1626,101 @@ pub async fn review(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<V
     // from the command line for a run of its own and kept a "worker" card open for it (runelite
     // and asm, 2026-11-12); a tagged line of a card with no live run is dropped there
     let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id);
-    review_to(store, id, worker, TaskState::Accepted).instrument(span).await
+    async {
+        let rerun = rerun_stale_check(store, id, worker).await;
+        let lines = review_to(store, id, worker, TaskState::Accepted).await?;
+        Ok::<_, anyhow::Error>(rerun.into_iter().chain(lines).collect())
+    }
+    .instrument(span)
+    .await
+}
+
+/// What the stamp on a check output's last line starts with: the tree the check ran on.
+const CHECKED_ON: &str = "checked on tree ";
+
+/// The tree of what a worktree holds now, committed or not: the checkpoint the walk commits
+/// after a run changes the commit and not this, a commit after the check or a merge changes it.
+pub async fn content_tip(path: &Path) -> Option<String> {
+    let made = git(path, &["stash", "create"]).await.ok()?;
+    let made = made.trim();
+    let spec = format!("{}^{{tree}}", if made.is_empty() { "HEAD" } else { made });
+    let tree = git(path, &["rev-parse", &spec]).await.ok()?;
+    Some(tree.trim().to_owned()).filter(|t| !t.is_empty())
+}
+
+/// The check output with the tree it ran on at its end, where the clip to the tail keeps it.
+#[must_use]
+pub fn stamped(output: &str, tip: Option<&str>) -> String {
+    match tip {
+        Some(tip) => format!("{}\n{CHECKED_ON}{tip}", output.trim_end()),
+        None => output.to_owned(),
+    }
+}
+
+/// Whether a stored check output was made on another tree than `tip`: one that holds output and
+/// names no tree, or another, is stale; no output at all is a card that never ran its checks.
+#[must_use]
+pub fn check_is_stale(output: &str, tip: &str) -> bool {
+    if output.trim().is_empty() {
+        return false;
+    }
+    let stamp = output.trim_end().lines().last().and_then(|line| line.strip_prefix(CHECKED_ON));
+    stamp.is_none_or(|stamp| stamp.trim() != tip)
+}
+
+/// The card's checks run again in its worktree when its branch holds other content than the
+/// last check ran on, before the reviewer reads: asm #143 was judged on the output of a run
+/// whose test was committed after it. The line of the rerun; `None` when the stored output
+/// is current, there is no worktree or the card has no checks.
+async fn rerun_stale_check(store: &Store, id: i64, worker: &Worker) -> Option<String> {
+    let root = workspace_of(store);
+    let path = worker.workspace.clone().unwrap_or_else(|| root.join(WORKTREES_DIR).join(id.to_string()));
+    if !path.join(".git").exists() || same_tree(&root, &path) {
+        return None;
+    }
+    let mut task = ra_context::TaskContext::open(&root, id);
+    let tip = content_tip(&path).await?;
+    if !check_is_stale(&task.check_output, &tip) {
+        return None;
+    }
+    let node = store.read(id).await.ok()?;
+    let Checks { commands, timeout, .. } = checks_of(&root, &node);
+    if commands.is_empty() {
+        return None;
+    }
+    tracing::info!(target: crate::trace::PROGRESS, "#{id} · the branch moved since its last check: checks run again");
+    let own_target = ra_providers::claude_code::shared_target(&path);
+    let toolbox = worker.toolbox(&path).map(|toolbox| {
+        toolbox.with_timeout(timeout).with_env(own_target.iter().map(|t| ("CARGO_TARGET_DIR".to_owned(), t.display().to_string())))
+    });
+    let runs = {
+        let _slot = hold_build(&root, &path).await;
+        let target = own_target.unwrap_or_else(|| crate::hub::cargo_target(&root));
+        let cargo = commands.iter().find(|c| c.trim_start().starts_with("cargo")).cloned();
+        let waited = match &cargo {
+            Some(_) => guard_target(&root, &path, &target, timeout).await,
+            None => Ok(None),
+        };
+        match waited {
+            Ok(_target) => run_checks(&toolbox, &commands, &[]).await,
+            Err(text) => vec![CheckRun {
+                command: cargo.unwrap_or_default(),
+                passed: false,
+                exit: "not run".to_owned(),
+                text,
+                failed_tests: 0,
+                failures: Vec::new(),
+                tests: Vec::new(),
+                first_error: String::new(),
+                setup: false,
+            }],
+        }
+    };
+    let output: Vec<String> = runs.iter().map(|run| format!("$ {} · {}\n{}", run.command, run.exit, run.text.trim_end())).collect();
+    task.set_check_output(&stamped(&output.join("\n\n"), Some(&tip)));
+    save_context(store, &root, &task).await;
+    let passed = runs.iter().all(|run| run.passed);
+    Some(format!("  #{id}: the branch moved since its last check; checks run again: {}", if passed { "passed" } else { "failed" }))
 }
 
 /// The reviewer on a card a run just left implemented, before it is offered for acceptance:
@@ -7276,7 +7370,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     };
     // the checks' output, for the reviewer: it reads what the check showed, not only its line
     let output: Vec<String> = checks.iter().map(|run| format!("$ {} · {}\n{}", run.command, run.exit, run.text.trim_end())).collect();
-    task.set_check_output(&output.join("\n\n"));
+    let tip = match &worker.workspace {
+        Some(path) if !same_tree(&root, path) => content_tip(path).await,
+        _ => None,
+    };
+    task.set_check_output(&stamped(&output.join("\n\n"), tip.as_deref()));
     let mut last = handoff(outcome, check_line.trim(), &handed, changed, &open);
     last.warnings = lint_warnings;
     // a run sent back by its check hands on what it read, as a capped one does, and every
