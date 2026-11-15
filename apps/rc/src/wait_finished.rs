@@ -30,6 +30,13 @@ pub(crate) fn exit_code(id: u32, line: &str) -> Option<i32> {
 pub(crate) fn finished(dir: &Path, id: u32) -> Option<i32> {
     let line = std::fs::read_to_string(exit_path(dir, id)).ok()?;
     print!("{line}");
+    // the job record is written when the build starts, so its age is the build's
+    let started = std::fs::metadata(dir.join("var").join("jobs").join(format!("{id}.job"))).and_then(|m| m.modified());
+    if let Ok(started) = started
+        && let Some(note) = crate::stale_edits::note(&crate::stale_edits::edited_since(dir, started))
+    {
+        println!("{note}");
+    }
     Some(exit_code(id, &line).unwrap_or_else(|| {
         eprintln!("rc wait: the exit line of {id} holds no exit code");
         1

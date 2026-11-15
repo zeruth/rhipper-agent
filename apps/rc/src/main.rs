@@ -17,6 +17,7 @@ mod tests;
 #[allow(dead_code)]
 mod bench;
 mod doctor;
+mod stale_edits;
 mod status;
 mod wait;
 mod wait_finished;
