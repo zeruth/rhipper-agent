@@ -7667,6 +7667,20 @@ fn person_line(report: &str) -> Option<String> {
     Some(line.trim_start_matches(['-', '*', '#', '>', ' ']).chars().take(200).collect())
 }
 
+/// What a `[machine]` note says when a tool is gone from the machine.
+const MISSING_TOOL_PHRASES: [&str; 5] = ["not installed", "isn't installed", "is missing", "not on this machine", "no such tool"];
+
+/// The first `[machine]` line of a report that says an external tool is missing or not installed
+/// (csmith in WSL, a prebuilt binary), clipped to 200 characters: only a person can install it,
+/// so a rerun would meet the same gap. `None` when no machine note names a missing tool.
+pub fn missing_tool_line(report: &str) -> Option<String> {
+    let line = report.lines().map(str::trim).find(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("[machine]") && MISSING_TOOL_PHRASES.iter().any(|phrase| lower.contains(phrase))
+    })?;
+    Some(line.trim_start_matches(['-', '*', '#', '>', ' ']).chars().take(200).collect())
+}
+
 /// The reason a worker's report gives under its `## Blocked` heading: the rest of the heading's
 /// line, else the first line under it. `None` when the report has no such heading.
 fn blocked_reason(report: &str) -> Option<String> {
@@ -7686,6 +7700,11 @@ fn held_reason(report: &str, changed: &[String], failed: Option<&CheckRun>, prin
         && let Some(reason) = blocked_reason(report)
     {
         return Some(format!("the worker reported it blocked: {reason}"));
+    }
+    if changed.is_empty()
+        && let Some(line) = missing_tool_line(report)
+    {
+        return Some(format!("a tool is missing, only a person can install it: {line}"));
     }
     let failed = failed?;
     if failed.setup {
@@ -9243,6 +9262,9 @@ fn held_round(last: &ra_context::Handoff, previous: Option<&ra_context::Handoff>
     }
     if let Some(line) = person_line(&last.report) {
         return Some(format!("only a person can move it: {line}"));
+    }
+    if let Some(line) = missing_tool_line(&last.report) {
+        return Some(format!("a tool is missing, only a person can install it: {line}"));
     }
     let points = last.points()?;
     if previous.and_then(ra_context::Handoff::points) != Some(points) {
