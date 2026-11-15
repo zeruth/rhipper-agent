@@ -21,7 +21,9 @@ jobs:
   windows:
     name: build and test (windows)
     runs-on: windows-latest
-    timeout-minutes: 45
+    # ra-console's tests build small cargo projects of their own and take over 20 minutes on a
+    # hosted runner: three runs in a row hit the old 45-minute limit (2026-11-13 to 11-15)
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:

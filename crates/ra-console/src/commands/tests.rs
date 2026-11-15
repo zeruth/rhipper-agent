@@ -5236,18 +5236,12 @@ async fn run_refuses_a_project_and_names_a_missing_key() {
     let error = run("/run 1", &store, &worker()).await.unwrap_err();
     assert!(format!("{error:#}").contains("is a project"), "{error:#}");
     run("/add task T parent 1", &store, &worker()).await.unwrap();
-    // this machine may hold a stored key or a real one in the environment; when neither source
-    // holds a key, the run must refuse with the key's name. The env lock covers the read and the
-    // removal, so a parallel secret test cannot flip the variable in between.
-    let guard = crate::secret::ENV_LOCK.lock();
-    let key_configured = std::env::var("OPENROUTER_API_KEY").map_or(false, |k| !k.trim().is_empty()) || crate::secret::has_key();
-    if !key_configured {
-        // SAFETY: the test holds the env lock; no parallel test reads the key
-        unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
-        let error = run("/run 2", &store, &worker()).await.unwrap_err();
-        assert!(format!("{error:#}").contains("OPENROUTER_API_KEY") || format!("{error:#}").contains("key"), "{error:#}");
-    }
-    drop(guard);
+    // a card whose route has no key does not refuse since #643: it falls back to Claude Code
+    // before the worker starts, and the fallback names the missing key (a real run here would
+    // need the `claude` CLI, which CI lacks, so the choice itself is what this checks)
+    let chosen = crate::route::choose("z-ai/glm-5.3-flash", |route| route != crate::agent::Route::OpenRouter);
+    assert_eq!(chosen.route, crate::agent::Route::ClaudeCode);
+    assert!(chosen.note().is_some_and(|note| note.contains("no key")), "{:?}", chosen.note());
 }
 
 /// A project with one card, `acceptance` on it, and a worker whose script logs every command and
