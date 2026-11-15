@@ -22,8 +22,10 @@ pub fn default_dir() -> PathBuf {
 }
 
 /// Installs the build into `dir` (the default when `None`), puts the directory on the user's
-/// path when it is not, and says what it did, one line each. The build is `target/debug` under
-/// the working directory when it holds the binaries, else the directory of the running binary;
+/// path when it is not, and says what it did, one line each. The build is `debug` under the
+/// target directory cargo names for the working directory (`CARGO_TARGET_DIR` when set) when
+/// it holds the binaries, else the directory of the running binary; the copied rc must answer
+/// the version the sources name;
 /// an installed binary asked to install from its own directory refuses, rather than setting
 /// itself aside and copying nothing (which once left no `rc` at all).
 ///
@@ -35,14 +37,16 @@ pub fn install(dir: Option<&Path>) -> anyhow::Result<Vec<String>> {
     let _install = crate::hub::guard(crate::hub::INSTALL_LOCK);
     let dir = dir.map_or_else(default_dir, Path::to_path_buf);
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot make {}", dir.display()))?;
-    let suffix = std::env::consts::EXE_SUFFIX;
     let beside = std::env::current_exe()?.parent().context("the running binary has no directory")?.to_path_buf();
-    let build = std::env::current_dir().ok().map(|d| d.join("target").join("debug")).filter(|d| d.join(format!("rc{suffix}")).is_file());
+    let cwd = std::env::current_dir().ok();
+    let target = std::env::var_os("CARGO_TARGET_DIR").filter(|t| !t.is_empty());
+    // cargo's own answer covers a subdirectory of the workspace and a target set in its config
+    let build = cwd.as_deref().and_then(|d| build_source(&cargo_target_dir(d).unwrap_or_else(|| target_dir(d, target.as_deref()))));
     // an install from a checkout builds both binaries first: `cargo run -p rc -- install`
     // builds rc alone, and the window went out three times on a stale binary before anyone
     // noticed (the person: "install should install the window too")
     if let Some(build) = &build
-        && let Some(root) = build.parent().and_then(Path::parent)
+        && let Some(root) = cwd.as_deref()
     {
         // the binary running this install cannot be rebuilt under itself (`target\debug\rc
         // install` is the freshly built rc): the others are
@@ -56,6 +60,12 @@ pub fn install(dir: Option<&Path>) -> anyhow::Result<Vec<String>> {
         let packages: Vec<&str> = BINARIES.iter().copied().filter(|stem| !(from_build && running.as_deref() == Some(stem))).collect();
         build_packages(root, &packages)?;
     }
+    // the version the copied rc must answer: the one the sources name for a build, this
+    // binary's own when the install copies the directory it runs from
+    let expected = match (&build, cwd.as_deref()) {
+        (Some(_), Some(root)) => sources_version(root),
+        _ => Some(crate::VERSION.to_owned()),
+    };
     let source = build.unwrap_or(beside);
     let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
@@ -68,6 +78,64 @@ pub fn install(dir: Option<&Path>) -> anyhow::Result<Vec<String>> {
     );
     let mut lines = Vec::new();
     sweep(&dir, &mut lines);
+    lines.extend(copy_binaries(&source, &dir, expected.as_deref(), version_of)?);
+    lines.push(on_path(&dir));
+    Ok(lines)
+}
+
+/// The build an install copies: `debug` under the target directory the build wrote; `None`
+/// when it holds no rc.
+fn build_source(target: &Path) -> Option<PathBuf> {
+    let suffix = std::env::consts::EXE_SUFFIX;
+    Some(target.join("debug")).filter(|d| d.join(format!("rc{suffix}")).is_file())
+}
+
+/// The target directory cargo builds the workspace around `cwd` into, as `cargo metadata`
+/// names it (`CARGO_TARGET_DIR`, the config's, else the workspace root's `target`); `None`
+/// outside a workspace or when cargo does not answer.
+fn cargo_target_dir(cwd: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps", "--offline"])
+        .current_dir(cwd)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let metadata: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    metadata.get("target_directory")?.as_str().map(PathBuf::from)
+}
+
+/// The version the sources at `root` name, as the build script counts it: `0.2.<commits>`, and
+/// a `+` when `crates` or `apps` holds uncommitted changes; `None` without git.
+fn sources_version(root: &Path) -> Option<String> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let commits = git(&["rev-list", "--count", "HEAD"])?.parse::<u64>().ok()?;
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no", "--", "crates", "apps"]).is_some_and(|s| !s.is_empty());
+    Some(format!("0.2.{commits}{}", if dirty { "+" } else { "" }))
+}
+
+/// Copies the binaries of `source` into `dir` and says what it copied, one line each. The rc
+/// copied is asked its version through `version` and refused, with the binary set aside put
+/// back, when it is not `expected`, the version the build was made at.
+///
+/// # Errors
+/// When a binary cannot be set aside or copied, or the copied rc is not the build's.
+fn copy_binaries(
+    source: &Path,
+    dir: &Path,
+    expected: Option<&str>,
+    version: impl Fn(&Path) -> Option<String>,
+) -> anyhow::Result<Vec<String>> {
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let mut lines = Vec::new();
     for stem in BINARIES {
         let name = format!("{stem}{suffix}");
         let from = source.join(&name);
@@ -88,22 +156,52 @@ pub fn install(dir: Option<&Path>) -> anyhow::Result<Vec<String>> {
             }
             return Err(anyhow::anyhow!(e).context(format!("cannot copy {} to {}", from.display(), to.display())));
         }
-        // the copy's own version, which is the build's and not this binary's when they differ;
-        // only rc is asked, the window would open
-        let version = (stem == "rc")
-            .then(|| std::process::Command::new(&to).arg("--version").output().ok())
-            .flatten()
-            .filter(|out| out.status.success())
-            .and_then(|out| String::from_utf8_lossy(&out.stdout).split_whitespace().last().map(str::to_owned))
-            .unwrap_or_else(|| crate::VERSION.to_owned());
+        // the copy's own version against the sources': a stale build copied from the wrong
+        // directory answers an older one; only rc is asked, the window would open
+        let copied = if stem == "rc" { version(&to) } else { None };
+        if let Err(e) = check_versions(expected.filter(|_| stem == "rc"), copied.as_deref()) {
+            // nothing of this install stays: the binary set aside comes back
+            let _ = std::fs::remove_file(&to);
+            if let Some(aside) = &aside {
+                let _ = std::fs::rename(aside, &to);
+            }
+            return Err(e);
+        }
+        let version = copied.unwrap_or_else(|| crate::VERSION.to_owned());
         lines.push(format!("{name} {version} → {}", to.display()));
         // a running walk reads it between cards and moves to the new rc
         if stem == "rc" {
             let _ = std::fs::write(dir.join(crate::hub::INSTALLED_FILE), format!("{version} {}\n", unix_now()));
         }
     }
-    lines.push(on_path(&dir));
     Ok(lines)
+}
+
+/// The target directory of a build from `cwd` when cargo does not say: `target`
+/// (`CARGO_TARGET_DIR`, relative to `cwd` as cargo reads it) when set, else `<cwd>/target`.
+fn target_dir(cwd: &Path, target: Option<&std::ffi::OsStr>) -> PathBuf {
+    cwd.join(target.unwrap_or_else(|| std::ffi::OsStr::new("target")))
+}
+
+/// What `binary --version` prints last, the version; `None` when it does not run.
+fn version_of(binary: &Path) -> Option<String> {
+    let out = std::process::Command::new(binary).arg("--version").output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).split_whitespace().last().map(str::to_owned)).flatten()
+}
+
+/// Refuses an install whose copied rc is not the build's, naming both. The `+` of a tree
+/// with changes is not compared: the sources' count does not carry it.
+///
+/// # Errors
+/// When both versions are known and differ.
+fn check_versions(built: Option<&str>, copied: Option<&str>) -> anyhow::Result<()> {
+    if let (Some(built), Some(copied)) = (built, copied) {
+        anyhow::ensure!(
+            built.trim_end_matches('+') == copied.trim_end_matches('+'),
+            "the build's rc is {built} but the copied rc is {copied}; nothing was installed"
+        );
+    }
+    Ok(())
 }
 
 /// Builds `packages` in the workspace at `root`, so an install from a checkout installs what
@@ -218,20 +316,4 @@ fn unix_now() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_default_dir_is_under_the_user_and_a_sweep_removes_the_set_aside_binaries() {
-        let dir = default_dir();
-        assert!(dir.ends_with(if cfg!(windows) { "Programs/rhipper" } else { ".local/bin" }), "{}", dir.display());
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("rc.old.1.exe"), b"x").unwrap();
-        std::fs::write(tmp.path().join("rc.exe"), b"x").unwrap();
-        let mut lines = Vec::new();
-        sweep(tmp.path(), &mut lines);
-        assert_eq!(lines, ["1 set-aside binary of earlier installs removed"]);
-        assert!(tmp.path().join("rc.exe").exists());
-        assert!(!tmp.path().join("rc.old.1.exe").exists());
-    }
-}
+mod tests;
