@@ -54,7 +54,9 @@ fn a_card_run_twice_yields_its_line_with_its_runs_and_last_verdict_and_a_once_ru
     let lines = reruns_from(&nodes, runs_of);
     assert_eq!(
         lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        ["[context #3] card #3 Twice ran 2 times (needs revision (trivial), implemented), last verdict: no verdict yet"]
+        [
+            "[context #3] card #3 Twice ran 2 times (needs revision (trivial): review sent back, implemented: check passed), last verdict: no verdict yet"
+        ]
     );
     // the milestone is no card: its id never reaches the reader
     let lines = reruns_from(&nodes, |id| if id == 1 { vec![run("implemented", None); 2] } else { vec![] });
@@ -72,7 +74,11 @@ fn a_card_run_twice_in_its_context_file_is_read_from_the_root() {
     let lines = reruns(dir.path(), &nodes);
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].source, "context #2");
-    assert!(lines[0].text.ends_with("ran 2 times (needs revision, implemented), last verdict: accepted by glm"), "{}", lines[0].text);
+    assert!(
+        lines[0].text.ends_with("ran 2 times (needs revision: review sent back, implemented: check passed), last verdict: accepted by glm"),
+        "{}",
+        lines[0].text
+    );
 }
 
 #[test]

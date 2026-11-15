@@ -118,7 +118,7 @@ pub fn reruns_from(nodes: &[Node], runs_of: impl Fn(i64) -> Vec<Handoff>) -> Vec
 /// a reviewer gave one.
 #[must_use]
 pub fn rerun_line(node: &Node, runs: &[Handoff]) -> Line {
-    let outcomes: Vec<&str> = runs.iter().map(|run| run.outcome.as_str()).collect();
+    let outcomes: Vec<String> = runs.iter().map(|run| format!("{}: {}", run.outcome, run_reason(run))).collect();
     let last = runs.last();
     let verdict = match last.and_then(|run| run.verdict.as_deref()) {
         Some(verdict) => verdict.to_owned(),
@@ -130,6 +130,26 @@ pub fn rerun_line(node: &Node, runs: &[Handoff]) -> Line {
     Line {
         source: format!("context #{}", node.id),
         text: format!("card #{} {} ran {} times ({}), last verdict: {verdict}", node.id, node.title, runs.len(), outcomes.join(", ")),
+    }
+}
+
+/// The one phrase for why a run ended, read off its stored check line, outcome and verdict.
+fn run_reason(run: &Handoff) -> &'static str {
+    let check = run.check.to_lowercase();
+    if check.contains("conflict") || run.report.to_lowercase().contains("merge conflict") {
+        "merge conflict on main"
+    } else if let Some(why) = check.strip_prefix("no check:") {
+        if why.contains("cap") { "turn cap" } else { "worker crashed" }
+    } else if run.verdict.as_deref().is_some_and(|v| v.starts_with("needs revision")) {
+        "review sent back"
+    } else if check.contains("failed") {
+        "check failed"
+    } else if run.outcome.starts_with("needs revision") {
+        "review sent back"
+    } else if run.outcome == "failed" {
+        "worker crashed"
+    } else {
+        "check passed"
     }
 }
 
