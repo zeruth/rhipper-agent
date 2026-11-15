@@ -11,7 +11,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+ra-roadmap.workspace = true
+serde.workspace = true
 sha2.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

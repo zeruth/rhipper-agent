@@ -4,4 +4,58 @@ max_usd = 15.0
 max_minutes = 40
 max_rounds = 5        # a card's sixth start stops the walk
 
-card = []
+[[card]]
+id = 3
+key = "top"
+v = 1
+crate = "tally"
+check = ["cargo test -p tally -q top_"]
+
+[[card]]
+id = 4
+key = "words"
+v = 1
+crate = "tally"
+check = ["cargo test -p tally -q third_word"]
+
+[[card]]
+id = 5
+key = "names"
+v = 1
+crate = "tally"
+check = ["cargo test -p tally -q category_name"]
+
+[[card]]
+id = 6
+key = "display"
+v = 1
+crate = "tally"
+check = ["cargo test -p tally -q error_reads"]
+
+[[card]]
+id = 7
+key = "stdin"
+v = 1
+crate = "tally-cli"
+check = ["cargo test -p tally-cli -q --test cli"]
+
+[[card]]
+id = 8
+key = "share"
+v = 1
+crate = "tally"
+check = ["cargo test -p tally -q share_"]
+
+[[card]]
+id = 9
+key = "negative"
+v = 1
+crate = "tally"
+check = ["cargo test -p tally -q negative_"]
+
+[[card]]
+id = 10
+key = "comments"
+v = 1
+crate = "tally-cli"
+check = ["cargo test -p tally-cli -q skips_"]
