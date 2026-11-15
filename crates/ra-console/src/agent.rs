@@ -475,6 +475,13 @@ impl Worker {
         }
     }
 
+    /// The turns of the card's latest run of the worker's own, from the ledger; `None` without a
+    /// ledger, or when the card has no run in it.
+    async fn last_run_turns(&self, node: i64) -> Option<u64> {
+        let calls = self.ledger.as_ref()?.calls_of(Some(node)).await.ok()?;
+        calls.iter().find(|call| call.role.is_none()).map(|call| call.turns)
+    }
+
     /// Books one completion of `turns` turns against the tally and the ledger. A ledger that
     /// cannot be written is a warning, not a failed run: the answer already came back.
     pub(crate) async fn record(&self, node: Option<i64>, usage: &Usage, turns: u64) {
@@ -6676,6 +6683,12 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // the commands of the acceptance the worker may not run, or that outlive its turn, are
     // named under the card, so the session spends no turn on a refusal or a wait
     task.brief = format!("{}{}", brief.text, orchestrated_line(&checks_of(&root, node)));
+    if let Some(last) = task.handoffs.last()
+        && let Some(turns) = worker.last_run_turns(node.id).await
+        && let Some(note) = short_run_note(last, turns)
+    {
+        task.brief = format!("{}\n\n{note}", task.brief);
+    }
     // the outline is read from the tree the worker acts in, as its quotes are, so a rerun in a
     // worktree gets the line numbers the file has there
     let acts_in = workspace.as_deref().unwrap_or(&root);
@@ -8203,6 +8216,23 @@ fn report_ask(changed: &[String]) -> String {
     format!(
         "Your answer named no file and no result, and the check is the orchestrator's to run, not yours. Give the report now, in a few lines: what you changed, naming the file each change landed in in backticks, and what you verified; do not run the check again.\n{files}"
     )
+}
+
+/// The runs that end in fewer turns than this are too short to have got anywhere: the next run
+/// is told why the last one stopped.
+const SHORT_RUN_TURNS: u64 = 3;
+
+/// The note a card's next handoff carries when its last run ended unfinished (it continues, or
+/// failed) in under [`SHORT_RUN_TURNS`] turns: the turns and the stop reason the run recorded in
+/// its check line, or `no reason recorded`. `None` for a longer run or one that finished.
+#[must_use]
+pub fn short_run_note(last: &ra_context::Handoff, turns: u64) -> Option<String> {
+    let unfinished = last.outcome == ra_context::CONTINUES || last.outcome == "failed";
+    if !unfinished || turns >= SHORT_RUN_TURNS {
+        return None;
+    }
+    let reason = last.check.trim().strip_prefix("no check:").map(str::trim).filter(|why| !why.is_empty()).unwrap_or("no reason recorded");
+    Some(format!("The last run of this card ended unfinished after {turns} turn(s): {reason}"))
 }
 
 /// The warnings the last run of the card left, as a machine note: the lint found them in the
