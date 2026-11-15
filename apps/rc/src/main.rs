@@ -971,6 +971,8 @@ async fn context(id: Option<i64>, init: bool) -> anyhow::Result<()> {
         Some(id) => {
             let store = open_store().await?;
             print!("{}", ra_console::agent::context_preview(&store, id).await?);
+            // the build hook refuses `cargo` until a file is changed; the refusal says the same
+            println!("\nbuild: write the card's change first; `cargo` is refused in a worktree with nothing changed yet");
         }
         None => match ra_context::Project::load(root) {
             Some(text) => print!("{text}"),
