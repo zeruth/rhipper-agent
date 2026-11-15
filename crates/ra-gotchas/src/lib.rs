@@ -74,13 +74,91 @@ pub enum Where {
     Text,
     /// The worker's final report.
     Answer,
-    /// A Read of a whole file, offset and limit both missing, of a file over [`LONG_FILE`]
-    /// lines the card's outline knows; the pattern is matched against the file's path.
+    /// A Read of a whole file, offset and limit both missing, or a shell's `cat` or
+    /// `Get-Content` of one, of a file over [`LONG_FILE`] lines; the pattern is matched against
+    /// the file's path.
     Read,
 }
 
-/// A file of more lines than this is read by region once the card's outline knows it.
+/// A file of more lines than this is read by region.
 pub const LONG_FILE: usize = 400;
+
+/// The file a shell command prints whole, when the command is nothing but that: `cat x.rs`,
+/// `cat -n x.rs`, `Get-Content x.rs`, `Get-Content -Path x.rs -Raw`, `gc`, `type`. A pipe, a
+/// redirect, a second command or a range (`-TotalCount`, `-Tail`) is no whole read; neither is
+/// a flag this does not know.
+#[must_use]
+pub fn whole_read(command: &str) -> Option<String> {
+    if command.contains(['|', '>', '<', ';', '&', '\n', '$', '`']) {
+        return None;
+    }
+    let words = shell_words(command)?;
+    let (name, args) = words.split_first()?;
+    let mut file = None;
+    let mut take = |word: &str| file.replace(word.to_owned()).is_none();
+    match name.to_ascii_lowercase().as_str() {
+        "cat" => {
+            for arg in args {
+                let ok = if arg.starts_with('-') {
+                    matches!(arg.as_str(), "-n" | "-b" | "-A" | "-v" | "-e" | "-t" | "-s" | "--number")
+                } else {
+                    take(arg)
+                };
+                if !ok {
+                    return None;
+                }
+            }
+        }
+        "get-content" | "gc" | "type" => {
+            let mut args = args.iter();
+            while let Some(arg) = args.next() {
+                let ok = match arg.to_ascii_lowercase().as_str() {
+                    "-raw" => true,
+                    "-encoding" => args.next().is_some(),
+                    "-path" | "-literalpath" => args.next().is_some_and(|path| take(path)),
+                    flag if flag.starts_with('-') => false,
+                    _ => take(arg),
+                };
+                if !ok {
+                    return None;
+                }
+            }
+        }
+        _ => return None,
+    }
+    file
+}
+
+/// The words of a one-line command, a quoted word unquoted; `None` for an unclosed quote.
+fn shell_words(command: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut started = false;
+    for c in command.trim().chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started || !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                started = false;
+            }
+            (Some(_) | None, c) => word.push(c),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started || !word.is_empty() {
+        words.push(word);
+    }
+    Some(words)
+}
 
 /// A Read about to run, as the pre-tool hook sees it.
 #[derive(Debug, Clone, Copy)]
@@ -670,17 +748,20 @@ impl Catalogue {
     }
 
     /// What to do with a Read about to run: a whole-file Read of a file over [`LONG_FILE`] lines
-    /// the card's outline knows is denied by the first hint whose pattern matches its path, the
-    /// outline's items in the reason, so the next Read takes a region; a ranged Read, a short
-    /// file and a file the outline does not know pass.
+    /// is denied by the first hint whose pattern matches its path, the outline's items in the
+    /// reason when one is known, so the next Read takes a region; a ranged Read and a short file
+    /// pass. A file the card does not name is refused too: those are the reads that spent a
+    /// session's context before its first edit.
     #[must_use]
     pub fn read(&self, call: ReadCall<'_>) -> Verdict {
-        let Some(items) = call.items.filter(|_| !call.ranged && call.lines > LONG_FILE) else { return Verdict::Pass };
+        if call.ranged || call.lines <= LONG_FILE {
+            return Verdict::Pass;
+        }
         for gotcha in self.entries.iter().filter(|g| g.place == Where::Read && g.pattern.is_match(call.file)) {
             match gotcha.remedy {
                 Remedy::Hint => {
                     let mut reason = format!("{}: {} is {} lines", gotcha.message, call.file, call.lines);
-                    if !items.is_empty() {
+                    if let Some(items) = call.items.filter(|items| !items.is_empty()) {
                         let _ = write!(reason, "; its items: {}", items.join(", "));
                     }
                     return Verdict::Deny { id: gotcha.id.clone(), reason };

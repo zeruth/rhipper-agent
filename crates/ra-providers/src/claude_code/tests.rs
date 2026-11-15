@@ -551,7 +551,7 @@ fn the_gotchas_route_the_hooks_and_count_what_the_stream_shows() {
 }
 
 #[test]
-fn the_pre_hook_refuses_a_whole_read_of_a_long_outlined_file_with_its_items_and_the_stream_counts_it() {
+fn the_pre_hook_refuses_a_whole_read_of_any_long_file_with_its_items_and_the_stream_counts_it() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -559,15 +559,10 @@ fn the_pre_hook_refuses_a_whole_read_of_a_long_outlined_file_with_its_items_and_
         (1..=1200).map(|n| if n % 300 == 1 { format!("pub fn item_{n}() {{\n") } else { "    let _ = 1;\n".to_owned() }).collect();
     std::fs::write(root.join("src/long.rs"), &long).unwrap();
     std::fs::write(root.join("src/short.rs"), "fn a() {}\n".repeat(300)).unwrap();
-    std::fs::write(root.join("src/other.rs"), &long).unwrap();
-    let context = format!(
-        "# Task #1 context\n\n## Brief\n\nb\n\n## Files\n\n{}{}src/gone.rs (not in the workspace yet)\n\n## Handoff 1 · m · done\nsrc/other.rs (1200 lines)\n",
-        ra_context::outline(Path::new("src/long.rs"), &long),
-        ra_context::outline(Path::new("src/short.rs"), &"fn a() {}\n".repeat(300)),
-    );
     let catalogue = Catalogue::seed();
-    let read =
-        |input: serde_json::Value| read_verdict(&catalogue, root, &context, &serde_json::json!({"tool_name": "Read", "tool_input": input}));
+    let call =
+        |tool: &str, input: serde_json::Value| read_verdict(&catalogue, root, &serde_json::json!({"tool_name": tool, "tool_input": input}));
+    let read = |input: serde_json::Value| call("Read", input);
     let absolute = root.join("src/long.rs").display().to_string();
     let reason = match read(serde_json::json!({"file_path": absolute})) {
         Verdict::Deny { id, reason } => {
@@ -580,10 +575,16 @@ fn the_pre_hook_refuses_a_whole_read_of_a_long_outlined_file_with_its_items_and_
         reason.contains("src/long.rs is 1200 lines; its items: item_1 1-300, item_301 301-600, item_601 601-900, item_901 901-1200"),
         "{reason}"
     );
-    // a ranged Read, a short file, and a file the outline does not know pass
+    // a ranged Read, a short file and a missing one pass
     assert_eq!(read(serde_json::json!({"file_path": absolute, "offset": 300, "limit": 80})), Verdict::Pass);
     assert_eq!(read(serde_json::json!({"file_path": "src/short.rs"})), Verdict::Pass);
-    assert_eq!(read(serde_json::json!({"file_path": "src/other.rs"})), Verdict::Pass);
+    assert_eq!(read(serde_json::json!({"file_path": "src/gone.rs"})), Verdict::Pass);
+    // a shell's whole print of the file is the same read; a ranged one is not
+    for (tool, command) in [("Bash", "cat src/long.rs"), ("PowerShell", "Get-Content src\\long.rs")] {
+        assert!(matches!(call(tool, serde_json::json!({"command": command})), Verdict::Deny { .. }), "{command}");
+    }
+    assert_eq!(call("Bash", serde_json::json!({"command": "head -n 40 src/long.rs"})), Verdict::Pass);
+    assert_eq!(call("Bash", serde_json::json!({"command": "cat src/short.rs"})), Verdict::Pass);
 
     // the refusal comes back as the Read's error, and that is the hit the end line counts
     let mut tools = std::collections::HashMap::new();

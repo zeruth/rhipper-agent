@@ -1736,7 +1736,13 @@ fn gotchas_of_event(
                 let tool = block.get("tool_use_id").and_then(Value::as_str).and_then(|id| tools.get(id)).map(String::as_str);
                 let content = text_of(block.get("content").unwrap_or(&Value::Null));
                 let place = match tool {
-                    Some("Bash" | "PowerShell") => Where::Result,
+                    // a `cat` of a long file the pre hook refused comes back an error too
+                    Some("Bash" | "PowerShell") => {
+                        if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+                            hits.extend(catalogue.refused_read(&content));
+                        }
+                        Where::Result
+                    }
                     Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit") => Where::Edit,
                     // a Read the pre hook refused comes back an error with the reason; a file's
                     // own text never does
@@ -1777,35 +1783,44 @@ fn gotchas_of_event(
     hits
 }
 
-/// What the pre hook does with a Read `call` of the harness's hook input, in `root`: the
-/// catalogue's [`Catalogue::read`] on the file, its line count, whether the call names a range,
-/// and the items of the file when `context`, the card's context file, outlines it. A call that
-/// is no Read, or a file that cannot be read, passes.
+/// What the pre hook does with a Read `call` of the harness's hook input, or a shell's `cat` or
+/// `Get-Content` of a whole file ([`ra_gotchas::whole_read`]), in `root`: the catalogue's
+/// [`Catalogue::read`] on the file, its line count, whether the call names a range, and the
+/// file's items. Any file counts, the card's or not: no context file is needed, so a run in a
+/// worktree, which has none, is judged as one in the checkout. Any other call, or a file that
+/// cannot be read, passes.
 #[must_use]
-pub fn read_verdict(catalogue: &Catalogue, root: &Path, context: &str, call: &serde_json::Value) -> Verdict {
+pub fn read_verdict(catalogue: &Catalogue, root: &Path, call: &serde_json::Value) -> Verdict {
     use serde_json::Value;
-    if call.get("tool_name").and_then(Value::as_str) != Some("Read") {
+    let input = call.get("tool_input").unwrap_or(&Value::Null);
+    let (file, ranged) = match call.get("tool_name").and_then(Value::as_str) {
+        Some("Read") => {
+            let Some(file) = input.get("file_path").and_then(Value::as_str) else { return Verdict::Pass };
+            (file.to_owned(), ["offset", "limit"].iter().any(|key| input.get(key).is_some_and(|v| !v.is_null())))
+        }
+        Some("Bash" | "PowerShell") => {
+            let Some(file) = input.get("command").and_then(Value::as_str).and_then(ra_gotchas::whole_read) else {
+                return Verdict::Pass;
+            };
+            (file, false)
+        }
+        _ => return Verdict::Pass,
+    };
+    if ranged {
         return Verdict::Pass;
     }
-    let Some(input) = call.get("tool_input") else { return Verdict::Pass };
-    let Some(file) = input.get("file_path").and_then(Value::as_str) else { return Verdict::Pass };
-    let ranged = ["offset", "limit"].iter().any(|key| input.get(key).is_some_and(|v| !v.is_null()));
-    let path = if Path::new(file).is_absolute() { PathBuf::from(file) } else { root.join(file) };
-    let shown = relative(file, Some(root));
-    // the outline names a file as the card does, relative and with forward slashes
-    if ranged || !ra_context::outlined(context).contains(&shown) {
-        return Verdict::Pass;
-    }
+    let path = if Path::new(&file).is_absolute() { PathBuf::from(&file) } else { root.join(&file) };
     let Ok(text) = std::fs::read_to_string(&path) else { return Verdict::Pass };
+    // named as the card names a file, relative and with forward slashes
+    let shown = relative(&file, Some(root));
     let items = ra_context::item_ranges(Path::new(&shown), &text);
     catalogue.read(ra_gotchas::ReadCall { file: &shown, ranged, lines: text.lines().count(), items: Some(&items) })
 }
 
 /// The `--settings` JSON that routes the harness's tool hooks to `rc hook pre` and `rc hook
 /// post`, so a command the catalogue knows is refused or rewritten before it runs, a whole-file
-/// Read of a long file the card outlines is refused with its items, a result it knows gets its
-/// hint right after, and any other whole-file Read is answered with the outline, with no model
-/// call.
+/// Read or `cat` of a long file is refused with its items, a result it knows gets its hint right
+/// after, and any other whole-file Read is answered with the outline, with no model call.
 fn hook_settings(rc: &Path) -> String {
     // the JSON encoder escapes the backslashes of a Windows path itself
     let command = |event: &str| format!("\"{}\" hook {event}", rc.display());

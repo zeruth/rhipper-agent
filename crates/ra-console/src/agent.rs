@@ -912,14 +912,14 @@ pub fn read_hint(root: &Path, call: &serde_json::Value) -> Option<String> {
     hint_of(root, call, card_of_run(root))
 }
 
-/// The reason the pre hook refuses a Read with: a whole-file Read of a long file the outline of
-/// the run's card knows, the file's items in it, as the project's catalogue says. Nothing for any
-/// other Read, or when there is no card, context file or catalogue to judge by.
+/// The reason the pre hook refuses a Read, or a shell's `cat` of a whole file, with: a whole read
+/// of a long file, the file's items in it, as the project's catalogue says, the seed's when the
+/// project has none. No card or context file is asked for: a worktree has neither, and every
+/// walk runs in one, so asking for them let every whole read through. Nothing for any other call.
 #[must_use]
 pub fn read_refusal(root: &Path, call: &serde_json::Value) -> Option<String> {
-    let context = std::fs::read_to_string(ra_context::TaskContext::path(root, card_of_run(root)?)).ok()?;
-    let (catalogue, _) = Catalogue::refresh(&root.join(GOTCHAS_FILE)).ok()?;
-    match ra_providers::claude_code::read_verdict(&catalogue, root, &context, call) {
+    let catalogue = Catalogue::refresh(&root.join(GOTCHAS_FILE)).map_or_else(|_| Catalogue::seed(), |(catalogue, _)| catalogue);
+    match ra_providers::claude_code::read_verdict(&catalogue, root, call) {
         ra_gotchas::Verdict::Deny { reason, .. } => Some(reason),
         _ => None,
     }

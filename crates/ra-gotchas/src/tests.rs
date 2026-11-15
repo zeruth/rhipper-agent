@@ -126,9 +126,42 @@ fn a_whole_read_of_a_long_outlined_file_is_denied_with_its_items_and_the_rest_pa
     }
     assert_eq!(catalogue.read(ReadCall { ranged: true, ..bare }), Verdict::Pass);
     assert_eq!(catalogue.read(ReadCall { lines: 300, ..bare }), Verdict::Pass);
-    assert_eq!(catalogue.read(ReadCall { items: None, ..bare }), Verdict::Pass);
+    // a file the card does not outline is refused all the same, with no items to name
+    match catalogue.read(ReadCall { items: None, ..bare }) {
+        Verdict::Deny { id, reason } => {
+            assert_eq!(id, "whole-file-read");
+            assert!(reason.ends_with("crates/x/src/lib.rs is 1200 lines"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
     // a file's own text is no refusal
     assert!(catalogue.refused_read("fn main() {}\n").is_empty());
+}
+
+#[test]
+fn a_shell_that_prints_a_file_whole_names_the_file_and_a_ranged_or_piped_one_none() {
+    for (command, file) in [
+        ("cat src/lib.rs", "src/lib.rs"),
+        ("cat -n src/lib.rs", "src/lib.rs"),
+        ("Get-Content src\\lib.rs", "src\\lib.rs"),
+        ("Get-Content -Path \"src/my lib.rs\" -Raw", "src/my lib.rs"),
+        ("gc -Encoding utf8 src/lib.rs", "src/lib.rs"),
+        ("type 'src/lib.rs'", "src/lib.rs"),
+    ] {
+        assert_eq!(whole_read(command).as_deref(), Some(file), "{command}");
+    }
+    for command in [
+        "cat src/lib.rs | head -n 40",
+        "cat a.rs b.rs",
+        "cat",
+        "Get-Content src/lib.rs -TotalCount 40",
+        "Get-Content src/lib.rs -Tail 20",
+        "cat src/lib.rs > out.txt",
+        "sed -n '1,20p' src/lib.rs",
+        "cat \"unclosed",
+    ] {
+        assert_eq!(whole_read(command), None, "{command}");
+    }
 }
 
 #[test]

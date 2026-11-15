@@ -1141,7 +1141,7 @@ fn hook(event: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     // a file the worker read is not the machine talking: no gotcha reads it, but a whole long
-    // file the card outlines is refused with its items, and any other gets the outline after
+    // file is refused with its items, and any other gets the outline after
     if call.get("tool_name").and_then(serde_json::Value::as_str) == Some("Read") {
         if event == "pre"
             && let Some(reason) = ra_console::agent::read_refusal(&cwd, &call)
@@ -1163,10 +1163,18 @@ fn hook(event: &str) -> anyhow::Result<()> {
     let Ok((catalogue, _)) = ra_gotchas::Catalogue::refresh(&cwd.join("var/gotchas.toml")) else { return Ok(()) };
     let answer = match event {
         "pre" => {
-            let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str).unwrap_or("");
-            // the project's table, read above a worktree, which has no copy of it
-            let worker = ra_console::router::Router::load(&ra_console::hub::project_root_of(&cwd)).map(|r| r.worker).ok();
-            hook_pre(&catalogue, &call, &cwd, command, worker.as_ref())
+            // a `cat` or `Get-Content` of a whole long file is that Read by another tool, ahead
+            // of the shape table, which allows both
+            if let ra_gotchas::Verdict::Deny { reason, .. } = ra_providers::claude_code::read_verdict(&catalogue, &cwd, &call) {
+                Some(
+                    serde_json::json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}),
+                )
+            } else {
+                let command = call.pointer("/tool_input/command").and_then(serde_json::Value::as_str).unwrap_or("");
+                // the project's table, read above a worktree, which has no copy of it
+                let worker = ra_console::router::Router::load(&ra_console::hub::project_root_of(&cwd)).map(|r| r.worker).ok();
+                hook_pre(&catalogue, &call, &cwd, command, worker.as_ref())
+            }
         }
         "post" => {
             // what a shell said is read one way, what an edit tool said another
