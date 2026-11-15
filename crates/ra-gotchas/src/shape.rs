@@ -221,11 +221,10 @@ pub fn in_dirs(word: &str, dirs: &[std::path::PathBuf]) -> bool {
 #[must_use]
 pub fn judge_with(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool, extra: &[std::path::PathBuf]) -> Shape {
     let target = std::env::var_os("CARGO_TARGET_DIR").filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
-    // the run's TEMP is `<scratch>/tmp/<project>/run-<id>`: its parent is the project's tmp root
+    // the run's TEMP is `<scratch>/tmp/<project>/run-<id>`: its own directory, never a sibling run's
     let tmp = std::env::var_os("TEMP")
         .map(std::path::PathBuf::from)
-        .filter(|t| t.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run")))
-        .and_then(|t| t.parent().map(Path::to_path_buf));
+        .filter(|t| t.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run")));
     let roots: Vec<&Path> = target.iter().chain(tmp.iter()).chain(extra).map(std::path::PathBuf::as_path).collect();
     judge_roots(command, shell, workspace, own, &roots)
 }
