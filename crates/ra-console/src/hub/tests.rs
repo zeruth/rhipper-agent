@@ -189,9 +189,10 @@ fn a_status_counts_the_spend_of_today_only() {
 fn counting_build_slots_asks_without_taking_them() {
     // the slots are the machine's: a build of another test or a walk may hold any of them, so the
     // test takes the last free one (CI run 43743652158 failed on the last slot being held)
-    let Some((slot, held)) = (0..build_slot_count()).rev().find_map(|slot| {
-        try_guard_as(&build_lock_name(slot), "asker #1").ok().flatten().map(|guard| (slot, guard))
-    }) else {
+    let Some((slot, held)) = (0..build_slot_count())
+        .rev()
+        .find_map(|slot| try_guard_as(&build_lock_name(slot), "asker #1").ok().flatten().map(|guard| (slot, guard)))
+    else {
         eprintln!("SKIPPED: counting_build_slots_asks_without_taking_them: every build slot is held");
         return;
     };
