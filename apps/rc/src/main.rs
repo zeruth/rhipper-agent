@@ -1937,6 +1937,41 @@ fn next_check_log(dir: &Path, card: i64) -> anyhow::Result<PathBuf> {
     Ok(dir.join(format!("{card}-{}.log", last + 1)))
 }
 
+/// What bringing main into a card's worktree came to.
+enum MainMerge {
+    /// Nothing to do: the tree is on main, has no main, or already holds it.
+    Current,
+    /// Main was merged in.
+    Merged,
+    /// The merge conflicts in these files and was aborted, the tree as it was.
+    Conflict(Vec<String>),
+}
+
+/// Merges `main` into the tree at `here` when the tree is behind it, so a branch that main has
+/// moved past is not checked stale. A merge that conflicts is aborted and returned as such; one
+/// git refuses for another reason (a dirty file in the way) leaves the tree as it was.
+fn bring_main_in(here: &Path) -> MainMerge {
+    let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(here).output().ok();
+    let ok = |args: &[&str]| git(args).is_some_and(|out| out.status.success());
+    if !ok(&["rev-parse", "--verify", "-q", "refs/heads/main"])
+        || git(&["symbolic-ref", "--short", "-q", "HEAD"]).is_none_or(|out| String::from_utf8_lossy(&out.stdout).trim() == "main")
+        || ok(&["merge-base", "--is-ancestor", "main", "HEAD"])
+    {
+        return MainMerge::Current;
+    }
+    if ok(&["merge", "--no-edit", "main"]) {
+        return MainMerge::Merged;
+    }
+    let files: Vec<String> = git(&["diff", "--name-only", "--diff-filter=U"])
+        .map(|out| String::from_utf8_lossy(&out.stdout).lines().map(str::to_owned).collect())
+        .unwrap_or_default();
+    // a refusal before any conflict began has no merge to abort
+    if ok(&["rev-parse", "-q", "--verify", "MERGE_HEAD"]) {
+        git(&["merge", "--abort"]);
+    }
+    if files.is_empty() { MainMerge::Current } else { MainMerge::Conflict(files) }
+}
+
 /// Runs the checks of a card here, in the order written, and stops at the first failure. Each
 /// command's whole output, stdout and stderr, is kept in `var/checks/<card>-<run>.log` and the
 /// path is the last line printed, so a failure is read from the file and never lost to a `tail`.
@@ -1955,6 +1990,15 @@ async fn check_card(card: i64) -> anyhow::Result<()> {
     let temp = temp.to_string_lossy().into_owned();
     let toolbox = ra_tools::Toolbox::new(&here)?.with_env([("TEMP".to_owned(), temp.clone()), ("TMP".to_owned(), temp)]);
     let commands = ra_console::agent::check_commands(node.acceptance.as_deref());
+    // a branch behind main fails for what main already fixed: main comes in before anything runs
+    match bring_main_in(&here) {
+        MainMerge::Current => {}
+        MainMerge::Merged => println!("brought main in: the branch was behind it"),
+        MainMerge::Conflict(files) => {
+            println!("conflict: main does not merge into this branch, in {}; no check ran", files.join(", "));
+            std::process::exit(1);
+        }
+    }
     // a merge from main since the last check leaves the card's crates stale: they rebuild
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
