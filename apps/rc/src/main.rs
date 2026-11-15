@@ -1477,6 +1477,14 @@ fn show_lines(nodes: &[ra_roadmap::model::Node], id: Option<i64>, root: &Path) -
         if let Some(objective) = &node.objective {
             lines.push(format!("{indent}    {objective}"));
         }
+        // a node asked for by id carries its whole notes, the failure excerpt of the last run
+        // included, so the frame that names the faulting function needs no rerun
+        if id.is_some()
+            && let Some(notes) = node.notes.as_deref().map(str::trim_end).filter(|n| !n.is_empty())
+        {
+            lines.push(format!("{indent}    notes:"));
+            lines.extend(notes.lines().map(|line| format!("{indent}      {line}")));
+        }
         if !node.files.is_empty() {
             lines.push(format!("{indent}    files: {}", node.files.join(" ")));
         }
