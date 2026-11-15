@@ -1095,6 +1095,33 @@ async fn the_idle_round_count_survives_a_new_walk() {
 }
 
 #[tokio::test]
+async fn third_send_back_blocks_the_card() {
+    use ra_roadmap::model::TaskState;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Probe parent 1", &store, &worker()).await.unwrap();
+    store.set_state(2, TaskState::NeedsRevision).await.unwrap();
+    let mut task = ra_context::TaskContext::open(dir.path(), 2);
+    // the changed files do not matter: the reviewer's word does
+    task.record(sent_back_run(1, &["src/a.rs"], "points one"));
+    task.record(sent_back_run(2, &["src/b.rs"], "points two"));
+    task.save(dir.path()).unwrap();
+    assert!(crate::hub::block_after_send_backs(&store, dir.path(), 2).await.is_none());
+    assert_eq!(store.read(2).await.unwrap().state, TaskState::NeedsRevision);
+
+    task.record(sent_back_run(3, &["src/c.rs"], "points three"));
+    task.save(dir.path()).unwrap();
+    let line = crate::hub::block_after_send_backs(&store, dir.path(), 2).await.unwrap();
+    assert!(line.starts_with("#2 blocked: sent back 3 times"), "{line}");
+    let node = store.read(2).await.unwrap();
+    assert_eq!(node.state, TaskState::Blocked);
+    let notes = node.notes.unwrap_or_default();
+    for point in ["points one", "points two", "points three"] {
+        assert!(notes.contains(point), "{notes}");
+    }
+}
+
+#[tokio::test]
 async fn a_blocked_card_is_in_the_status_with_its_reason() {
     use ra_roadmap::model::TaskState;
     let dir = tempfile::tempdir().unwrap();

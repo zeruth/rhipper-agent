@@ -541,6 +541,41 @@ fn feed_reason(feed: &[String], id: i64) -> Option<String> {
     })
 }
 
+/// How many reviewer rejections in a row a card takes before it waits for the person.
+pub const SEND_BACKS: usize = 3;
+
+/// Blocks card `id` when its last [`SEND_BACKS`] runs in a row were each sent back by the reviewer:
+/// the three verdicts are quoted at the head of its notes and no walk starts it until the person
+/// sets it defined. The line for the walk's output, or none when the card has not been sent back
+/// that often (or could not be blocked).
+pub async fn block_after_send_backs(store: &ra_roadmap::store::Store, root: &Path, id: i64) -> Option<String> {
+    let task = ra_context::TaskContext::open(root, id);
+    let verdicts: Vec<&str> = task
+        .handoffs
+        .iter()
+        .rev()
+        .filter(|h| !h.outcome.starts_with("note from"))
+        .map_while(|h| h.verdict.as_deref().filter(|v| v.starts_with("needs revision")))
+        .take(SEND_BACKS)
+        .collect();
+    if verdicts.len() < SEND_BACKS {
+        return None;
+    }
+    let quoted: Vec<String> =
+        verdicts.iter().rev().map(|v| format!("> {}", clip(v.lines().next().unwrap_or_default(), REASON_WIDTH * 2))).collect();
+    let head = format!("sent back {SEND_BACKS} times in a row by the reviewer; a person sets it defined again\n{}", quoted.join("\n"));
+    let node = store.read(id).await.ok()?;
+    let notes = match node.notes.as_deref().filter(|n| !n.trim().is_empty()) {
+        Some(old) => format!("{head}\n\n{old}"),
+        None => head,
+    };
+    store.set_state_by(id, ra_roadmap::model::TaskState::Blocked, ra_roadmap::history::Source::Run).await.ok()?;
+    store.set_notes(id, &notes).await.ok()?;
+    let text = format!("#{id} blocked: sent back {SEND_BACKS} times in a row by the reviewer; a person sets it defined again");
+    crate::pair::event(root, &text);
+    Some(text)
+}
+
 /// What the paired feed has open in a project.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Run {

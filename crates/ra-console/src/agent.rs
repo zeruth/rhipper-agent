@@ -2999,6 +2999,9 @@ pub async fn run_all(store: &Store, worker: &Worker, stop_on_revision: bool) -> 
             let moved = ra_context::TaskContext::open(&root, id).handoffs.last().is_some_and(|h| !h.changed.is_empty());
             let rerun = (count <= allowed || (node.is_absolute() && moved)).then_some((count, allowed.max(count)));
             lines.push(crate::pair::sent_back(&root, id, &node.title, &why, rerun));
+            let blocked = if rejected { crate::hub::block_after_send_backs(store, &root, id).await } else { None };
+            let rerun = rerun.filter(|_| blocked.is_none());
+            lines.extend(blocked);
             if rerun.is_some() {
                 retry = Some(id);
             } else {
@@ -5463,9 +5466,19 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // handoffs, so a window restarted between its rounds does not start it again
                 // (1024 restarts within a minute of a card's last event). A card the reviewer
                 // accepted is sent back by the landing, not by its work: it never counts
+                // The idle rounds are asked first: their line says the card moved nothing; a card
+                // that moved files and was still rejected three times is then blocked by the
+                // send-back count alone
                 if sent_back && !accepted_by_review(&root, id) {
                     let count = ra_context::TaskContext::open(&root, id).idle_rounds();
-                    if count >= RERUNS_A_WALK {
+                    if count < RERUNS_A_WALK {
+                        if rejected_by_review(&root, id)
+                            && let Some(line) = crate::hub::block_after_send_backs(store, &root, id).await
+                        {
+                            parked.insert(id);
+                            lines.push(line);
+                        }
+                    } else {
                         parked.insert(id);
                         // blocked, not only parked: a card sent back three times in a row is
                         // one its worker cannot move (a missing toolchain or fixture, asm #53
