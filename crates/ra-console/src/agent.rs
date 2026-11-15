@@ -4815,12 +4815,22 @@ fn commit_section(report: &str) -> Option<(String, String)> {
 /// The message of the one commit that lands a card: the worker's own `## Commit` section when
 /// its report has one, else the card's title and the first paragraph of what the run reported.
 /// Written about the change; no card number, no review or check boilerplate.
-fn landing_message(node: &Node, handoff: Option<&ra_context::Handoff>) -> String {
-    let notes = node.notes.as_deref().unwrap_or_default();
-    let report = handoff.map(|h| h.report.as_str()).unwrap_or_default();
-    let (subject, body) = commit_section(notes).or_else(|| commit_section(report)).unwrap_or_else(|| {
+fn landing_message(node: &Node, handoffs: &[ra_context::Handoff]) -> String {
+    card_landing_message(&node.title, node.notes.as_deref().unwrap_or_default(), handoffs)
+}
+
+/// [`landing_message`] from the card's parts. The message is the card's own runs': the latest
+/// handoff with a `## Commit` section that is not a lint pass's (a branch's last commit was a
+/// lint fix's on 2026-11-15, and three landings went under it), so a review's rerun that
+/// rewrites the section is the one that lands; the notes, which a fix pass overwrites with its
+/// report, come only after the handoffs.
+#[must_use]
+pub fn card_landing_message(title: &str, notes: &str, handoffs: &[ra_context::Handoff]) -> String {
+    let own = || handoffs.iter().filter(|h| !h.report.lines().any(|l| l.trim() == format!("{LINT_PASS_FRESH}.")));
+    let (subject, body) = own().rev().find_map(|h| commit_section(&h.report)).or_else(|| commit_section(notes)).unwrap_or_else(|| {
+        let report = own().next().or(handoffs.last()).map(|h| h.report.as_str()).unwrap_or_default();
         let first: String = report.trim().split("\n\n").next().unwrap_or_default().trim().to_owned();
-        (node.title.clone(), first)
+        (title.to_owned(), first)
     });
     let subject: String = subject.chars().take(100).collect();
     if body.is_empty() { subject } else { format!("{subject}\n\n{body}") }
@@ -5653,7 +5663,7 @@ async fn land_once(store: &Store, id: i64, worker: &Worker, regenerate: bool) ->
             let mut args = vec!["add", "--"];
             args.extend(own.iter().copied());
             git(&root, &args).await?;
-            git(&root, &["commit", "-q", "-m", &landing_message(&node, handoff)]).await?;
+            git(&root, &["commit", "-q", "-m", &landing_message(&node, &task.handoffs)]).await?;
             lines.push(format!(
                 "committed {} file(s) of the handoff on {}",
                 own.len(),
@@ -5662,7 +5672,7 @@ async fn land_once(store: &Store, id: i64, worker: &Worker, regenerate: bool) ->
         }
     }
     if has_branch {
-        land_branch(&root, &branch, &node, handoff, worker, regenerate, &mut lines).await?;
+        land_branch(&root, &branch, &node, &task.handoffs, worker, regenerate, &mut lines).await?;
     }
     if node.state != TaskState::Accepted {
         store.set_state_by(id, TaskState::Accepted, Source::Run).await?;
@@ -5682,7 +5692,7 @@ async fn land_branch(
     root: &Path,
     branch: &str,
     node: &Node,
-    handoff: Option<&ra_context::Handoff>,
+    handoffs: &[ra_context::Handoff],
     worker: &Worker,
     regenerate: bool,
     lines: &mut Vec<String>,
@@ -5759,10 +5769,12 @@ async fn land_branch(
                 }
             }
         }
-        git(root, &["commit", "-q", "-m", &landing_message(node, handoff)]).await?;
+        let message = landing_message(node, handoffs);
+        git(root, &["commit", "-q", "-m", &message]).await?;
         lines.push(format!(
-            "squashed {branch} into one commit on {}",
-            git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default()
+            "squashed {branch} into one commit on {}: {}",
+            git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_default(),
+            first_line(&message)
         ));
     }
     if aside {
