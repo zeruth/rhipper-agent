@@ -1024,17 +1024,21 @@ fn hook_pre(
     // denies the whole, a rewrite's allow included; a shape it cannot read is left to the
     // allowlist. The card's own target and run directory count as the workspace.
     let dirs = ra_providers::claude_code::card_dirs(cwd);
+    let reads = ra_providers::claude_code::card_read_dirs(cwd);
     let shape = call.get("tool_name").and_then(serde_json::Value::as_str).and_then(ra_gotchas::shape::Shell::of_tool).map_or(
         ra_gotchas::shape::Shape::Unknown,
         |shell| {
             let own_part = |part: &str| worker.is_some_and(|w| w.allows(part));
-            ra_gotchas::shape::judge_with(judged, shell, cwd, &own_part, &dirs)
+            ra_gotchas::shape::judge_reading(judged, shell, cwd, &own_part, &dirs, &reads)
         },
     );
     // the outside-path hints name a path the worker may not read; the card's own directories
     // are the one outside the shape table has judged allowed
     let in_dirs = matches!(shape, ra_gotchas::shape::Shape::Allowed)
-        && judged.split_whitespace().any(|w| ra_gotchas::shape::in_dirs(w.trim_matches(['"', '\'']), &dirs));
+        && judged.split_whitespace().any(|w| {
+            let word = w.trim_matches(['"', '\'']);
+            ra_gotchas::shape::in_dirs(word, &dirs) || ra_gotchas::shape::in_dirs(word, &reads)
+        });
     let verdict = match catalogue.command_in(cwd, command, &held, suite_check, own) {
         ra_gotchas::Verdict::Deny { id, .. } | ra_gotchas::Verdict::Rewrite { id, .. } if own && id == "shell-outside-allowlist" => {
             ra_gotchas::Verdict::Pass

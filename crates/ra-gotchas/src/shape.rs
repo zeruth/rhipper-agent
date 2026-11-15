@@ -226,7 +226,32 @@ pub fn judge_with(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&s
         .map(std::path::PathBuf::from)
         .filter(|t| t.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run")));
     let roots: Vec<&Path> = target.iter().chain(tmp.iter()).chain(extra).map(std::path::PathBuf::as_path).collect();
-    judge_roots(command, shell, workspace, own, &roots)
+    judge_roots(command, shell, workspace, own, &roots, &[])
+}
+
+/// [`judge_with`] with the `reads` directories besides: a listing or an existence test of a path
+/// under one passes, while running from it or any writing command stays refused.
+#[must_use]
+pub fn judge_reading(
+    command: &str,
+    shell: Shell,
+    workspace: &Path,
+    own: &dyn Fn(&str) -> bool,
+    extra: &[std::path::PathBuf],
+    reads: &[std::path::PathBuf],
+) -> Shape {
+    let target = std::env::var_os("CARGO_TARGET_DIR").filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
+    let tmp = std::env::var_os("TEMP")
+        .map(std::path::PathBuf::from)
+        .filter(|t| t.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run")));
+    let roots: Vec<&Path> = target.iter().chain(tmp.iter()).chain(extra).map(std::path::PathBuf::as_path).collect();
+    let reads: Vec<&Path> = reads.iter().map(std::path::PathBuf::as_path).collect();
+    judge_roots(command, shell, workspace, own, &roots, &reads)
+}
+
+/// Whether `name` only lists or tests a path, never writes or runs it.
+fn lists(name: &str) -> bool {
+    ["ls", "dir", "test-path", "get-childitem"].iter().any(|n| n.eq_ignore_ascii_case(name))
 }
 
 /// [`judge`] with the card's own `target` named: listing it and running a program under it pass,
@@ -234,10 +259,10 @@ pub fn judge_with(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&s
 #[must_use]
 pub fn judge_in(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool, target: Option<&Path>) -> Shape {
     let roots: Vec<&Path> = target.into_iter().collect();
-    judge_roots(command, shell, workspace, own, &roots)
+    judge_roots(command, shell, workspace, own, &roots, &[])
 }
 
-fn judge_roots(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool, target: &[&Path]) -> Shape {
+fn judge_roots(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str) -> bool, target: &[&Path], reads: &[&Path]) -> Shape {
     let Some(parts) = split(command, shell) else { return Shape::Unknown };
     if parts.is_empty() {
         return Shape::Unknown;
@@ -246,7 +271,7 @@ fn judge_roots(command: &str, shell: Shell, workspace: &Path, own: &dyn Fn(&str)
     // the PowerShell variables the command sets itself, to a value judged where it is set
     let mut assigned: Vec<String> = Vec::new();
     for part in &parts {
-        match judge_part(part, shell, workspace, own, target, &mut assigned) {
+        match judge_part(part, shell, workspace, own, (target, reads), &mut assigned) {
             Shape::Allowed => {}
             Shape::Denied(form) => return Shape::Denied(format!("`{}` is refused here: {form}", part.words.join(" "))),
             Shape::Unknown => all = false,
@@ -260,11 +285,14 @@ fn judge_part(
     shell: Shell,
     workspace: &Path,
     own: &dyn Fn(&str) -> bool,
-    target: &[&Path],
+    (target, reads): (&[&Path], &[&Path]),
     assigned: &mut Vec<String>,
 ) -> Shape {
     let in_target = |w: &str| target.iter().any(|t| in_target(w, t));
-    let away = |w: &str| outside(w, workspace) && !in_target(w);
+    // a listing may also look under the read-only roots
+    let listing = part.words.iter().find(|w| !is_assignment(w)).is_some_and(|w| lists(program(w)));
+    let readable = |w: &str| listing && reads.iter().any(|t| self::in_target(w, t));
+    let away = |w: &str| outside(w, workspace) && !in_target(w) && !readable(w);
     if part.writes {
         return Shape::Denied(REDIRECT_FORM.to_owned());
     }
