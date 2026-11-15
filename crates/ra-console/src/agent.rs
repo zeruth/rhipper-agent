@@ -5895,6 +5895,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     if let Some(fresh) = &fresh {
         tracing::info!(target: crate::trace::PROGRESS, "{}", fresh.trim_start());
     }
+    if caps.doubled {
+        tracing::info!(target: crate::trace::PROGRESS, "context cap doubled (read-in hit)");
+    }
     // whether the report was asked for a second time, for the end line
     let mut asked_twice = false;
     // the handoffs' reports are the history a lint pass does without; the task keeps them for
@@ -6533,7 +6536,7 @@ struct Prepared {
 }
 
 /// The caps of a run; no turn cap stands by default, and the context cap is the project's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct Caps {
     /// The hard cap, when `--turns` named one: a run that reaches it failed.
     hard: Option<u32>,
@@ -6543,12 +6546,8 @@ struct Caps {
     /// The project's `[worker] context`: a harness run ends the same way after a turn whose
     /// input passes this many tokens; `None`, the default, is no cap.
     context: Option<u64>,
-}
-
-impl Default for Caps {
-    fn default() -> Self {
-        Self { hard: None, restart: None, context: None }
-    }
+    /// Whether `context` is twice the project's: the run is exempt from the plain cap, bounded.
+    doubled: bool,
 }
 
 /// What ended a run short of its answer so the card continues in a fresh session: the project's
@@ -6628,16 +6627,17 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // an absolute card works until it is done: no cap restarts it or ends it, the whole run in
     // one session costing less than the restarts a cap would cut it into
     let absolute = node.is_absolute();
+    let configured = router.as_ref().and_then(|router| router.worker.context());
+    let doubled = !is_lint_pass(worker) && (capped_reading_in(&task) || absolute);
     let caps = Caps {
         hard: worker.turns.filter(|_| !absolute),
         restart: router.as_ref().and_then(|router| router.worker.turns()).filter(|_| !absolute),
-        // no context cap on a run whose last session hit it while still reading in: the fresh
-        // session reads the same files and hits it again, and the card never gets past them
-        // (runelite #15: AffineTransform and Arc2D from the JDK, 161k at turn 7)
-        context: router
-            .as_ref()
-            .and_then(|router| router.worker.context())
-            .filter(|_| is_lint_pass(worker) || !capped_reading_in(&task) && !absolute),
+        // twice the context cap on a run whose last session hit it while still reading in: the
+        // fresh session reads the same files and hits it again, and the card never gets past
+        // them (runelite #15: AffineTransform and Arc2D from the JDK, 161k at turn 7); never
+        // none, or the session grows without bound
+        context: configured.map(|c| if doubled { c.saturating_mul(2) } else { c }),
+        doubled: doubled && configured.is_some(),
     };
     let effort = worker.effort.unwrap_or(node.effort);
     Ok(Prepared { workspace, root, task, project, budget, caps, effort })
@@ -6813,7 +6813,11 @@ pub async fn dry_run(store: &Store, id: i64, worker: &Worker) -> anyhow::Result<
             budget.map_or_else(|| "none".to_owned(), |b| format!("${b:.2}")),
             caps.hard.map_or_else(|| "none".to_owned(), |c| c.to_string()),
             caps.restart.map_or_else(String::new, |r| format!(" · fresh session after {r} turns")),
-            caps.context.map_or_else(String::new, |c| format!(" · fresh session past {} tokens a turn", kilo(c))),
+            caps.context.map_or_else(String::new, |c| format!(
+                " · fresh session past {} tokens a turn{}",
+                kilo(c),
+                if caps.doubled { " · context cap doubled (read-in hit)" } else { "" }
+            )),
             match resume {
                 Ok(Some(session)) => session,
                 Ok(None) => "none".to_owned(),

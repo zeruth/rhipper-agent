@@ -718,7 +718,7 @@ async fn a_harness_run_the_turn_cap_ends_books_its_usage_and_the_card_sums_its_s
 }
 
 #[tokio::test]
-async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_names_the_cap_and_the_turn() {
+async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_context_cap_doubled_after_a_read_in_hit() {
     let dir = tempfile::tempdir().unwrap();
     cargo_project(dir.path(), true);
     git_ok(dir.path(), &["init", "-q"]);
@@ -793,8 +793,8 @@ async fn a_harness_run_the_context_cap_ends_continues_fresh_and_the_end_line_nam
     assert!(opened.contains("Cargo.toml 6-6  [workspace]  · read by the last session\n"), "{opened}");
     assert!(!opened.contains("   6  [workspace]"), "what was only read is not quoted: {opened}");
     // the cap fell at turn 5, while the session was still reading in: the fresh session reads
-    // the same files, so it runs without the cap rather than hit it again (runelite #15)
-    assert_eq!(harness.requests.lock().last().unwrap().max_context, None, "no cap after a cap hit reading in");
+    // the same files, so it runs under twice the cap rather than hit it again (runelite #15)
+    assert_eq!(harness.requests.lock()[1].max_context, Some(240_000), "the cap is doubled after a cap hit reading in");
 }
 
 #[tokio::test]
