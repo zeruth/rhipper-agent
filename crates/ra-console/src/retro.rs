@@ -228,6 +228,18 @@ pub async fn landed(root: &Path, card: &ra_roadmap::model::Node, ledger: &ra_usa
     if let Some(event) = claim.as_deref().and_then(event_of) {
         return landed_by_event(root, card, ledger, event, claim.as_deref().unwrap_or_default()).await;
     }
+    // a claim in no unit the ledger counts is logged, not judged against the median
+    if let Some(claim) = claim.as_deref().filter(|c| !names_median(c)) {
+        let text = format!("{SAVING} #{} unscored: claimed \"{claim}\"", card.id);
+        let note = Note { when: 0, node: Some(card.id), machine: false, pair: false, text: text.clone(), against: None };
+        return match record(root, Some(card.id), &[note]) {
+            Ok(()) => vec![text],
+            Err(e) => {
+                tracing::warn!("the saving of #{} was not recorded: {e:#}", card.id);
+                Vec::new()
+            }
+        };
+    }
     let (Ok(own), Ok(others)) = (ledger.card_cost(card.id).await, ledger.recent_cards(mark, MEDIAN_OF + 1).await) else {
         return Vec::new();
     };
@@ -270,11 +282,14 @@ pub enum Event {
     Rerun,
     /// An `rc wait` call.
     Wait,
+    /// A person's intervention: a refused command or a send-back.
+    Intervention,
 }
 
 impl Event {
     fn name(self) -> &'static str {
         match self {
+            Self::Intervention => "interventions",
             Self::Refusal => "refused commands",
             Self::Rerun => "reruns",
             Self::Wait => "rc wait calls",
@@ -289,6 +304,8 @@ pub fn event_of(claim: &str) -> Option<Event> {
     let claim = claim.to_lowercase();
     if claim.contains("rc wait") {
         Some(Event::Wait)
+    } else if ["intervention", "send-back", "send back", "sent back", "sends back"].iter().any(|word| claim.contains(word)) {
+        Some(Event::Intervention)
     } else if claim.contains("refus") {
         Some(Event::Refusal)
     } else if claim.contains("rerun") || claim.contains("re-run") {
@@ -298,12 +315,23 @@ pub fn event_of(claim: &str) -> Option<Event> {
     }
 }
 
+/// Whether a claim counts in turns or tokens (context, reads and cost with them), the units the
+/// median measures; a claim in neither them nor an [`Event`] cannot be scored.
+#[must_use]
+pub fn names_median(claim: &str) -> bool {
+    let claim = claim.to_lowercase();
+    ["turn", "token", "context", "cost", "read"].iter().any(|word| claim.contains(word))
+}
+
 /// How often `event` happened in the card's run: the refusals and `rc wait` calls the gotcha
 /// journal holds under the card, the runs of the card after its first.
 #[must_use]
 pub fn count_of(event: Event, root: &Path, node: i64, runs: u64) -> u64 {
     if event == Event::Rerun {
         return runs.saturating_sub(1);
+    }
+    if event == Event::Intervention {
+        return count_of(Event::Refusal, root, node, runs) + runs.saturating_sub(1);
     }
     let journal = std::fs::read_to_string(root.join("var/gotchas.log")).unwrap_or_default();
     let mine = journal.lines().filter_map(|line| {

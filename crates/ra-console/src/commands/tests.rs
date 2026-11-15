@@ -1432,7 +1432,7 @@ async fn a_saving_line_compares_the_card_to_the_median() {
     use ra_roadmap::store::Card;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
-    let card = Card { saving: Some("one verdict line instead of rc usage"), ..Card::new() };
+    let card = Card { saving: Some("one verdict line instead of rc usage, in fewer tokens"), ..Card::new() };
     let id = store.insert_card(Some(1), ra_roadmap::model::NodeKind::Task, "Measured", &card).await.unwrap();
     run(&format!("/set {id} implemented"), &store, &worker()).await.unwrap();
     let node = store.read(id).await.unwrap();
@@ -1457,8 +1457,9 @@ async fn a_saving_line_compares_the_card_to_the_median() {
     // the card's run: 3 turns at 110 tokens a turn, its cost reported
     ledger.record(&row(id, 3, 330, Some(0.05))).await.unwrap();
     let lines = crate::retro::landed(dir.path(), &node, &ledger, mark).await;
-    let held =
-        format!("[saving] #{id} held: 3 turns, 110 tokens/turn, $0.05 vs median 1000; claimed \"one verdict line instead of rc usage\"");
+    let held = format!(
+        "[saving] #{id} held: 3 turns, 110 tokens/turn, $0.05 vs median 1000; claimed \"one verdict line instead of rc usage, in fewer tokens\""
+    );
     assert_eq!(lines, vec![held.clone()]);
     assert_eq!(crate::retro::recent(dir.path(), 5).iter().map(|n| (n.node, n.text.clone())).collect::<Vec<_>>(), [(Some(id), held)]);
     // a second card, over the median, misses; the first card's rows now count among the twenty
@@ -1509,10 +1510,12 @@ async fn saving_of(card: &ra_roadmap::store::Card<'_>) -> (i64, Vec<String>, Vec
 
 #[tokio::test]
 async fn a_landed_card_without_a_saving_field_is_judged_by_its_objective() {
-    let objective = "Make the walk judge every card. [saving] one verdict line instead of rc usage. The rest is detail.";
+    let objective = "Make the walk judge every card. [saving] one verdict line instead of rc usage, in fewer tokens. The rest is detail.";
     let card = ra_roadmap::store::Card { objective: Some(objective), ..ra_roadmap::store::Card::new() };
     let (id, lines, logged) = saving_of(&card).await;
-    let held = format!("[saving] #{id} held: 3 turns, 110 tokens/turn vs median 1000; claimed \"one verdict line instead of rc usage\"");
+    let held = format!(
+        "[saving] #{id} held: 3 turns, 110 tokens/turn vs median 1000; claimed \"one verdict line instead of rc usage, in fewer tokens\""
+    );
     assert_eq!((lines, logged), (vec![held.clone()], vec![held]));
     // the other spelling the Phase P/Q cards used reads the same
     let card = ra_roadmap::store::Card { objective: Some("Smaller reads.\nSaving: fewer tokens a turn"), ..ra_roadmap::store::Card::new() };
