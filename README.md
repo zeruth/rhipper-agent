@@ -8,7 +8,7 @@ the lint, the review, the landing, the handoff, the ledger, the gotchas. One win
 project as a tab and a dashboard over all of them, and an external agent session pairs with
 the whole thing over a one-line-per-event feed.
 
-![The dashboard: three projects walking at once, the worker slots, each project's allocation and its live runs](docs/window.png)
+![The dashboard: two projects walking at once, the worker slots, each project's allocation and its live runs](docs/window.png)
 
 The roadmap owns the work. Models are replaceable workers. The orchestrator owns coordination,
 execution state, acceptance and the merge. The agent runs on its own roadmap too, and its
