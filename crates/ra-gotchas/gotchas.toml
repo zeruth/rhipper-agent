@@ -179,6 +179,15 @@ pattern = '^\s*(&\s+)?(\.[\\/])?(gw\.ps1|gradlew(\.bat)?)\b|^\s*cargo\s+(build|t
 message = "a build takes one of the machine's build slots, shared by every project: the command runs under `rc hold --`, which waits its turn while they are all taken, then runs it as written"
 remedy = { kind = "rewrite", insert = "rc hold --", after = 0, unless = '^\s*rc\s+hold\b' }
 
+# a path on another drive or two levels up is outside the workspace, which the harness refuses
+# whatever the program that reads it; named here instead of logging as unmatched
+[[gotcha]]
+id = "path-outside-workspace"
+where = "command"
+pattern = '(^|[\s"\x27=])([Dd]:[\\/]|\.\.[\\/]\.\.[\\/])'
+message = "a path outside the workspace is refused: read a file under the workspace with Read, search it with Grep or Glob, and name paths relative to it; a build's output is read from its own tail, not from the scratch root"
+remedy = { kind = "hint" }
+
 # the last of the command hints: a pipeline or `;` chain the shape table allows stands aside, one
 # it refuses is named here instead of logging as unmatched
 [[gotcha]]
