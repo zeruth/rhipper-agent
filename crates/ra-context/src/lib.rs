@@ -847,6 +847,9 @@ pub struct TaskContext {
     /// a reject; `None` for a fresh card. The notes are in the roadmap, which the worker does not
     /// read, so the prompt quotes them.
     pub review: Option<String>,
+    /// The fingerprint of the card's title and objective as they read now ([`brief_fingerprint`]):
+    /// a review that judged other words is shown stale. `None` until the run sets it.
+    pub card_print: Option<String>,
     /// The output of the last run's checks, clipped to its tail ([`TaskContext::set_check_output`]):
     /// the reviewer reads it, so a point never asks for what the check already shows. Kept in
     /// the file before the handoffs; empty until a run checked the card.
@@ -932,6 +935,52 @@ pub fn review_of(notes: &str) -> Option<String> {
     Some(block.join("\n"))
 }
 
+/// The line a review block is shown under when the card's objective or title was rewritten after
+/// the review, as in a split: the points answered a card that no longer reads so.
+pub const STALE_REVIEW: &str = "stale: reviewed before the objective changed";
+
+/// The mark of the fingerprint of the card a review judged on a rejecting verdict, beside the
+/// points' ([`POINTS_MARK`]): ` · brief <hex>`.
+pub const BRIEF_MARK: &str = " · brief ";
+
+/// The fingerprint of the words a review judges, a card's title and objective, trimmed: FNV-1a,
+/// as the other fingerprints of a run, so a rewrite of either reads as another card.
+#[must_use]
+pub fn brief_fingerprint(title: &str, objective: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in title.trim().bytes().chain([0]).chain(objective.trim().bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Whether a review that judged the card whose fingerprint is `judged` is stale on the card
+/// that reads `now`: both are known and differ. A review recorded without one is not stale.
+#[must_use]
+pub fn is_stale(judged: Option<&str>, now: Option<&str>) -> bool {
+    judged.zip(now).is_some_and(|(judged, now)| judged != now)
+}
+
+/// `review` as the handoff shows it: under [`STALE_REVIEW`] when it is stale ([`is_stale`]),
+/// verbatim otherwise; a block shown stale already keeps its one line.
+#[must_use]
+pub fn review_shown(review: &str, judged: Option<&str>, now: Option<&str>) -> String {
+    if !is_stale(judged, now) || review.lines().any(|l| l == STALE_REVIEW) {
+        return review.to_owned();
+    }
+    format!("{STALE_REVIEW}\n{review}")
+}
+
+/// The points of a review block still open: none when the block is marked [`STALE_REVIEW`].
+#[must_use]
+pub fn open_points(review: &str) -> usize {
+    if review.lines().any(|l| l == STALE_REVIEW) {
+        return 0;
+    }
+    review.lines().filter(|l| l.starts_with("- ")).count()
+}
+
 impl TaskContext {
     /// The file of task `id` under `workspace`.
     #[must_use]
@@ -949,7 +998,24 @@ impl TaskContext {
         let check_output = section_of(&text, CHECK_OUTPUT_HEADING)
             .map(|output| output.lines().map(|line| line.strip_prefix(CHECK_OUTPUT_INDENT).unwrap_or(line)).collect::<Vec<_>>().join("\n"))
             .unwrap_or_default();
-        Self { id, brief: String::new(), outlines: String::new(), handoffs: parse_handoffs(&text), review, check_output }
+        Self { id, brief: String::new(), outlines: String::new(), handoffs: parse_handoffs(&text), review, card_print: None, check_output }
+    }
+
+    /// The review as the prompt and the file show it: under [`STALE_REVIEW`] when the verdict
+    /// that drew it, the newest handoff's ([`Handoff::brief`]), judged another title or objective
+    /// than the card's now. A newest verdict without a fingerprint is not stale: an older one's
+    /// fingerprint judged another review.
+    #[must_use]
+    pub fn review_shown(&self) -> Option<String> {
+        let review = self.review.as_deref()?.trim_matches(['\n', '\r']);
+        let judged = self.handoffs.last().and_then(Handoff::brief);
+        Some(review_shown(review, judged, self.card_print.as_deref()))
+    }
+
+    /// The reviewer's points the run still answers: none for a stale review or no review.
+    #[must_use]
+    pub fn open_points(&self) -> usize {
+        self.review_shown().map_or(0, |review| open_points(&review))
     }
 
     /// Keeps the output of a run's checks, clipped to its last [`CHECK_OUTPUT_ROOM`] characters.
@@ -972,12 +1038,14 @@ impl TaskContext {
             text.push_str("\nFiles: read the regions the outline points at, not whole files.\n");
             text.push_str(&self.outlines);
         }
-        if let Some(review) = &self.review {
-            let _ = write!(
-                text,
-                "\n{REVIEW_HEADING}\nThe reviewer sent the last run back on these points; answer each:\n{}\n",
-                review.trim_matches(['\n', '\r'])
-            );
+        if let Some(review) = self.review_shown() {
+            // a stale review's points answered other words: the worker reads them, not answers them
+            let lead = if review.starts_with(STALE_REVIEW) {
+                "The reviewer judged the card before its objective changed; its points are not open, read them as background:"
+            } else {
+                "The reviewer sent the last run back on these points; answer each:"
+            };
+            let _ = write!(text, "\n{REVIEW_HEADING}\n{lead}\n{review}\n");
         }
         let shown = &self.handoffs[self.handoffs.len().saturating_sub(HANDOFFS_SHOWN)..];
         if !shown.is_empty() {
@@ -1066,7 +1134,7 @@ impl TaskContext {
             let _ = write!(text, "\n## Files\n\n{}", self.outlines);
         }
         // the review rides before the handoffs, where the reader of the handoffs skips it
-        if let Some(review) = &self.review {
+        if let Some(review) = self.review_shown() {
             let _ = write!(text, "\n{REVIEW_HEADING}\n\n{}\n", review.trim());
         }
         if !self.check_output.trim().is_empty() {
@@ -1124,6 +1192,15 @@ impl Handoff {
     #[must_use]
     pub fn points(&self) -> Option<&str> {
         let (_, rest) = self.verdict.as_deref()?.split_once(POINTS_MARK)?;
+        let print = rest.split(" · ").next().unwrap_or_default().trim();
+        (!print.is_empty()).then_some(print)
+    }
+
+    /// The fingerprint of the card's title and objective the reviewer judged, as the verdict
+    /// carries it beside the points'; `None` for a verdict without one.
+    #[must_use]
+    pub fn brief(&self) -> Option<&str> {
+        let (_, rest) = self.verdict.as_deref()?.split_once(BRIEF_MARK)?;
         let print = rest.split(" · ").next().unwrap_or_default().trim();
         (!print.is_empty()).then_some(print)
     }

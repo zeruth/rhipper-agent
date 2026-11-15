@@ -1728,9 +1728,12 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     }
     let (verdict, left) = split_points(store, &node, verdict).await;
     // the points' fingerprint rides the handoff's verdict, so a run that changed nothing and drew
-    // the same points again is held on that round, not run a third time
+    // the same points again is held on that round, not run a third time; the words the review
+    // judged ride beside them, so a rewrite of the card after it, as in a split, shows it stale
     let print = match &verdict {
-        Verdict::NeedsRevision(points) => format!("{}{}", ra_context::POINTS_MARK, points_fingerprint(points)),
+        Verdict::NeedsRevision(points) => {
+            format!("{}{}{}{}", ra_context::POINTS_MARK, points_fingerprint(points), ra_context::BRIEF_MARK, card_print(&node))
+        }
         Verdict::Accepted | Verdict::Malformed => String::new(),
     };
     let Judged { state, mut head, said, trivial } = judged(&verdict, id, &model, &root, accepted);
@@ -6603,6 +6606,7 @@ async fn prepare(store: &Store, node: &Node, worker: &Worker, draft: bool) -> an
     // a card sent back by its reviewer carries the verdict's points in its context: the notes
     // that hold them are in the roadmap, which the worker does not read
     task.review = if is_rerun(node, worker) { ra_context::review_of(node.notes.as_deref().unwrap_or_default()) } else { None };
+    task.card_print = Some(card_print(node));
     // the map of a rerun quotes what its failures, warnings and points name and lists what the
     // last session read as rows, so the worker opens on the few items the rerun is about
     let points = rerun_points(task.review.as_deref(), task.handoffs.last());
@@ -6708,7 +6712,9 @@ fn task_text(task: &ra_context::TaskContext, rerun: Option<&str>) -> String {
     match rerun {
         None => task.prompt(),
         Some(block) => {
-            let bare = ra_context::TaskContext { handoffs: Vec::new(), ..task.clone() };
+            // the review is judged stale or not on the handoffs before they leave the prompt:
+            // the newest one's verdict says which words the review judged
+            let bare = ra_context::TaskContext { handoffs: Vec::new(), review: task.review_shown(), ..task.clone() };
             format!("{}\n{block}", bare.prompt())
         }
     }
@@ -6966,6 +6972,7 @@ pub async fn context_preview(store: &Store, id: i64) -> anyhow::Result<String> {
     // the points of a review rank the map in `prepare`, so the preview ranks it by them too;
     // a fix pass is the one rerun it cannot tell, having no worker
     task.review = if sent_back(&node) { ra_context::review_of(node.notes.as_deref().unwrap_or_default()) } else { None };
+    task.card_print = Some(card_print(&node));
     let points = rerun_points(task.review.as_deref(), task.handoffs.last());
     let changed = last_change(&root, &node, &task).await;
     let read = task.handoffs.last().map_or(&[][..], |last| last.read.as_slice());
@@ -9226,6 +9233,11 @@ fn sent_back(node: &Node) -> bool {
     node.state == TaskState::NeedsRevision
         || ra_context::review_of(node.notes.as_deref().unwrap_or_default())
             .is_some_and(|review| review.lines().next().is_some_and(|first| first.contains("needs revision")))
+}
+
+/// The fingerprint of the words a review of `node` judges, its title and objective.
+fn card_print(node: &Node) -> String {
+    ra_context::brief_fingerprint(&node.title, node.objective.as_deref().unwrap_or_default())
 }
 
 /// The points a rerun carries: the failures and the warnings its last run left and the lines

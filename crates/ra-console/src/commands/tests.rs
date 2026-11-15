@@ -4971,6 +4971,40 @@ async fn a_card_sent_back_and_requeued_as_defined_is_still_a_rerun() {
 }
 
 #[tokio::test]
+async fn a_review_from_before_the_objective_changed_reaches_the_rerun_stale() {
+    // rhipper-asm #93: a card split after its review reran on the old card's points. The verdict
+    // records the words it judged; a rewrite of the objective after it shows the block stale
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
+    run("/add task Greet parent 1", &store, &worker()).await.unwrap();
+    let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\nexit code 0\n".to_owned())));
+    let provider = Scripted::new(vec![
+        says("wrote the greeting into hello.rs", vec![]),
+        says("needs revision\n- rename greet to salute", vec![]),
+        says("wrote the farewell into bye.rs", vec![]),
+        says("accepted", vec![]),
+    ]);
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_provider(provider.clone()).with_script(script);
+    run("/run 2", &store, &worker).await.unwrap();
+    let verdict = ra_context::TaskContext::open(dir.path(), 2).handoffs.last().unwrap().verdict.clone().unwrap_or_default();
+    assert!(verdict.contains(ra_context::BRIEF_MARK), "{verdict}");
+    run("/edit 2 objective Say goodbye instead", &store, &worker).await.unwrap();
+    run("/set 2 defined", &store, &worker).await.unwrap();
+    run("/run 2", &store, &worker).await.unwrap();
+    let seen = provider.seen.lock();
+    let prompt = &seen[2].messages.last().unwrap().content;
+    assert!(
+        prompt.contains(&format!(
+            "## Review\nThe reviewer judged the card before its objective changed; its points are not open, read them as background:\n{}\n",
+            ra_context::STALE_REVIEW
+        )),
+        "{prompt}"
+    );
+    assert!(prompt.contains("- rename greet to salute"), "{prompt}");
+    assert!(!prompt.contains("answer each:"), "{prompt}");
+}
+
+#[tokio::test]
 async fn a_revision_prompt_lists_the_reviewers_points() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
