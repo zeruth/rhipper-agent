@@ -1294,6 +1294,71 @@ impl Handoff {
         }
         text
     }
+
+    /// The handoff the agent writes itself for a run a cap ended before the worker reported:
+    /// outcome [`CUT_OFF`], the files the tree shows `changed`, and the tail of the worker's
+    /// `last_message`, so the next run starts from where this one stopped rather than from
+    /// nothing. `why` names the cap, as `the turn cap of 40`.
+    #[must_use]
+    pub fn cut_off(when: u64, model: &str, why: &str, changed: Vec<String>, last_message: &str) -> Self {
+        Self {
+            when,
+            model: model.to_owned(),
+            outcome: CUT_OFF.to_owned(),
+            check: format!("no check: {why} ended the run before its report"),
+            verdict: None,
+            report: cut_off_report(why, &changed, last_message),
+            changed,
+            warnings: Vec::new(),
+            read: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
+/// The outcome of a run a cap ended before the worker reported ([`Handoff::cut_off`]).
+pub const CUT_OFF: &str = "cut off";
+
+/// The lines of the worker's last message a cut-off handoff keeps, from its end.
+const LAST_MESSAGE_LINES: usize = 12;
+
+/// The characters of the worker's last message a cut-off handoff keeps, from its end.
+const LAST_MESSAGE_ROOM: usize = 1_500;
+
+/// The report of a cut-off run: what ended it, what the tree shows changed, and the tail of the
+/// worker's last message, the latest words of what it was doing; the agent's, not the worker's.
+#[must_use]
+pub fn cut_off_report(why: &str, changed: &[String], last_message: &str) -> String {
+    let mut text = format!("{why} ended the run before the worker reported; this handoff is the agent's\n");
+    if changed.is_empty() {
+        text.push_str("changed: nothing in the tree\n");
+    } else {
+        let _ = writeln!(text, "changed in the tree: {}", changed.join(", "));
+    }
+    let tail = last_message_tail(last_message);
+    if tail.is_empty() {
+        text.push_str("the worker's last message: none");
+    } else {
+        let _ = write!(text, "the worker's last message, its tail:\n{tail}");
+    }
+    text
+}
+
+/// The outcome of a run the project's turn or context cap ended: the card continues in a fresh
+/// session, its handoff carrying the changed files and the tail of the worker's last message.
+pub const CONTINUES: &str = "continues";
+
+/// The end of a worker's message: its last [`LAST_MESSAGE_LINES`] non-blank lines within
+/// [`LAST_MESSAGE_ROOM`] characters, behind a `…` line when the head is clipped; empty when the
+/// message says nothing.
+#[must_use]
+pub fn last_message_tail(message: &str) -> String {
+    let lines: Vec<&str> = message.lines().map(str::trim_end).filter(|line| !line.trim().is_empty()).collect();
+    let kept = &lines[lines.len().saturating_sub(LAST_MESSAGE_LINES)..];
+    let joined = kept.join("\n");
+    let count = joined.chars().count();
+    let tail: String = joined.chars().skip(count.saturating_sub(LAST_MESSAGE_ROOM)).collect();
+    if kept.len() < lines.len() || count > LAST_MESSAGE_ROOM { format!("… the head of the message is clipped\n{tail}") } else { tail }
 }
 
 /// The diagnostics of a warnings section, one per `warning`/`error` opening line; the blank

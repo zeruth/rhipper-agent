@@ -6067,7 +6067,12 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                         read_in: answer.read_in,
                         whole_reads: answer.whole_reads,
                     }),
-                    None => Err(map_error(ProviderError::TurnsOut(answer))),
+                    // the hard cap fails the run, but what the worker got to stays for the next
+                    None => Err(anyhow::Error::new(CutOff {
+                        cap: caps.limit().map_or_else(|| "the harness's turn cap".to_owned(), |limit| Capped::Turns(limit).to_string()),
+                        said: answer.text.clone(),
+                        failure: format!("{:#}", map_error(ProviderError::TurnsOut(answer))),
+                    })),
                 }
             }
             // the project's context cap ended the run after the turn that crossed it: booked
@@ -6133,8 +6138,25 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 store.set_notes(id, &over.to_string()).await?;
             }
             store.set_state_by(id, TaskState::Failed, Source::Run).await?;
-            let changed = card_changed(&root, &acting, &dirty_before, &git_status(&acting).await, run_started, "", &task).await;
-            task.record(handoff("failed", "no check: the run failed", &format!("{error:#}"), changed, &acceptance));
+            let cut = error.downcast_ref::<CutOff>();
+            let said = cut.map_or("", |cut| cut.said.as_str());
+            let changed = card_changed(&root, &acting, &dirty_before, &git_status(&acting).await, run_started, said, &task).await;
+            // a run its turn cap ended before a report leaves the agent's own handoff: the
+            // tree's changes and the worker's last words, so the next run starts from them
+            let last = match cut {
+                Some(cut) => {
+                    let report = ra_context::cut_off_report(&cut.cap, &changed, &cut.said);
+                    handoff(
+                        ra_context::CUT_OFF,
+                        &format!("no check: {} ended the run before its report", cut.cap),
+                        &report,
+                        changed,
+                        &acceptance,
+                    )
+                }
+                None => handoff("failed", "no check: the run failed", &format!("{error:#}"), changed, &acceptance),
+            };
+            task.record(last);
             save_context(store, &root, &task).await;
             return Err(error);
         }
@@ -6172,7 +6194,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         }
         let why = format!("{cap} ended the run; the card continues in a fresh session");
         let turns = session.cap.map_or_else(|| session.turns.to_string(), |limit| format!("{}/{limit}", session.turns));
-        let mut last = handoff("continues", &format!("no check: {why}"), &report, changed, &acceptance);
+        let mut last = handoff(ra_context::CONTINUES, &format!("no check: {why}"), &report, changed, &acceptance);
         if let Some(branch) = &worker.branch {
             last.check = format!("{} · branch {branch}", last.check);
         }
@@ -8353,8 +8375,11 @@ fn capped_report(cap: Capped, session: &Session, changed: &[String], node: &Node
     if !untouched.is_empty() {
         let _ = writeln!(text, "left to touch: {}, which the card names and no run has changed", untouched.join(", "));
     }
-    if !session.text.trim().is_empty() {
-        let _ = write!(text, "\n{}", session.text.trim());
+    // the tail, as a cut-off run's: the latest words say where the worker was, and the whole of
+    // a long message is context the fresh session would read in again
+    let tail = ra_context::last_message_tail(&session.text);
+    if !tail.is_empty() {
+        let _ = write!(text, "\nthe worker's last message, its tail:\n{tail}");
     }
     text
 }
@@ -8493,6 +8518,24 @@ impl std::fmt::Display for OverBudget {
 }
 
 impl std::error::Error for OverBudget {}
+
+/// A run the hard turn cap ended before the worker reported: the failure it reads as, and what
+/// the handoff the agent writes for it ([`ra_context::Handoff::cut_off`]) needs, the cap and the
+/// worker's last words.
+#[derive(Debug)]
+struct CutOff {
+    failure: String,
+    cap: String,
+    said: String,
+}
+
+impl std::fmt::Display for CutOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.failure)
+    }
+}
+
+impl std::error::Error for CutOff {}
 
 /// The tool loop of a bare model: the model answers with tool calls, the toolbox executes them in
 /// the workspace, the results go back, until the hard cap of `caps` runs out when there is one,

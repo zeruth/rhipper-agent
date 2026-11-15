@@ -575,7 +575,8 @@ impl ClaudeCode {
         // a result names the reason itself, exit code or not
         if let Some(result) = result {
             let listed = turns.cost(&request.model);
-            with_stream(parse_result(&result), |completion| {
+            let parsed = with_last_words(parse_result(&result), &turns);
+            with_stream(parsed, |completion| {
                 // a result without a cost, as a run out of turns can end, is priced from its turns
                 if completion.usage.cost_usd.is_none() && listed.is_some() {
                     completion.usage.cost_usd = listed;
@@ -643,8 +644,11 @@ struct TurnTally {
     cached: Vec<u64>,
     /// The share of each turn's input written to the cache, which is priced at its own rate.
     written: Vec<u64>,
-    /// The text blocks of the last turn, the worker's words when the run ends without a result.
+    /// The text blocks of the last turn with any, the worker's words when the run ends without
+    /// a result or on its turns running out: a last turn of tool calls alone says nothing.
     said: Vec<String>,
+    /// The index of the turn `said` is of.
+    said_at: usize,
     /// The index of the turn that made the first edit or write, once one has.
     first_edit: Option<usize>,
     /// The files read whole, with no range, as the calls named them.
@@ -710,14 +714,21 @@ impl TurnTally {
                 if let Some(written) = self.written.last_mut() {
                     *written = count("cache_creation_input_tokens");
                 }
-                self.said.extend(text);
             }
             _ => {
                 self.turns.push((id, turn));
                 self.cached.push(count("cache_read_input_tokens"));
                 self.written.push(count("cache_creation_input_tokens"));
-                self.said = text.collect();
             }
+        }
+        let words: Vec<String> = text.collect();
+        if !words.is_empty() {
+            let at = self.turns.len() - 1;
+            if self.said_at != at {
+                self.said.clear();
+                self.said_at = at;
+            }
+            self.said.extend(words);
         }
         // the calls of the turn: a whole read is context every later turn carries, and the
         // first edit ends the reading-in
@@ -1046,6 +1057,37 @@ fn with_stream(parsed: Result<Completion, ProviderError>, seen: impl FnOnce(&mut
         }
         Err(error) => Err(error),
     }
+}
+
+/// A run out of turns has an empty result: the words of the last turn that said any stand in
+/// for it, so the agent's handoff carries where the worker was.
+fn with_last_words(parsed: Result<Completion, ProviderError>, turns: &TurnTally) -> Result<Completion, ProviderError> {
+    match parsed {
+        Err(ProviderError::TurnsOut(mut completion)) if completion.text.trim().is_empty() => {
+            completion.text = turns.said.join("\n");
+            Err(ProviderError::TurnsOut(completion))
+        }
+        parsed => parsed,
+    }
+}
+
+/// What a whole `stream-json` output of a run comes to, read as a run reads it: the result
+/// event's completion or error, a run out of turns carrying the words of its last turn with
+/// text. An output without a result event is an error.
+///
+/// # Errors
+/// The error the result reports, or [`ProviderError::Other`] when there is none.
+pub fn result_of_stream(stream: &str) -> Result<Completion, ProviderError> {
+    let mut turns = TurnTally::default();
+    let mut result = None;
+    for line in stream.lines() {
+        turns.note(line);
+        if line.contains(r#""type":"result""#) {
+            result = Some(line);
+        }
+    }
+    let result = result.ok_or_else(|| ProviderError::Other("the stream has no result".to_owned()))?;
+    with_last_words(parse_result(result), &turns)
 }
 
 /// Reads the result JSON into a completion, or the error it reports.
