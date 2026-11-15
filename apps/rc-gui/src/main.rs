@@ -4841,7 +4841,12 @@ fn waiting_subtree(
     let shown = children.len().min(WAITING_SHOWN);
     let indent = 4.0 + 16.0 * (f32::from(u16::try_from(depth).unwrap_or(u16::MAX)) - 1.0);
     for (i, child) in children.iter().take(shown).enumerate() {
-        placed.insert(*child);
+        // placed when drawn, not when listed: a card waiting both on `id` and on a sibling
+        // drawn above it was placed by that sibling's subtree and is not drawn twice (asm's
+        // #141 under #213 and under #80 drew two rows with one widget id, 2026-11-15)
+        if !placed.insert(*child) {
+            continue;
+        }
         let Some(node) = nodes.iter().find(|n| n.id == *child) else { continue };
         let last = i + 1 == shown && children.len() <= WAITING_SHOWN;
         ui.horizontal(|ui| {
