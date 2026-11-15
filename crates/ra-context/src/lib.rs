@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+pub mod also_read;
 pub mod carve;
 pub mod digest;
 pub mod map;

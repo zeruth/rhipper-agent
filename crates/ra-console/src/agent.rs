@@ -9546,6 +9546,17 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<Brief> {
             let _ = writeln!(text, "  {file}");
         }
     }
+    // the files where the symbols the card names are defined or called, so the worker opens
+    // them by name rather than searching the tree for them
+    let named =
+        format!("{}\n{}\n{}", node.title, node.objective.as_deref().unwrap_or_default(), node.acceptance.as_deref().unwrap_or_default());
+    let also = ra_context::also_read::also_read(&workspace_of(store), &named, files);
+    if !also.is_empty() {
+        text.push_str("Also read, where the symbols the card names are defined or used:\n");
+        for file in also {
+            let _ = writeln!(text, "  {file}");
+        }
+    }
     // the ancestors: the chain of parents above the task, nearest first
     let mut parent = node.parent.and_then(find);
     while let Some(ancestor) = parent {
