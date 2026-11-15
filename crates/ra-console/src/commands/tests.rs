@@ -3052,7 +3052,8 @@ async fn a_reviewer_with_points_leaves_the_card_needs_revision_with_the_points_f
     run("/add task Probe parent 1", &store, &worker()).await.unwrap();
     store.set_notes(2, "wrote hello.txt and read it back").await.unwrap();
     store.set_state(2, ra_roadmap::model::TaskState::Implemented).await.unwrap();
-    let reviewer = Scripted::new(vec![says("needs_revision\n- hello.txt: the greeting lacks a newline\n- no test covers it", vec![])]);
+    let reviewer =
+        Scripted::new(vec![says("needs_revision\n- hello.txt: the greeting lacks a newline\n- hello.txt: no test covers it", vec![])]);
     let runner = Worker::new("z-ai/glm-5.3-flash").with_provider(reviewer.clone());
 
     let (out, _) = run("/review 2", &store, &runner).await.unwrap();
@@ -3063,7 +3064,7 @@ async fn a_reviewer_with_points_leaves_the_card_needs_revision_with_the_points_f
     assert_eq!(
         node.notes.as_deref(),
         Some(
-            "review by z-ai/glm-5.3-flash: needs revision (substantive)\n- hello.txt: the greeting lacks a newline\n- no test covers it\n\nwrote hello.txt and read it back"
+            "review by z-ai/glm-5.3-flash: needs revision (substantive)\n- hello.txt: the greeting lacks a newline\n- hello.txt: no test covers it\n\nwrote hello.txt and read it back"
         )
     );
     // the reviewer read the acceptance and the worker's report, with no tools and no workspace
@@ -3300,7 +3301,7 @@ async fn review_kinds_a_second_round_brief_holds_the_first_verdict_and_the_check
     assert!(second.contains("## Your last verdict on this card\n"), "{second}");
     assert!(second.contains("- 1. [work] hello.txt: the greeting lacks a newline"), "{second}");
     assert!(second.contains("## Check output\n") && second.contains("test result: ok. 7 passed"), "{second}");
-    assert!(seen[5].messages[0].content.contains("N. [work|card|environment] file: what"), "{}", seen[5].messages[0].content);
+    assert!(seen[5].messages[0].content.contains("N. [work|card|environment|nit] path:line: what"), "{}", seen[5].messages[0].content);
 }
 
 #[tokio::test]
@@ -3735,7 +3736,9 @@ async fn a_trivial_rejection_without_a_fix_model_waits_for_the_person() {
 /// A run of card #2 in a project whose check passes, with `answers` as what the model says in
 /// turn: the worker's report, then the reviewer's verdict. The lines, the node after the run and
 /// the handoff the run left.
-async fn judged_run(answers: Vec<&str>) -> (Vec<String>, ra_roadmap::model::Node, ra_context::Handoff, std::sync::Arc<Scripted>) {
+pub(crate) async fn judged_run(
+    answers: Vec<&str>,
+) -> (Vec<String>, ra_roadmap::model::Node, ra_context::Handoff, std::sync::Arc<Scripted>) {
     let dir = tempfile::tempdir().unwrap();
     cargo_project(dir.path(), true);
     let store = Store::open(&dir.path().join("rhipper.md"), "Rhipper").await.unwrap();
@@ -4867,7 +4870,7 @@ async fn a_rerun_of_a_card_sent_back_starts_fresh_on_the_verdict_without_the_tra
     let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\nexit code 0\n".to_owned())));
     let provider = Scripted::new(vec![
         says("wrote the greeting into hello.rs and read it back", vec![]),
-        says("needs revision\n- rename greet to salute", vec![]),
+        says("needs revision\n- hello.rs:1: rename greet to salute", vec![]),
         says("renamed it", vec![]),
         says("accepted", vec![]),
     ]);
@@ -4882,7 +4885,7 @@ async fn a_rerun_of_a_card_sent_back_starts_fresh_on_the_verdict_without_the_tra
     assert!(prompt.contains("Task #2: Greet"), "{prompt}");
     assert!(prompt.contains("verdict: needs revision (") && prompt.contains("## Review\n"), "{prompt}");
     assert!(
-        prompt.contains("\nreview by z-ai/glm-5.3-flash: needs revision (") && prompt.contains(")\n- rename greet to salute\n"),
+        prompt.contains("\nreview by z-ai/glm-5.3-flash: needs revision (") && prompt.contains(")\n- hello.rs:1: rename greet to salute\n"),
         "{prompt}"
     );
     // the last report rides once, in the rerun block; the handoffs do not
@@ -4907,7 +4910,7 @@ async fn a_rerun_of_a_card_not_absolute_starts_fresh_though_it_has_a_session() {
     first.session_id = Some("sess-1".into());
     let provider = Scripted::new(vec![
         first,
-        says("needs revision\n- rename greet to salute", vec![]),
+        says("needs revision\n- hello.rs:1: rename greet to salute", vec![]),
         says("renamed it", vec![]),
         says("accepted", vec![]),
     ]);
@@ -4918,7 +4921,7 @@ async fn a_rerun_of_a_card_not_absolute_starts_fresh_though_it_has_a_session() {
     let seen = provider.seen.lock();
     assert_eq!(seen[2].resume, None);
     let prompt = &seen[2].messages.last().unwrap().content;
-    assert!(prompt.contains("## Review\n") && prompt.contains(")\n- rename greet to salute\n"), "{prompt}");
+    assert!(prompt.contains("## Review\n") && prompt.contains(")\n- hello.rs:1: rename greet to salute\n"), "{prompt}");
     assert!(prompt.contains("The last run's report:\nwrote the greeting into hello.rs"), "{prompt}");
 }
 
@@ -4938,7 +4941,8 @@ async fn a_rerun_of_an_absolute_card_resumes_the_session_it_came_back_from() {
     first.session_id = Some("sess-1".into());
     let mut again = says("renamed greet to salute in hello.rs", vec![]);
     again.session_id = Some("sess-1".into());
-    let provider = Scripted::new(vec![first, says("needs revision\n- rename greet to salute", vec![]), again, says("accepted", vec![])]);
+    let provider =
+        Scripted::new(vec![first, says("needs revision\n- hello.rs:1: rename greet to salute", vec![]), again, says("accepted", vec![])]);
     let runner = Worker::new("claude-opus-5-5").with_provider(std::sync::Arc::new(Harness(provider.clone()))).with_script(script);
     let (out, _) = run("/run 2", &store, &runner).await.unwrap();
     assert!(out.iter().any(|l| l.contains("rerun on the session: the verdict")), "{}", out.join("\n"));
@@ -4947,7 +4951,7 @@ async fn a_rerun_of_an_absolute_card_resumes_the_session_it_came_back_from() {
     assert_eq!(seen.len(), 4);
     assert_eq!(seen[2].resume.as_deref(), Some("sess-1"), "the rerun resumes the session it came back from");
     let prompt = &seen[2].messages.last().unwrap().content;
-    assert!(prompt.contains("## Review\n") && prompt.contains(")\n- rename greet to salute\n"), "{prompt}");
+    assert!(prompt.contains("## Review\n") && prompt.contains(")\n- hello.rs:1: rename greet to salute\n"), "{prompt}");
     assert!(!prompt.contains("Earlier runs of this task"), "{prompt}");
 }
 
@@ -4962,7 +4966,7 @@ async fn a_card_sent_back_and_requeued_as_defined_is_still_a_rerun() {
     let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\nexit code 0\n".to_owned())));
     let provider = Scripted::new(vec![
         says("wrote the greeting into hello.rs and read it back", vec![]),
-        says("needs revision\n- rename greet to salute", vec![]),
+        says("needs revision\n- hello.rs:1: rename greet to salute", vec![]),
         says("renamed it", vec![]),
         says("accepted", vec![]),
     ]);
@@ -4974,7 +4978,7 @@ async fn a_card_sent_back_and_requeued_as_defined_is_still_a_rerun() {
     assert!(out.iter().any(|l| l.contains("no session to resume; a rerun carries the verdict")), "{}", out.join("\n"));
     let seen = provider.seen.lock();
     let prompt = &seen[2].messages.last().unwrap().content;
-    assert!(prompt.contains("## Review\n") && prompt.contains(")\n- rename greet to salute\n"), "{prompt}");
+    assert!(prompt.contains("## Review\n") && prompt.contains(")\n- hello.rs:1: rename greet to salute\n"), "{prompt}");
     assert_eq!(prompt.matches("wrote the greeting into hello.rs").count(), 1, "{prompt}");
     assert_eq!(seen[2].resume, None);
 }
@@ -4989,7 +4993,7 @@ async fn a_review_from_before_the_objective_changed_reaches_the_rerun_stale() {
     let script: ra_tools::Script = std::sync::Arc::new(|_: &str| Ok((0, "ok\nexit code 0\n".to_owned())));
     let provider = Scripted::new(vec![
         says("wrote the greeting into hello.rs", vec![]),
-        says("needs revision\n- rename greet to salute", vec![]),
+        says("needs revision\n- hello.rs:1: rename greet to salute", vec![]),
         says("wrote the farewell into bye.rs", vec![]),
         says("accepted", vec![]),
     ]);
@@ -5009,7 +5013,7 @@ async fn a_review_from_before_the_objective_changed_reaches_the_rerun_stale() {
         )),
         "{prompt}"
     );
-    assert!(prompt.contains("- rename greet to salute"), "{prompt}");
+    assert!(prompt.contains("- hello.rs:1: rename greet to salute"), "{prompt}");
     assert!(!prompt.contains("answer each:"), "{prompt}");
 }
 
@@ -5035,7 +5039,12 @@ async fn a_revision_prompt_lists_the_reviewers_points() {
     let long = "the greeting is built by hand where format! would do;".repeat(5);
     let provider = Scripted::new(vec![
         says("wrote the greeting into hello.rs", vec![]),
-        says(&format!("needs revision\n- rename greet to salute\n- {long}\n- no test covers the empty name"), vec![]),
+        says(
+            &format!(
+                "needs revision\n- hello.rs:1: rename greet to salute\n- hello.rs:2: {long}\n- hello.rs:3: no test covers the empty name"
+            ),
+            vec![],
+        ),
         says("renamed it", vec![]),
         says("tested it", vec![]),
         says("accepted", vec![]),
@@ -5047,7 +5056,7 @@ async fn a_revision_prompt_lists_the_reviewers_points() {
     run("/run 2", &store, &worker).await.unwrap();
     let seen = provider.seen.lock();
     assert_eq!(seen.len(), 5);
-    let points = format!(")\n- rename greet to salute\n- {long}\n- no test covers the empty name\n");
+    let points = format!(")\n- hello.rs:1: rename greet to salute\n- hello.rs:2: {long}\n- hello.rs:3: no test covers the empty name\n");
     // the first rerun reads them from the verdict, the second from the notes the failed rerun
     // left, whole both times and verbatim; neither prompt says only how many there were
     for request in &seen[2..4] {

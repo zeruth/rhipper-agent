@@ -1217,7 +1217,7 @@ async fn run_picked(store: &Store, id: i64, worker: &Worker, tight: bool) -> any
 }
 
 /// What the reviewer is told: the verdict on the first line, the points after it.
-const REVIEW_INSTRUCTION: &str = "You review one card of a roadmap after a worker implemented it. You get the card's objective and acceptance, the worker's handoff, the files the card names and the run changed with their diff stat, and the git diff of those files, the output of the card's checks, which passed, and your own last verdict on the card when there was one. A change may live in any file of that list, not only the one you expect; read the stat before judging something missing, and the check output before asking for a run of it. Judge whether the diff meets the acceptance and whether the handoff tells the truth about it. Answer with one word on the first line: `accepted` or `needs_revision`. After `needs_revision`, list the points one per line as `N. [work|card|environment] file: what`: `work` is what the worker can change in the project's files; `card` is what only the card's own text or the person's decision settles (its acceptance, its files, a choice between designs); `environment` is what the machine lacks and the worker cannot make (another toolchain, a fixture another tool builds, a CI run, a service). Where your last verdict is given, a point of it that still stands keeps its number and its words, a point the change settled is dropped, and a new point takes the next number. After `accepted`, nothing or one line of why. No other text.";
+const REVIEW_INSTRUCTION: &str = "You review one card of a roadmap after a worker implemented it. You get the card's objective and acceptance, the worker's handoff, the files the card names and the run changed with their diff stat, and the git diff of those files, the output of the card's checks, which passed, and your own last verdict on the card when there was one. A change may live in any file of that list, not only the one you expect; read the stat before judging something missing, and the check output before asking for a run of it. Judge whether the diff meets the acceptance and whether the handoff tells the truth about it. Answer with one word on the first line: `accepted` or `needs_revision`. After `needs_revision`, list the points one per line as `N. [work|card|environment|nit] path:line: what`, every point citing the file and line it is about: `work` is what the worker can change in the project's files and the card needs; `card` is what only the card's own text or the person's decision settles (its acceptance, its files, a choice between designs); `environment` is what the machine lacks and the worker cannot make (another toolchain, a fixture another tool builds, a CI run, a service); `nit` is a matter of taste the card does not need (a name, a wording, a \"consider\"), which never sends the card back. At most five `work` points: name the five worst. Where your last verdict is given, a point of it that still stands keeps its number and its words, a point the change settled is dropped, and a new point takes the next number. After `accepted`, nothing or one line of why. No other text.";
 
 /// How much of the diff the reviewer reads: a card's files, not a reformat of the tree.
 const REVIEW_DIFF: usize = 60_000;
@@ -1239,7 +1239,7 @@ pub enum Verdict {
 pub fn verdict_of(answer: &str) -> Verdict {
     let mut lines = answer.lines().map(str::trim).filter(|line| !line.is_empty());
     let Some(first) = lines.next() else {
-        return Verdict::NeedsRevision(vec!["the reviewer answered nothing".to_owned()]);
+        return Verdict::NeedsRevision(vec![NO_ANSWER_POINT.to_owned()]);
     };
     let word_of = |line: &str| line.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase().replace(' ', "_");
     let word = word_of(first);
@@ -1268,7 +1268,92 @@ pub fn verdict_of(answer: &str) -> Verdict {
     if points.is_empty() && !rest.is_empty() {
         return Verdict::Accepted;
     }
-    Verdict::NeedsRevision(if points.is_empty() { vec!["the reviewer gave no points".to_owned()] } else { points })
+    Verdict::NeedsRevision(if points.is_empty() { vec![NO_POINTS_POINT.to_owned()] } else { points })
+}
+
+/// The point of an empty answer, which [`verdict_of`] writes, not the reviewer.
+const NO_ANSWER_POINT: &str = "the reviewer answered nothing";
+
+/// The point of a `needs_revision` with nothing after it, which [`verdict_of`] writes.
+const NO_POINTS_POINT: &str = "the reviewer gave no points";
+
+/// The most work points one send-back carries: past them the reviewer is asked for its worst,
+/// and the rest are dropped.
+const WORK_POINTS: usize = 5;
+
+/// The prefix of a notes line that keeps a nit of the reviewer's: read, never rerun.
+const NIT_POINT: &str = "nit: ";
+
+/// Whether a point cites a place: a word of it is a path, `src/a.rs:12` or `hello.txt`. A point
+/// with no place could not be found, and "consider renaming" rode reruns beside real points.
+#[must_use]
+pub fn cites_a_place(point: &str) -> bool {
+    let what = tagged(point).map_or(point, |(_, _, what)| what);
+    what.split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | '(' | ')' | ';')).any(is_path)
+}
+
+/// Whether a word is a file's path, with a line after it or not: a stem and a short extension
+/// with a letter in it, which `1.5` and `...` are not.
+fn is_path(word: &str) -> bool {
+    let word = word.trim_end_matches(['.', ':']);
+    let file = word.split_once(':').map_or(word, |(file, _)| file);
+    let Some((stem, ext)) = file.rsplit_once('.') else {
+        return false;
+    };
+    stem.chars().any(char::is_alphanumeric)
+        && (1..=5).contains(&ext.len())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        && ext.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Whether a point is one [`verdict_of`] wrote for want of the reviewer's, which no place settles.
+fn is_stand_in(point: &str) -> bool {
+    let point = tagged(point).map_or(point, |(_, _, what)| what);
+    point == NO_ANSWER_POINT || point == NO_POINTS_POINT
+}
+
+/// Whether a point is the worker's to settle: tagged `work`, or not tagged at all.
+fn is_work(point: &str) -> bool {
+    matches!(point_kind(point), None | Some(PointKind::Work))
+}
+
+/// Whether a send-back is asked once more before it stands: a point of the reviewer's cites no
+/// place, or more than [`WORK_POINTS`] are work.
+#[must_use]
+pub fn wants_another_ask(points: &[String]) -> bool {
+    points.iter().any(|point| !is_stand_in(point) && !cites_a_place(point))
+        || points.iter().filter(|point| is_work(point)).count() > WORK_POINTS
+}
+
+/// The verdict once its points were asked for again: a point that still cites no place is
+/// dropped, and so are the work points past the first [`WORK_POINTS`]. Nothing left is an
+/// acceptance.
+#[must_use]
+pub fn placed(verdict: Verdict) -> Verdict {
+    let Verdict::NeedsRevision(points) = verdict else {
+        return verdict;
+    };
+    let mut work = 0;
+    let kept: Vec<String> = points
+        .into_iter()
+        .filter(|point| is_stand_in(point) || cites_a_place(point))
+        .filter(|point| {
+            work += usize::from(is_work(point));
+            !is_work(point) || work <= WORK_POINTS
+        })
+        .collect();
+    if kept.is_empty() { Verdict::Accepted } else { Verdict::NeedsRevision(kept) }
+}
+
+/// A verdict without its nits, and the nits, which go on the notes: a list of nits alone is an
+/// acceptance, since a nit never sends a card back.
+#[must_use]
+pub fn without_nits(verdict: Verdict) -> (Verdict, Vec<String>) {
+    let Verdict::NeedsRevision(points) = verdict else {
+        return (verdict, Vec::new());
+    };
+    let (nits, rest): (Vec<String>, Vec<String>) = points.into_iter().partition(|point| point_kind(point) == Some(PointKind::Nit));
+    if rest.is_empty() { (Verdict::Accepted, nits) } else { (Verdict::NeedsRevision(rest), nits) }
 }
 
 /// Who can settle a point of the reviewer's: the tag it carries, `N. [kind] file: what`.
@@ -1280,6 +1365,8 @@ pub enum PointKind {
     Card,
     /// The machine lacks it (a toolchain, a fixture, a CI run): no rerun makes it.
     Environment,
+    /// A matter of taste the card does not need: it rides the notes and never sends the card back.
+    Nit,
 }
 
 impl PointKind {
@@ -1290,6 +1377,7 @@ impl PointKind {
             Self::Work => "work",
             Self::Card => "card",
             Self::Environment => "environment",
+            Self::Nit => "nit",
         }
     }
 }
@@ -1461,6 +1549,7 @@ fn tagged(point: &str) -> Option<(Option<u32>, PointKind, &str)> {
         "work" => PointKind::Work,
         "card" => PointKind::Card,
         "environment" | "env" => PointKind::Environment,
+        "nit" => PointKind::Nit,
         _ => return None,
     };
     Some((number, kind, what.trim()))
@@ -1938,6 +2027,34 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
             return Ok((vec![line], None));
         }
     }
+    // a point with no place, or a list past five work points, is asked for once more; what still
+    // has no place then is dropped. An ask that fails leaves the verdict as it came
+    if let Verdict::NeedsRevision(points) = &verdict
+        && wants_another_ask(points)
+    {
+        let listed: Vec<String> = points.iter().map(|point| format!("- {point}")).collect();
+        let again = CompletionRequest {
+            messages: vec![
+                Message::system(REVIEW_INSTRUCTION),
+                Message::user(format!(
+                    "{brief}\n\n## Your verdict on this card\n{}\n\nSome of its points cite no `path:line`, or more than {WORK_POINTS} are work. Give the verdict again in the form: `accepted` or `needs_revision` on the first line, then every point as `N. [work|card|environment|nit] path:line: what`, at most {WORK_POINTS} work points, your worst. A point that cites no place is dropped.",
+                    listed.join("\n")
+                )),
+            ],
+            ..ask(1)
+        };
+        match provider.complete(again).await {
+            Ok(second) => {
+                worker.record_as(&model, Some("reviewer"), Some(id), &second.usage, second.turns).await;
+                let asked = verdict_of(&second.text);
+                // an answer off the form keeps the first list, with its points that still have no place
+                verdict = placed(if asked == Verdict::Malformed { verdict } else { asked });
+            }
+            Err(error) => tracing::warn!("#{id} the ask for the points' places failed, the verdict stands as given: {error}"),
+        }
+    }
+    let (verdict, nits) = without_nits(verdict);
+    let nits: Vec<String> = nits.iter().map(|nit| format!("{NIT_POINT}{nit}")).collect();
     let (verdict, mut left) = split_points(store, &node, verdict).await;
     let (verdict, filed) = split_by_point(store, &node, &root, verdict).await;
     let split = !filed.is_empty() && matches!(&verdict, Verdict::NeedsRevision(rest) if rest.is_empty());
@@ -2002,11 +2119,20 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     // the verdict leads the notes when it is the next reader's task: a rejection's points for
     // the next run, or an acceptance the person asked for. An acceptance after a run leaves the
     // notes to the worker's report; the handoff carries it
-    if state != TaskState::Implemented {
-        let notes = match node.notes.as_deref().map(str::trim) {
-            Some(report) if !report.is_empty() => format!("{head}\n\n{report}"),
-            _ => head,
-        };
+    let report = node.notes.as_deref().map(str::trim).filter(|report| !report.is_empty());
+    let mut notes = if state == TaskState::Implemented {
+        report.map(str::to_owned)
+    } else {
+        Some(report.map_or_else(|| head.clone(), |report| format!("{head}\n\n{report}")))
+    };
+    // the nits are kept for the person to read, past the report, where no rerun takes them up
+    if !nits.is_empty() {
+        let kept = nits.join("\n");
+        notes = Some(notes.map_or(kept.clone(), |notes| format!("{notes}\n\n{kept}")));
+    }
+    if let Some(notes) = notes
+        && (state != TaskState::Implemented || !nits.is_empty())
+    {
         store.set_notes(id, &notes).await?;
     }
     store.set_state_by(id, state, Source::Run).await?;
@@ -2023,7 +2149,7 @@ async fn judge(store: &Store, id: i64, worker: &Worker, accepted: TaskState) -> 
     if let Verdict::NeedsRevision(points) = &verdict {
         lines.extend(points.iter().map(|point| format!("  - {point}")));
     }
-    lines.extend(left.iter().map(|line| format!("  {line}")));
+    lines.extend(left.iter().chain(&nits).map(|line| format!("  {line}")));
     Ok((lines, trivial))
 }
 

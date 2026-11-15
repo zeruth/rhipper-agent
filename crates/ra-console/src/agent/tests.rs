@@ -1337,3 +1337,50 @@ fn review_asked_test_runs_before_change_still_refuses_without_the_ask() {
     let command = "rc hold -- cargo test -p ra-console -q";
     assert!(build_allowance(dir.path(), "s1", command).is_err());
 }
+
+#[tokio::test]
+async fn points_must_cite_a_place_are_asked_for_it_once_and_no_more_than_five_work_points_stand() {
+    assert!(cites_a_place("1. [work] src/a.rs:12: the empty case is untested"));
+    assert!(cites_a_place("hello.txt: the greeting lacks a newline"));
+    assert!(!cites_a_place("1. [work] consider renaming the helper"));
+    assert!(!cites_a_place("version 1.5 is wrong..."));
+    let points = |list: &[&str]| list.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+    assert!(wants_another_ask(&points(&["[work] consider renaming", "[work] src/a.rs:3: x"])));
+    assert!(!wants_another_ask(&points(&["[work] src/a.rs:3: x", "the reviewer gave no points"])));
+    let seven: Vec<String> = (1..=7).map(|n| format!("{n}. [work] src/a.rs:{n}: point {n}")).collect();
+    assert!(wants_another_ask(&seven));
+    let Verdict::NeedsRevision(kept) = placed(Verdict::NeedsRevision(seven.clone())) else { panic!("seven points still reject") };
+    assert_eq!(kept, seven[..5]);
+    assert_eq!(placed(Verdict::NeedsRevision(points(&["[work] consider renaming"]))), Verdict::Accepted);
+
+    // the point with no place is asked for once; still without one, it is dropped
+    let vague = "needs_revision\n- 1. [work] consider renaming the probe\n- 2. [work] src/lib.rs:3: no test covers the empty case";
+    let again = "needs_revision\n- 1. [work] the naming of the probe\n- 2. [work] src/lib.rs:3: no test covers the empty case";
+    let (_, node, _, model) = crate::commands::tests::judged_run(vec!["done", vague, again]).await;
+    let seen = model.seen.lock();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[2].messages[1].content.contains("cite no `path:line`"), "{}", seen[2].messages[1].content);
+    assert_eq!(node.state, TaskState::NeedsRevision);
+    let notes = node.notes.as_deref().unwrap_or_default();
+    assert!(notes.contains("2. [work] src/lib.rs:3: no test covers the empty case"), "{notes}");
+    assert!(!notes.contains("naming") && !notes.contains("renaming"), "{notes}");
+}
+
+#[tokio::test]
+async fn nits_never_reject_and_a_list_of_only_nits_is_an_acceptance_with_the_nits_in_the_notes() {
+    let nit = "1. [nit] src/lib.rs:2: consider renaming `probe`";
+    assert_eq!(point_kind(nit), Some(PointKind::Nit));
+    let work = "2. [work] src/lib.rs:4: no test covers the empty case";
+    let (verdict, nits) = without_nits(Verdict::NeedsRevision(vec![nit.to_owned(), work.to_owned()]));
+    assert_eq!(verdict, Verdict::NeedsRevision(vec![work.to_owned()]));
+    assert_eq!(nits, vec![nit.to_owned()]);
+    assert_eq!(without_nits(Verdict::NeedsRevision(vec![nit.to_owned()])), (Verdict::Accepted, vec![nit.to_owned()]));
+    assert_eq!(crate::commands::review::classify(&[nit.to_owned()]), crate::commands::review::Weight::Trivial);
+
+    let (out, node, handoff, model) = crate::commands::tests::judged_run(vec!["done", &format!("needs_revision\n- {nit}")]).await;
+    assert_eq!(model.seen.lock().len(), 2, "a nit with its place is not asked for again");
+    assert_eq!(node.state, TaskState::Implemented, "{out:?}");
+    assert!(handoff.verdict.as_deref().is_some_and(|verdict| verdict.starts_with("accepted by")), "{handoff:?}");
+    assert_eq!(node.notes.as_deref(), Some(format!("done\n\n{NIT_POINT}{nit}").as_str()));
+    assert!(out.iter().any(|line| line.contains(&format!("{NIT_POINT}{nit}"))), "{out:?}");
+}

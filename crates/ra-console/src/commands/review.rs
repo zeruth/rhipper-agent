@@ -70,6 +70,10 @@ pub fn classify(points: &[String]) -> Weight {
 }
 
 fn weight_of(point: &str) -> Weight {
+    // a nit is the reviewer's own word that the card does not need it
+    if crate::agent::point_kind(point) == Some(crate::agent::PointKind::Nit) {
+        return Weight::Trivial;
+    }
     let text = point.to_ascii_lowercase();
     let names = |words: &[&str]| words.iter().any(|word| text.contains(word));
     if names(&SUBSTANTIVE) || !names(&TRIVIAL) { Weight::Substantive } else { Weight::Trivial }
