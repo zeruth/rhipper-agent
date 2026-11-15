@@ -5972,6 +5972,8 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // set back by [`MTIME_SLACK`]: a file's time comes off a coarser clock than `now`, and a
     // write in the run's first tick read as older than the run
     let run_started = crate::clock::now() - MTIME_SLACK;
+    // the worker's own runs of the check, `rc check <id> --mid`, are counted a run
+    reset_mid_checks(&acting, id);
     // the gotchas the run hits, for the journal and the summary
     let mut gotcha_hits: Vec<ra_gotchas::Hit> = Vec::new();
     // a run of a card resumes the session of the last one (the person: be generous with
@@ -6179,6 +6181,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     // still open, so the next run reads them as facts
     let tree = crate::review::tree_of(&acting, &base, worker.branch.as_deref(), since).await;
     let acceptance = named_checks(node.acceptance.as_deref());
+    // the worker's mid-run checks are facts of the run, as the tree's lines are
+    let mut mid_checks: String = mid_check_lines(&acting, id).join("\n");
+    if !mid_checks.is_empty() {
+        mid_checks.push('\n');
+    }
     // the handoff of this run, for the next one of the card; the done cards' files go
     let handoff = |outcome: &str, check: &str, report: &str, changed: Vec<String>, open: &[String]| ra_context::Handoff {
         when: unix_now(),
@@ -6191,15 +6198,17 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         // see where the tree is and why this model
         // the route rides in the head with the tree's lines, never ahead of the worker's report:
         // what reads a report reads how it opens (the context cap's words, the rerun's quote)
-        report: format!(
-            "{}{}{}",
-            match tree.head(open) {
-                head if head.is_empty() => head,
-                head => format!("{head}route: {} · {}\n", worker.route().name(), worker.model),
-            },
-            if lint_pass { format!("{LINT_PASS_FRESH}.\n") } else { String::new() },
-            worker.step.as_ref().map_or_else(|| report.to_owned(), |step| format!("Route: {step}.\n{report}"))
-        ),
+        // the worker's mid-run checks ride there too, or close the report when there is no head
+        report: {
+            let head = tree.head(open);
+            let tail = if head.is_empty() && !mid_checks.is_empty() { format!("\n{}", mid_checks.trim_end()) } else { String::new() };
+            format!(
+                "{}{}{}{tail}",
+                if head.is_empty() { head } else { format!("{head}{mid_checks}route: {} · {}\n", worker.route().name(), worker.model) },
+                if lint_pass { format!("{LINT_PASS_FRESH}.\n") } else { String::new() },
+                worker.step.as_ref().map_or_else(|| report.to_owned(), |step| format!("Route: {step}.\n{report}"))
+            )
+        },
         warnings: Vec::new(),
         read: Vec::new(),
         failures: Vec::new(),
@@ -7909,6 +7918,109 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
         }
     }
     runs
+}
+
+/// The runs of its card's own check a worker may ask for in one run, `rc check <id> --mid`: in
+/// a project whose builds are refused a hard card was written blind, and each attempt was a
+/// whole run judged by a check the worker never saw (asm #233, #265 and #269 of 2026-11-14/15,
+/// three or four runs each, about 7 dollars a card).
+pub const MID_CHECKS_A_RUN: usize = 2;
+
+/// The file the mid-run checks of the current run of `card` in `tree` are noted in, one line
+/// each: `var/mid-checks/<card>` of the tree, beside its build count.
+fn mid_checks_file(tree: &Path, card: i64) -> PathBuf {
+    tree.join("var").join("mid-checks").join(card.to_string())
+}
+
+/// The lines of the mid-run checks the current run of `card` in `tree` has run, in order, for
+/// its handoff.
+#[must_use]
+pub fn mid_check_lines(tree: &Path, card: i64) -> Vec<String> {
+    let text = std::fs::read_to_string(mid_checks_file(tree, card)).unwrap_or_default();
+    text.lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned).collect()
+}
+
+/// Gives the run of `card` in `tree` its [`MID_CHECKS_A_RUN`] afresh, at the run's start.
+pub fn reset_mid_checks(tree: &Path, card: i64) {
+    let _ = std::fs::remove_file(mid_checks_file(tree, card));
+}
+
+/// What a mid-run check came to: whether every command passed, and what the worker is shown.
+#[derive(Debug, Clone)]
+pub struct MidCheck {
+    pub passed: bool,
+    /// One `passed`/`failed` line a command up to the first failure, then that failure's first
+    /// failed test and its tail, as the notes clip a failed check.
+    pub text: String,
+}
+
+/// Runs the checks of `node` in `tree` for its worker, mid-run: the commands the orchestrator's
+/// check runs at the end, under the project's check timeout, on one of the project's build
+/// slots and in the tree's own cargo target. The use is noted in the tree, for the run's
+/// handoff, and on the project's activity log; the orchestrator's own check is unchanged.
+///
+/// # Errors
+/// When the run has spent its [`MID_CHECKS_A_RUN`], or the tree cannot be noted in.
+pub async fn mid_run_check(tree: &Path, node: &Node) -> anyhow::Result<MidCheck> {
+    let id = node.id;
+    let spent = mid_check_lines(tree, id).len();
+    if spent >= MID_CHECKS_A_RUN {
+        anyhow::bail!(
+            "this run has spent its {MID_CHECKS_A_RUN} mid-run checks of #{id}: report the change as it stands; the orchestrator's check runs after the report, and a failure comes back as a rerun with its output"
+        );
+    }
+    // the tree's path as given, not canonical: a verbatim `\\?\` root takes no `var/…` join
+    let (root, _) = ra_providers::claude_code::project_of(tree);
+    let Checks { commands, timeout, .. } = checks_of(&root, node);
+    let own_target = ra_providers::claude_code::shared_target(tree);
+    let scratch = ra_providers::claude_code::scratch_env(tree).into_iter().map(|(key, dir)| (key, dir.display().to_string()));
+    let target_env = own_target.iter().map(|t| ("CARGO_TARGET_DIR".to_owned(), t.display().to_string()));
+    let toolbox = ra_tools::Toolbox::new(tree).map(|toolbox| toolbox.with_timeout(timeout).with_env(scratch.chain(target_env)));
+    // spent when it starts: a check the worker's shell gave up on still held a slot
+    let file = mid_checks_file(tree, id);
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let started = format!("mid-run check {} of {MID_CHECKS_A_RUN}: {}", spent + 1, commands.join(" · then "));
+    let mut lines = mid_check_lines(tree, id);
+    lines.push(format!("{started} · running"));
+    std::fs::write(&file, format!("{}\n", lines.join("\n")))?;
+    let _slot = hold_build(&root, tree).await;
+    let target = own_target.unwrap_or_else(|| crate::hub::cargo_target(&root));
+    let cargo = commands.iter().any(|c| c.trim_start().starts_with("cargo"));
+    let waited = if cargo { guard_target(&root, tree, &target, timeout).await } else { Ok(None) };
+    let (passed, text) = match waited {
+        Ok(_guard) => {
+            let runs = run_checks(&toolbox, &commands, &[]).await;
+            let passed = runs.iter().all(|run| run.passed);
+            let mut text: Vec<String> =
+                runs.iter().map(|run| format!("{} {}", if run.passed { "passed" } else { "failed" }, run.command)).collect();
+            if let Some(failed) = runs.iter().find(|run| !run.passed) {
+                text.extend([String::new(), failed.text.clone()]);
+            }
+            (passed, text.join("\n"))
+        }
+        Err(text) => (false, format!("failed {}\n\n{text}", commands.join(" · then "))),
+    };
+    let verdict = if passed { "passed" } else { "failed" };
+    lines.pop();
+    lines.push(format!("{started} · {verdict}"));
+    std::fs::write(&file, format!("{}\n", lines.join("\n")))?;
+    note_activity(&root, &crate::logs::tag_card(id, &format!("  {started} · {verdict}")));
+    Ok(MidCheck { passed, text })
+}
+
+/// Appends `line` to the activity log of the project at `root`, which a running window tails.
+fn note_activity(root: &Path, line: &str) {
+    use std::io::Write as _;
+    let file = root.join(crate::ui::ACTIVITY_FILE);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let written = std::fs::OpenOptions::new().create(true).append(true).open(&file).and_then(|mut out| writeln!(out, "{line}"));
+    if let Err(e) = written {
+        tracing::warn!("the activity line was not written: {e}");
+    }
 }
 
 /// The failures the project's own tree gives for `command`: the base a card's worktree started

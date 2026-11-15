@@ -296,6 +296,9 @@ fn judge_part(
     if words.iter().any(|w| away(w) || !known(w, shell, assigned)) {
         return Shape::Unknown;
     }
+    if mid_check(name, rest) {
+        return Shape::Allowed;
+    }
     // the program is the card's own build output
     if in_target(first) && !part.call {
         return Shape::Allowed;
@@ -322,6 +325,21 @@ fn judge_move(args: &[&str], shell: Shell, workspace: &Path, assigned: &[String]
         return Shape::Unknown;
     }
     Shape::Allowed
+}
+
+/// Whether `name` with `rest` is a mid-run check of a card, `rc check <id> --mid`: the run of
+/// its card's own check a worker may ask for, which `rc` caps a run and puts on a build slot,
+/// so it passes where the builds are refused. A bare `rc check <id>` runs uncapped and stays
+/// the harness's to judge.
+fn mid_check(name: &str, rest: &[&str]) -> bool {
+    name.eq_ignore_ascii_case("rc") && matches!(rest, ["check", id, "--mid"] | ["check", "--mid", id] if id.parse::<i64>().is_ok())
+}
+
+/// Whether `command` is a mid-run check of a card, as [`mid_check`] judges it.
+#[must_use]
+pub fn is_mid_check(command: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words.split_first().is_some_and(|(&first, rest)| mid_check(program(first), rest))
 }
 
 /// The form to use instead of a refused program, when `name` with `rest` is one.
@@ -647,6 +665,7 @@ pub fn block_with(rg: bool, builds_refused: bool) -> String {
     }
     if builds_refused {
         lines.insert(3, "- this project's builds are refused: `cargo fmt`/`rustfmt` are the only cargo commands that run, and the check does the building".to_owned());
+        lines.insert(4, "- `rc check <id> --mid` runs your card's own check once on a build slot and prints its first failure and tail, at most twice a run: once the change is written, start it in the background and wait on its notification".to_owned());
     }
     if !rg {
         lines.insert(3, "- `rg` is not on this shell's PATH: search with the Grep tool or `grep`".to_owned());

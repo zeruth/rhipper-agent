@@ -101,6 +101,9 @@ enum Command {
     Check {
         /// The card whose checks run in the current directory.
         card: Option<i64>,
+        /// A worker's run of its card's check mid-run: on a build slot, under the project's check timeout, in the tree's own target, at most twice a run; prints the first failure and the tail.
+        #[arg(long, requires = "card")]
+        mid: bool,
     },
     /// Lists the gambits: the standing directions that order the walk, each with its weight, its state and its focus.
     Gambits,
@@ -537,11 +540,13 @@ async fn run_main() -> anyhow::Result<()> {
             plain_tracing()?;
             next(why).await
         }
-        Command::Check { card: None } => {
+        Command::Check { card: None, .. } => {
             plain_tracing()?;
             check().await
         }
-        Command::Check { card: Some(card) } => {
+        // no tracing: the check's progress lines would land untagged in the tree's activity file
+        Command::Check { card: Some(card), mid: true } => mid_check(card).await,
+        Command::Check { card: Some(card), mid: false } => {
             plain_tracing()?;
             check_card(card).await
         }
@@ -1927,6 +1932,20 @@ async fn check_card(card: i64) -> anyhow::Result<()> {
     std::fs::write(&log, kept)?;
     println!("{}", log.display());
     if !passed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Runs the checks of a card for its worker mid-run, from the card's tree, and prints what
+/// they came to; exits 1 when one failed. A run past its mid-run checks is refused.
+async fn mid_check(card: i64) -> anyhow::Result<()> {
+    let store = open_store().await?;
+    let node = store.read(card).await?;
+    let here = std::env::current_dir()?;
+    let done = ra_console::agent::mid_run_check(&here, &node).await?;
+    println!("{}", done.text);
+    if !done.passed {
         std::process::exit(1);
     }
     Ok(())
