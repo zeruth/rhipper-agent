@@ -1832,6 +1832,8 @@ async fn rerun_stale_check(store: &Store, id: i64, worker: &Worker) -> Option<St
                 command: cargo.unwrap_or_default(),
                 passed: false,
                 exit: "not run".to_owned(),
+                // the guard's refusal is the whole of it: no command ran
+                full: text.clone(),
                 text,
                 failed_tests: 0,
                 failures: Vec::new(),
@@ -7565,6 +7567,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 passed: false,
                 exit: text.clone(),
                 first_error: text.clone(),
+                full: String::new(),
                 text,
                 failed_tests: 0,
                 failures: Vec::new(),
@@ -7574,6 +7577,9 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
             (None, vec![run])
         }
     };
+    if let Some(failed) = checks.iter_mut().find(|run| !run.passed) {
+        keep_full_output(&root, id, failed);
+    }
     // a failure the base gives too is not the card's: in a card's worktree the failed tests run
     // alone on the project's base commit, and the failures the two share are marked, so a rerun
     // does not spend its turns on what it did not break. When every one fails there, main is
@@ -9001,6 +9007,9 @@ struct CheckRun {
     /// The output as the notes keep it: the failures and the tail of a failed command, the
     /// short tail of a passed one.
     text: String,
+    /// The whole stdout and stderr of a failed command, uncut; kept in a file by
+    /// [`keep_full_output`]. Empty for a passed command.
+    full: String,
     failed_tests: usize,
     /// The failures of a failed command, read from its whole output by
     /// [`ra_context::failures_of`]; the next run reads them where the tail would have cut them.
@@ -9153,6 +9162,27 @@ fn held_reason(report: &str, changed: &[String], failed: Option<&CheckRun>, prin
         .then(|| format!("the check failed as the last run's did: {}: {}", failed.command, failed.first_error))
 }
 
+/// Keeps a failed check's whole output in `var/runs/<card>/check-<n>.log` under `root`, and names
+/// the file under the tail in `run.text`, which the notes and the handoff carry: the tail cuts,
+/// the file does not. A file that cannot be written leaves the tail alone.
+fn keep_full_output(root: &Path, card: i64, run: &mut CheckRun) {
+    if run.full.is_empty() {
+        return;
+    }
+    let dir = root.join("var/runs").join(card.to_string());
+    let next = std::fs::read_dir(&dir).map_or(0, |entries| {
+        entries
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter_map(|name| name.strip_prefix("check-")?.strip_suffix(".log")?.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+    }) + 1;
+    let path = dir.join(format!("check-{next}.log"));
+    if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&path, format!("$ {}\n{}\n", run.command, run.full)).is_ok() {
+        run.text = format!("{}\nfull output: {}", run.text.trim_end(), path.display());
+    }
+}
+
 /// How many lines of a passed command's output the notes keep.
 const PASSED_TAIL_LINES: usize = 5;
 
@@ -9239,6 +9269,7 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                 passed: true,
                 exit: output.lines().last().unwrap_or_default().to_owned(),
                 text: passed_text(&output, kept),
+                full: String::new(),
                 failed_tests: 0,
                 failures: Vec::new(),
                 tests: Vec::new(),
@@ -9253,6 +9284,7 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                     passed: false,
                     exit: output.lines().last().unwrap_or_default().to_owned(),
                     text: failure.text,
+                    full: output.clone(),
                     failed_tests: failure.failed,
                     failures: ra_context::failures_of(&output),
                     tests: failed_test_names(&output, gradle),
@@ -9268,6 +9300,7 @@ async fn run_checks(toolbox: &anyhow::Result<ra_tools::Toolbox>, commands: &[Str
                     exit: text.clone(),
                     first_error: first_error(&text),
                     setup: is_setup_failure(&text),
+                    full: text.clone(),
                     text,
                     failed_tests: 0,
                     failures: Vec::new(),
