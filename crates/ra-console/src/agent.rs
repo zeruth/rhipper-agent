@@ -5025,6 +5025,27 @@ pub fn sweep_temp(names: &[String], age: std::time::Duration) -> (usize, u64) {
     (count, bytes)
 }
 
+/// Removes the `wt-<id>` targets of the project whose card has no worktree: what landings left
+/// behind before the cleanup asked the provider where a worktree builds. A line with the count
+/// and the bytes freed; nothing when none was there.
+fn sweep_orphan_targets(root: &Path) -> Option<String> {
+    let target = ra_providers::claude_code::project_target(root);
+    let (mut count, mut bytes) = (0usize, 0u64);
+    for entry in std::fs::read_dir(&target).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_prefix("wt-") else { continue };
+        if root.join(WORKTREES_DIR).join(id).exists() || !entry.path().is_dir() {
+            continue;
+        }
+        let size = dir_size(&entry.path());
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            count += 1;
+            bytes += size;
+        }
+    }
+    (count > 0).then(|| format!("targets: {count} of cards with no worktree removed, {:.1} GB", bytes as f64 / 1e9))
+}
+
 /// The bytes under a path, a file's own or a directory's whole.
 fn dir_size(path: &Path) -> u64 {
     match std::fs::metadata(path) {
@@ -5232,6 +5253,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     let mut lines = Vec::new();
     // the cards a killed walk left in progress go back on the queue before this one reads it
     lines.extend(requeue_orphans(store, &root).await);
+    lines.extend(sweep_orphan_targets(&root));
     // the planned cards done a day ago are read back first: the day since them against the
     // day before, so the plan's claims are judged before the walk spends the next day
     lines.extend(crate::commands::plan::read_back(store, &root, worker).await);

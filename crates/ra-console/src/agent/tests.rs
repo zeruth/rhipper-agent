@@ -1218,6 +1218,40 @@ fn a_carried_directory_is_linked_into_the_worktree_and_a_carried_file_copied() {
     assert!(!worktree.join("absent").exists());
 }
 
+#[tokio::test]
+async fn target_of_the_worktree_is_the_providers_on_the_scratch_drive_and_orphans_are_swept() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("proj");
+    let guard = crate::secret::ENV_LOCK.lock();
+    let before = std::env::var_os("RHIPPER_SCRATCH");
+    // SAFETY: the test holds the env lock; no parallel test reads the variable
+    unsafe { std::env::set_var("RHIPPER_SCRATCH", scratch.path()) };
+    let targets: Vec<PathBuf> =
+        (1..=3).map(|id| ra_providers::claude_code::shared_target(&root.join(WORKTREES_DIR).join(id.to_string())).unwrap()).collect();
+    let own = |id: usize| targets[id - 1].clone();
+    for id in 1..=3 {
+        std::fs::create_dir_all(own(id)).unwrap();
+        std::fs::write(own(id).join("blob"), "x").unwrap();
+    }
+    // card 3 still has its worktree
+    std::fs::create_dir_all(root.join(WORKTREES_DIR).join("3")).unwrap();
+    let swept = sweep_orphan_targets(&root);
+    let landed = clean_after(&root, 3, false).await;
+    // SAFETY: still under the env lock
+    unsafe {
+        match before {
+            Some(value) => std::env::set_var("RHIPPER_SCRATCH", value),
+            None => std::env::remove_var("RHIPPER_SCRATCH"),
+        }
+    }
+    drop(guard);
+    assert!(own(1).starts_with(scratch.path()));
+    assert!(!own(1).exists() && !own(2).exists(), "the targets of cards with no worktree are gone");
+    assert!(swept.is_some_and(|line| line.contains("2 of cards")));
+    assert!(!own(3).exists(), "the landing removed the scratch target: {landed:?}");
+}
+
 #[test]
 fn a_project_ahead_keeps_no_more_seats_than_its_runners_can_use() {
     // six runners and thirty ready cards keep six seats, not thirty

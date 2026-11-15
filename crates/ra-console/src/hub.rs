@@ -1032,15 +1032,17 @@ fn worktree_card(root: &Path) -> Option<String> {
         .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
 }
 
-/// The cargo target a build in `root` writes: a worktree's is the project's, else the target of the cargo workspace `root` is in; `None` where no
-/// `Cargo.toml` is, since a gradle build has none.
+/// The cargo target a build in `root` writes: a worktree's is the provider's own for it
+/// (`wt-<id>` under the project's target, on the scratch drive when there is one), else the
+/// target of the cargo workspace `root` is in; `None` where no `Cargo.toml` is, since a gradle
+/// build has none.
 #[must_use]
 pub fn build_target(root: &Path) -> Option<PathBuf> {
     if !root.join("Cargo.toml").exists() {
         return None;
     }
     Some(match worktree_card(root) {
-        Some(_) => cargo_target(&project_root_of(root)),
+        Some(_) => ra_providers::claude_code::shared_target(root).unwrap_or_else(|| cargo_target(&project_root_of(root))),
         None => cargo_target(root),
     })
 }
