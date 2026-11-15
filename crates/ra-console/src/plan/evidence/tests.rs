@@ -181,8 +181,8 @@ async fn the_ledger_lines_name_the_card_its_cost_and_its_average_a_turn() {
     assert_eq!(
         lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
         [
-            "[usage.db #12] card #12 cost $0.50 in the last day over 2 runs and 10 turn(s), 500 tokens a turn on average; runs: r1 8t 500 unfinished, r2 2t 500 unfinished",
-            "[usage.db #13] card #13 cost an unreported amount in the last day over 1 run and 1 turn(s), 300 tokens a turn on average; runs: r1 1t 300 unfinished",
+            "[usage.db #12] card #12 cost $0.50 in the last day over 2 runs and 10 turn(s), 500 tokens a turn on average; runs: r1 8t 500 unfinished (no report), r2 2t 500 unfinished (no report)",
+            "[usage.db #13] card #13 cost an unreported amount in the last day over 1 run and 1 turn(s), 300 tokens a turn on average; runs: r1 1t 300 unfinished (no report)",
         ]
     );
 }

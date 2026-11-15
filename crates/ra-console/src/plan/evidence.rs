@@ -66,14 +66,27 @@ pub fn ledger_line_by_run(card: &CardCost, calls: &[Call], handoffs: &[Handoff])
         .enumerate()
         .map(|(i, call)| {
             let tokens = (call.prompt_tokens + call.completion_tokens).checked_div(call.turns).unwrap_or(0);
-            let outcome = handoffs.get(i).map_or("unfinished", |h| h.outcome.split(" (").next().unwrap_or_default());
-            format!("r{} {}t {} {}", i + 1, call.turns, tokens_short(tokens), outcome.replace(' ', "-"))
+            let outcome = handoffs.get(i).map_or_else(|| "unfinished (no report)".to_owned(), run_end);
+            format!("r{} {}t {} {}", i + 1, call.turns, tokens_short(tokens), outcome)
         })
         .collect();
     if !runs.is_empty() {
         line.text = format!("{}; runs: {}", line.text, runs.join(", "));
     }
     line
+}
+
+/// How a run ended as its entry shows it. A run that continues or failed carries the reason its
+/// check line recorded (`continues (the-turn-cap-ended-the-run)`), so a capped run reads apart
+/// from a broken one; without a recorded reason it says `no reason recorded`.
+fn run_end(handoff: &Handoff) -> String {
+    let outcome = handoff.outcome.split(" (").next().unwrap_or_default().replace(' ', "-");
+    if handoff.outcome != ra_context::CONTINUES && handoff.outcome != "failed" {
+        return outcome;
+    }
+    let reason =
+        handoff.check.trim().strip_prefix("no check:").map(str::trim).filter(|why| !why.is_empty()).unwrap_or("no reason recorded");
+    format!("{outcome} ({})", reason.replace(' ', "-"))
 }
 
 /// A token count as the run entries show it: whole under a thousand, else in thousands.
