@@ -642,6 +642,9 @@ pub fn block_with(rg: bool, builds_refused: bool) -> String {
         "- a `$( )` or backtick substitution, a `( )` or `{ }` block, a heredoc and a `<` redirect are not judged by the hook, and the allowlist usually refuses them".to_owned(),
         "- refused, with what to use instead:".to_owned(),
     ];
+    if !builds_refused {
+        lines.insert(3, "- a `cargo build`, `cargo test` or `cargo clippy` is started with `run_in_background` on its first call and awaited by its task notification: a foreground call dies at the Bash timeout while the build waits for a slot".to_owned());
+    }
     if builds_refused {
         lines.insert(3, "- this project's builds are refused: `cargo fmt`/`rustfmt` are the only cargo commands that run, and the check does the building".to_owned());
     }
