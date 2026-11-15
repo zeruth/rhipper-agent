@@ -11055,6 +11055,7 @@ async fn context_of(store: &Store, node: &Node) -> anyhow::Result<Brief> {
             text.push_str(&format!("  notes of #{}: {notes}\n", dep.id));
         }
     }
+    text.push_str(context_cancel_line::CANCEL_LINE);
     Ok(Brief { text, files: files.to_vec() })
 }
 
@@ -11102,6 +11103,7 @@ pub(crate) fn short(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
+mod context_cancel_line;
 #[cfg(test)]
 mod tests;
 mod turn_cap_warning;
