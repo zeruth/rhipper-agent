@@ -43,12 +43,10 @@ async fn scored(saving: &str, refusals: usize) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_claim_on_refused_commands_is_scored_on_the_refusal_count() {
-    let held = scored("no refused command", 0).await;
-    assert!(held[0].contains("held: 0 refused commands in the run"), "{held:?}");
-    // the run was cheap per turn, which a refusal claim does not read
-    let missed = scored("no refused command", 2).await;
-    assert!(missed[0].contains("missed: 2 refused commands in the run"), "{missed:?}");
+async fn a_claim_on_refused_commands_waits_for_later_runs() {
+    // its own run says nothing of refusals elsewhere
+    let lines = scored("no refused command", 2).await;
+    assert!(lines[0].contains("pending"), "{lines:?}");
 }
 
 #[tokio::test]

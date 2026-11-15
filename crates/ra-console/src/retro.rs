@@ -302,11 +302,15 @@ pub enum Event {
     Wait,
     /// A person's intervention: a refused command or a send-back.
     Intervention,
+    /// The tokens the evidence lines add to a later card's turns: the ledger has no count of
+    /// them apart, so the tokens a turn of the later cards stand for them.
+    EvidenceTokens,
 }
 
 impl Event {
     fn name(self) -> &'static str {
         match self {
+            Self::EvidenceTokens => "evidence-line tokens",
             Self::Intervention => "interventions",
             Self::Refusal => "refused commands",
             Self::Rerun => "reruns",
@@ -328,6 +332,8 @@ pub fn event_of(claim: &str) -> Option<Event> {
         Some(Event::Refusal)
     } else if claim.contains("rerun") || claim.contains("re-run") {
         Some(Event::Rerun)
+    } else if claim.contains("evidence") && claim.contains("token") {
+        Some(Event::EvidenceTokens)
     } else {
         None
     }
@@ -345,6 +351,10 @@ pub fn names_median(claim: &str) -> bool {
 /// journal holds under the card, the runs of the card after its first.
 #[must_use]
 pub fn count_of(event: Event, root: &Path, node: i64, runs: u64) -> u64 {
+    // tokens are not events; the walk compares them over the later cards' turns
+    if event == Event::EvidenceTokens {
+        return 0;
+    }
     if event == Event::Rerun {
         return runs.saturating_sub(1);
     }
@@ -369,6 +379,9 @@ async fn landed_by_event(
     event: Event,
     claim: &str,
 ) -> Vec<String> {
+    if matches!(event, Event::Refusal | Event::Rerun | Event::EvidenceTokens) {
+        return landed_on_later_runs(root, card, ledger, event, claim).await;
+    }
     let Ok(own) = ledger.card_cost(card.id).await else {
         return Vec::new();
     };
@@ -387,6 +400,69 @@ async fn landed_by_event(
             Vec::new()
         }
     }
+}
+
+/// The cards that must have run after a card before a claim about `event` is scored on them.
+pub const LATER_CARDS: usize = 3;
+
+/// The verdict on a claim that the card saves reruns, refusals or evidence-line tokens
+/// elsewhere: its own run says nothing of that, so the line reads `pending` (and is not kept, the
+/// claim stays unread) until [`LATER_CARDS`] cards have run after it; then the events a run of
+/// those had, or their median tokens a turn, are compared to those of the cards before it, held
+/// when fewer.
+async fn landed_on_later_runs(
+    root: &Path,
+    card: &ra_roadmap::model::Node,
+    ledger: &ra_usage::UsageStore,
+    event: Event,
+    claim: &str,
+) -> Vec<String> {
+    let Ok(cards) = ledger.recent_cards(i64::MAX, 200).await else {
+        return Vec::new();
+    };
+    let at = cards.iter().position(|c| c.node == card.id);
+    let (later, before) = match at {
+        Some(at) => (&cards[..at], &cards[at + 1..]),
+        None => (&cards[..0], &cards[..0]),
+    };
+    if later.len() < LATER_CARDS {
+        return vec![format!("{SAVING} #{} pending: {} of {LATER_CARDS} later cards have run; claimed \"{claim}\"", card.id, later.len())];
+    }
+    let before = &before[..before.len().min(MEDIAN_OF as usize)];
+    let text = if event == Event::EvidenceTokens {
+        let (Some(after), Some(prior)) = (median_tokens_per_turn(later.iter()), median_tokens_per_turn(before.iter())) else {
+            return Vec::new();
+        };
+        format!(
+            "{SAVING} #{} {}: {after} tokens/turn over {} later cards vs median {prior} before; claimed \"{claim}\"",
+            card.id,
+            if after < prior { "held" } else { "missed" },
+            later.len()
+        )
+    } else {
+        let (events, runs) = rate_of(event, root, later);
+        let (events_before, runs_before) = rate_of(event, root, before);
+        let held = events == 0 || (runs_before > 0 && events * runs_before < events_before * runs);
+        format!(
+            "{SAVING} #{} {}: {events} {} in {runs} later runs vs {events_before} in {runs_before} before; claimed \"{claim}\"",
+            card.id,
+            if held { "held" } else { "missed" },
+            event.name()
+        )
+    };
+    let note = Note { when: 0, node: Some(card.id), machine: false, pair: false, text: text.clone(), against: None };
+    match record(root, Some(card.id), &[note]) {
+        Ok(()) => vec![text],
+        Err(e) => {
+            tracing::warn!("the saving of #{} was not recorded: {e:#}", card.id);
+            Vec::new()
+        }
+    }
+}
+
+/// The events of `event` over `cards` and the runs they took.
+fn rate_of(event: Event, root: &Path, cards: &[ra_usage::CardCost]) -> (u64, u64) {
+    cards.iter().fold((0, 0), |(events, runs), c| (events + count_of(event, root, c.node, c.totals.runs), runs + c.totals.runs))
 }
 
 /// The saving an objective claims in its own text, as the Phase P/Q cards wrote it: the sentence
