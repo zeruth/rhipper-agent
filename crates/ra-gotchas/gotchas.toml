@@ -66,7 +66,7 @@ remedy = { kind = "hint" }
 id = "shell-outside-allowlist"
 where = "command"
 pattern = '^\s*(cd|Set-Location|Start-Process|powershell(\.exe)?|pwsh|cmd(\.exe)?|sh|bash|pip|npm|node|sed|awk|perl)\b|^\s*git\s+-C\b'
-message = "the shells here run cargo, the read-only git commands and the read-only listing and reading commands, from the workspace directory; read files with Read, change them with Edit (never sed), search with Grep and Glob, start from the files on the card, and pipe a long output through tail"
+message = "the shells here run cargo, the read-only git commands and the read-only listing and reading commands, from the workspace directory; read files with Read, change them with Edit (never sed), search with Grep and Glob, start from the files on the card, and run a test as `cargo test -q -p <crate>` alone, with no pipe"
 remedy = { kind = "hint" }
 
 [[gotcha]]
@@ -193,7 +193,7 @@ remedy = { kind = "hint" }
 id = "long-output"
 where = "command"
 pattern = '^\s*cargo\s+(test|build|clippy|check)\b'
-message = "a cargo test, build or clippy prints more than a turn should carry, and every later turn carries it again; the tail is what matters, so the command runs with `2>&1 | tail -n 80` on its end"
+message = "a cargo test, build or clippy prints more than a turn should carry, and every later turn carries it again; the command runs with its output tailed; run `cargo test -q -p <crate>` alone, with no pipe"
 remedy = { kind = "rewrite", insert = "2>&1 | tail -n 80", append = true, unless = '\|\s*\S|>\s*[^&\s]|\stest\b.*\s--test[\s=]+\S' }
 
 [[gotcha]]
