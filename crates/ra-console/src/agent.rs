@@ -9806,9 +9806,10 @@ fn warnings_note(task: &ra_context::TaskContext) -> String {
 
 /// The build rules every run carries, stated once here: a worker that learns them from a refused
 /// or timed-out command has already spent the turns.
-const BUILD_RULES: &str = "machine:\n\
+pub const BUILD_RULES: &str = "machine:\n\
 - a first `cargo build` or `cargo test` compile runs past the 120 s foreground limit: start it with `run_in_background` on the first call and wait on its task notification\n\
-- a first compile behind other projects can exceed nine minutes; `rc wait <id>` gives up at nine\n\
+- `rc wait` takes only rc's own ids, never a shell background task's; that task's output file is empty or partial until the notification arrives (always empty under `rc hold --shell bash`): make no call between starting the run and its notification\n\
+- a first compile behind other projects can exceed nine minutes, and the notification still arrives\n\
 - write tool outputs under `var/`, never `%TEMP%`";
 
 /// The machine notes of a run: what the gotchas say about the last hits in the journal, for the
