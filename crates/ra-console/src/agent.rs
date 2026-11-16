@@ -7585,7 +7585,7 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
         None => Ok(None),
     };
     // a wait that ran out is the check's failure, named as the output a timed-out check leaves
-    let (_target, mut checks) = match waited {
+    let (target_guard, mut checks) = match waited {
         Ok(guard) => {
             // a test binary the card's earlier runs left running holds the target the check
             // links into: the card's own are stopped, never another card's
@@ -7641,7 +7641,10 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
     } else if workspace_dir.is_some()
         && let Some(failed) = checks.iter_mut().find(|run| !run.passed && !run.failures.is_empty())
     {
-        let base = base_failures(worker, &root, &failed.command, timeout).await;
+        // the check's lock on its target is still held: the base's run in the same target takes
+        // it again only when it is another
+        let held = target_guard.as_ref().map(|_| target.as_path());
+        let base = base_failures(worker, &root, &failed.command, held, timeout).await;
         failed.failures = ra_context::marked_on_base(&failed.failures, &base);
     }
     // a test target the worktree lacks ran no test: the card that lists it is built on a main
@@ -9437,12 +9440,17 @@ fn note_activity(root: &Path, line: &str) {
 }
 
 /// The failures the project's own tree gives for `command`: the base a card's worktree started
-/// from. None when the command passes there or cannot run.
-async fn base_failures(worker: &Worker, root: &Path, command: &str, timeout: std::time::Duration) -> Vec<String> {
+/// from. None when the command passes there or cannot run. `held` is the target whose lock the
+/// card's check holds still: the project's own when no scratch root gives the check another,
+/// and a lock this process holds is not taken twice (on such a machine every failed check of a
+/// project's tree waited out its whole timeout on its own lock: CI's twenty-minute test hangs).
+async fn base_failures(worker: &Worker, root: &Path, command: &str, held: Option<&Path>, timeout: std::time::Duration) -> Vec<String> {
     let Ok(toolbox) = worker.toolbox(root).map(|toolbox| toolbox.with_timeout(timeout)) else { return Vec::new() };
+    let target = crate::hub::cargo_target(root);
+    let own = held.is_some_and(|held| crate::hub::target_lock_name(held) == crate::hub::target_lock_name(&target));
     // a wait on the project's target that ran out leaves the failures unmarked, not the check failed
-    let _target = if command.trim_start().starts_with("cargo") {
-        match guard_target(root, root, &crate::hub::cargo_target(root), timeout).await {
+    let _target = if command.trim_start().starts_with("cargo") && !own {
+        match guard_target(root, root, &target, timeout).await {
             Ok(guard) => guard,
             Err(_) => return Vec::new(),
         }

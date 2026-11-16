@@ -93,6 +93,32 @@ fn scripted_checks(answers: fn(&str, usize) -> (i32, String)) -> (anyhow::Result
 const FAILED_ALONE: &str = "running 2 tests\ntest timing::a_check_is_killed ... FAILED\n\nfailures:\n    timing::a_check_is_killed\n\ntest result: FAILED. 1 passed; 1 failed\nexit code 101";
 
 #[tokio::test]
+async fn the_base_run_beside_a_check_holding_the_projects_target_does_not_wait_on_its_own_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n\n[workspace]\n").unwrap();
+    let script: ra_tools::Script = Arc::new(|_: &str| Ok((101, format!("{FAILED_ALONE}\n"))));
+    let worker = Worker::new("z-ai/glm-5.3-flash").with_script(script);
+    // the card's check holds the lock on the project's own target, as it does where no scratch
+    // root gives the check another
+    let target = crate::hub::cargo_target(root);
+    let held = guard_target(root, root, &target, std::time::Duration::from_secs(1)).await.unwrap().expect("the target was free");
+    let base = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        base_failures(&worker, root, "cargo test -q", Some(&target), CHECK_TIMEOUT),
+    )
+    .await
+    .expect("the base run waited on the lock its own check holds");
+    assert!(!base.is_empty(), "the base's failures were read: {base:?}");
+    // a lock held by another than the check is still waited on: the wait runs out, and the
+    // base's failures go unread
+    let other = tempfile::tempdir().unwrap();
+    let waited = base_failures(&worker, root, "cargo test -q", Some(other.path()), std::time::Duration::from_secs(1)).await;
+    assert!(waited.is_empty(), "the base ran on a target another holds: {waited:?}");
+    drop(held);
+}
+
+#[tokio::test]
 async fn flaky_rerun_passes_a_test_that_passes_alone_and_names_it() {
     let (toolbox, seen) =
         scripted_checks(
