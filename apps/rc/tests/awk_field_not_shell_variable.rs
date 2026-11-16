@@ -1,9 +1,10 @@
 //! An awk field `$1` inside single quotes is not a shell variable: a chain with `;` between
-//! pipelines matches `piped-or-chained`, never `shell-variable-command`.
+//! pipelines matches `piped-or-chained`, never `shell-variable-command`. The chain writes a file
+//! (`tee`), since a chain of read-only filters passes the hook (d603f34).
 
 use ra_gotchas::{Catalogue, Conditions, Verdict};
 
-const COMMAND: &str = "grep -n x f | awk -F: '$1>6540 && $1<6620' ; grep -n y f | cut -c1-9";
+const COMMAND: &str = "grep -n x f | awk -F: '$1>6540 && $1<6620' ; grep -n y f | tee out.txt";
 
 #[test]
 fn a_single_quoted_awk_field_does_not_match_the_shell_variable_gotcha() {
