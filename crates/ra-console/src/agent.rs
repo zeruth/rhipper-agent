@@ -7694,7 +7694,11 @@ async fn run_task(store: &Store, node: Node, worker: &Worker, roles: &Roles) -> 
                 .filter(|head| base.failing.contains(&run_name(head)))
                 .collect();
             failed.failures = ra_context::marked_on_base(&failed.failures, &shared);
-            if failed.tests.iter().all(|test| base.failing.contains(test)) {
+            // a test the check names by its filter is the card's to make pass: a card filed to
+            // fix main's red is sent back to its worker, never parked on the red it is for (asm
+            // #592 waited on main for the two rhtest_stl tests it was filed to fix, 2026-11-17)
+            let the_cards = failed.tests.iter().any(|test| named_by_filter(&failed.command, test));
+            if !the_cards && failed.tests.iter().all(|test| base.failing.contains(test)) {
                 red_main = Some(base);
             }
         }
@@ -9686,6 +9690,32 @@ fn short_sha(sha: &str) -> &str {
 
 /// The name a run of a test alone takes for a failure's name line: gradle's `Class > method()`
 /// as `Class.method`, any other line as it is.
+/// Whether a check's own test filter names `test`: a bare word of a `cargo test` line (not a
+/// flag nor a flag's value, as `-p`'s package or `--test`'s target) that the test's name holds,
+/// or gradle's `--tests` pattern without its `*`s.
+fn named_by_filter(command: &str, test: &str) -> bool {
+    const TAKES_A_VALUE: [&str; 12] =
+        ["-p", "--package", "--test", "--features", "-F", "--bin", "--example", "--bench", "--target", "--manifest-path", "-j", "--jobs"];
+    let mut words = command.split_whitespace().map(|w| w.trim_matches(['"', '\'']));
+    if !words.by_ref().any(|w| w == "test" || w == "nextest") {
+        // gradle: `--tests <pattern>`
+        let mut words = command.split_whitespace();
+        return words.by_ref().any(|w| w == "--tests")
+            && words.next().is_some_and(|p| p.split('*').filter(|part| !part.is_empty()).all(|part| test.contains(part.trim_matches('"'))));
+    }
+    let mut skip = false;
+    for word in words {
+        if skip {
+            skip = false;
+        } else if TAKES_A_VALUE.contains(&word) {
+            skip = true;
+        } else if !word.starts_with('-') && word.len() > 1 && test.contains(word) {
+            return true;
+        }
+    }
+    false
+}
+
 fn run_name(head: &str) -> String {
     match head.split_once(" > ") {
         Some((class, method)) => format!("{class}.{}", method.trim_end_matches("()")),

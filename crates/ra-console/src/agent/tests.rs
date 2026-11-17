@@ -1438,6 +1438,21 @@ async fn nits_never_reject_and_a_list_of_only_nits_is_an_acceptance_with_the_nit
 }
 
 #[test]
+fn a_check_names_the_tests_its_filter_holds_and_not_its_package_or_target() {
+    let check = "cargo test -q -p ra-asm-emit --features oracle --test oracle rhtest_stl";
+    assert!(named_by_filter(check, "rhtest_stl_clang_runs_as_c"));
+    assert!(named_by_filter(check, "rhtest_stlio_clang_runs_as_c"));
+    assert!(!named_by_filter(check, "classes64_calls_its_virtual_functions_by_name"));
+    // the package, the target and the feature are no filter
+    assert!(!named_by_filter("cargo test -q -p oracle --test oracle", "oracle_runs"));
+    assert!(!named_by_filter("cargo test -q -p ra-asm-emit", "ra-asm-emit_case"));
+    // a filter past `--`, as `--exact` takes it
+    assert!(named_by_filter("cargo test -q --test oracle -- --exact mips_control_runs_as_c", "mips_control_runs_as_c"));
+    // gradle's pattern
+    assert!(named_by_filter(".\\gw.ps1 :app:test --tests \"*PoolTest*\"", "com.x.PoolTest.clears"));
+}
+
+#[test]
 fn follow_up_title_drops_the_number_the_tag_and_the_location() {
     assert_eq!(
         follow_up_title("2. [work] crates/x/tests/oracle.rs:1013: The three new oracle tests never ran."),
