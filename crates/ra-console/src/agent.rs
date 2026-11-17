@@ -6531,6 +6531,11 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
     // the project's root, which the runs' futures borrow
     let git_lock_owned = tokio::sync::Mutex::new(());
     let root_owned = root.clone();
+    // the cards whose run ended accepted: the run's future gives its runner back at once and the
+    // loop puts the landing in flight on a seat of its own. A landing proves the merged tree for
+    // ten minutes and more, one at a time under the git lock, and held its runner all the while:
+    // asm showed one bubble with four runners while #148 and #586 waited to land (2026-11-17)
+    let landing_due: std::cell::RefCell<Vec<i64>> = std::cell::RefCell::new(Vec::new());
     let mut flight: Vec<(i64, InFlight<'_>, Seat)> = Vec::new();
     // the cards the reviewer accepted that a walk stopped before they landed are landed so a
     // restart never strands accepted work (runelite #21 and #35, 2026-11-12), each in flight on
@@ -6550,7 +6555,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                     let _git = git_lock.lock().await;
                     Ok(land_or_say(store, id, worker).instrument(span).await)
                 }),
-                Seat::Investigate,
+                Seat::Land,
             ));
         }
     }
@@ -6699,7 +6704,7 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                 // on the progress target: the filter lets that target through and no other,
                 // and a span the filter drops is no span at all
                 let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id);
-                let (git_lock, root_ref) = (&git_lock_owned, &root_owned);
+                let (git_lock, root_ref, landing_due) = (&git_lock_owned, &root_owned, &landing_due);
                 flight.push((
                     id,
                     Box::pin(
@@ -6733,11 +6738,11 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
                             if let (Some(mark), Some(ledger)) = (mark, runner.ledger()) {
                                 out.extend(crate::retro::landed(root_ref, &node, ledger, mark).await);
                             }
-                            let git_guard = git_lock.lock().await;
                             if node.state == TaskState::Implemented {
-                                out.extend(land_or_say(store, id, &runner).await);
-                                drop(git_guard);
+                                // landed on a seat of its own, so this runner takes the next card
+                                landing_due.borrow_mut().push(id);
                             } else {
+                                let git_guard = git_lock.lock().await;
                                 out.extend(checkpoint_and_prove(root_ref, &node, &runner, git_guard).await);
                             }
                             Ok(out)
@@ -6846,9 +6851,32 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
             continue;
         };
         let (id, _, seat) = flight.remove(at);
+        // a run that ended accepted: its landing goes in flight now, its runner is free
+        let due_now: Vec<i64> = landing_due.borrow_mut().drain(..).collect();
+        for landing in due_now {
+            let git_lock = &git_lock_owned;
+            let span = tracing::info_span!(target: crate::trace::PROGRESS, crate::trace::CARD_SPAN, id = landing);
+            flight.push((
+                landing,
+                Box::pin(
+                    async move {
+                        let _git = git_lock.lock().await;
+                        Ok(land_or_say(store, landing, worker).await)
+                    }
+                    .instrument(span),
+                ),
+                Seat::Land,
+            ));
+        }
         match (seat, outcome) {
             // an investigator's end is a brief or a line in the log, never the walk's end
-            (Seat::Investigate, Ok(brief_lines)) => lines.extend(brief_lines),
+            (Seat::Investigate | Seat::Land, Ok(brief_lines)) => lines.extend(brief_lines),
+            (Seat::Land, Err(error)) => {
+                let text = format!("the landing of #{id} failed: {error:#}");
+                tracing::warn!("{text}");
+                crate::pair::event(&root, &text);
+                lines.push(text);
+            }
             (Seat::Investigate, Err(error)) => {
                 let text = format!("the investigation of #{id} failed: {error:#}");
                 tracing::warn!("{text}");
@@ -6952,6 +6980,8 @@ pub async fn run_parallel(store: &Store, worker: &Worker, width: usize, stop_on_
 enum Seat {
     Build(PoolKind),
     Investigate,
+    /// An accepted card's landing: under the project's git lock, on no runner.
+    Land,
 }
 
 /// Where a card's research brief lives, under the project's `var`.
