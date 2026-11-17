@@ -1436,3 +1436,34 @@ async fn nits_never_reject_and_a_list_of_only_nits_is_an_acceptance_with_the_nit
     assert_eq!(node.notes.as_deref(), Some(format!("done\n\n{NIT_POINT}{nit}").as_str()));
     assert!(out.iter().any(|line| line.contains(&format!("{NIT_POINT}{nit}"))), "{out:?}");
 }
+
+#[test]
+fn follow_up_title_drops_the_number_the_tag_and_the_location() {
+    assert_eq!(
+        follow_up_title("2. [work] crates/x/tests/oracle.rs:1013: The three new oracle tests never ran."),
+        "The three new oracle tests never ran"
+    );
+    assert_eq!(follow_up_title("3. [card] rhipper.md: the acceptance asks for a CI run"), "the acceptance asks for a CI run");
+    assert_eq!(follow_up_title("the [x] slot {c3} reads"), "the x slot c3 reads", "no bracket or brace survives");
+    // a long point is cut at a word, under the limit
+    let long = follow_up_title(&format!("1. [work] src/lib.rs:4: {}", "word ".repeat(40)));
+    assert!(long.chars().count() <= FOLLOW_UP_TITLE && long.ends_with("word"), "{long}");
+}
+
+#[tokio::test]
+async fn a_card_made_from_a_point_reads_back_with_its_title_and_no_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rhipper.md");
+    let point = "2. [work] crates/ra-asm-emit/tests/oracle.rs:1013: The three new oracle tests (`lines64_runs_as_c`, `lines32_runs_as_c`) never ran. The handoff says so itself.";
+    let title = follow_up_title(point);
+    let id = {
+        let store = Store::open(&path, "Rhipper").await.unwrap();
+        let card = Card { objective: Some(point), ..Card::new() };
+        store.insert_card(Some(1), NodeKind::Task, &title, &card).await.unwrap()
+    };
+    // a fresh store parses the file the first one wrote
+    let node = Store::open(&path, "Rhipper").await.unwrap().read(id).await.unwrap();
+    assert_eq!(node.title, title);
+    assert_eq!(node.state, TaskState::Defined);
+    assert!(node.assignee.is_none(), "the point's text took the model slot: {node:?}");
+}

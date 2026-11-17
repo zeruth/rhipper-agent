@@ -1433,6 +1433,36 @@ const FOLLOW_UP_POINT: &str = "follow-up #";
 /// The characters of a card point a follow-up card takes for its title.
 const FOLLOW_UP_TITLE: usize = 80;
 
+/// The title of a card made from a review point: the point without its number, its `[work]`
+/// tag and its leading `path:line:` location, with no bracket or brace (the roadmap line reads
+/// `[...]` as the state and `{c3}` as the complexity), cut at a word under [`FOLLOW_UP_TITLE`].
+/// The raw point made asm's #569..#573 and #579..#583 titled `1.` with the point's text in the
+/// model slot, so every run of them failed with "the provider knows no model".
+fn follow_up_title(point: &str) -> String {
+    let what = tagged(point).map_or_else(|| point.trim(), |(_, _, what)| what);
+    let what = match what.split_once(": ") {
+        Some((location, rest)) if is_location(location) => rest,
+        _ => what,
+    };
+    let clean: String = what.chars().filter(|c| !matches!(c, '[' | ']' | '{' | '}')).collect();
+    let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.chars().count() <= FOLLOW_UP_TITLE {
+        return clean.trim_end_matches(['.', ':']).to_owned();
+    }
+    let cut: String = clean.chars().take(FOLLOW_UP_TITLE).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
+    cut.trim_end_matches(['.', ',', ':', ';', '(', '`']).trim_end().to_owned()
+}
+
+/// A point's leading place: a path with a dot in its file name, a `:line` after it or not.
+fn is_location(word: &str) -> bool {
+    let file = match word.rsplit_once(':') {
+        Some((file, line)) if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) => file,
+        _ => word,
+    };
+    !file.contains(' ') && file.rsplit(['/', '\\']).next().is_some_and(|name| name.contains('.'))
+}
+
 /// A mixed rejection split at its source: the work points (and the untagged ones) stay the
 /// rerun's; each environment point goes on the notes as a `person:` line, and each card point
 /// becomes a follow-up card under the card's parent, waiting on this one, with the point as its
@@ -1451,9 +1481,9 @@ async fn split_points(store: &Store, node: &Node, verdict: Verdict) -> (Verdict,
         match tagged(&point) {
             Some((_, PointKind::Environment, _)) => left.push(format!("{PERSON_POINT}{point}")),
             Some((_, PointKind::Card, what)) => {
-                let title: String = what.chars().take(FOLLOW_UP_TITLE).collect();
+                let title = follow_up_title(what);
                 let card = Card { objective: Some(what), waits_on: &[node.id], ..Card::new() };
-                match store.insert_card(node.parent, NodeKind::Task, title.trim(), &card).await {
+                match store.insert_card(node.parent, NodeKind::Task, &title, &card).await {
                     Ok(follow) => left.push(format!("{FOLLOW_UP_POINT}{follow}: {point}")),
                     Err(e) => {
                         // a point no card could take still leaves the rerun: the person reads it
@@ -1504,10 +1534,10 @@ async fn split_by_point(store: &Store, node: &Node, root: &Path, verdict: Verdic
     }
     let mut made = Vec::new();
     for point in points {
-        let title: String = point.chars().take(FOLLOW_UP_TITLE).collect();
+        let title = follow_up_title(point);
         let files = files_named(root, point);
         let card = Card { objective: Some(point), files: &files, ..Card::new() };
-        let child_result = match store.insert_card(node.parent, NodeKind::Task, title.trim(), &card).await {
+        let child_result = match store.insert_card(node.parent, NodeKind::Task, &title, &card).await {
             Ok(child) => store.depend_on(node.id, child).await.map(|()| child),
             Err(e) => Err(e),
         };
