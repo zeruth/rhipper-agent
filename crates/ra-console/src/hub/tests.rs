@@ -17,6 +17,21 @@ fn digest_of(name: &str, pid: u32, when: u64) -> Digest {
 }
 
 #[test]
+fn a_card_sent_back_waits_on_the_person_only_when_the_walk_gave_it_up() {
+    let lines = |lines: &[&str]| lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>();
+    // a rerun the walk queued, or a run started since: the worker's
+    assert!(!given_up(&lines(&["rerun #7 Card · the reviewer sent it back 1 time(s) · rerun 1 of 1"]), 7));
+    assert!(!given_up(&lines(&["waits #7 Card · x · waits for the person", "start #7 Card · claude"]), 7));
+    // a landing that sent the card back to its worker said nothing of the person
+    assert!(!given_up(&lines(&["#7 not landed: the merged tree fails cargo test; sent back to its worker"]), 7));
+    assert!(!given_up(&[], 7));
+    // given up: the latest word is a wait or a park, and another card's lines do not count
+    assert!(given_up(&lines(&["start #7 Card", "waits #7 Card · x · waits for the person: `rc set 7 defined` re-queues it"]), 7));
+    assert!(given_up(&lines(&["parked #7: sent back twice", "start #17 Other"]), 7));
+    assert!(!given_up(&lines(&["waits #17 Other · x"]), 7));
+}
+
+#[test]
 fn a_walk_moves_to_a_newer_install_or_a_rebuild_of_its_own_and_never_to_an_older_one() {
     // newer by its number, whatever the walk saw at its start
     assert_eq!(moved_to("0.2.10", Some("0.2.11 5"), Some("0.2.11 5")), Some("0.2.11".to_owned()));

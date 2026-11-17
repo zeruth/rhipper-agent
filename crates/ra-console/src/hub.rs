@@ -530,8 +530,8 @@ pub fn waiting(root: &Path, nodes: &[ra_roadmap::model::Node]) -> Vec<Waiting> {
 }
 
 /// The cards of `nodes` that wait on the person, by their stored state: the blocked ones, the
-/// ones that need revision, and the implemented ones whose last landing word on `feed` is `not
-/// landed`. The reason is the card's latest word on the feed or its notes' first line; a blocked
+/// ones that need revision the walk gave up on ([`given_up`]), and the implemented ones whose
+/// last landing word on `feed` is `not landed`. The reason is the card's latest word on the feed or its notes' first line; a blocked
 /// card's notes come first, where a park or the person put the reason.
 #[must_use]
 pub fn waiting_of(nodes: &[ra_roadmap::model::Node], feed: &[String]) -> Vec<Waiting> {
@@ -544,7 +544,16 @@ pub fn waiting_of(nodes: &[ra_roadmap::model::Node], feed: &[String]) -> Vec<Wai
             let said = feed_reason(feed, id);
             let reason = match node.state {
                 TaskState::Blocked => noted.or(said),
-                TaskState::NeedsRevision => said.or(noted),
+                // a card sent back is on the walk's queue again, its worker's: it waits on the
+                // person only when the walk gave it up, its latest word a `waits` or a `parked`
+                // line (asm counted five cards on the person, 2026-11-17, four of them queued
+                // reruns and one a landing sent back to its worker)
+                TaskState::NeedsRevision => {
+                    if !given_up(feed, id) {
+                        return None;
+                    }
+                    said.or(noted)
+                }
                 TaskState::Implemented => {
                     let not_landed = format!("#{id} not landed");
                     let (landed, start) = (format!("landed #{id} "), format!("start #{id} "));
@@ -560,6 +569,17 @@ pub fn waiting_of(nodes: &[ra_roadmap::model::Node], feed: &[String]) -> Vec<Wai
             Some(Waiting { id, title: node.title.clone(), state: node.state, reason })
         })
         .collect()
+}
+
+/// Whether the walk gave card `id` up to the person: of its `waits`, `parked`, `rerun` and
+/// `start` lines on `feed`, the latest is a `waits` or a `parked` one. A rerun queued or a run
+/// started since leaves it with its worker.
+fn given_up(feed: &[String], id: i64) -> bool {
+    let (waits, parked, rerun, start) = (format!("waits #{id} "), format!("parked #{id}: "), format!("rerun #{id} "), format!("start #{id} "));
+    feed.iter()
+        .rev()
+        .find(|line| line.starts_with(&waits) || line.starts_with(&parked) || line.starts_with(&rerun) || line.starts_with(&start))
+        .is_some_and(|line| line.starts_with(&waits) || line.starts_with(&parked))
 }
 
 /// The latest word on the feed of why card `id` waits: the `why` of a `waits`/`rerun` line, the
