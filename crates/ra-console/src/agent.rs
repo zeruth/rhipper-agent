@@ -5895,14 +5895,21 @@ async fn check_merged(
         let _slot = hold_build(root, root).await;
         let runs = run_checks(&toolbox, &commands, &[]).await;
         if let Some(failed) = runs.iter().find(|r| !r.passed) {
+            let tree = root.join(WORKTREES_DIR).join(id.to_string());
+            // a tracked output the project regenerates (a scoreboard, a snapshot) is rewritten
+            // even when its test sits outside the card's crates: landed over with a note, the
+            // stale file stayed on main and parked every card whose check ran it (asm's board
+            // after #513 and #590, 2026-11-17)
+            let tests: Vec<Vec<String>> = runs.iter().filter(|run| !run.passed).map(|run| run.tests.clone()).collect();
+            let regenerable = regenerate
+                && crate::router::Router::load(root).is_ok_and(|router| router.worker.regenerations(&tree, &tests).is_some());
             // a failure outside the card's files and crates is the project's: the card
             // lands and a note carries the failure (#207 failed another card's test)
-            if let Some(outside) = outside_failure(root, &failed.text, staged) {
+            if !regenerable && let Some(outside) = outside_failure(root, &failed.text, staged) {
                 lines.push(outside_note(root, id, &failed.command, &outside));
             } else {
                 // the squash commit goes; what the checkout held uncommitted stays
                 let _ = git(root, &["reset", "--merge", "HEAD~1"]).await;
-                let tree = root.join(WORKTREES_DIR).join(id.to_string());
                 if regenerate && let Some(line) = regenerate_outputs(root, &tree, id, worker, &runs, timeout).await {
                     lines.push(line);
                     return Err(anyhow::Error::new(Regenerated { lines: std::mem::take(lines) }));
