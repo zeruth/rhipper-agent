@@ -6240,10 +6240,14 @@ async fn clean_after(root: &Path, id: i64, has_branch: bool) -> Vec<String> {
             Err(e) => lines.push(format!("branch kept: {}", first_line(&format!("{e:#}")))),
         }
     }
-    // a pooled target outlives the card, its build kept for the next one's lease
+    // a pooled target outlives the card, its build kept for the next one's lease; the card's own
+    // `wt-<id>` goes either way: a worker that leased a pooled target still built its own there
+    // (the project's context sends it to), and asm's landings left 54 of them, 140 GB, until the
+    // drive was full (2026-11-17)
     if let Some(target) = ra_providers::claude_code::release_target(&path) {
         lines.push(pool_cap(root, &target));
-    } else if let Some(target) = ra_providers::claude_code::shared_target(&path)
+    }
+    if let Some(target) = ra_providers::claude_code::shared_target(&path)
         && target.is_dir()
     {
         match std::fs::remove_dir_all(&target) {
@@ -6251,6 +6255,9 @@ async fn clean_after(root: &Path, id: i64, has_branch: bool) -> Vec<String> {
             Err(e) => lines.push(format!("target kept: {e}")),
         }
     }
+    // and what the cards that left without landing (removed, cancelled) left, at each landing
+    // rather than only when a walk starts: a walk runs for a day
+    lines.extend(sweep_orphan_targets(root));
     let _ = std::fs::remove_file(brief_path(root, id));
     // a proof that failed and was fixed in a run that ran no proof after it would open a
     // later card of the same id, or a reopened one, on a job that is done
