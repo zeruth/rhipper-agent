@@ -93,6 +93,42 @@ fn scripted_checks(answers: fn(&str, usize) -> (i32, String)) -> (anyhow::Result
 const FAILED_ALONE: &str = "running 2 tests\ntest timing::a_check_is_killed ... FAILED\n\nfailures:\n    timing::a_check_is_killed\n\ntest result: FAILED. 1 passed; 1 failed\nexit code 101";
 
 #[tokio::test]
+async fn a_failed_landing_drops_its_own_squash_and_keeps_a_commit_made_on_top_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git").args(args).current_dir(root).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["config", "user.email", "t@example.com"]);
+    run(&["config", "user.name", "t"]);
+    let commit = |file: &str, message: &str| {
+        std::fs::write(root.join(file), message).unwrap();
+        run(&["add", file]);
+        run(&["commit", "-q", "-m", message]);
+        run(&["rev-parse", "HEAD"])
+    };
+    let base = commit("base.txt", "base");
+    // still the head: the squash is reset away
+    let squash = commit("card.txt", "the squash");
+    run(&["update-ref", PROVING_REF, &squash]);
+    let mut lines = Vec::new();
+    drop_squash(root, &mut lines).await;
+    assert_eq!(run(&["rev-parse", "HEAD"]), base, "{lines:?}");
+    // a commit landed on top during the check: the squash is reverted and the commit stays
+    let squash = commit("card.txt", "the squash again");
+    run(&["update-ref", PROVING_REF, &squash]);
+    let theirs = commit("theirs.txt", "a pairing session's commit");
+    drop_squash(root, &mut lines).await;
+    assert_eq!(run(&["rev-parse", "HEAD~1"]), theirs, "{lines:?}");
+    assert!(root.join("theirs.txt").is_file(), "{lines:?}");
+    assert!(!root.join("card.txt").exists(), "the squash's file stayed: {lines:?}");
+    assert!(lines.iter().any(|l| l.contains("reverted, not reset")), "{lines:?}");
+}
+
+#[tokio::test]
 async fn the_base_run_beside_a_check_holding_the_projects_target_does_not_wait_on_its_own_lock() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

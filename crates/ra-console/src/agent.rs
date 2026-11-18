@@ -5862,6 +5862,28 @@ async fn land_branch(
 /// them; a catch-up merges the commit before this one instead ([`catch_up_target`]).
 pub const PROVING_REF: &str = "refs/rhipper/proving";
 
+/// Takes the squash commit a failed landing check proved ([`PROVING_REF`]) off the project's
+/// branch, and only that commit: a reset while it is still the head, a revert when someone
+/// committed on top of it meanwhile. A blind `reset HEAD~1` dropped a pairing session's commit
+/// that had landed during the check and left the squash on main (asm, 2026-11-17). A squash no
+/// longer on the branch is left alone.
+async fn drop_squash(root: &Path, lines: &mut Vec<String>) {
+    let Ok(squash) = git(root, &["rev-parse", "-q", "--verify", PROVING_REF]).await else { return };
+    let squash = squash.trim().to_owned();
+    let head = git(root, &["rev-parse", "HEAD"]).await.unwrap_or_default();
+    if head.trim() == squash {
+        let _ = git(root, &["reset", "--merge", "HEAD~1"]).await;
+    } else if git(root, &["merge-base", "--is-ancestor", &squash, "HEAD"]).await.is_ok() {
+        match git(root, &["revert", "--no-edit", &squash]).await {
+            Ok(_) => lines.push(format!("the squash {} was under later commits: reverted, not reset", &squash[..squash.len().min(7)])),
+            Err(e) => {
+                let _ = git(root, &["revert", "--abort"]).await;
+                lines.push(format!("the squash {} stays on the branch: its revert failed: {}", &squash[..squash.len().min(7)], first_line(&format!("{e:#}"))));
+            }
+        }
+    }
+}
+
 /// What a card's catch-up merges of the project's branch `main` in the checkout at `root`:
 /// `main` itself, or the commit before the squash a landing is still proving on it, so a
 /// card's branch takes only the work the project has kept. A proving ref whose commit is no
@@ -5909,7 +5931,7 @@ async fn check_merged(
                 lines.push(outside_note(root, id, &failed.command, &outside));
             } else {
                 // the squash commit goes; what the checkout held uncommitted stays
-                let _ = git(root, &["reset", "--merge", "HEAD~1"]).await;
+                drop_squash(root, lines).await;
                 if regenerate && let Some(line) = regenerate_outputs(root, &tree, id, worker, &runs, timeout).await {
                     lines.push(line);
                     return Err(anyhow::Error::new(Regenerated { lines: std::mem::take(lines) }));
